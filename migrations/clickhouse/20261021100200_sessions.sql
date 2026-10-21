@@ -42,7 +42,7 @@ ENGINE = AggregatingMergeTree
 PARTITION BY toYYYYMM(start_date)
 ORDER BY (site_id, start_date, visitor_id, session_id)
 SAMPLE BY visitor_id
-TTL start_date + INTERVAL 400 DAY DELETE
+TTL start_date + INTERVAL 731 DAY DELETE
 SETTINGS ttl_only_drop_parts = 1, non_replicated_deduplication_window = 1000;
 
 -- SQL SECURITY 必须显式写：服务端设置 ignore_empty_sql_security_in_create_view_query 默认为 1，
