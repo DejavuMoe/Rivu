@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+license.workspace = true
 description = "Rivu：开源、自托管的网站分析系统（单个二进制，按角色启动）"
 
 [lints]
