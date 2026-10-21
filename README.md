@@ -2,7 +2,7 @@
 
 Rivu 是开源、自托管的网站分析系统（Plausible 的替代品）：一个 Rust 二进制，Lite 模式一个进程搭配 ClickHouse 和 PostgreSQL 就能跑，需要不丢数据和横向扩展时再切到基于 NATS JetStream 的 Reliable 模式。
 
-技术栈：Rust（Axum + Tokio）、ClickHouse、PostgreSQL、可选 NATS JetStream。许可证待定。
+技术栈：Rust（Axum + Tokio）、ClickHouse、PostgreSQL、可选 NATS JetStream。许可证：[MIT](LICENSE)。
 
 ## 当前阶段
 
