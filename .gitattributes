@@ -1,0 +1,7 @@
+# 统一用 LF：迁移文件的 checksum 在计算前也会做 CRLF 归一化，但仓库内保持 LF 更稳妥。
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.woff2 binary
