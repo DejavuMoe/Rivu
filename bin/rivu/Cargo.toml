@@ -1,0 +1,40 @@
+[package]
+name = "rivu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Rivu：开源、自托管的网站分析系统（单个二进制，按角色启动）"
+
+[lints]
+workspace = true
+
+[lib]
+name = "rivu"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rivu"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+clap.workspace = true
+clickhouse.workspace = true
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
+rivu-common.workspace = true
+rivu-storage-ch.workspace = true
+rivu-storage-pg.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+clickhouse = { workspace = true, features = ["time", "uuid"] }
+serde.workspace = true
+time.workspace = true
+uuid.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

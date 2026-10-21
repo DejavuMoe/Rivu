@@ -1,0 +1,5 @@
+[alias]
+rivu = "run -p rivu --"
+
+[term]
+color = "auto"

@@ -1,0 +1,73 @@
+# Rivu 开发依赖：只起 ClickHouse / PostgreSQL / NATS，Rust 在宿主机 cargo run。
+# 仅用于开发：账号密码是公开的开发值，不得用于生产。
+# 端口都只绑 127.0.0.1，可用 deploy/.env（见 .env.dev.example）覆盖。
+#
+#   docker compose -f deploy/compose.dev.yml up -d                     # clickhouse + postgres
+#   docker compose -f deploy/compose.dev.yml --profile reliable up -d  # 另加 nats（JetStream）
+name: rivu-dev
+
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.8.33.6
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${RIVU_DEV_CH_HTTP_PORT:-8123}:8123"
+      - "127.0.0.1:${RIVU_DEV_CH_NATIVE_PORT:-9000}:9000"
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    volumes:
+      - rivu-ch-data:/var/lib/clickhouse
+      - ./clickhouse/users.d/rivu-dev.xml:/etc/clickhouse-server/users.d/rivu-dev.xml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8123/ping | grep -q Ok"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  postgres:
+    image: postgres:18.6-alpine
+    restart: unless-stopped
+    environment:
+      # 开发环境的 POSTGRES_USER 就是 rivu_migrator（在容器里是超级用户，仅限开发）。
+      POSTGRES_USER: rivu_migrator
+      POSTGRES_PASSWORD: rivu_dev_migrator
+      POSTGRES_DB: rivu
+    ports:
+      - "127.0.0.1:${RIVU_DEV_PG_PORT:-5432}:5432"
+    volumes:
+      # PG 18 镜像的数据目录带版本子目录，挂载点是 /var/lib/postgresql
+      - rivu-pg-data:/var/lib/postgresql
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rivu_migrator -d rivu"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  nats:
+    image: nats:2.15.1-alpine
+    profiles: ["reliable"]
+    restart: unless-stopped
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    ports:
+      - "127.0.0.1:${RIVU_DEV_NATS_PORT:-4222}:4222"
+      - "127.0.0.1:${RIVU_DEV_NATS_MONITOR_PORT:-8222}:8222"
+    volumes:
+      - rivu-nats-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8222/healthz | grep -q ok"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  rivu-ch-data:
+    name: rivu-ch-data
+  rivu-pg-data:
+    name: rivu-pg-data
+  rivu-nats-data:
+    name: rivu-nats-data
