@@ -1,0 +1,85 @@
+# Rivu CI（Forgejo Actions）。
+# `runs-on` 的标签取决于 runner 的配置；这里假设有带 Docker 的 `docker` 标签 runner，按实际环境调整。
+# 本文件尚未在真实的 Forgejo runner 上运行过。
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RIVU_GIT_COMMIT: ${{ github.sha }}
+
+jobs:
+  lint-and-unit:
+    runs-on: docker
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust 工具链（版本由 rust-toolchain.toml 决定）
+        run: rustup show
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo test（集成测试在没有 RIVU_TEST_* 变量时自动跳过）
+        run: cargo test --workspace
+
+  migrate-and-integration:
+    runs-on: docker
+    needs: lint-and-unit
+    services:
+      postgres:
+        image: postgres:18.6-alpine
+        env:
+          POSTGRES_USER: rivu_migrator
+          POSTGRES_PASSWORD: rivu_ci
+          POSTGRES_DB: rivu
+        options: >-
+          --health-cmd "pg_isready -U rivu_migrator -d rivu"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+      clickhouse:
+        image: clickhouse/clickhouse-server:25.8.33.6
+        env:
+          # CI 里没法挂载 users.d，用一个有全部权限的账号代替四个角色。
+          # 所以 CI 不验证账号权限分离，那部分只在本地 compose.dev 上验证。
+          CLICKHOUSE_USER: rivu_ci
+          CLICKHOUSE_PASSWORD: rivu_ci
+          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+        options: >-
+          --ulimit nofile=262144:262144
+          --health-cmd "wget -qO- http://127.0.0.1:8123/ping"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    env:
+      RIVU_DATABASE_URL: postgres://rivu_migrator:rivu_ci@postgres:5432/rivu
+      RIVU_CLICKHOUSE_URL: http://clickhouse:8123
+      RIVU_CH_MIGRATOR_USER: rivu_ci
+      RIVU_CH_MIGRATOR_PASSWORD: rivu_ci
+      # 集成测试
+      RIVU_TEST_DATABASE_URL: postgres://rivu_migrator:rivu_ci@postgres:5432/rivu
+      RIVU_TEST_CLICKHOUSE_URL: http://clickhouse:8123
+      RIVU_TEST_CH_MIGRATOR_USER: rivu_ci
+      RIVU_TEST_CH_MIGRATOR_PASSWORD: rivu_ci
+      RIVU_TEST_CH_WRITER_USER: rivu_ci
+      RIVU_TEST_CH_WRITER_PASSWORD: rivu_ci
+      RIVU_TEST_CH_READER_USER: rivu_ci
+      RIVU_TEST_CH_READER_PASSWORD: rivu_ci
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust 工具链
+        run: rustup show
+      - name: 构建 rivu
+        run: cargo build -p rivu
+      - name: rivu migrate（第一次：全部应用）
+        run: ./target/debug/rivu migrate
+      - name: rivu migrate（第二次：必须幂等，没有待执行的迁移）
+        run: |
+          out="$(./target/debug/rivu migrate)"
+          echo "$out"
+          echo "$out" | grep -q "没有待执行的迁移"
+      - name: rivu migrate status
+        run: ./target/debug/rivu migrate status
+      - name: 集成测试
+        run: cargo test -p rivu --test clickhouse_sessions -- --nocapture
