@@ -1,0 +1,188 @@
+//! 内部端口（`RIVU_INTERNAL_ADDR`）：`/healthz`、`/readyz`、`/metrics`。不经反向代理对外暴露。
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use axum::Router;
+use axum::extract::State;
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Json};
+use axum::routing::get;
+use metrics_exporter_prometheus::PrometheusHandle;
+use rivu_common::build_info;
+use rivu_common::config::Role;
+use rivu_common::migration::{self, Store};
+use serde_json::{Value, json};
+
+/// 单项检查的超时：依赖卡住时 `/readyz` 也要及时返回 503，而不是挂起。
+const CHECK_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// `/readyz` 用到的依赖。
+pub struct Probe {
+    pub pg: sqlx::PgPool,
+    pub ch: clickhouse::Client,
+    pub ch_database: String,
+    /// 编译期嵌入的各库最高迁移版本
+    pub required_pg: u64,
+    pub required_ch: u64,
+}
+
+impl Probe {
+    pub fn new(
+        pg: sqlx::PgPool,
+        ch: clickhouse::Client,
+        ch_database: String,
+    ) -> anyhow::Result<Self> {
+        let migrations = migration::embedded().map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        Ok(Probe {
+            pg,
+            ch,
+            ch_database,
+            required_pg: migration::highest_version(&migrations, Store::Postgres).unwrap_or(0),
+            required_ch: migration::highest_version(&migrations, Store::ClickHouse).unwrap_or(0),
+        })
+    }
+}
+
+pub struct InternalState {
+    pub role: Role,
+    pub probe: Probe,
+    pub metrics: PrometheusHandle,
+    pub started: Instant,
+}
+
+pub fn router(state: Arc<InternalState>) -> Router {
+    Router::new()
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
+        .route("/metrics", get(metrics))
+        .with_state(state)
+}
+
+/// 存活：进程能响应就是 200。
+async fn healthz() -> &'static str {
+    "ok"
+}
+
+async fn with_timeout<T>(fut: impl Future<Output = anyhow::Result<T>>) -> Result<T, String> {
+    match tokio::time::timeout(CHECK_TIMEOUT, fut).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(format!("{e:#}")),
+        Err(_) => Err(format!("超时（{}s）", CHECK_TIMEOUT.as_secs())),
+    }
+}
+
+fn check_json(result: &Result<(), String>) -> Value {
+    match result {
+        Ok(()) => json!({ "ok": true }),
+        Err(e) => json!({ "ok": false, "error": e }),
+    }
+}
+
+/// 某个库的 schema 检查：已应用最高版本 >= 编译期最高版本。
+fn schema_json(required: u64, applied: &Result<u64, String>) -> (bool, Value) {
+    match applied {
+        Ok(applied) => {
+            let ok = *applied >= required;
+            (
+                ok,
+                json!({ "ok": ok, "required": required, "applied": applied }),
+            )
+        }
+        Err(e) => (
+            false,
+            json!({ "ok": false, "required": required, "error": e }),
+        ),
+    }
+}
+
+async fn readyz(State(state): State<Arc<InternalState>>) -> impl IntoResponse {
+    let p = &state.probe;
+    let (pg, ch, pg_version, ch_version) = tokio::join!(
+        with_timeout(rivu_storage_pg::ping(&p.pg)),
+        with_timeout(rivu_storage_ch::ping(&p.ch)),
+        with_timeout(rivu_storage_pg::max_applied_version(&p.pg)),
+        with_timeout(rivu_storage_ch::max_applied_version(&p.ch, &p.ch_database)),
+    );
+
+    let (pg_schema_ok, pg_schema) = schema_json(p.required_pg, &pg_version);
+    let (ch_schema_ok, ch_schema) = schema_json(p.required_ch, &ch_version);
+    let ready = pg.is_ok() && ch.is_ok() && pg_schema_ok && ch_schema_ok;
+
+    let body = json!({
+        "status": if ready { "ready" } else { "not_ready" },
+        "version": build_info::VERSION,
+        "commit": build_info::GIT_COMMIT,
+        "role": state.role.as_str(),
+        "checks": {
+            "postgres": check_json(&pg),
+            "clickhouse": check_json(&ch),
+            "schema": {
+                "ok": pg_schema_ok && ch_schema_ok,
+                "postgres": pg_schema,
+                "clickhouse": ch_schema,
+            },
+        },
+    });
+    let status = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, Json(body))
+}
+
+async fn metrics(State(state): State<Arc<InternalState>>) -> impl IntoResponse {
+    metrics::gauge!("rivu_uptime_seconds").set(state.started.elapsed().as_secs_f64());
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        state.metrics.render(),
+    )
+}
+
+/// 注册进程级指标。`build_info` 恒为 1，版本信息在标签里。
+pub fn describe_metrics() {
+    metrics::describe_gauge!(
+        "rivu_build_info",
+        "构建信息，恒为 1，版本与 commit 在标签里"
+    );
+    metrics::describe_gauge!("rivu_uptime_seconds", "进程已运行的秒数");
+    metrics::gauge!(
+        "rivu_build_info",
+        "version" => build_info::VERSION,
+        "commit" => build_info::GIT_COMMIT
+    )
+    .set(1.0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schema_check_passes_when_applied_reaches_required() {
+        let (ok, v) = schema_json(10, &Ok(10));
+        assert!(ok);
+        assert_eq!(v["applied"], 10);
+        assert!(schema_json(10, &Ok(11)).0);
+        assert!(!schema_json(10, &Ok(9)).0);
+        assert!(!schema_json(10, &Ok(0)).0);
+    }
+
+    #[test]
+    fn schema_check_fails_on_error() {
+        let (ok, v) = schema_json(10, &Err("relation does not exist".into()));
+        assert!(!ok);
+        assert_eq!(v["ok"], false);
+        assert!(v["error"].as_str().unwrap().contains("relation"));
+    }
+
+    #[test]
+    fn check_json_shapes() {
+        assert_eq!(check_json(&Ok(())), json!({"ok": true}));
+        assert_eq!(check_json(&Err("x".into()))["ok"], false);
+    }
+}
