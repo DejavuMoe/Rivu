@@ -8,7 +8,7 @@
 ### 1.1 目标
 | 类别 | 约束 | 依据 |
 |---|---|---|
-| 隐私 | 不读写 Cookie；不写任何浏览器存储；唯一的读取是站点所有者手动设置的 `localStorage.rivu_ignore === "true"`（`try/catch`，失败即忽略） | 决策 7；同类开关 `[01 §2.7]` |
+| 隐私 | 不读写 Cookie；不写任何浏览器存储；唯一的读取是站点所有者手动设置的 `localStorage.rivu_ignore === "true"`（`try/catch`，失败即忽略）。只读：脚本从不写入该键，也不用它标识访客，不随事件上报 | 决策 7；已决定，`system-design.md` §10 Q3；同类开关 `[01 §2.7]` |
 | 隐私 | 客户端不发送屏幕尺寸、语言、时区等指纹字段；设备与地理由服务端从 UA、IP 短暂推导，IP 不落库 | `[01 §8.2]` `[01 §9.1]` |
 | 隐私 | URL 在服务端收敛为 hostname、pathname、白名单 query 参数；其余 query 与 fragment 直接丢弃 | 决策 5 |
 | 可信 | 时间戳只由服务端在接收时生成（毫秒，UTC）；客户端不可传时间 | 决策 4；`[01 §0 #3]` |
@@ -212,7 +212,7 @@ window.rivu=window.rivu||function(){(rivu.q=rivu.q||[]).push(arguments)};rivu.c=
 |---|---|---|
 | localhost | `hostname` 为 `localhost`、`127.x.x.x`、`[::1]`，或 `protocol === 'file:'`；配置 `local:true` 时跳过此条 `[01 §2.7]` | core+full |
 | 自动化 | `navigator.webdriver` 或 `window.Cypress` 为真，且 `window.__rivu` 非真。Rivu 不再检查 `_phantom`/`__nightmare`（项目已停更，省体积） `[01 §2.7]` | core+full |
-| 自助排除 | `localStorage.rivu_ignore === "true"`；读取抛异常则视为未设置。站点所有者在自己浏览器控制台手动设置 | core+full |
+| 自助排除 | `localStorage.rivu_ignore === "true"`；读取抛异常则视为未设置。站点所有者在自己浏览器控制台手动设置。脚本只读该键：不写入、不删除、不用于标识，也不随事件发送（`system-design.md` §10 Q3） | core+full |
 | 缺站点 | 无 `site` | core+full |
 
 被忽略时：不发请求；调用 `callback()`（无参）；若是 pageview 则该页 engagement 禁用（4.5）；`full` 在 `debug`（默认关）时输出 `console.warn('[rivu] ignored: <reason>')`，`core` 静默。Plausible web 变体默认就打印警告 `[src]`（可选 `console.warn` 见 `[01 §2.7]`），Rivu 默认静默并提供 `debug` 与 `rivu.b` 供排查，对应 `[00 §7]` 对「忽略原因可观测」的要求。
@@ -348,8 +348,8 @@ rivu('event', 'Video Play', { interactive: false })   // 发 i:false，不影响
 | 为什么需要窗口 | 站点脚本最多缓存 5 分钟，但第三方自托管的 `t.js` 副本可能长期不更新 |
 | `sv` 的用途 | CI 生成的单调递增整数（`__SV__`）。只用于计数标签、排障（定位哪个构建在产生 400 或异常流量）、安装检测；服务端**不得**依据 `sv` 改变协议行为（行为分支只看 `v`） |
 
-## 9. Plausible 兼容层设计（第 4 阶段，仅设计）
-端点 `POST /api/plausible/event`，目标：Plausible 用户把 `data-api`（旧式脚本）或 `endpoint`（`plausible-web`/npm 的 init 选项）指向 Rivu 即可复用现有集成 `[01 §2.1]` `[01 §2.10]`。Plausible tracker 为 MIT，可以在文档中引导用户继续使用其脚本；兼容层只按公开协议行为独立实现。限制与 HTTP 契约（8 KB、CORS、可信代理 IP、不读 `x-plausible-ip` 等无条件信任头 `[01 §4.4]`）与原生端点一致。
+## 9. Plausible 兼容层设计（第 4 阶段提供，已决定）
+`system-design.md` §10 Q4 已决定在第 4 阶段提供兼容端点；本节是设计，第 4 阶段之前不实现。端点 `POST /api/plausible/event`，目标：Plausible 用户把 `data-api`（旧式脚本）或 `endpoint`（`plausible-web`/npm 的 init 选项）指向 Rivu 即可复用现有集成 `[01 §2.1]` `[01 §2.10]`。Plausible tracker 为 MIT，可以在文档中引导用户继续使用其脚本；兼容层只按公开协议行为独立实现。限制与 HTTP 契约（8 KB、CORS、可信代理 IP、不读 `x-plausible-ip` 等无条件信任头 `[01 §4.4]`）与原生端点一致。
 
 | Plausible 字段（短键/长键） | Rivu 内部字段 | 转换与差异 |
 |---|---|---|
@@ -398,7 +398,7 @@ rivu('event', 'Video Play', { interactive: false })   // 发 i:false，不影响
 | 26 | 收入格式 `$`:{a,c} 公开定义（第 4 阶段） | 仅 EE 解析，CE 为空操作 | 开源版需完整功能；只参考行为契约 | `[01 §2.9]` |
 
 ### 10.2 相对 v1 草案的修订
-以本规范为准：产物名 	racker.min.js/	racker.ext.js → core/ull；字段 site/type/path/ref → 短键 s/n/u/r（pathname 由服务端提取）；成功返回 204 → 202 空体；「不使用 localStorage」→ 仅读取 ivu_ignore；「不直接信任 X-Forwarded-For」沿用，落实为可信代理名单（6.1）。
+以本规范为准：产物名 `tracker.min.js`/`tracker.ext.js` → `core`/`full`；字段 site/type/path/ref → 短键 s/n/u/r（pathname 由服务端提取）；成功返回 204 → 202 空体；「不使用 localStorage」→ 仅只读 `rivu_ignore`（`system-design.md` §10 Q3 已决定）；「不直接信任 X-Forwarded-For」沿用，落实为可信代理名单（6.1）。
 
 ## 11. 测试清单
 ### 11.1 协议契约测试（Rust，表驱动）
