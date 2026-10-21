@@ -1,6 +1,6 @@
 # Rivu 系统设计 v2
 
-> 状态：草案（2026-10-21）。本文与 v1《网站统计系统技术架构设计 v1.0》（存档于 [`archive/v1-architecture.md`](archive/v1-architecture.md)）冲突时，以本文为准；v1 未被本文提到的部分继续有效。
+> 状态：草案（2026-10-21）；§10 的八个开放问题已于 2026-10-22 定案，决定已写入正文。本文与 v1《网站统计系统技术架构设计 v1.0》（存档于 [`archive/v1-architecture.md`](archive/v1-architecture.md)）冲突时，以本文为准；v1 未被本文提到的部分继续有效。
 > 依据：对 Plausible Analytics 源码的 REA 分析和源码通读。源码为 `plausible/analytics` master 分支，commit `b8cc135`，本地路径 `examples/plausible-analytics/`。Plausible 服务端是 AGPL-3.0，本文只抽象设计，不复制代码。tracker 是 MIT 许可。`extra/` 目录是 EE 代码，本文只记录其行为，不参考实现。
 > 配套文档：[`tracker-and-protocol.md`](tracker-and-protocol.md)（采集脚本与线协议）；[`platform-and-ops.md`](platform-and-ops.md)（业务库、权限、后台任务、部署与运维）。
 > 证据在 [`docs/research/plausible/`](../research/plausible/) 下，编号 00–04。下文用「R01 §5.2」表示「01 号文档第 5.2 节」，每条事实在原文中都附有 `路径:行号`。
@@ -27,14 +27,14 @@ Rivu 保留这三个抽象，但替换 Plausible 最脆弱的一环。Plausible 
 | D2 | 统计 API | 7 个固定端点 | 一个查询 DSL 加一个执行器，看板、公开 API、导出、邮件共用。字段用白名单枚举，取值一律由服务端参数绑定 | R03 §0、§12.1 |
 | D3 | 预聚合 | 用 MV 增量写 `agg_site_hour/day`、`agg_page_day` 等表 | 以直接查原始层为主。另设「日汇总层」，由后台任务按站点本地日期幂等重算，表结构对齐 Plausible 的 `imported_*` 维度族，导入数据和超出保留期的数据都放这一层。查询规划器自动选层 | R02 §8.4；R03 §8、§9 |
 | D4 | 时区 | Collector 计算 `site_day`，放进排序键 | 存 UTC，查询时换算（与 Plausible 相同）。只有日汇总层按站点本地日期存储，站点改时区时重建 | R03 §7.1 |
-| D5 | 访客 ID | 每日轮换 | 盐按日期存。事件使用「站点本地日期」对应的盐，所以 ID 在站点本地午夜轮换。同时计算前一天的 ID，用于跨午夜续会话 | R01 §9.2、§9.3 |
+| D5 | 访客 ID | 每日轮换 | 盐按日期存。事件使用「站点本地日期」对应的盐，所以 ID 在站点本地午夜轮换。同时计算前一天的 ID，用于跨午夜续会话；会话最长 7 天，跨多个午夜靠会话的别名 key（§4.6） | R01 §9.2、§9.3 |
 | D6 | 写入确认 | Lite 用 `async_insert` 加 `wait_for_async_insert=1`，等 ClickHouse 确认 | 应用内批量写入（1 s、2 万行或 8 MB 先到先写）。事件进入有界缓冲就回 `202`，缓冲满时回 `503`。Reliable 在 JetStream 返回 PubAck 后回 `202` | R01 §2.5、§3.3；R02 §5、§7 |
 | D7 | 响应语义 | 成功回 `204`，失败回明确状态 | 事件被接受或被过滤都回 `202`，用响应头 `x-rivu-dropped` 给出丢弃数量，不暴露原因。`400` 只用于协议错误，`503` 只用于过载 | R01 §3.2、§3.3；R00 §5.4 |
 | D8 | 可靠模式去重 | 没有解决，v1 列为风险 | 用稳定的分区键，每个分区只有一个消费者；批次边界先写入 NATS KV，保证重放时批次不变；写入时带 `insert_deduplication_token`。会话状态尽量小，重放不改变结果 | R02 §11.2 #10 |
 | D9 | 站点标识 | `data-site` | 继续用不透明的 `site_key`，与域名解耦（Plausible 的 `pa-<id>` 脚本也已改为与域名解耦）。域名只作为 hostname 白名单 | R01 §2.10、§6.5 |
 | D10 | 客户端 IP | 只信任可信代理 | 保持不变，并改为可配置的 CIDR 列表。Plausible 无条件信任 5 种转发头，是反例 | R01 §4.4 |
 | D11 | 进程 | 3 个可执行服务 | 1 个二进制，按角色启动：`rivu collector/worker/api/migrate/all`。`all` 就是最简单的自托管形态 | 降低自托管复杂度 |
-| D12 | 原始数据保留 | 90 天 TTL | 可配置，默认 400 天，以支持同比。超出保留期的时间范围由日汇总层回答 | R02 §9 |
+| D12 | 原始数据保留 | 90 天 TTL | 可配置，默认 731 天（连续两个自然年，含一个闰年），以支持同比。超出保留期的时间范围由日汇总层回答 | R02 §9 |
 
 ---
 
@@ -146,7 +146,7 @@ Rivu 保留这三个抽象，但替换 Plausible 最脆弱的一环。Plausible 
 | TinySock 会话交接 | 替换 | 快照文件，或从 ClickHouse 预热 |
 | 5 s / 100 KB 写缓冲，失败即丢弃 | 改进 | 1 s 批量、重试、有界背压 |
 | Remote persistor（Erlang term 序列化后 base64） | 替换 | JetStream + 带版本号的 MessagePack |
-| 无物化视图、无结果缓存、采样仅 EE 提供 | 改进 | 日汇总层自动分层 + moka 结果缓存；采样往后放 |
+| 无物化视图、无结果缓存、采样仅 EE 提供 | 改进 | 日汇总层自动分层 + moka 结果缓存；暂不做采样（§10 Q6） |
 | 统一 DSL、两段式解析、白名单 | 保留 | §6 |
 | 公开 schema 和内部解析器各一套 | 改进 | 从同一套 Rust 类型生成 |
 | 带页面过滤时跳出率按入口页计算 | 保留语义 | 写进文档和响应的 `meta`（§6.6） |
@@ -261,18 +261,61 @@ api × M ─► ClickHouse（只读账号）/ PostgreSQL          jobs：运行�
   - 每 10 秒按 `updated_at > 水位` 做增量刷新，删除通过 `deleted_at` 墓碑感知（Plausible 的删除要等全量刷新才生效，R01 §6.2）；
   - PG `LISTEN/NOTIFY` 推送失效通知，新站点 1 秒内可用（Plausible 有约 30 秒的未知站点窗口，R01 §11.2 #11）。
 - 热路径不回源。查不到 `site_key` 就按 `unknown_site` 丢弃，这样随机 key 洪水打不到 PG。
-- UA 解析结果缓存用 moka（10 万条，TTL 1 小时）；GeoIP 用内存映射的 mmdb。
+- UA 解析结果缓存用 moka（10 万条，TTL 1 小时）；GeoIP 用内存映射的 mmdb，更新后原子替换并热加载（§4.4）。
 
-### 4.4 富化数据源与许可（需要在实施前确认）
+### 4.4 富化数据源与许可
 
-| 用途 | 候选 | 许可与注意 |
+| 用途 | 选型 | 许可与注意 |
 |---|---|---|
 | UA 解析 | `ua-parser/uap-core` 正则（Rust 有 `uaparser` 等实现） | Apache-2.0。Plausible 用的 Matomo device-detector 数据是 LGPL-3.0，需单独评估 |
 | 机器人 | uap-core 的 device=Spider，加自维护的 Headless 和自动化规则 | 同上 |
-| GeoIP | DB-IP Lite（国家或城市）或 MaxMind GeoLite2 | DB-IP Lite 为 CC BY 4.0，必须署名；GeoLite2 需要 license key 并遵守其 EULA |
+| GeoIP | 默认 DB-IP Lite；可选 MaxMind GeoLite2；可选自定义 mmdb 直链（§10 Q5，详见下） | DB-IP Lite 为 CC BY 4.0，必须署名；GeoLite2 需要 license key 并遵守其 EULA，也要求署名；自定义库的许可由运维者负责 |
 | 地名 | GeoNames（查询时经 CH 字典转换，与 Plausible 的 `location_data_dict` 做法相同） | CC BY 4.0 |
 | 来源 | Snowplow referer-parser 数据，加自维护的补充表（AI 助手、社交平台等） | 许可证需核对 |
 | 垃圾引荐 | 开源 referrer spam 列表 | 许可证需核对 |
+
+#### GeoIP 数据源、更新与署名（Q5）
+
+**来源与优先级**：只启用优先级最高的一个来源，同时配置了多个时，其余忽略，并在启动日志里打一条 `warn`。
+
+| 优先级 | 条件 | 数据源 | 获取方式 | 署名 |
+|---|---|---|---|---|
+| 1 | 设置了 `RIVU_GEOIP_DB_URL` | 自定义 mmdb 直链（http/https，例如 `https://git.via.moe/dejavu/GeoLite.mmdb`）；内容可以是 `.mmdb`，也可以是 `.mmdb.gz`（按 gzip 魔数判断） | 对该 URL 做条件 GET | `RIVU_GEOIP_ATTRIBUTION_TEXT`、`RIVU_GEOIP_ATTRIBUTION_URL`；不设置则不显示署名 |
+| 2 | 设置了 `RIVU_MAXMIND_LICENSE_KEY` | MaxMind GeoLite2，版本由 `RIVU_MAXMIND_EDITION` 指定（默认 `GeoLite2-City`） | MaxMind 官方下载接口，带 `If-Modified-Since`。现行接口按 Account ID 加 license key 认证，实现时核对；需要的话新增 `RIVU_MAXMIND_ACCOUNT_ID` | 内置 MaxMind 署名（见下） |
+| 3 | 以上都没有设置（默认） | DB-IP Lite，`RIVU_DBIP_EDITION` 取 `city`（默认）或 `country` | `https://download.db-ip.com/free/dbip-<city\|country>-lite-<YYYY-MM>.mmdb.gz`，每月 1 日发布。先试当月（UTC），404 就回退到上个月。链接形式取自 DB-IP 下载页（2026-10 版：city 约 121 MB，country 约 8 MB，均为 gz），实现前用实际下载验证 | 内置 DB-IP 署名（见下） |
+
+**文件与元数据**：所有来源都落在同一个文件 `RIVU_GEOIP_DB_PATH`。旁边的 `<文件名>.meta.json` 记录来源标识、ETag、Last-Modified、SHA-256、下载时间、`build_epoch` 和署名。meta 里的来源标识与当前配置不一致（例如从 DB-IP 改成自定义 URL）时，视为没有本地副本。没有 meta 的文件视为运维者手工放置，直接使用，署名取自 `RIVU_GEOIP_ATTRIBUTION_*`。
+
+**生命周期**
+
+| 阶段 | 行为 |
+|---|---|
+| 启动 | 没有本地副本就立即后台下载（由开启 jobs 的进程执行，collector 只读共享目录）；有副本则直接加载。下载完成前事件的位置字段为空，不阻塞 `/readyz`：下载上百 MB 远超预热预算，`/readyz` 里的 geoip 项只报告状态，不判失败 |
+| 定期刷新 | 每隔 `RIVU_GEOIP_REFRESH_INTERVAL` 发一次条件 GET（默认 `24h`，下限 `1h`，加 ±10% 抖动；设为 `0` 表示不定期刷新，只在没有本地副本时下载一次）。请求带 `If-None-Match` / `If-Modified-Since`，取值来自 meta；返回 `304` 只更新检查时间 |
+| 无校验头 | 服务器既不给 ETag 也不给 Last-Modified 时，只能整文件 GET，再按 SHA-256 与 meta 比较，相同则不替换。运维者应在这种服务器上加大刷新间隔 |
+| 校验 | 先写入同目录的临时文件（超过 1 GiB 中止），gz 先解压，再打开 mmdb 检查：元数据可解析；`binary_format_major_version = 2`；`database_type` 含 `Country` 或 `City`（不区分大小写，覆盖 `GeoLite2-*` 和 `DBIP-*-Lite`）；`node_count > 0`；对一个固定公网地址做一次查询，解码不出错 |
+| 替换 | 校验通过后 fsync，`rename` 覆盖 `RIVU_GEOIP_DB_PATH`（同目录，原子），然后原子写 meta。崩溃在两步之间只会多下载一次。collector 每小时比较 mtime 后用 `ArcSwap` 热加载，旧映射在途查询结束后释放 |
+| 失败 | 网络错误、状态码不是 200/304、超时（连接 10 s，整体 10 min）、解压或校验失败：删除临时文件，继续使用上一份有效副本；记 `warn` 日志（URL 去掉用户信息和查询串）并累加 `rivu_geoip_refresh_total{result="failed"}`；10 分钟后重试，之后每次加倍，直到一个刷新周期。失败不影响采集。指标见 `platform-and-ops.md` 第 10 节 |
+
+HTTP 约束：只接受 `http`、`https`；跟随最多 5 次重定向；`http` 允许，但启动时打 `warn`。URL 可能带令牌（私有托管），所以 `RIVU_GEOIP_DB_URL` 同样支持 `_FILE`，日志里一律脱敏。
+
+**署名要求**
+
+DB-IP Lite 的许可与署名要求，摘自 DB-IP 的 Lite 页面（<https://db-ip.com/db/lite.php>、<https://db-ip.com/db/download/ip-to-city-lite>、<https://db-ip.com/db/download/ip-to-country-lite>，2026-10 查阅）：
+
+- 许可：Creative Commons Attribution 4.0 International（CC BY 4.0）。页面写明：you may use the database in your application, “provided you give attribution to DB-IP.com for the data”。
+- Web 应用须在显示或使用库结果的页面放回链：“you must include a link back to DB-IP.com on pages that display or use results from the database”。
+- 页面给出的署名 HTML：`<a href='https://db-ip.com'>IP Geolocation by DB-IP</a>`。
+- Rivu 内置：文本 `IP Geolocation by DB-IP`，链接 `https://db-ip.com`，许可 CC BY 4.0。
+
+MaxMind GeoLite2：EULA 第 3 条要求注明使用来源，并给出示例 `This product includes GeoLite Data created by MaxMind, available from https://www.maxmind.com.`（<https://www.maxmind.com/en/geolite2/eula>；EULA 称其为示例，措辞以 EULA 为准）。Rivu 内置该句，链接 `https://www.maxmind.com`。EULA 还要求新版本发布后 30 天内停用旧库，每日检查满足这一点。
+
+落实：
+
+- **看板**在所有显示位置数据的地方都必须显示当前库的署名（文本加可点击链接）：国家、地区、城市报表，地图，实时视图，共享链接与公开看板，以及邮件报告（P4）。站点设置不能关闭它。GeoNames 的署名（CC BY 4.0）在同一位置显示。
+- **查询 API** 在 `meta.geo_attribution` 返回当前生效库的署名：`{source, text, url, license}`，`source` 取 `dbip-lite`、`maxmind-geolite2`、`custom`。凡查询含 `visit:country`、`visit:region`、`visit:city` 维度或过滤，该字段必填；导出文件带同样字段。调用方在自己的界面展示位置数据时，署名义务由调用方承担。
+- 署名跟随**实际加载的库**，而不是配置：切换来源后新库尚未下载成功时，仍显示旧库的署名。
+- 自定义来源两个署名变量都未设置时，`geo_attribution` 为 `null`，看板不显示。**自定义数据库的许可（是否要署名、能否使用与再分发）由运维者负责**，Rivu 不做检查。
 
 ### 4.5 身份
 
@@ -281,7 +324,7 @@ salt(d)           = salts 表中日期 d 的 16 字节随机数（只存在 PG�
 local_date        = date(ts in site.timezone)
 visitor_id        = SipHash-2-4(salt(local_date),     site_id ‖ len‖ip ‖ len‖ua) → u64
 prev_visitor_id   = SipHash-2-4(salt(local_date - 1), site_id ‖ len‖ip ‖ len‖ua) → u64
-partition         = SipHash-2-4(routing_secret,       site_id ‖ len‖ip ‖ len‖ua) mod P   （仅 Reliable）
+partition         = SipHash-2-4(routing_secret,       site_id ‖ len‖ip ‖ len‖ua) mod P   （Reliable 的分区号；Lite 用同一个哈希取分片号，不落库）
 ```
 
 - **按站点本地日期选盐**（D5）。Plausible 在 UTC 午夜轮换全局盐，对 UTC+8 的站点来说 ID 在本地 08:00 切换。同一个人 07:30 来一次、09:00 再来一次，当天会被算成 2 个访客。
@@ -292,11 +335,12 @@ partition         = SipHash-2-4(routing_secret,       site_id ‖ len‖ip ‖ l
 
 ### 4.6 SessionAssigner
 
-**状态**（key 为 `(site_id, visitor_id)`，visitor_id 取会话自己的 ID）
+**状态**（索引的 key 为 `(site_id, visitor_id)`，一个会话可以有多个 key，见「别名 key」）
 
 | 字段 | 说明 |
 |---|---|
 | `session_id` | 随机 u64 |
+| `keys` | 会话的全部 visitor_id，最多 8 个。第一个是会话的原始 ID（盖章用），其余是别名 |
 | `started_at`、`last_seen_at` | 毫秒；`last_seen_at` 取 max，乱序事件不会让它倒退（Plausible 直接覆盖，R02 §11.2 #6） |
 | `entry`（hostname、pathname） | 会话中的第一个 pageview；在它之前为空 |
 | `attrs` | 首个事件的 referrer、source、channel、utm×5、click_id_param、country、region、city、device、browser(+ver)、os(+ver)，字符串做驻留 |
@@ -306,34 +350,37 @@ partition         = SipHash-2-4(routing_secret,       site_id ‖ len‖ip ‖ l
 
 | 情况 | 行为 |
 |---|---|
-| 查找 | 先按 `visitor_id` 查，查不到再按 `prev_visitor_id` 查 |
-| 续期 | `ts - last_seen_at ≤ 30 min`，且 `ts - started_at ≤ 24 h`。24 小时上限是新增的，用来把查询回溯范围限定在 1 天以内；Plausible 没有上限，却在查询里假设会话不超过 7 天（R03 §8.2、§12.2 #11） |
-| 新会话 | 生成新 `session_id`，事件属性成为会话属性 |
-| 盖章 | 事件写入 `session_id`、`session_start`、`entry_pathname` 和全部会话属性；`visitor_id` 改写为会话的 ID，因此跨午夜后 ID 保持不变 |
+| 查找 | 先按 `visitor_id` 查，查不到再按 `prev_visitor_id` 查。两次都查不到就是新会话 |
+| 续期 | `ts - last_seen_at ≤ 30 min`，且 `ts - started_at ≤ 7 d`（§10 Q7）。7 天上限是新增的：Plausible 没有上限，却在查询里假设会话不超过 7 天（R03 §8.2、§12.2 #11），Rivu 把这个假设变成写入侧的硬约束，查询的回溯范围因此固定为 7 天（§6.5）。超过上限的事件开新会话 |
+| 新会话 | 生成新 `session_id`，事件属性成为会话属性，`keys` 只含当前 `visitor_id` |
+| 别名 key | 事件是通过 `prev_visitor_id` 续上会话的，也就是它自己的 `visitor_id` 不在该会话的 `keys` 里：把当前 `visitor_id` 加进 `keys` 并建立索引。访客 ID 在每个本地午夜轮换，7 天的会话最多跨 7 个午夜，所以最多 8 个 key。旧 key 保留到会话过期，迟到或乱序的前一天事件仍然能查到会话。已满 8 个时不再添加，事件照常续期，并累加 `session_alias_cap_hit`（正常情况不会发生，站点改时区时可能出现） |
+| 盖章 | 事件写入 `session_id`、`session_start`、`entry_pathname` 和全部会话属性；`visitor_id` 改写为会话的原始 ID（`keys[0]`），因此跨午夜后 ID 保持不变 |
 | engagement | 没有会话就丢弃（`no_session`）；有会话就推进 `last_seen_at`，事件照常写入（用于停留时长和滚动深度），但不计入 pageviews/events |
 
 **并发**
 
-- Lite：64 个分片，每个是 `parking_lot::Mutex<HashMap<…>>`。临界区只有查找、更新、盖章，不做任何 IO，也没有 `.await`。没有调用超时，所以不会出现 Plausible 的幽灵执行。
+- Lite：64 个分片，每个是 `parking_lot::Mutex<HashMap<…>>`，分片号取 routing 哈希（§4.5）对 64 取模。routing 哈希不随盐轮换，所以同一访客的所有 key（原始、别名、前一天）总在同一个分片，一次加锁就能完成查找和加别名。临界区只有查找、更新、盖章，不做任何 IO，也没有 `.await`。没有调用超时，所以不会出现 Plausible 的幽灵执行。
 - Reliable：每个分区由一个任务顺序处理，不需要锁。
 
 **过期**
 
-按「分片内事件时间水位 − 30 min」定期清扫，不用墙钟 TTL。这样实时处理和积压重放都正确，避开了 Plausible 判定用事件时间、淘汰用墙钟带来的问题（R02 §11.2 #5）。
+按「分片内事件时间水位 − 30 min」定期清扫，不用墙钟 TTL。这样实时处理和积压重放都正确，避开了 Plausible 判定用事件时间、淘汰用墙钟带来的问题（R02 §11.2 #5）。过期时一次移除会话的全部 key，只删除仍指向该会话的索引项：如果某个 key 已经被新会话占用，就不动它。
 
 **内存**
 
-每个会话约 150–300 B。日均 1000 万事件、平均每会话 3 个事件时，同时活跃的会话约 10 万个，占几十 MB。另设 `max_sessions` 上限（默认 200 万），超出后按 LRU 淘汰，并计数。
+每个会话约 150–300 B（含原始 key），每个别名 key 再加约 48 B（哈希表项）。别名只出现在跨过本地午夜、活跃间隔始终不超过 30 min 的会话上，平均每个会话不到 1 个，所以内存基本不变。日均 1000 万事件、平均每会话 3 个事件时，同时活跃的会话约 10 万个，占几十 MB；7 天的上限不会增加同时活跃的会话数，会话仍按 30 min 不活跃过期。另设 `max_sessions` 上限（默认 200 万），超出后按 LRU 淘汰整个会话（含全部 key），并计数。
 
 **预热**（替代 TinySock）
 
-1. 优雅关停时，把状态写到 `${DATA_DIR}/sessions.snapshot`，带格式版本号和结构哈希，这一点借鉴 Plausible 的版本门控（R02 §4.1）。启动时，如果快照不超过 30 分钟且版本一致，就直接加载。
-2. 否则从 ClickHouse 的 `sessions` 表重建最近 31 分钟内活跃的会话。Reliable 模式下按 `ingest_partition` 分区过滤，并以分区内最新事件时间为准。
+1. 优雅关停时，把状态写到 `${DATA_DIR}/sessions.snapshot`，带格式版本号和结构哈希，这一点借鉴 Plausible 的版本门控（R02 §4.1）。快照包含每个会话的全部 key。启动时，如果快照不超过 30 分钟且版本一致，就直接加载。
+2. 否则从 ClickHouse 的 `sessions` 表重建最近 31 分钟内活跃的会话。每个会话只能按表里存的原始 `visitor_id` 建 key，别名无法恢复。Reliable 模式下按 `ingest_partition` 分区过滤，并以分区内最新事件时间为准。
 3. 预热完成之前 `/readyz` 返回未就绪；Reliable 模式下，预热完成前不消费该分区。
 
 **失败语义**
 
 状态丢失只会让会话被切开，访问数和跳出率略高。不会产生孤儿行，聚合结果也不会损坏，因为根本没有 `-1` 行。
+
+崩溃后从 ClickHouse 预热（含 Reliable 的故障恢复）只有原始 key，所以已经跨过 2 个及以上本地午夜的多日会话，在恢复后的下一个事件处可能被切开：这个事件的 `prev_visitor_id` 对应的是已丢失的别名。只跨过 1 个午夜的会话不受影响，因为前一天的 ID 就是原始 ID；恢复后续上的会话会重新建立别名。这个代价可以接受。优雅关停的快照保留全部 key，不受影响。
 
 ### 4.7 写入（Lite：BatchWriter）
 
@@ -354,7 +401,7 @@ partition         = SipHash-2-4(routing_secret,       site_id ‖ len‖ip ‖ l
 
 | 项 | 值 | 原因 |
 |---|---|---|
-| 名称与 subject | `RIVU_EVENTS`，subject 为 `rivu.ev.<p>`，`p ∈ [0, P)`，P 默认 32，安装时固定 | 分区内顺序处理，同一访客总在同一分区 |
+| 名称与 subject | `RIVU_EVENTS`，subject 为 `rivu.ev.<p>`，`p ∈ [0, P)`，**P = 32，安装时固定**（§10 Q8） | 分区内顺序处理，同一访客总在同一分区。32 个分区可让最多 32 个 worker 并行；峰值 5000 事件/s 下每个分区约 160 事件/s，`ingest_partition` 是 UInt8，上限 256。`RIVU_PARTITIONS`（默认 32）只在首次创建流时读取，之后以流元数据里记录的 P 为准，两者不一致就拒绝启动；以后要改，必须先排空队列再迁移 |
 | 保留策略 | `WorkQueue`，`max_age = 72h`，`max_bytes` 按磁盘设定，`discard = New` | 消息确认后即删除；满了拒收新消息，collector 回 `503`，而不是悄悄丢掉未消费的旧消息 |
 | 去重窗口 | 2 分钟，`Nats-Msg-Id = event_id`（UUIDv7） | collector 重试发布时不会重复 |
 | 副本 | 单机 1 个，集群 3 个 | |
@@ -400,7 +447,7 @@ AggregatingMergeTree 的状态本身不幂等，一旦漏掉去重，就会永�
 
 | 表 | 引擎 | 写入方 | 用途 | 保留 |
 |---|---|---|---|---|
-| `events` | MergeTree | BatchWriter | 原始事件，是事实来源 | `raw_retention`（默认 400 天） |
+| `events` | MergeTree | BatchWriter | 原始事件，是事实来源 | `raw_retention`（默认 731 天，§10 Q1） |
 | `sessions` | AggregatingMergeTree | 物化视图 `mv_sessions`（数据来自 `events`） | 会话级聚合 | 同上 |
 | `ingest_counters` | SummingMergeTree | collector / worker | 接入计数：站点 × 指标 × 脚本版本 × 分钟 | 90 天 |
 | `rollup_*`（10 张） | ReplacingMergeTree(version) | 后台任务重算，或导入 | 日汇总层，同时存放原生和导入数据 | 永久 |
@@ -457,11 +504,12 @@ PARTITION BY toYYYYMM(ts)
 ORDER BY (site_id, toDate(ts), name, visitor_id, ts)
 PRIMARY KEY (site_id, toDate(ts), name, visitor_id)
 SAMPLE BY visitor_id
-TTL toDate(ts) + INTERVAL 400 DAY DELETE
+TTL toDate(ts) + INTERVAL 731 DAY DELETE
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1, non_replicated_deduplication_window = 1000;
 ```
 
 - 排序键沿用 Plausible 的 `(site_id, 日期, name, user_id, ts)`（R02 §8.3）：所有查询都先限定站点和日期；`name` 用于按目标过滤和排除 engagement 事件；`visitor_id` 让 `SAMPLE` 和 `uniq` 更友好。主键去掉末尾的 `ts`，稀疏索引更小。
+- 暂不使用 `SAMPLE` 采样（§10 Q6），大站的长时间范围由日汇总层回答（§6.4）。`SAMPLE BY visitor_id` 仍保留在 DDL 里，将来要采样时不用改表。`sessions` 同理。
 - 不再把 v1 的 `site_day` 放进排序键（D4）。
 - 会话属性和 `entry_pathname` 已经盖章到事件上，所以大部分 `visit:*` 过滤可以直接在 `events` 上做，不需要 JOIN。只有 exit page 和会话聚合值（例如停留时长）需要关联 `sessions`。Plausible 的入口页过滤也要 JOIN（R03 §3.4）。
 - `props` 用 `Map(LowCardinality(String), String)`。每个事件最多 30 个键，`props['k']` 的线性查找代价可以接受；只读键或只读值时，可以用 `props.keys`、`props.values` 子列。常用属性可以提升为独立列。`JSON` 类型从 25.3 起可用于生产，但属性集合有上限时，Map 更简单（#15）。
@@ -501,7 +549,7 @@ ENGINE = AggregatingMergeTree
 PARTITION BY toYYYYMM(start_date)
 ORDER BY (site_id, start_date, visitor_id, session_id)
 SAMPLE BY visitor_id
-TTL start_date + INTERVAL 400 DAY DELETE
+TTL start_date + INTERVAL 731 DAY DELETE
 SETTINGS ttl_only_drop_parts = 1, non_replicated_deduplication_window = 1000;
 
 CREATE MATERIALIZED VIEW rivu.mv_sessions TO rivu.sessions
@@ -530,7 +578,8 @@ GROUP BY site_id, start_date, visitor_id, session_id;
 **派生指标**在查询时计算，语义与 Plausible 一致（R02 §2.3）：
 
 - `is_bounce = pageviews ≤ 1 AND interactive_events = 0`
-- `duration = last_event_at − started_at`，不含 engagement，与 Plausible 一致（见 §10 Q2）
+- `duration = last_event_at − started_at`，不含 engagement，与 Plausible 和导入数据一致（§10 Q2）
+- `engaged_duration = engagement_ms / 1000`，只统计 `engagement_ms > 0` 的会话。它是独立指标，不并入 `duration`
 
 **为什么不用 Plausible 的折叠表**
 
@@ -573,7 +622,7 @@ TTL minute + INTERVAL 90 DAY DELETE;
 
 | 表 | 维度 | 指标列 |
 |---|---|---|
-| `rollup_site_day` | 无 | visitors, visits, pageviews, events, bounces, duration_sum |
+| `rollup_site_day` | 无 | visitors, visits, pageviews, events, bounces, duration_sum, engagement_ms_sum, engagement_sessions（供 `engaged_duration`） |
 | `rollup_pages_day` | hostname, pathname | visitors, pageviews, visits, exits, engagement_ms_sum, engagement_sessions, scroll_sum, scroll_sessions |
 | `rollup_entry_pages_day` | entry hostname, entry pathname | visitors, visits（入口次数）, bounces, duration_sum, pageviews |
 | `rollup_exit_pages_day` | exit hostname, exit pathname | visitors, visits（退出次数）, pageviews |
@@ -630,7 +679,7 @@ v1 的 `overview`、`timeseries`、`breakdown`、`goals` 改为看板中的查�
 | 字段 | 取值 |
 |---|---|
 | `site` | `site_key`。必须与鉴权上下文一致，否则返回 404 |
-| `metrics` | `visitors` `visits` `pageviews` `events` `views_per_visit` `bounce_rate` `visit_duration` `conversion_rate` `group_conversion_rate` `percentage` `exit_rate` `time_on_page` `scroll_depth`；收入指标（P4） |
+| `metrics` | `visitors` `visits` `pageviews` `events` `views_per_visit` `bounce_rate` `visit_duration` `engaged_duration` `conversion_rate` `group_conversion_rate` `percentage` `exit_rate` `time_on_page` `scroll_depth`；收入指标（P4） |
 | `date_range` | `day` `24h` `7d` `28d` `30d` `month` `6mo` `12mo` `year` `all`、`Nd`、`Nmo`，或 `[from, to]`（日期或带时区的时间）；看板另有 `realtime` |
 | `dimensions` | `event:name` `event:page` `event:hostname` `event:goal` `event:props:<k>`、`visit:entry_page` `visit:exit_page` `visit:source` `visit:channel` `visit:referrer` `visit:utm_*` `visit:country` `visit:region` `visit:city` `visit:device` `visit:browser(_version)` `visit:os(_version)`、`time` `time:hour` `time:day` `time:week` `time:month` |
 | `filters` | 叶子节点为 `[op, dim, [values], {case_sensitive}]`，`op` 取 `is` `is_not` `contains` `contains_not` `matches` `matches_not` `matches_wildcard` `matches_wildcard_not`；组合节点为 `and` `or` `not` `has_done` `has_not_done`；另有 `["is","segment",[id]]` |
@@ -664,7 +713,7 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 | 对象 | 归属 |
 |---|---|
 | `pageviews` `events` `time_on_page` `scroll_depth` 收入 | events |
-| `visits` `bounce_rate` `visit_duration` `views_per_visit` `exit_rate` | sessions |
+| `visits` `bounce_rate` `visit_duration` `engaged_duration` `views_per_visit` `exit_rate` | sessions |
 | `visitors`、各种比率 | events 和 sessions 都可以 |
 | `event:*` 维度和过滤 | events |
 | `visit:exit_page` | 只在 sessions |
@@ -705,10 +754,11 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 | 指标 | 定义 |
 |---|---|
 | `visitors` | `uniq(visitor_id)` |
-| `visits` | 区间内活跃的会话数：内层聚合后 `last_event_at ≥ from AND started_at ≤ to`，并且 `start_date ≥ from_date − 1`（依赖 24 小时上限） |
+| `visits` | 区间内活跃的会话数：内层聚合后 `last_event_at ≥ from AND started_at ≤ to`，并且 `start_date ≥ from_date − 7`（依赖 7 天的会话上限，§4.6）。代价是多读 7 天的会话行，排序键含 `start_date`，按范围裁剪 |
 | `pageviews` / `events` | `countIf(name='pageview')` / `countIf(name != 'engagement')` |
 | `bounce_rate` | `countIf(pageviews ≤ 1 AND interactive_events = 0) / visits`；带 `event:page` 过滤时，只统计入口页匹配的会话（§6.6） |
-| `visit_duration` | `avg(last_event_at − started_at)`，单位秒 |
+| `visit_duration` | `avg(last_event_at − started_at)`，单位秒。不含 engagement 时间（§10 Q2） |
+| `engaged_duration` | `sum(engagement_ms) / 1000 / count()`，只统计 `engagement_ms > 0` 的会话，单位秒。与 `time_on_page` 同口径，避免没有开启 engagement 的 `core` 脚本把均值拉向 0。超出 `raw_retention` 时只有无维度查询能由 `rollup_site_day` 回答（§6.4 兼容规则） |
 | `views_per_visit` | `avg(pageviews)` |
 | `time_on_page` | 按页面计算：`sum(engagement_ms) / uniqIf(session_id, name='engagement')` |
 | `scroll_depth` | 按页面计算：先对每个会话取 `max(scroll_depth ≤ 100)`，再取平均 |
@@ -759,8 +809,8 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 | 写入 | 5000 事件/s 约等于每秒 1 次 INSERT、每次 5000 行；RowBinary 约 2 MB/s | §4.7 |
 | collector CPU | 每个事件 ≤50 µs（JSON 解析约 5 µs，UA 缓存命中约 1 µs、未命中 50–200 µs，地理查询约 2 µs，SipHash ×3 可忽略），5000 事件/s 约 0.25 核 | 需压测 |
 | 事件可见 | p95 < 2 s（Lite），< 2.5 s（Reliable），v1 目标 5 s | §4.7、§4.8 |
-| 会话内存 | 常态几十 MB；上限 `max_sessions` 200 万 × 300 B ≈ 600 MB | §4.6 |
-| 磁盘 | 按 v1 估算的每事件 60–150 B（需实测），`sessions` 约再加 30–50%。日均 1000 万事件、保留 400 天约需 0.3–0.8 TB，超出 v1 单机 500 GB 的参考配置：这个规模应把 `raw_retention` 设为 180 天或扩容磁盘。日均 100 万事件、保留 400 天约 30–80 GB | v1 第七节 |
+| 会话内存 | 常态几十 MB；上限 `max_sessions` 200 万 × 约 350 B（含平均不到 1 个别名 key）≈ 700 MB。理论最坏是每个会话 8 个 key、约 650 B，合计约 1.3 GB，实际不会出现，因为多个别名需要会话跨多个午夜 | §4.6 |
+| 磁盘 | 按 v1 估算的每事件 60–150 B（需实测），`sessions` 约再加 30–50%，保留 731 天。日均 1000 万事件：7.31 十亿事件，事件表约 0.44–1.1 TB，加 `sessions` 后约 0.6–1.6 TB，超出 v1 单机 500 GB 的参考配置：这个规模应把 `RIVU_RETENTION_DAYS` 调低到 180 天（约 0.14–0.4 TB）或扩容磁盘。日均 100 万事件：约 60–165 GB。按月分区整块删除，实际占用最多再多约一个月（§5.6） | v1 第七节 |
 | 查询 | 中小站：原始层 30 天约几百万行，几十 ms。大站（每天 200 万事件）30 天约 6000 万行：已结束的天走日汇总层，今天走原始层，目标 p95 < 300 ms | §6.4 |
 
 压测目标沿用 v1：持续 1000 事件/s，峰值 5000 事件/s，同时有并发看板查询。需要观察以下指标：
@@ -776,7 +826,8 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 
 | 原则 | 落实 |
 |---|---|
-| 无持久标识 | 不读写 Cookie；tracker 不写任何存储；访客 ID 按站点本地日轮换，盐 2 天后删除，跨天无法关联同一个人 |
+| 无持久标识 | 不读写 Cookie；tracker 不写任何存储，唯一的读取是站点所有者手动设置的 `localStorage.rivu_ignore`，只读，不用于标识（§10 Q3）；访客 ID 按站点本地日轮换，盐 2 天后删除，跨天无法关联同一个人（会话连续的情形见下一行） |
+| 跨天连续性 | 访客 ID 跨天保持不变的唯一情形是同一会话持续活跃：活动间隔始终不超过 30 min，且最长 7 天。别名 key 只存在于内存和关停快照，不落库；间隔超过 30 min 后无法再关联（§4.6） |
 | 数据最小化 | IP 和 UA 只在内存中短暂使用，不进入 ClickHouse、JetStream、日志和错误上报；query 参数只保留 UTM 和 click id 参数名；props 有长度限制，可选白名单；地理精度可按站点设为国家、地区或城市 |
 | `site_key` 不是密钥 | 它是公开的，只用来路由。真实性靠 hostname 白名单、限流和机器人过滤，只能提高门槛，不能保证每个事件都真实（与 v1 相同） |
 | 租户隔离 | `TenantScope`、服务端参数、只读账号、按租户的超时和并发上限（§6.8） |
@@ -797,18 +848,20 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 
 ---
 
-## 10. 未决问题（需要拍板）
+## 10. 已决问题（2026-10-22）
 
-| # | 问题 | 建议 |
-|---|---|---|
-| Q1 | 原始数据默认保留期 | 默认 400 天；日均 1000 万事件的部署建议设为 180 天（§7） |
-| Q2 | `visit_duration` 是否计入 engagement 时间 | 默认不计入，与 Plausible 和导入数据一致；另提供 `engaged_duration` 指标 |
-| Q3 | tracker 是否读取 `localStorage.rivu_ignore`（站点所有者排除自己的访问） | 允许只读，tracker 不写入，也不用于标识。v1 写的是「不使用 localStorage」，需要确认 |
-| Q4 | 是否提供 Plausible 协议兼容端点 | P4 提供，便于迁移；Plausible 的 tracker 是 MIT 许可 |
-| Q5 | UA 库和 GeoIP 库的选型与许可 | 建议 uap-core（Apache-2.0）加 DB-IP Lite（需署名），MaxMind 作为可选项 |
-| Q6 | 是否做 `SAMPLE` 采样 | 先不做，用日汇总层的自动分层代替；`SAMPLE BY visitor_id` 预先保留 |
-| Q7 | 会话最长时长 | 24 小时（Plausible 没有上限） |
-| Q8 | Reliable 的分区数 P | 32，安装时固定；以后要改，需要先排空队列再迁移 |
+下列问题原为开放问题，现已定案，决定已写入各节正文。
+
+| # | 问题 | 决定 | 影响 |
+|---|---|---|---|
+| Q1 | 原始数据默认保留期 | 默认 731 天（连续两个自然年，含一个闰年）。日均 1000 万事件的部署建议把 `RIVU_RETENTION_DAYS` 调低到 180 天 | D12；§5.1 表；§5.2、§5.3 的 TTL 改为 `INTERVAL 731 DAY`；§7 容量重算；`RIVU_RETENTION_DAYS` 默认 731；迁移 `…100100_events.sql`、`…100200_sessions.sql` 就地修改（尚未发布） |
+| Q2 | `visit_duration` 是否计入 engagement 时间 | 不计入，与 Plausible 和导入数据一致；另设独立指标 `engaged_duration` | §5.3 派生指标；§5.5 `rollup_site_day` 增列；§6.2 指标列表；§6.4 归属；§6.5 定义 |
+| Q3 | tracker 是否读取 `localStorage.rivu_ignore`（站点所有者排除自己的访问） | 只读：tracker 永不写入，也不用于标识或上报。v1 的「不使用 localStorage」作废 | `tracker-and-protocol.md` §1.1、§4.7、§10.2；§8 |
+| Q4 | 是否提供 Plausible 协议兼容端点 | P4 提供 `POST /api/plausible/event`，便于迁移；Plausible 的 tracker 是 MIT 许可 | §9 的 P4；`tracker-and-protocol.md` §9 |
+| Q5 | UA 库和 GeoIP 库的选型与许可 | UA 用 uap-core（Apache-2.0）。GeoIP 默认 DB-IP Lite（CC BY 4.0，必须署名）；继续支持 MaxMind GeoLite2；新增自定义 mmdb 直链 `RIVU_GEOIP_DB_URL`。优先级：自定义 URL > MaxMind key > DB-IP | §4.4（来源、更新、校验、署名）；看板必须在显示位置数据处署名，查询 API 返回当前库的署名；`platform-and-ops.md` 的 `geoip_refresh` 任务、配置变量、指标 |
+| Q6 | 是否做 `SAMPLE` 采样 | 暂不做，用日汇总层的自动分层代替；DDL 里保留 `SAMPLE BY visitor_id` | §2.6；§5.2；§6.4 |
+| Q7 | 会话最长时长 | 7 天（原为 24 小时）。续期条件：`ts − last_seen_at ≤ 30 min` 且 `ts − started_at ≤ 7 d`。跨午夜靠会话的别名 key，最多 8 个 | §4.6（规则、并发、内存、预热、失败语义）；§4.5；§6.5 `visits` 回溯 7 天；§7 内存；§8 |
+| Q8 | Reliable 的分区数 P | P = 32，安装时固定；以后要改，必须先排空队列再迁移 | §4.8；`platform-and-ops.md` 的 `RIVU_PARTITIONS` |
 
 ---
 
