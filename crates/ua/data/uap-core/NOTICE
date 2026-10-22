@@ -1,0 +1,10 @@
+This directory redistributes a file from the uap-core project, unmodified.
+
+  Project   : https://github.com/ua-parser/uap-core
+  License   : Apache License, Version 2.0 (see LICENSE in this directory)
+  Copyright : 2009 Google Inc. and the uap-core contributors
+
+The upstream repository has no NOTICE file at the pinned commit (its root contains
+.github, docs, test_resources, tests, LICENSE, README.md, package.json, regexes.yaml and a few
+dotfiles). This NOTICE only records attribution for the redistributed regexes.yaml, as required
+by Apache-2.0 section 4. regexes.yaml is embedded into the rivu-ua binary with include_str!.

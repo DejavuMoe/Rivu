@@ -1,0 +1,4 @@
+# 上游文件的字节原样保存：mmdb 是二进制，JSON 与许可证文本保持 LF。
+*.mmdb binary
+*.json text eol=lf
+LICENSE-* text eol=lf

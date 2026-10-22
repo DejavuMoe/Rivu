@@ -1,0 +1,714 @@
+# Rivu 自维护的来源补充表（随 RULES_VERSION 管理：任何改动都要加一，见 src/lib.rs）。
+#
+# 作用（优先级从高到低，先登记的域名/别名先赢，见 build.rs）：
+#   1. 补充表里的条目覆盖 Matomo 数据里同一域名的名字和类别；
+#   2. Matomo 的三份列表（data/matomo/）：AIAssistants > Socials > SearchEngines；
+#   3. renames：把 Matomo 的名字改成 Rivu 的展示名，或把同一家的子产品合并成一个名字。
+#
+# 条目字段：
+#   name          展示名，写入 referrer_source；同名同类别的条目在表里只有一个。
+#   kind          search | social | video | shopping | ai | email | other。other 只命名，不参与渠道类别。
+#   domains       域名后缀：`youtube.com` 同时命中 `m.youtube.com`；结尾 `.{}` 是国家/地区后缀占位符
+#                 （语义见 docs/research/enrich-source.md §4.3；YAML 里含 `{}` 的值必须加引号：`["amazon.{}"]`）。
+#   aliases       utm_source 里常见的写法，小写；名字本身自动成为别名，不用重复写。
+#   paid_aliases  utm_source 本身就表示「付费」的写法（如 `fb-ads`）：来源按本条目解析，
+#                 且视为付费证据，与 utm_medium 的付费正则等价。
+#   basis         依据。没有 basis 的条目不允许存在。
+#
+# 依据缩写：
+#   GA4-LIST   Google 官方「来源与类别」清单（见 docs/research/enrich-source.md §2.2，下载于 2026-10-22）把该来源列为对应类别。
+#   FACT       公开可验证的事实：该域名由该产品官方持有、官方文档或站点本身可查。
+#   CONVENTION 业界常见的 utm_source 写法；行为参照 Plausible（只借鉴行为，不复制其数据文件）。
+
+renames:
+  # Matomo 名字的拼写/大小写修正
+  "Twitter": "X (Twitter)"      # 2023-07 更名为 X，用户仍按 Twitter 搜索，两个名字并列
+  "reddit": "Reddit"
+  "tumblr": "Tumblr"
+  "Google%2B": "Google+"         # Matomo 里的名字是百分号编码形态
+  "Haboo": "Habbo"               # Matomo 的拼写错误（域名是 habbo.com）
+  "Deepseek": "DeepSeek"
+  "Copilot": "Microsoft Copilot" # copilot.microsoft.com；避免与 GitHub Copilot 混淆
+  "Gemini": "Google Gemini"
+  # 同一家的子产品合并成一个来源：用户关心「来自 Google」，不关心是图片搜索还是地图
+  "Google Images": "Google"
+  "Google Maps": "Google"
+  "Google News": "Google"
+  "Google Scholar": "Google"
+  "Google Blogsearch": "Google"
+  "Google Custom Search": "Google"
+  "Google syndicated search": "Google"
+  "Google Translations": "Google"
+  "Google Video": "Google"
+  "Bing Images": "Bing"
+  "Yahoo! Images": "Yahoo!"
+  "Yahoo! Directory": "Yahoo!"
+  "Yahoo! Japan Images": "Yahoo! Japan"
+  "Yahoo! Japan Videos": "Yahoo! Japan"
+  "Yandex Images": "Yandex"
+  "Biglobe Images": "Biglobe"
+  "auone Images": "auone"
+
+entries:
+  # ---------- 搜索：给已有的名字加 utm_source 写法 ----------
+  - name: Google
+    kind: search
+    aliases: [google, google.com]
+    paid_aliases: [google_ads, google-ads, googleads, gads, google ads, adwords]
+    basis: CONVENTION（GA4-LIST 也以 `google` 为搜索来源）
+  - name: Bing
+    kind: search
+    domains: [ntp.msn.com]
+    paid_aliases: [bing-ads, bing_ads, bingads, bing ads]
+    basis: CONVENTION（ntp.msn.com 是 Edge 新标签页，GA4-LIST 列为搜索，Plausible 同样归 Bing）
+  - name: Yahoo!
+    kind: search
+    domains: [yahoo.com]
+    aliases: [yahoo]
+    basis: GA4-LIST（yahoo、yahoo.com 为搜索）；mail./shopping./answers. 等子域有更具体的条目
+  - name: Baidu
+    kind: search
+    aliases: [baidu]
+    basis: GA4-LIST
+  - name: Yandex
+    kind: search
+    domains: [ya.ru, yandex.com.tr, yandex.eu, yandex.kz, yandex.uz, yandex.tm, yandex.by, yandex.ua]
+    basis: FACT（Yandex 官方域名；GA4-LIST 列有 yandex.by/.kz/.ua/.uz 等）
+  - name: DuckDuckGo
+    kind: search
+    domains: [duckduckgo.com]
+    aliases: [duckduckgo, ddg]
+    basis: CONVENTION
+  - name: Ecosia
+    kind: search
+    aliases: [ecosia, ecosia.org]
+    basis: GA4-LIST（`ecosia.org`）
+  - name: Sogou
+    kind: search
+    aliases: [sogou]
+    basis: GA4-LIST
+  - name: Naver
+    kind: search
+    domains: [naver.com]
+    aliases: [naver]
+    basis: GA4-LIST（`naver`、`naver.com` 为搜索）
+
+  # ---------- 视频：Matomo 把它们归在社交，GA4 清单归视频 ----------
+  - name: YouTube
+    kind: video
+    domains: [youtube.com, youtu.be, youtube-nocookie.com]
+    aliases: [youtube, yt]
+    paid_aliases: [yt-ads, youtube-ads, youtubeads, youtube_ads]
+    basis: GA4-LIST（youtube、youtube.com、m.youtube.com、music.youtube.com 为 VIDEO）
+  - name: Vimeo
+    kind: video
+    domains: [vimeo.com]
+    aliases: [vimeo]
+    basis: GA4-LIST（vimeo、vimeo.com、player.vimeo.com 为 VIDEO）
+  - name: Twitch
+    kind: video
+    domains: [twitch.tv]
+    aliases: [twitch]
+    basis: GA4-LIST（twitch、twitch.tv 为 VIDEO）
+  - name: Dailymotion
+    kind: video
+    domains: [dailymotion.com]
+    aliases: [dailymotion]
+    basis: GA4-LIST
+  - name: Niconico
+    kind: video
+    domains: [nicovideo.jp]
+    aliases: [niconico]
+    basis: GA4-LIST（nicovideo.jp 为 VIDEO）
+  - name: Netflix
+    kind: video
+    domains: [netflix.com]
+    aliases: [netflix]
+    basis: GA4-LIST
+  - name: Hulu
+    kind: video
+    domains: [hulu.com]
+    aliases: [hulu]
+    basis: GA4-LIST
+  - name: Disney+
+    kind: video
+    domains: [disneyplus.com]
+    aliases: [disneyplus]
+    basis: GA4-LIST
+  - name: Crackle
+    kind: video
+    domains: [crackle.com]
+    aliases: [crackle]
+    basis: GA4-LIST
+  - name: CuriosityStream
+    kind: video
+    domains: [curiositystream.com]
+    aliases: [curiositystream]
+    basis: GA4-LIST
+  - name: iQIYI
+    kind: video
+    domains: [iqiyi.com, iq.com]
+    aliases: [iqiyi]
+    basis: GA4-LIST
+  - name: Youku
+    kind: video
+    domains: [youku.com]
+    aliases: [youku]
+    basis: GA4-LIST
+  - name: Veoh
+    kind: video
+    domains: [veoh.com]
+    aliases: [veoh]
+    basis: GA4-LIST
+  - name: TED
+    kind: video
+    domains: [ted.com]
+    aliases: [ted]
+    basis: GA4-LIST
+  - name: Wistia
+    kind: video
+    domains: [wistia.com, wistia.net]
+    aliases: [wistia]
+    basis: GA4-LIST（wistia、wistia.com、fast.wistia.net 为 VIDEO）
+  - name: Utreon
+    kind: video
+    domains: [utreon.com]
+    aliases: [utreon]
+    basis: GA4-LIST
+  - name: DTube
+    kind: video
+    domains: [d.tube]
+    basis: GA4-LIST（d.tube 为 VIDEO）
+  - name: Rumble
+    kind: video
+    domains: [rumble.com]
+    aliases: [rumble]
+    basis: FACT（视频平台；GA4-LIST 未收录，Rivu 自行补充）
+
+  # ---------- 购物 ----------
+  - name: Amazon
+    kind: shopping
+    domains: ["amazon.{}", amazon-adsystem.com]
+    aliases: [amazon]
+    basis: GA4-LIST（amazon、amazon.com、amazon.co.uk、aax.amazon-adsystem.com 为 SHOPPING）
+  - name: eBay
+    kind: shopping
+    domains: ["ebay.{}"]
+    aliases: [ebay]
+    basis: GA4-LIST（ebay、ebay.com、.co.uk、.com.au、.de 为 SHOPPING）
+  - name: Etsy
+    kind: shopping
+    domains: [etsy.com]
+    aliases: [etsy]
+    basis: GA4-LIST
+  - name: Alibaba
+    kind: shopping
+    domains: [alibaba.com]
+    aliases: [alibaba]
+    basis: GA4-LIST（alibaba、alibaba.com、m.alibaba.com 等为 SHOPPING）
+  - name: AliExpress
+    kind: shopping
+    domains: [aliexpress.com, aliexpress.us]
+    aliases: [aliexpress]
+    basis: FACT（Alibaba 旗下购物站；GA4-LIST 未收录，Rivu 自行补充）
+  - name: Taobao
+    kind: shopping
+    domains: [taobao.com]
+    aliases: [taobao]
+    basis: FACT（购物站；GA4-LIST 未收录，Rivu 自行补充）
+  - name: Tmall
+    kind: shopping
+    domains: [tmall.com]
+    aliases: [tmall]
+    basis: FACT（购物站；GA4-LIST 未收录，Rivu 自行补充）
+  - name: JD.com
+    kind: shopping
+    domains: [jd.com]
+    aliases: [jd]
+    basis: FACT（购物站；GA4-LIST 未收录，Rivu 自行补充）
+  - name: Walmart
+    kind: shopping
+    domains: [walmart.com]
+    aliases: [walmart]
+    basis: GA4-LIST（walmart、walmart.com、one.walmart.com 为 SHOPPING）
+  - name: Shopify
+    kind: shopping
+    domains: [shopify.com, shop.app]
+    aliases: [shopify]
+    basis: GA4-LIST（shopify、shopify.com、apps/checkout/partners.shopify.com、shop.app 为 SHOPPING）
+  - name: Stripe
+    kind: shopping
+    domains: [stripe.com]
+    aliases: [stripe]
+    basis: GA4-LIST（stripe、stripe.com、checkout.stripe.com 为 SHOPPING；结账页回跳的来源）
+  - name: MercadoLibre
+    kind: shopping
+    domains: ["mercadolibre.{}"]
+    aliases: [mercadolibre]
+    basis: GA4-LIST（mercadolibre、.com.ar、.com.mx 为 SHOPPING）
+  - name: Naver Shopping
+    kind: shopping
+    domains: [shopping.naver.com]
+    basis: GA4-LIST（shopping.naver.com 及其 m./cr./msearch. 子域为 SHOPPING，比 naver.com 更具体）
+  - name: Yahoo! Shopping
+    kind: shopping
+    domains: [shopping.yahoo.com, shopping.yahoo.co.jp]
+    basis: GA4-LIST（shopping.yahoo.com、shopping.yahoo.co.jp 为 SHOPPING，比 yahoo 搜索更具体）
+  - name: Shopzilla
+    kind: shopping
+    domains: [shopzilla.com]
+    aliases: [shopzilla]
+    basis: GA4-LIST
+  - name: SimplyCodes
+    kind: shopping
+    domains: [simplycodes.com]
+    basis: GA4-LIST
+  - name: Temu
+    kind: shopping
+    domains: [temu.com]
+    aliases: [temu]
+    basis: FACT（购物站）；归类参照 Plausible 的行为，GA4-LIST 未收录
+  - name: Google Shopping
+    kind: shopping
+    domains: [shopping.google.com]
+    basis: GA4-LIST（`Google Shopping` 为 SHOPPING 来源名）；shopping.google.com 是其官方入口
+  - name: Instagram Shopping
+    kind: shopping
+    aliases: [igshopping]
+    basis: GA4-LIST（`IGShopping` 为 SHOPPING 来源名）
+
+  # ---------- 社交 ----------
+  - name: Facebook
+    kind: social
+    domains: [fb.com, fb.watch]
+    aliases: [fb, fcb]
+    paid_aliases: [fb-ads, fbads, fbad, facebook-ads, facebook_ads, facebook_ad, facebook_feed_ad, facebook ads]
+    basis: FACT（Meta 官方短域名）+ CONVENTION
+  - name: Instagram
+    kind: social
+    aliases: [ig]
+    basis: CONVENTION
+  - name: LinkedIn
+    kind: social
+    aliases: [li]
+    basis: CONVENTION
+  - name: Reddit
+    kind: social
+    domains: [redd.it]
+    paid_aliases: [reddit-ads, reddit_ads, redditads]
+    basis: FACT（Reddit 官方短域名）+ CONVENTION
+  - name: X (Twitter)
+    kind: social
+    domains: [twitter.com, x.com, t.co]
+    aliases: [twitter, x, tw]
+    paid_aliases: [twitter-ads, twitter_ads, x-ads]
+    basis: GA4-LIST（twitter、t.co 为 SOCIAL）+ CONVENTION
+  - name: TikTok
+    kind: social
+    domains: [tiktok.com]
+    aliases: [tiktok, tik.tok]
+    paid_aliases: [tiktokads, tiktok-ads, tiktok_ads]
+    basis: GA4-LIST（tiktok、tiktok.com 为 SOCIAL；与 GA 说明页把 TikTok 写进视频的措辞不一致，规则引用清单，故取清单）
+  - name: Pinterest
+    kind: social
+    domains: ["pinterest.{}"]
+    aliases: [pinterest]
+    basis: GA4-LIST 列有 pinterest.at/.cl/.co.kr/.com.mx/.it/.ph/.ru 等，Matomo 只列了部分国家站，用 .{} 统一
+  - name: Telegram
+    kind: social
+    domains: [t.me, telegram.org, telegram.me]
+    aliases: [telegram]
+    basis: FACT（Telegram 官方短链 t.me）
+  - name: Bluesky
+    kind: social
+    domains: [go.bsky.app, bsky.social]
+    basis: FACT（Bluesky 官方域名）
+  - name: Threads
+    kind: social
+    domains: [threads.net, threads.com]
+    aliases: [threads]
+    basis: FACT（Meta Threads 官方域名）
+  - name: Microsoft Teams
+    kind: social
+    domains: [teams.microsoft.com, statics.teams.cdn.office.net]
+    basis: FACT（Teams 内打开链接的 referrer）；归类参照 Plausible 的行为
+  - name: Slack
+    kind: social
+    domains: [slack.com, slack-redir.net]
+    aliases: [slack]
+    basis: FACT；归类参照 Plausible 的行为
+  - name: Product Hunt
+    kind: social
+    domains: [producthunt.com]
+    aliases: [producthunt]
+    basis: 归类参照 Plausible 的行为
+  - name: Weibo
+    kind: social
+    domains: [weibo.com, weibo.cn, t.cn]
+    aliases: [weibo]
+    basis: FACT（Matomo 已有 weibo.com、t.cn；补 weibo.cn 移动站）
+  - name: Zhihu
+    kind: social
+    domains: [zhihu.com]
+    aliases: [zhihu]
+    basis: FACT（知乎官方域名）；Rivu 自行补充
+  - name: Xiaohongshu
+    kind: social
+    domains: [xiaohongshu.com, xhslink.com]
+    aliases: [xiaohongshu, xhs]
+    basis: FACT（小红书官方域名与分享短链）；Rivu 自行补充
+  - name: Steam Community
+    kind: social
+    domains: [steamcommunity.com]
+    basis: FACT（Steam 社区论坛）；归类参照 Plausible 的行为
+  - name: Mastodon
+    kind: social
+    aliases: [mastodon]
+    basis: Matomo 已列出大量实例；这里只加别名
+
+  # ---------- 搜索：GA4-LIST 里有、Matomo 没有的常见入口 ----------
+  - name: Yahoo! Japan
+    kind: search
+    domains: [yahoo.co.jp]
+    aliases: [yahoo japan]
+    basis: GA4-LIST（yahoo.co.jp 为 SEARCH）
+  - name: MSN
+    kind: search
+    domains: [msn.com]
+    aliases: [msn]
+    basis: GA4-LIST（msn、msn.com 为 SEARCH）
+  - name: Daum
+    kind: search
+    domains: [daum.net]
+    aliases: [daum]
+    basis: GA4-LIST
+  - name: Seznam
+    kind: search
+    domains: [seznam.cz]
+    aliases: [seznam]
+    basis: GA4-LIST
+  - name: Rambler
+    kind: search
+    domains: [rambler.ru]
+    aliases: [rambler]
+    basis: GA4-LIST
+  - name: Onet
+    kind: search
+    domains: [onet.pl]
+    aliases: [onet]
+    basis: GA4-LIST
+  - name: Excite
+    kind: search
+    domains: [excite.com]
+    aliases: [excite]
+    basis: GA4-LIST
+  - name: Biglobe
+    kind: search
+    domains: [biglobe.co.jp, biglobe.ne.jp]
+    aliases: [biglobe]
+    basis: GA4-LIST
+  - name: 360search
+    kind: search
+    domains: [360.cn]
+    basis: GA4-LIST（360.cn 为 SEARCH；Matomo 的同名条目只有 so.360.cn、so.com）
+  - name: Centrum
+    kind: search
+    domains: [centrum.cz]
+    aliases: [centrum]
+    basis: GA4-LIST
+
+  # ---------- 社交：GA4-LIST 里有、Matomo 没有的常见站点（长尾不全收，见研究文档偏离清单 D8） ----------
+  - name: WhatsApp
+    kind: social
+    domains: [whatsapp.com, wa.me]
+    aliases: [whatsapp]
+    basis: GA4-LIST（whatsapp、whatsapp.com 为 SOCIAL）+ FACT（wa.me 是官方短链）
+  - name: Messenger
+    kind: social
+    domains: [messenger.com]
+    aliases: [messenger]
+    basis: GA4-LIST（messenger、messenger.com、l.messenger.com 为 SOCIAL）
+  - name: Medium
+    kind: social
+    domains: [medium.com]
+    aliases: [medium]
+    basis: GA4-LIST
+  - name: Quora
+    kind: social
+    domains: [quora.com]
+    aliases: [quora]
+    basis: GA4-LIST
+  - name: LINE
+    kind: social
+    domains: [line.me]
+    aliases: [line]
+    basis: GA4-LIST
+  - name: Kakao
+    kind: social
+    domains: [kakao.com, kakaocorp.com]
+    aliases: [kakao]
+    basis: GA4-LIST
+  - name: Skype
+    kind: social
+    domains: [skype.com]
+    aliases: [skype]
+    basis: GA4-LIST
+  - name: Yelp
+    kind: social
+    domains: ["yelp.{}"]
+    aliases: [yelp]
+    basis: GA4-LIST（yelp、yelp.com、yelp.co.uk、m.yelp.com 为 SOCIAL）
+  - name: Tripadvisor
+    kind: social
+    domains: [tripadvisor.com]
+    aliases: [tripadvisor]
+    basis: GA4-LIST
+  - name: Goodreads
+    kind: social
+    domains: [goodreads.com]
+    aliases: [goodreads]
+    basis: GA4-LIST
+  - name: DeviantArt
+    kind: social
+    domains: [deviantart.com]
+    aliases: [deviantart]
+    basis: GA4-LIST
+  - name: Disqus
+    kind: social
+    domains: [disqus.com]
+    aliases: [disqus]
+    basis: GA4-LIST
+  - name: SlideShare
+    kind: social
+    domains: [slideshare.net]
+    aliases: [slideshare]
+    basis: GA4-LIST
+  - name: Scribd
+    kind: social
+    domains: [scribd.com]
+    aliases: [scribd]
+    basis: GA4-LIST
+  - name: Pixiv
+    kind: social
+    domains: [pixiv.net]
+    basis: GA4-LIST
+  - name: Wattpad
+    kind: social
+    domains: [wattpad.com]
+    aliases: [wattpad]
+    basis: GA4-LIST
+  - name: Meetup
+    kind: social
+    domains: [meetup.com]
+    aliases: [meetup]
+    basis: GA4-LIST
+  - name: MyAnimeList
+    kind: social
+    domains: [myanimelist.net]
+    basis: GA4-LIST
+  - name: Stack Exchange
+    kind: social
+    domains: [stackexchange.com, superuser.com, serverfault.com, askubuntu.com, stackapps.com]
+    aliases: [stackexchange]
+    basis: GA4-LIST（stackexchange 家族 5 个域名均为 SOCIAL；Matomo 只有 stackoverflow.com）
+  - name: Flipboard
+    kind: social
+    domains: [flipboard.com]
+    aliases: [flipboard]
+    basis: GA4-LIST
+  - name: Hootsuite
+    kind: social
+    domains: [hootsuite.com]
+    aliases: [hootsuite]
+    basis: GA4-LIST
+  - name: Pocket
+    kind: social
+    domains: [getpocket.com]
+    basis: GA4-LIST
+  - name: Yammer
+    kind: social
+    domains: [yammer.com]
+    aliases: [yammer]
+    basis: GA4-LIST
+  - name: Hatena
+    kind: social
+    domains: [hatena.ne.jp]
+    aliases: [hatena]
+    basis: GA4-LIST（Hatena、b.hatena.ne.jp 等为 SOCIAL）
+  - name: Ameba
+    kind: social
+    domains: [ameba.jp, ameblo.jp]
+    basis: GA4-LIST
+  - name: Livedoor
+    kind: social
+    domains: [livedoor.com]
+    basis: GA4-LIST
+  - name: FC2
+    kind: social
+    domains: [fc2.com]
+    aliases: [fc2]
+    basis: GA4-LIST
+  - name: Naver Blog
+    kind: social
+    domains: [blog.naver.com]
+    basis: GA4-LIST（blog.naver.com、m.blog.naver.com 为 SOCIAL，比 naver.com 搜索更具体）
+  - name: Naver Cafe
+    kind: social
+    domains: [cafe.naver.com]
+    basis: GA4-LIST（cafe.naver.com、m.cafe.naver.com 为 SOCIAL）
+  - name: Naver Kin
+    kind: social
+    domains: [kin.naver.com]
+    basis: GA4-LIST（kin.naver.com、m.kin.naver.com 为 SOCIAL）
+  - name: Zalo
+    kind: social
+    domains: [zalo.me]
+    aliases: [zalo]
+    basis: GA4-LIST（chat.zalo.me 为 SOCIAL）
+  - name: Digg
+    kind: social
+    domains: [digg.com]
+    aliases: [digg]
+    basis: GA4-LIST（digg、digg.com 为 SOCIAL；Matomo 当成搜索引擎）
+  - name: FriendFeed
+    kind: social
+    domains: [friendfeed.com]
+    aliases: [friendfeed]
+    basis: GA4-LIST（friendfeed 为 SOCIAL；Matomo 当成搜索引擎）
+  - name: WordPress
+    kind: social
+    domains: [wordpress.com, wordpress.org]
+    aliases: [wordpress]
+    basis: GA4-LIST（wordpress、wordpress.com、wordpress.org 为 SOCIAL）
+  - name: Blogger
+    kind: social
+    domains: [blogger.com, blogspot.com]
+    aliases: [blogger, blogspot]
+    basis: GA4-LIST（blogger、blogspot 等为 SOCIAL）
+  - name: Typepad
+    kind: social
+    domains: [typepad.com]
+    aliases: [typepad]
+    basis: GA4-LIST
+  - name: Weebly
+    kind: social
+    domains: [weebly.com]
+    aliases: [weebly]
+    basis: GA4-LIST
+  - name: Dianping
+    kind: social
+    domains: [dianping.com]
+    aliases: [dianping]
+    basis: GA4-LIST
+
+  # ---------- 购物：shopping.net ----------
+  - name: Shopping.net
+    kind: shopping
+    domains: [shopping.net]
+    basis: GA4-LIST（uk./nl./no./se.shopping.net 为 SHOPPING）
+  # ---------- AI 助手 ----------
+  - name: ChatGPT
+    kind: ai
+    domains: [chat.com]
+    aliases: [chatgpt]
+    basis: FACT（OpenAI 持有 chat.com 并跳转到 chatgpt.com）
+  - name: Claude
+    kind: ai
+    domains: [claude.com]
+    aliases: [claude]
+    basis: FACT（Anthropic 官方域名，与 claude.ai 并列）
+  - name: Perplexity
+    kind: ai
+    domains: [pplx.ai]
+    aliases: [perplexity]
+    basis: FACT（Perplexity 官方短域名）
+  - name: DeepSeek
+    kind: ai
+    domains: [deepseek.com]
+    aliases: [deepseek]
+    basis: FACT（DeepSeek 官方域名；Matomo 只收了 chat.deepseek.com）
+  - name: Phind
+    kind: ai
+    domains: [phind.com]
+    aliases: [phind]
+    basis: FACT（Phind 官方域名）；归类参照 Plausible 的行为
+  - name: Kimi
+    kind: ai
+    domains: [kimi.com, kimi.moonshot.cn]
+    aliases: [kimi]
+    basis: FACT（月之暗面 Kimi 官方域名）；Rivu 自行补充
+  - name: Doubao
+    kind: ai
+    domains: [doubao.com]
+    aliases: [doubao]
+    basis: FACT（字节跳动豆包官方域名）；Rivu 自行补充
+  - name: Tencent Yuanbao
+    kind: ai
+    domains: [yuanbao.tencent.com]
+    basis: FACT（腾讯元宝官方域名）；Rivu 自行补充
+  - name: Poe
+    kind: ai
+    domains: [poe.com]
+    aliases: [poe]
+    basis: FACT（Quora 的 Poe 官方域名）；Rivu 自行补充
+  - name: Pi
+    kind: ai
+    domains: [pi.ai]
+    basis: FACT（Inflection 的 Pi 官方域名）；Rivu 自行补充
+  - name: Grok
+    kind: ai
+    aliases: [grok]
+    basis: Matomo 已有 grok.com；`x.com/i/grok` 带路径，只有 host 的接口无法识别（见研究文档偏离清单）
+  - name: Google Gemini
+    kind: ai
+    aliases: [gemini]
+    basis: Matomo 已有 gemini.google.com；登记 utm_source 别名
+
+  # ---------- 网页邮箱：从邮件里点开的链接，referrer 是邮箱网页 ----------
+  - name: Gmail
+    kind: email
+    domains: [mail.google.com]
+    aliases: [gmail]
+    basis: FACT（Gmail 网页版 host）；归类参照 Plausible 的行为
+  - name: Outlook
+    kind: email
+    domains: [outlook.live.com, outlook.office.com, outlook.office365.com, mail.live.com]
+    aliases: [outlook]
+    basis: FACT（Outlook 网页版 host）
+  - name: Yahoo! Mail
+    kind: email
+    domains: [mail.yahoo.com]
+    basis: FACT（Yahoo 邮箱网页版 host）
+  - name: Proton Mail
+    kind: email
+    domains: [mail.proton.me, mail.protonmail.com]
+    basis: FACT（Proton 邮箱网页版 host）
+  - name: QQ Mail
+    kind: email
+    domains: [mail.qq.com]
+    basis: FACT（QQ 邮箱网页版 host）；Rivu 自行补充
+  - name: 163 Mail
+    kind: email
+    domains: [mail.163.com]
+    basis: FACT（网易邮箱网页版 host）；Rivu 自行补充
+
+  # ---------- 只命名，不参与渠道类别（渠道落到 Referral） ----------
+  - name: Wikipedia
+    kind: other
+    domains: [wikipedia.org]
+    aliases: [wikipedia]
+    basis: FACT（Wikipedia 有上百个语言子域名，合并成一个来源）
+  - name: Microsoft 365
+    kind: other
+    domains: [officeapps.live.com]
+    basis: FACT（Office 网页版内嵌浏览的 referrer）
+  - name: Linktree
+    kind: other
+    domains: [linktr.ee]
+    aliases: [linktree]
+    basis: FACT（链接聚合页，本身不是内容来源）
+  - name: GitHub
+    kind: social
+    domains: [github.com]
+    aliases: [github]
+    basis: Matomo Socials 已有；登记别名

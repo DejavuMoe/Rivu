@@ -28,6 +28,7 @@ metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 rand.workspace = true
 rivu-common.workspace = true
+rivu-geo.workspace = true
 rivu-ingest.workspace = true
 rivu-jobs.workspace = true
 rivu-query.workspace = true

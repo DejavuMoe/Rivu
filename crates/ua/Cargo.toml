@@ -1,0 +1,21 @@
+[package]
+name = "rivu-ua"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+moka.workspace = true
+serde-saphyr.workspace = true
+ua-parser.workspace = true
+
+[dev-dependencies]
+# 测试夹具（uap-core 的 test_*.yaml、crawler-user-agents.json）的反序列化。
+serde.workspace = true
+serde_json.workspace = true

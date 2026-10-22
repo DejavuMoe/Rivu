@@ -2,7 +2,9 @@
 //!
 //! 装配（按角色）：
 //! - collector / all：BatchWriter（`rivu_writer` 账号）、站点快照、盐缓存、接入管线、会话清扫；
-//! - worker / all：后台任务 `salts_rotate`（启动时补跑一次，之后每小时一次）；
+//! - worker / all：后台任务 `salts_rotate`（启动时补跑一次，之后每小时一次）、`geoip_refresh`
+//!   （无本地副本时立即下载，之后按 `RIVU_GEOIP_REFRESH_INTERVAL` 条件 GET）；
+//! - collector / all：持有 GeoIP 库并每小时检查文件修改时间、热加载（管线尚未接入，见 `rivu-geo`）；
 //! - api：P1 没有 HTTP 接口，`/api/*` 返回 501，指标用命令行 `rivu stats` 查询。
 //!
 //! 关停顺序：停止接收（HTTP 服务优雅关停）→ 停止后台刷新任务 → 排空 BatchWriter 并 flush →
@@ -17,15 +19,20 @@ use anyhow::{Context, Result};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use rivu_common::build_info;
 use rivu_common::config::{Config, Role};
+use rivu_geo::GeoDb;
 use rivu_ingest::pipeline::{Pipeline, SaltCache, SiteSnapshot, salt_window, utc_today};
+use rivu_jobs::GeoRefreshState;
 use rivu_writer::{BatchWriter, ChSink, WriterOptions};
 use sqlx::PgPool;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use crate::internal::{self, CollectorReadiness, InternalState, Probe};
+use crate::internal::{self, CollectorReadiness, GeoReadiness, InternalState, Probe};
 use crate::public;
+
+/// collector 比较 GeoIP 库文件修改时间的周期（`platform-and-ops.md` §6：每小时）。
+const GEO_RELOAD_CHECK_INTERVAL: Duration = Duration::from_secs(3600);
 
 /// 盐缓存的重载周期（`platform-and-ops.md` §3.3：各进程每 60 秒从 PG 刷新）。
 const SALT_CACHE_REFRESH: Duration = Duration::from_secs(60);
@@ -164,6 +171,7 @@ pub async fn run(config: Config) -> Result<ExitCode> {
     internal::describe_metrics();
     rivu_writer::describe_metrics();
     rivu_ingest::pipeline::describe_metrics();
+    rivu_geo::describe_metrics();
 
     // 先绑定端口：端口被占用时不应该留下已经启动的后台任务。
     let internal_listener = TcpListener::bind(config.internal_addr)
@@ -193,6 +201,33 @@ pub async fn run(config: Config) -> Result<ExitCode> {
         ));
     }
 
+    // GeoIP：collector / all 持有库并热加载（管线接入之前只是加载与报告状态）；
+    // worker / all 运行 `geoip_refresh`，all 里刷新成功后直接热加载同一个库。
+    for w in config.geo.warnings() {
+        tracing::warn!("{w}");
+    }
+    let geo_db = role
+        .serves_collector()
+        .then(|| Arc::new(GeoDb::from_config(&config.geo)));
+    if let Some(db) = &geo_db {
+        background.push(db.spawn_reloader(
+            config.geo.db_path.clone(),
+            GEO_RELOAD_CHECK_INTERVAL,
+            bg_stop_rx.clone(),
+        ));
+    }
+    let geo_refresh = role
+        .runs_jobs()
+        .then(|| Arc::new(GeoRefreshState::default()));
+    if let Some(state) = &geo_refresh {
+        background.push(rivu_jobs::spawn_geoip_refresh(
+            config.geo.clone(),
+            geo_db.clone(),
+            Arc::clone(state),
+            bg_stop_rx.clone(),
+        ));
+    }
+
     let collector = if role.serves_collector() {
         Some(start_collector(&config, &pg, &bg_stop_rx, &mut background).await?)
     } else {
@@ -203,6 +238,11 @@ pub async fn run(config: Config) -> Result<ExitCode> {
         role,
         probe,
         collector: collector.as_ref().map(|c| c.readiness.clone()),
+        geo: GeoReadiness {
+            db: geo_db,
+            refresh: geo_refresh,
+            db_path: config.geo.db_path.clone(),
+        },
         metrics,
         started,
     });
