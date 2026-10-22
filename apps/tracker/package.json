@@ -1,0 +1,28 @@
+{
+  "name": "@rivu/tracker",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Rivu 浏览器采集脚本（core / full），产物零运行时依赖",
+  "license": "MIT",
+  "type": "module",
+  "packageManager": "pnpm@12.5.1",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "size": "node scripts/size.mjs",
+    "typecheck": "tsc --noEmit",
+    "test:unit": "node --test \"test/unit/*.test.ts\"",
+    "test:e2e": "node scripts/build.mjs && playwright test",
+    "test": "pnpm run test:unit && pnpm run test:e2e",
+    "browsers": "playwright install chromium firefox webkit"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.64.1",
+    "@types/node": "26.6.5",
+    "acorn": "8.19.0",
+    "esbuild": "0.28.2",
+    "typescript": "7.0.2"
+  }
+}

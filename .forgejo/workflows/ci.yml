@@ -85,3 +85,46 @@ jobs:
         run: cargo test -p rivu --test clickhouse_sessions -- --nocapture
       - name: 端到端测试（管线 -> ClickHouse -> 查询，与参考实现对比）
         run: cargo test -p rivu --test e2e_lite -- --nocapture
+
+  # 浏览器采集脚本（apps/tracker）。与 Rust 的 job 互不依赖，可并行。
+  tracker:
+    runs-on: docker
+    defaults:
+      run:
+        working-directory: apps/tracker
+    env:
+      # 构建号：单调递增，随事件以 sv 上报（规范 §8）。
+      RIVU_SV: ${{ github.run_number }}
+      # 体积回归 > 64 B 需要 label 批准时，由流水线按 label 设为 1（规范 §3.3）；默认不批准。
+      RIVU_SIZE_APPROVED: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: 安装 pnpm（版本与 package.json 的 packageManager 一致）
+        run: npm install -g pnpm@12.5.1
+      - name: 安装依赖（锁文件必须是最新的）
+        run: pnpm install --frozen-lockfile
+      - name: 类型检查
+        run: pnpm run typecheck
+      - name: 构建
+        run: pnpm run build
+      - name: 产物检查（体积预算 gzip -9 ≤ 1024 B、模块泄漏、禁用 API、es2018、确定性）
+        run: pnpm run size
+      - name: 单元测试（node:test）
+        run: node --test "test/unit/*.test.ts"
+      # 浏览器测试需要 Playwright 的三个内核及其系统依赖。`--with-deps` 要 root 权限（apt-get）；
+      # 如果 runner 镜像不是 root、或没有 apt，这一步会失败：此时应改用预装了浏览器的镜像
+      # （如 mcr.microsoft.com/playwright）或自行安装依赖。镜像里缺任何一个内核的系统库，
+      # 对应项目会在启动时报错，而不是被静默跳过。
+      - name: 安装 Playwright 浏览器（chromium firefox webkit）
+        run: pnpm exec playwright install --with-deps chromium firefox webkit
+      - name: 浏览器测试（chromium / firefox / webkit）
+        run: pnpm exec playwright test
+      - name: 保存 Playwright 报告
+        if: failure()
+        uses: actions/upload-artifact@v3
+        with:
+          name: tracker-playwright-report
+          path: apps/tracker/playwright-report

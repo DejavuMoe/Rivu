@@ -1,0 +1,5 @@
+# pnpm 10+ 默认不运行依赖的安装脚本。esbuild 的 postinstall 只是校验/优化二进制，
+# 实际二进制来自 @esbuild/<平台> 的可选依赖，不运行它不影响构建。
+# 显式拒绝，让 `pnpm install` 不因 ERR_PNPM_IGNORED_BUILDS 失败。
+allowBuilds:
+  esbuild: false
