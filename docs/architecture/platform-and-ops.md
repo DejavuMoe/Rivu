@@ -111,7 +111,7 @@ Reliable:  浏览器 ─443─► Caddy ─┬ /api/event,/js/* ─► collector
 | `invitations` | 合并 Plausible 的 `team_invitations` 与 `guest_invitations`（04§1.2） | `organization_id`、`email`、`role`、`site_id` NULL、`site_role`、`token_hash`、`expires_at`、`accepted_at` | `UNIQUE(token_hash)`；`UNIQUE(org,email,COALESCE(site_id,0))` 仅待处理 |
 | `sites` | 站点 | `organization_id`、`site_key`、`name`、`timezone`、`is_public` | `UNIQUE(site_key)`（含已删除）；`INDEX(organization_id)`、`INDEX(updated_at)` |
 | `site_hostnames` | 来源主机名白名单 | `site_id`、`pattern`（小写 punycode，支持 `*.example.com`） | `UNIQUE(site,pattern)` 部分唯一 |
-| `site_settings` | 采集、隐私、保留期（1:1） | `site_id` PK、`collect_enabled`、`ingest_rate_limit_per_min`、`retention_days`、`geo_level`、`strip_query_params`、`allowed_event_props`、`tracker jsonb` | `retention_days` ≤ `RIVU_RETENTION_DAYS`（应用层校验）；`tracker` 取代 `tracker_script_configuration` 表（04§1.2） |
+| `site_settings` | 采集、隐私、保留期（1:1） | `site_id` PK、`collect_enabled`、`ingest_rate_limit_per_min`、`retention_days`、`geo_level`、`strip_query_params`、`allowed_event_props`、`tracker jsonb` | `retention_days` ≤ `RIVU_RETENTION_DAYS`（应用层校验）；`geo_level` 选 region / city 需要库提供子区划码与城市 id，默认 DB-IP Lite 没有，看板据 `meta.geo_capability` 提示（`system-design.md` §10 Q24、§6.10）；`tracker` 取代 `tracker_script_configuration` 表（04§1.2） |
 | `goals` | 转化目标 | `site_id`、`kind` ∈ event/page、`event_name`、`page_path`、`display_name` | `UNIQUE(site,kind,COALESCE(event_name,page_path))` 部分唯一 |
 | `funnels`、`funnel_steps` | 漏斗（第 4 阶段） | `site_id`、`name`；`funnel_id`、`goal_id`、`step_order` | `UNIQUE(funnel_id,step_order)` |
 | `segments` | 保存的筛选段 | `site_id`、`owner_user_id` NULL=站点级、`name`、`filter jsonb`（结构见 `system-design.md`） | `INDEX(site_id)` |
@@ -320,8 +320,8 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 | `rollup_today` | cron | 每小时 | 重算「今天」的 rollup，按 `(site_id, site_day)` 整体替换 |
 | `rollup_finalize` | cron | 每小时 | 站点本地日结束且过宽限（默认 2h）后重算并定稿；删除请求会使已定稿日期重新入队。定稿状态的记录位置见 `system-design.md` |
 | `site_delete_schedule` | cron | 每小时 | 为宽限期已过的软删除站点插入删除意图，部分唯一索引保证只插一次 |
-| `geoip_refresh` | 进程启动（无本地副本时立即执行）+ cron | 每 `RIVU_GEOIP_REFRESH_INTERVAL`（默认 24h；`0` 表示不定期刷新） | 来源按优先级选择：`RIVU_GEOIP_DB_URL` > `RIVU_MAXMIND_LICENSE_KEY` > DB-IP Lite（默认），所以默认配置下也会运行。条件 GET（ETag / Last-Modified），临时文件校验 mmdb 元数据后原子 rename，失败保留上一份有效副本并退避重试；`unique_key = geoip:{slot}`，slot = `floor(now / 间隔)`。collector 每小时检查 mtime 热加载。细节见 `system-design.md` §4.4（04§4.2 `MAXMIND_*`；Plausible 在构建时下载库） |
-| `sources_update` | cron | 每周 | 更新来源分类与垃圾 referrer 名单，原子替换 |
+| `geoip_refresh` | 进程启动（无本地副本时立即执行）+ 定时 | 每 `RIVU_GEOIP_REFRESH_INTERVAL`（默认 24h；`0` 表示不定期刷新）。有本地副本时，第一次检查在 meta 最近检查时间加一个周期（带抖动），已过期则立即 | 来源按优先级选择：`RIVU_GEOIP_DB_URL` > `RIVU_MAXMIND_LICENSE_KEY` > DB-IP Lite（默认），所以默认配置下也会运行。条件 GET（ETag / Last-Modified）；服务器没有校验头就整文件下载，按解压后 mmdb 的 SHA-256 判断是否替换；临时文件校验后原子 rename；失败保留上一份有效副本并退避重试。没有 meta 的文件：默认来源不刷新，配置了 URL 或 key 则立即下载（`system-design.md` §10 Q28）。P1 实现为进程内定时器（同 `salts_rotate`），没有任务队列，多个 worker 同时运行时各自下载：临时文件名带进程号，不会互相破坏，替换是原子的，后到者因 SHA-256 相同跳过替换；接入 PG 任务队列后用 `unique_key = geoip:{slot}`（slot = `floor(now / 间隔)`）去重。collector 每小时检查 mtime，把库读入内存并热加载（§10 Q25）。细节见 `system-design.md` §4.4（04§4.2 `MAXMIND_*`；Plausible 在构建时下载库） |
+| `sources_update` | cron | 每周 | 只更新垃圾 referrer 名单，原子替换。来源分类库（Matomo 数据加补充表）和 UA 规则库（uap-core）在编译期嵌入，随版本升级，不在线更新、不联网（`system-design.md` §4.4、§10 Q20） |
 | `import_run` | 用户触发 | 按需 | `unique_key = import:{id}`，`max_attempts = 3`；永久失败不重试（04§3.2 `ImportAnalytics`、04§8） |
 | `export_build` | 用户触发 | 按需 | `unique_key = export:{id}`，超时 15 分钟；ClickHouse 流式输出，S3 multipart 或本地临时文件后原子移动（04§8、04§9.10）；完成后由独立任务 `export_notify` 发邮件（`max_attempts = 5`，04§3.2） |
 | `ingest_counters` 过期 | 表级 TTL | 无 | 由 ClickHouse TTL 处理（默认 90 天，见 `system-design.md` §5.4），不需要单独任务 |
@@ -359,11 +359,11 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 | `RIVU_RETENTION_DAYS` | `731` | 原始数据保留上限（连续两个自然年，含一个闰年），站点可在其内调小。ClickHouse 表 TTL 同为 731 天，调高需要迁移；日均千万级事件的部署建议调低（`system-design.md` §7） |
 | `RIVU_SITE_DELETE_GRACE_DAYS` | `7` | 站点删除撤销窗口 |
 | `RIVU_SITE_CACHE_REFRESH_SECS` | `10` | 站点缓存刷新周期。P1 每个周期全量重载；按 `updated_at` 水位的增量刷新与 `pg_notify` 主动失效尚未实现（`system-design.md` §4.3） |
-| `RIVU_GEOIP_DB_PATH` | `${RIVU_DATA_DIR}/geoip/geoip.mmdb` | 当前生效的 mmdb。所有来源都落在这个文件，旁边有 `.meta.json` 记录来源、ETag、署名 |
+| `RIVU_GEOIP_DB_PATH` | `${RIVU_DATA_DIR}/geoip/geoip.mmdb` | 当前生效的 mmdb。所有来源都落在这个文件，旁边有 `.meta.json` 记录来源、ETag、SHA-256（解压后内容）、署名。没有 meta 的文件视为手工放置：默认来源时直接使用、不自动刷新；配置了 URL 或 key 时立即下载（`system-design.md` §10 Q28） |
 | `RIVU_GEOIP_DB_URL` | 空 | 自定义 mmdb 直链（http/https，`.mmdb` 或 `.mmdb.gz`），优先级最高；支持 `_FILE`。许可由运维者负责 |
-| `RIVU_MAXMIND_LICENSE_KEY`、`RIVU_MAXMIND_EDITION` | 空；`GeoLite2-City` | 配置 key 后使用 MaxMind GeoLite2 并自动更新；优先级低于 `RIVU_GEOIP_DB_URL`。下载接口若还要求 Account ID，则新增 `RIVU_MAXMIND_ACCOUNT_ID`（实现时核对） |
-| `RIVU_DBIP_EDITION` | `city` | 默认来源 DB-IP Lite 的版本：`city` \| `country`（CC BY 4.0，需署名） |
-| `RIVU_GEOIP_REFRESH_INTERVAL` | `24h`；下限 `1h`；`0` 关闭 | 条件 GET 的刷新周期（加 ±10% 抖动），对三种来源都生效 |
+| `RIVU_MAXMIND_LICENSE_KEY`、`RIVU_MAXMIND_ACCOUNT_ID`、`RIVU_MAXMIND_EDITION` | 空；空；`GeoLite2-City` | 配置 key 后使用 MaxMind GeoLite2 并自动更新；优先级低于 `RIVU_GEOIP_DB_URL`。现行下载接口是 HTTP Basic（Account ID + license key），所以**设置 key 时 Account ID 必填**，缺失则配置校验报错（不回显 key）。返回 `tar.gz`，取其中的 `.mmdb`；每日下载上限 30 次（`system-design.md` §10 Q27） |
+| `RIVU_DBIP_EDITION` | `city` | 默认来源 DB-IP Lite 的版本：`city` \| `country`（CC BY 4.0，需署名）。下载的 gz 约 60 MB / 4 MB，解压后约 121 MiB / 8 MiB 读入内存；两个版本都只有国家码，没有子区划码和 GeoNames id（`system-design.md` §10 Q24） |
+| `RIVU_GEOIP_REFRESH_INTERVAL` | `24h`；下限 `1h`；`0` 关闭 | 条件 GET 的刷新周期（加 ±10% 抖动），对三种来源都生效；MaxMind 每日下载额度 30 次，不要设得太短 |
 | `RIVU_GEOIP_ATTRIBUTION_TEXT`、`RIVU_GEOIP_ATTRIBUTION_URL` | 空 | 自定义来源（或手工放置的文件）的署名文本和链接，看板显示、查询 API 的 `meta.geo_attribution` 返回；DB-IP 和 MaxMind 使用内置署名，不读这两个变量 |
 | `RIVU_DATA_DIR` | `/var/lib/rivu` | GeoIP 与本地导出 |
 | `RIVU_JOBS`、`RIVU_JOBS_CONCURRENCY` | 见 1.1；`4` | 任务开关与同进程并发数 |
@@ -420,7 +420,7 @@ PG 与 ClickHouse 迁移放在同一目录、同一版本序列（14 位时间�
 | 项 | 设计 |
 |---|---|
 | 端点 | 内部端口 `:9090`：`/healthz`（存活）、`/readyz`（就绪）、`/metrics`（Prometheus，默认开，`RIVU_METRICS=off` 可关）；均不经 Caddy |
-| `/readyz` | 全部满足才 200，否则 503 并返回逐项 JSON：PG `SELECT 1`、ClickHouse `SELECT 1`、**站点缓存已预热**、**会话缓存已预热**、盐已加载（`today-1`、`today`、`today+1`）、schema 版本达标、Reliable 下 NATS 已连接；另报告 GeoIP 库是否已加载，但不判失败（下载上百 MB 超出预热预算，缺库只让位置字段为空）。借鉴 04§6 就绪检查（PG、CH、关键缓存），增加盐、schema、NATS。公共监听在预热完成后才绑定，预热预算应小于 `lb_try_duration`（预热细节见 `system-design.md`）。JSON 含 `version`、`commit`、`schema_version`（对应 04§6 的 info 端点） |
+| `/readyz` | 全部满足才 200，否则 503 并返回逐项 JSON：PG `SELECT 1`、ClickHouse `SELECT 1`、**站点缓存已预热**、**会话缓存已预热**、盐已加载（`today-1`、`today`、`today+1`）、schema 版本达标、Reliable 下 NATS 已连接；另报告 GeoIP 库的状态（`checks.geoip`，`ok` 恒为 `true`，不参与就绪判断；字段：`file_present`、持有库的进程另有 `loaded` `source` `database_type` `build_epoch` `age_seconds`、运行刷新任务的进程另有 `refresh.{schedule,last_attempt_at,last_result,last_error,consecutive_failures}`）：下载上百 MB 超出预热预算，缺库只让位置字段为空。借鉴 04§6 就绪检查（PG、CH、关键缓存），增加盐、schema、NATS。公共监听在预热完成后才绑定，预热预算应小于 `lb_try_duration`（预热细节见 `system-design.md`）。JSON 含 `version`、`commit`、`schema_version`（对应 04§6 的 info 端点） |
 | ClickHouse 查询 | 所有查询带 `log_comment`，JSON：`{"route":"stats.breakdown","site":123,"org":4,"user":56,"trace_id":"…"}`，只含 id，不含邮箱、IP、UA、过滤值，用于 `system.query_log` 归因慢查询 |
 | 采集计数 | ClickHouse `ingest_counters`（站点 × 原因 × 脚本版本 × 分钟，accepted/dropped），结构与原因枚举见 `system-design.md`。Prometheus 指标**不带 `site` 标签**（防基数爆炸），站点维度只查该表 |
 | 日志 | 结构化 JSON；请求日志只记 `method`、路由模板、状态、耗时、`trace_id`，**不记查询串**（Plausible 请求日志含路径加查询串，04§6）；`/api/event` 不记 IP、UA、完整 URL |
@@ -440,7 +440,7 @@ PG 与 ClickHouse 迁移放在同一目录、同一版本序列（14 位时间�
 | 缓存命中率 | `cache_hits_total`、`cache_misses_total`、`cache_entries`、`cache_refresh_seconds` | `cache`（site/session/query/salt） |
 | 限流与认证 | `ratelimit_rejected_total`、`auth_login_failures_total` | `scope` |
 | 后台任务 | `jobs_total`、`job_seconds`、`jobs_queue_age_seconds`、`jobs_leader` | `kind`、`state` |
-| GeoIP | `geoip_refresh_total`；`geoip_db_age_seconds`（按 meta 里的 `build_epoch`）、`geoip_loaded`（0/1） | `source`（dbip-lite/maxmind-geolite2/custom）、`result`（updated/not_modified/failed） |
+| GeoIP | `geoip_refresh_total`；`geoip_db_age_seconds`（按库的 `build_epoch`）、`geoip_loaded`（0/1） | 只有 `geoip_refresh_total` 带标签：`source`（dbip-lite/maxmind-geolite2/custom）、`result`（updated/not_modified/failed）；另两个无标签（来源切换后旧标签的序列会残留）。后两个由持有库的进程（collector、all）导出，worker 不持有库，所以对应的告警应针对 collector 的抓取目标 |
 | 依赖与状态 | `pg_pool_connections`、`ch_http_seconds`、`build_info`、`schema_version`、`salt_days_loaded` | `account` |
 
 Plausible 自定义指标覆盖缓存命中、ingest buffer 入队与丢弃、清理阶段耗时（04§6）；Rivu 补齐阶段耗时、JetStream 与按端点查询耗时。建议告警起点：写缓冲深度 > 80% 持续 1 分钟、`write_flush_failures_total` 增长、JetStream lag > 60s、非 bot/shield 丢弃率 > 1%、`/readyz` 失败 > 2 分钟、`jobs_leader` 总和 ≠ 1、`geoip_loaded` = 0 持续 1 小时或 `geoip_db_age_seconds` 超过 45 天（DB-IP 按月发布）、最近成功备份距今 > 26 小时。

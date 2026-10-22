@@ -1,6 +1,6 @@
 # Rivu 系统设计 v2
 
-> 状态：草案（2026-10-21）；§10 的八个开放问题已于 2026-10-22 定案，决定已写入正文。本文与 v1《网站统计系统技术架构设计 v1.0》（存档于 [`archive/v1-architecture.md`](archive/v1-architecture.md)）冲突时，以本文为准；v1 未被本文提到的部分继续有效。
+> 状态：草案（2026-10-21）；§10 的八个开放问题已于 2026-10-22 定案，决定已写入正文。2026-10-23 起，UA / 地理 / 来源三份富化研究（[`enrich-ua.md`](../research/enrich-ua.md)、[`enrich-geo.md`](../research/enrich-geo.md)、[`enrich-source.md`](../research/enrich-source.md)）的结论并入 §4.2、§4.4、§6.10、§10 Q19–Q28 与附录 C。本文与 v1《网站统计系统技术架构设计 v1.0》（存档于 [`archive/v1-architecture.md`](archive/v1-architecture.md)）冲突时，以本文为准；v1 未被本文提到的部分继续有效。
 > 依据：对 Plausible Analytics 源码的 REA 分析和源码通读。源码为 `plausible/analytics` master 分支，commit `b8cc135`，本地路径 `examples/plausible-analytics/`。Plausible 服务端是 AGPL-3.0，本文只抽象设计，不复制代码。tracker 是 MIT 许可。`extra/` 目录是 EE 代码，本文只记录其行为，不参考实现。
 > 配套文档：[`tracker-and-protocol.md`](tracker-and-protocol.md)（采集脚本与线协议）；[`platform-and-ops.md`](platform-and-ops.md)（业务库、权限、后台任务、部署与运维）。
 > 证据在 [`docs/research/plausible/`](../research/plausible/) 下，编号 00–04。下文用「R01 §5.2」表示「01 号文档第 5.2 节」，每条事实在原文中都附有 `路径:行号`。
@@ -150,7 +150,10 @@ Rivu 保留这三个抽象，但替换 Plausible 最脆弱的一环。Plausible 
 | 统一 DSL、两段式解析、白名单 | 保留 | §6 |
 | 公开 schema 和内部解析器各一套 | 改进 | 从同一套 Rust 类型生成 |
 | 带页面过滤时跳出率按入口页计算 | 保留语义 | 写进文档和响应的 `meta`（§6.6） |
+| UA 解析用 Matomo device-detector 数据（LGPL-3.0），来源用 Snowplow referers 数据（GPL-3.0） | 替换 | uap-core（Apache-2.0）+ Matomo `searchengine-and-social-list`（CC0）+ 自维护表（§4.4） |
+| 渠道分类有 Elixir 与 SQL 两份实现，分支顺序不一致 | 改进 | `rivu-source` 一份有序规则表 + `RULES_VERSION`（§4.2、§10 Q19） |
 | `imported_*` 维度族 +「恰好一张表」规则 | 保留并推广 | 日汇总层（§5.5） |
+| Plausible 的行为，Rivu 有意不同 | 逐条记录 | 刻意偏离清单索引见附录 C |
 | 内部 API 无限流、用户正则直接执行 | 改进 | 按租户限制并发和超时，正则加长度和数量上限 |
 | CE/EE 在编译期分叉 | 不需要 | Rivu 全部开源，只有一种构建 |
 
@@ -179,7 +182,10 @@ rivu/
 │   └── dashboard/      # SvelteKit + Tailwind + ECharts（adapter-static）
 ├── crates/
 │   ├── domain/         # 事件、会话、站点、查询 DSL 类型（serde + schemars）
-│   ├── ingest/         # 采集 HTTP、管线各阶段、富化（UA / 地理 / 来源 / 渠道）
+│   ├── ingest/         # 采集 HTTP、管线各阶段（富化调用下面三个库）
+│   ├── ua/             # rivu-ua：UA 解析、机器人判定、设备类别（纯库）
+│   ├── geo/            # rivu-geo：GeoIP 库的读取、下载、校验、署名（定时刷新由 `jobs` 调用）
+│   ├── source/         # rivu-source：referrer → source、渠道规则（纯库，数据编译期嵌入）
 │   ├── session/        # SessionAssigner：Lite 时跑在 collector 内，Reliable 时跑在 worker 内
 │   ├── writer/         # ClickHouse 批量写入、重试、去重 token
 │   ├── bus/            # JetStream 发布与消费、分区租约（Reliable）
@@ -240,19 +246,24 @@ api × M ─► ClickHouse（只读账号）/ PostgreSQL          jobs：运行�
 | 2 | 客户端上下文 | TCP 对端属于 `RIVU_TRUSTED_PROXIES` 时才读 `X-Forwarded-For`，从右往左取第一个不可信的地址；IP 规范化（IPv4-mapped 转为 IPv4，IPv6 转为小写压缩形式） | 无 | 配置 |
 | 3 | 准入 | 用 `site_key` 在内存快照中查 `SiteConfig`；检查站点是否停用、hostname 是否在白名单（白名单为空时全部丢弃，fail-closed，§10 Q12）、令牌桶限流、垃圾引荐 | `unknown_site` `site_disabled` `hostname_not_allowed` `rate_limited` `spam_referrer` | SiteSnapshot、垃圾引荐表 |
 | 4 | 规则 | IP/CIDR 规则、页面通配规则 | `ip_blocked` `page_blocked` | SiteConfig |
-| 5 | 机器人 | UA 机器人模式、Headless、自动化工具；可选数据中心 CIDR 表 | `bot` `datacenter_ip` | UA 规则库、CIDR 表 |
-| 6 | 地理 | 查 mmdb 得到 country、region、city，再过国家规则 | `country_blocked` | GeoIP 库 |
-| 7 | UA 富化 | 浏览器和系统（取 major.minor）、设备类型；结果按 UA 字符串缓存 | 无 | UA 库 |
-| 8 | 来源 | referrer → source（host 命中站点白名单的视为内部引荐）；UTM（空串视为缺失）；click id 只记参数名；渠道分类（只有一份 Rust 实现，规则带版本号） | 无 | 来源库、渠道规则 |
+| 5 | 机器人 | `rivu-ua` 判定：uap-core 的 `Spider`、Headless、自动化框架与脚本客户端、爬虫名与自报家门规则；**空 UA 也算机器人**（§10 Q21）；可选数据中心 CIDR 表 | `bot` `datacenter_ip` | uap-core 规则、自维护名字表、CIDR 表 |
+| 6 | 地理 | 非公网地址（私有、回环、链路本地、CGNAT、文档、保留、组播等；IPv4-mapped 先转 IPv4）不查库，位置为空。否则查 GeoIP 库得 country、region、city，按站点 `geo_level` 截断，再过国家规则。国家码不是两个 ASCII 字母，或为占位码（`ZZ` `XX` `A1` `A2` `T1`），视为未知；没有国家时区域与城市也为空；`region_code` 为 `<国家>-<第一级子区划代码>`（§10 Q26）。默认来源下 region、city 恒为空（§10 Q24） | `country_blocked` | GeoIP 库 |
+| 7 | UA 富化 | 与第 5 步共用一次 `UaParser::parse`（UA 先截断到 512 字节，结果按截断后的 UA 缓存，空 UA 不进缓存）。浏览器和系统取 major.minor，浏览器名按归一化表映射；冻结或精简的 `os_version` 报空串；设备类别只有 desktop / mobile / tablet（§10 Q22） | 无 | uap-core 规则 |
+| 8 | 来源 | `rivu-source` 的 `classify`：referrer → source（host 命中站点白名单的视为内部引荐，调用方传 `None`）；UTM（空串视为缺失）；click id 只记参数名；渠道分类（只有一份 Rust 实现，规则带版本号） | 无 | Matomo 来源库（CC0）、自维护补充表、渠道规则 |
 | 9 | 属性 | 规范化 props；可选的站点 props 白名单；收入（P4） | 无 | SiteConfig |
 | 10 | 身份 | 计算 `visitor_id`、`prev_visitor_id`、`partition`（§4.5） | `salt_missing` | salts |
 | 11 | 交接 | Lite：交给 SessionAssigner，再交给 BatchWriter；Reliable：发布到 JetStream | `no_session`（engagement）、`overloaded` | 无 |
 
 - **顺序原则**与 Plausible 相同（R01 §5.2）：先做便宜的判断，昂贵的 UA 解析和地理查询放在规则之后。
 - **每个阶段**都记录耗时直方图 `rivu_ingest_stage_seconds{stage}`；每个丢弃原因都计入 `ingest_counters`（§5.4）。
-- **丢弃原因的标识符**（§10 Q13）以 Rust 枚举 `DropReason`（`rivu-domain`）为唯一来源，共 13 个：`unknown_site` `site_disabled` `hostname_not_allowed` `rate_limited` `spam_referrer` `ip_blocked` `page_blocked` `bot` `datacenter_ip` `country_blocked` `no_session` `salt_missing` `overloaded`。`ingest_counters.metric` 取 `accepted` 或 `dropped_<原因>`；未知站点记 `site_id = 0`；已删除的站点从快照摘除后，同样按 `unknown_site` 计。`salt_missing` 表示事件的站点本地日期没有盐：collector 不现场生成盐（`platform-and-ops.md` §3.3）。
+- **丢弃原因的标识符**（§10 Q13）以 Rust 枚举 `DropReason`（`rivu-domain`）为唯一来源，共 13 个：`unknown_site` `site_disabled` `hostname_not_allowed` `rate_limited` `spam_referrer` `ip_blocked` `page_blocked` `bot` `datacenter_ip` `country_blocked` `no_session` `salt_missing` `overloaded`。`ingest_counters.metric` 取 `accepted` 或 `dropped_<原因>`；未知站点记 `site_id = 0`；已删除的站点从快照摘除后，同样按 `unknown_site` 计。机器人一律记 `dropped_bot`；`rivu-ua` 的 `BotKind`（`spider` `headless` `automation` `empty`）只用于统计与排错，不进 `ingest_counters.metric`（§10 Q21）。`salt_missing` 表示事件的站点本地日期没有盐：collector 不现场生成盐（`platform-and-ops.md` §3.3）。
 - **可选优化（仅 Lite）**：续期会话的事件最终会被盖上会话属性，所以第 5–8 步的结果会被覆盖。可以在第 10 步之后先查会话，命中时跳过这几步。
-- **渠道分类**只在 Rust 里实现一份，并带规则版本号。Plausible 的 Elixir 版和 SQL 版分支顺序不一致，是反面教训（R01 §8.4）。规则变更后，用离线 mutation 回填历史数据。
+- **UA 与机器人**（`rivu-ua`，详见 `docs/research/enrich-ua.md`）：第 5、7 步共用一次解析。机器人在第 5 步丢弃，其余字段第 7 步取用。`browser` 的取值不受 uap-core 控制（兜底规则会把任意 token 当家族名），所以查询层展示该维度必须 top-N 加「其它」（§6.10）。
+- **来源与渠道的实现**（`rivu-source`，`classify(&SourceInput) -> SourceInfo`，只有这一份；详见 `docs/research/enrich-source.md`）：
+  - 渠道取值是 GA4 默认渠道分组的 19 个渠道（不含 `Unassigned`），规则是一张 21 条的有序表，先匹配先赢；英文标识就是 ClickHouse `channel` 列的值，中文名在 UI 层按标识映射（§10 Q19）。
+  - 规则、取值或来源数据任何一处变化，`RULES_VERSION` 加一，并用离线 mutation 回填历史数据。Plausible 的 Elixir 版和 SQL 版分支顺序不一致，是反面教训（R01 §8.4）。
+  - 来源优先级：`utm_source`（含 `source`、`ref` 回退）> referrer host > click id 推断（§10 Q20）。`utm_source` 先按别名表（不区分大小写）规范化，认不出的原样保留；referrer 做 host 后缀匹配（`www.google.co.jp` → `Google`），认不出的用 host 本身。
+  - 只有 click id、没有 `utm_source` 和 referrer 时（隐私设置抹掉 referrer 的常见情形），按参数名推断来源；`gclid` `gbraid` `wbraid` `msclkid` `ttclid` 配同平台来源算付费证据，`fbclid` 不算。
 - **内部引荐的判定**改为「referrer 的 host 命中站点 hostname 白名单」。Plausible 要求 host 完全相等，同站子域名之间互相跳转会被当成外部来源（R01 §8.3）。
 
 ### 4.3 站点快照与缓存
@@ -263,17 +274,18 @@ api × M ─► ClickHouse（只读账号）/ PostgreSQL          jobs：运行�
   - 每 10 秒按 `updated_at > 水位` 做增量刷新，删除通过 `deleted_at` 墓碑感知（Plausible 的删除要等全量刷新才生效，R01 §6.2）；
   - PG `LISTEN/NOTIFY` 推送失效通知，新站点 1 秒内可用（Plausible 有约 30 秒的未知站点窗口，R01 §11.2 #11）。
 - 热路径不回源。查不到 `site_key` 就按 `unknown_site` 丢弃，这样随机 key 洪水打不到 PG。
-- UA 解析结果缓存用 moka（10 万条，TTL 1 小时）；GeoIP 用内存映射的 mmdb，更新后原子替换并热加载（§4.4）。
+- UA 解析结果缓存用 moka（10 万条，TTL 1 小时）。键是截断到 512 字节后的 UA，空 UA 不进缓存；键占用的内存上界约 50 MB（10 万 × 512 B）。
+- GeoIP 把 mmdb **读入内存**（City 约 121 MiB，Country 约 8 MiB），不用内存映射：`maxminddb` 的 mmap 入口是 `unsafe fn`，而工作区禁止 `unsafe`（§10 Q25）。更新后用 `ArcSwap` 原子替换并热加载（§4.4），每个加载库的进程各占一份。
 
 ### 4.4 富化数据源与许可
 
 | 用途 | 选型 | 许可与注意 |
 |---|---|---|
-| UA 解析 | `ua-parser/uap-core` 正则（Rust 有 `uaparser` 等实现） | Apache-2.0。Plausible 用的 Matomo device-detector 数据是 LGPL-3.0，需单独评估 |
-| 机器人 | uap-core 的 device=Spider，加自维护的 Headless 和自动化规则 | 同上 |
-| GeoIP | 默认 DB-IP Lite；可选 MaxMind GeoLite2；可选自定义 mmdb 直链（§10 Q5，详见下） | DB-IP Lite 为 CC BY 4.0，必须署名；GeoLite2 需要 license key 并遵守其 EULA，也要求署名；自定义库的许可由运维者负责 |
-| 地名 | GeoNames（查询时经 CH 字典转换，与 Plausible 的 `location_data_dict` 做法相同） | CC BY 4.0 |
-| 来源 | Snowplow referer-parser 数据，加自维护的补充表（AI 助手、社交平台等） | 许可证需核对 |
+| UA 解析 | `ua-parser` 0.2（uap-core 官方 Rust 实现）+ 固定 commit 的 `regexes.yaml`，随仓库嵌入（`crates/ua/data/uap-core/`），运行期不读文件、不联网。固定 commit 与升级流程见该目录的 `PROVENANCE.md`；uap-core 自带测试集 100% 通过（`test_ua` 1601、`test_os` 483、`test_device` 16129，见 `docs/research/enrich-ua.md` §6.1） | Apache-2.0。Plausible 用的 Matomo device-detector 数据是 LGPL-3.0，不用。上游在固定 commit 没有 `NOTICE`，仓库里的 `NOTICE` 是我们写的署名说明 |
+| 机器人 | uap-core 的 device=Spider，加自维护的 Headless、自动化框架、脚本 HTTP 客户端、爬虫名与自报家门规则（全是子串或前缀比较，没有正则）；空 UA 算机器人（§10 Q21）。在 crawler-user-agents 的 2120 个样例 UA 上检测率 84.58%（uap-core 单独 62.36%）；这是对一份名单的数字，不代表线上流量（§6.10） | 规则库同上；自维护名字表每条要有证据。crawler-user-agents 是 MIT，只当测试输入，不嵌入其正则 |
+| GeoIP | 默认 DB-IP Lite；可选 MaxMind GeoLite2；可选自定义 mmdb 直链（§10 Q5，详见下） | DB-IP Lite 为 CC BY 4.0，必须署名；GeoLite2 需要 Account ID 加 license key 并遵守其 EULA，也要求署名；自定义库的许可由运维者负责 |
+| 地名 | GeoNames（查询时经 CH 字典转换，与 Plausible 的 `location_data_dict` 做法相同） | CC BY 4.0。默认来源 DB-IP Lite 没有城市的 GeoNames id、也没有子区划代码（§10 Q24），字典只在 MaxMind 或同结构的自定义库下有数据可转换 |
+| 来源 | Matomo `searchengine-and-social-list`（`SearchEngines.yml`、`Socials.yml`、`AIAssistants.yml`，固定 commit，`crates/source/data/matomo/`）加自维护补充表（`supplement.yml`，每条写明依据）。构建时核对数据文件的 SHA-256，编译成排序静态表，运行期无解析、无初始化 | Matomo 数据为 CC0-1.0，无署名义务。Snowplow `referers.yml` 的 README 写明数据按 **GPL-3.0** 提供，**不用**。Google GA4 来源清单无许可声明，只作对照不入库（`docs/research/enrich-source.md` §4.1） |
 | 垃圾引荐 | 开源 referrer spam 列表 | 许可证需核对 |
 
 #### GeoIP 数据源、更新与署名（Q5）
@@ -283,23 +295,41 @@ api × M ─► ClickHouse（只读账号）/ PostgreSQL          jobs：运行�
 | 优先级 | 条件 | 数据源 | 获取方式 | 署名 |
 |---|---|---|---|---|
 | 1 | 设置了 `RIVU_GEOIP_DB_URL` | 自定义 mmdb 直链（http/https，例如 `https://git.via.moe/dejavu/GeoLite.mmdb`）；内容可以是 `.mmdb`，也可以是 `.mmdb.gz`（按 gzip 魔数判断） | 对该 URL 做条件 GET | `RIVU_GEOIP_ATTRIBUTION_TEXT`、`RIVU_GEOIP_ATTRIBUTION_URL`；不设置则不显示署名 |
-| 2 | 设置了 `RIVU_MAXMIND_LICENSE_KEY` | MaxMind GeoLite2，版本由 `RIVU_MAXMIND_EDITION` 指定（默认 `GeoLite2-City`） | MaxMind 官方下载接口，带 `If-Modified-Since`。现行接口按 Account ID 加 license key 认证，实现时核对；需要的话新增 `RIVU_MAXMIND_ACCOUNT_ID` | 内置 MaxMind 署名（见下） |
-| 3 | 以上都没有设置（默认） | DB-IP Lite，`RIVU_DBIP_EDITION` 取 `city`（默认）或 `country` | `https://download.db-ip.com/free/dbip-<city\|country>-lite-<YYYY-MM>.mmdb.gz`，每月 1 日发布。先试当月（UTC），404 就回退到上个月。链接形式取自 DB-IP 下载页（2026-10 版：city 约 121 MB，country 约 8 MB，均为 gz），实现前用实际下载验证 | 内置 DB-IP 署名（见下） |
+| 2 | 设置了 `RIVU_MAXMIND_LICENSE_KEY` | MaxMind GeoLite2，版本由 `RIVU_MAXMIND_EDITION` 指定（默认 `GeoLite2-City`） | `https://download.maxmind.com/geoip/databases/<edition>/download?suffix=tar.gz`，HTTP Basic（用户名 Account ID，密码 license key），返回 `tar.gz`，取其中的 `.mmdb`；会重定向到对象存储，凭据不随跨源重定向转发。`RIVU_MAXMIND_ACCOUNT_ID` 在设置 license key 时必填。每日下载上限 30 次，超限回 `429`（§10 Q27） | 内置 MaxMind 署名（见下） |
+| 3 | 以上都没有设置（默认） | DB-IP Lite，`RIVU_DBIP_EDITION` 取 `city`（默认）或 `country` | `https://download.db-ip.com/free/dbip-<city\|country>-lite-<YYYY-MM>.mmdb.gz`，每月 1 日发布（UTC 06:30 左右才有当月文件）。先试当月（UTC），404 就回退到上个月，这一步是必须的。链接形式于 2026-10-22 用 HEAD 与真实下载核实有效，响应带 `ETag` 与 `Last-Modified`，条件请求返回 304。DB-IP 页面标注的大小（city 121.1 MB、country 8.0 MB）是**解压后**的大小（MiB）；实际下载的 `.mmdb.gz` 约 60 MB（city）与 4 MB（country）（`docs/research/enrich-geo.md` §2） | 内置 DB-IP 署名（见下） |
 
-**文件与元数据**：所有来源都落在同一个文件 `RIVU_GEOIP_DB_PATH`。旁边的 `<文件名>.meta.json` 记录来源标识、ETag、Last-Modified、SHA-256、下载时间、`build_epoch` 和署名。meta 里的来源标识与当前配置不一致（例如从 DB-IP 改成自定义 URL）时，视为没有本地副本。没有 meta 的文件视为运维者手工放置，直接使用，署名取自 `RIVU_GEOIP_ATTRIBUTION_*`。
+**数据能力**：不同来源能提供的位置字段不同（`docs/research/enrich-geo.md` §5.3、§4）。
+
+| 来源 | `country_code` | `region_code`（ISO 3166-2） | `city_geoname_id` |
+|---|---|---|---|
+| DB-IP Lite（默认，city 或 country 版） | 有 | **无**：只有英文州省名，没有 `iso_code` | **无**：城市只有英文名，没有 `geoname_id` |
+| MaxMind GeoLite2 City | 有 | 有（`subdivisions[0].iso_code`，只取第一级） | 有（`city.geoname_id`） |
+| MaxMind GeoLite2 Country | 有 | 无 | 无 |
+| 自定义 mmdb | 取决于库；需要 `country.iso_code`，区域与城市要同 MaxMind 的结构 | 同左 | 同左 |
+
+`rivu-geo` 不猜测：没有代码就返回空，不拿英文名拼凑。所以默认配置下 `geo_level` 设为 region 或 city 实际等同于 country，要用地区与城市报表须配置 MaxMind 或同结构的自定义库（§10 Q24；看板的提示要求见 §6.10）。
+
+**文件与元数据**：所有来源都落在同一个文件 `RIVU_GEOIP_DB_PATH`。旁边的 `<文件名>.meta.json` 记录来源标识、ETag、Last-Modified、SHA-256、下载时间、`build_epoch` 和署名。meta 里的来源标识与当前配置不一致（例如从 DB-IP 改成自定义 URL）时，视为没有本地副本；meta 的 `build_epoch` 与库文件不一致（文件被手工换过）时，meta 作废，署名退回手工署名。SHA-256 记的是**解压后的 mmdb 内容**，所以传输压缩方式变化不会触发替换。
+
+没有 meta 的文件视为运维者手工放置，署名取自 `RIVU_GEOIP_ATTRIBUTION_*`，刷新规则取决于配置（§10 Q28）：
+
+| 配置 | 行为 |
+|---|---|
+| 默认来源（DB-IP Lite） | 直接使用，**不自动刷新**（否则 24 小时后会被 DB-IP 的库覆盖） |
+| 设置了 `RIVU_GEOIP_DB_URL` 或 `RIVU_MAXMIND_LICENSE_KEY` | 视为没有本地副本，立即下载；新库校验通过前继续用旧文件 |
 
 **生命周期**
 
 | 阶段 | 行为 |
 |---|---|
-| 启动 | 没有本地副本就立即后台下载（由开启 jobs 的进程执行，collector 只读共享目录）；有副本则直接加载。下载完成前事件的位置字段为空，不阻塞 `/readyz`：下载上百 MB 远超预热预算，`/readyz` 里的 geoip 项只报告状态，不判失败 |
+| 启动 | 没有本地副本就立即后台下载（由开启 jobs 的进程执行，collector 只读共享目录）；有副本则直接加载，第一次条件 GET 安排在 meta 的最近检查时间加一个（带抖动的）刷新周期，已过期则立即，避免频繁重启时每次都请求服务器（MaxMind 有每日额度）。下载完成前事件的位置字段为空，不阻塞 `/readyz`：下载上百 MB 远超预热预算，`/readyz` 里的 geoip 项只报告状态，不判失败 |
 | 定期刷新 | 每隔 `RIVU_GEOIP_REFRESH_INTERVAL` 发一次条件 GET（默认 `24h`，下限 `1h`，加 ±10% 抖动；设为 `0` 表示不定期刷新，只在没有本地副本时下载一次）。请求带 `If-None-Match` / `If-Modified-Since`，取值来自 meta；返回 `304` 只更新检查时间 |
 | 无校验头 | 服务器既不给 ETag 也不给 Last-Modified 时，只能整文件 GET，再按 SHA-256 与 meta 比较，相同则不替换。运维者应在这种服务器上加大刷新间隔 |
-| 校验 | 先写入同目录的临时文件（超过 1 GiB 中止），gz 先解压，再打开 mmdb 检查：元数据可解析；`binary_format_major_version = 2`；`database_type` 含 `Country` 或 `City`（不区分大小写，覆盖 `GeoLite2-*` 和 `DBIP-*-Lite`）；`node_count > 0`；对一个固定公网地址做一次查询，解码不出错 |
-| 替换 | 校验通过后 fsync，`rename` 覆盖 `RIVU_GEOIP_DB_PATH`（同目录，原子），然后原子写 meta。崩溃在两步之间只会多下载一次。collector 每小时比较 mtime 后用 `ArcSwap` 热加载，旧映射在途查询结束后释放 |
+| 校验 | 先写入同目录的临时文件（超过 1 GiB 中止），按魔数判断 gzip 并解压（MaxMind 的 `tar.gz` 再取第一个 `.mmdb` 条目；压缩前后各限 1 GiB，防 gzip 炸弹），再打开 mmdb 检查：元数据可解析；`binary_format_major_version = 2`；`database_type` 含 `Country` 或 `City`（不区分大小写，覆盖 `GeoLite2-*` 和 `DBIP-*-Lite`）；`node_count > 0`；对一个固定公网地址做一次查询，解码不出错。校验**不覆盖数据区内部的损坏**：MaxMind 测试库 `GeoIP2-City-Test-Broken-Double-Format.mmdb`（某个 double 编码损坏）能通过这五项；整库 `Reader::verify()` 对 City 库代价较大，没有采用。下载截断会被 gzip CRC 和文件尾部的 mmdb 元数据两道检查挡住，其余依赖来源服务器的完整性与传输层校验 |
+| 替换 | 校验通过后 fsync，`rename` 覆盖 `RIVU_GEOIP_DB_PATH`（同目录，原子），然后原子写 meta。崩溃在两步之间只会多下载一次。collector 每小时比较 mtime 后用 `ArcSwap` 热加载，新旧两份库在热加载期间同时在内存，旧库在途查询结束后释放（§10 Q25） |
 | 失败 | 网络错误、状态码不是 200/304、超时（连接 10 s，整体 10 min）、解压或校验失败：删除临时文件，继续使用上一份有效副本；记 `warn` 日志（URL 去掉用户信息和查询串）并累加 `rivu_geoip_refresh_total{result="failed"}`；10 分钟后重试，之后每次加倍，直到一个刷新周期。失败不影响采集。指标见 `platform-and-ops.md` 第 10 节 |
 
-HTTP 约束：只接受 `http`、`https`；跟随最多 5 次重定向；`http` 允许，但启动时打 `warn`。URL 可能带令牌（私有托管），所以 `RIVU_GEOIP_DB_URL` 同样支持 `_FILE`，日志里一律脱敏。
+HTTP 约束：只接受 `http`、`https`；跟随最多 5 次重定向；`http` 允许，但启动时打 `warn`。URL 可能带令牌（私有托管），所以 `RIVU_GEOIP_DB_URL` 同样支持 `_FILE`，日志里一律脱敏。TLS 根证书内置（webpki-roots），不读系统证书库：`RIVU_GEOIP_DB_URL` 指向使用私有 CA 的内网服务器时校验会失败。`RIVU_GEOIP_CA_FILE`（追加受信根证书）未实现，有需求再做。
 
 **署名要求**
 
@@ -310,12 +340,12 @@ DB-IP Lite 的许可与署名要求，摘自 DB-IP 的 Lite 页面（<https://db
 - 页面给出的署名 HTML：`<a href='https://db-ip.com'>IP Geolocation by DB-IP</a>`。
 - Rivu 内置：文本 `IP Geolocation by DB-IP`，链接 `https://db-ip.com`，许可 CC BY 4.0。
 
-MaxMind GeoLite2：EULA 第 3 条要求注明使用来源，并给出示例 `This product includes GeoLite Data created by MaxMind, available from https://www.maxmind.com.`（<https://www.maxmind.com/en/geolite2/eula>；EULA 称其为示例，措辞以 EULA 为准）。Rivu 内置该句，链接 `https://www.maxmind.com`。EULA 还要求新版本发布后 30 天内停用旧库，每日检查满足这一点。
+MaxMind GeoLite2：EULA 第 3 条要求注明使用来源，并给出示例 `This product includes GeoLite Data created by MaxMind, available from https://www.maxmind.com.`（<https://www.maxmind.com/en/geolite2/eula>；EULA 称其为示例，措辞以 EULA 为准）。Rivu 内置该句，链接 `https://www.maxmind.com`，`license` 字段填 `GeoLite2 EULA`。EULA 还要求新版本发布后 30 天内停用旧库，每日检查满足这一点。
 
 落实：
 
 - **看板**在所有显示位置数据的地方都必须显示当前库的署名（文本加可点击链接）：国家、地区、城市报表，地图，实时视图，共享链接与公开看板，以及邮件报告（P4）。站点设置不能关闭它。GeoNames 的署名（CC BY 4.0）在同一位置显示。
-- **查询 API** 在 `meta.geo_attribution` 返回当前生效库的署名：`{source, text, url, license}`，`source` 取 `dbip-lite`、`maxmind-geolite2`、`custom`。凡查询含 `visit:country`、`visit:region`、`visit:city` 维度或过滤，该字段必填；导出文件带同样字段。调用方在自己的界面展示位置数据时，署名义务由调用方承担。
+- **查询 API** 在 `meta.geo_attribution` 返回当前生效库的署名：`{source, text, url, license}`，`source` 取 `dbip-lite`、`maxmind-geolite2`、`custom`。凡查询含 `visit:country`、`visit:region`、`visit:city` 维度或过滤，该字段必填；导出文件带同样字段。同一批查询另返回 `meta.geo_capability`（`country` 或 `city`，取自实际加载的库，判定见 §6.10），供看板判断是否提示（§6.10）。调用方在自己的界面展示位置数据时，署名义务由调用方承担。
 - 署名跟随**实际加载的库**，而不是配置：切换来源后新库尚未下载成功时，仍显示旧库的署名。
 - 自定义来源两个署名变量都未设置时，`geo_attribution` 为 `null`，看板不显示。**自定义数据库的许可（是否要署名、能否使用与再分发）由运维者负责**，Rivu 不做检查。
 
@@ -811,6 +841,33 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 - 站点配置（目标、时区）变化时，`config_version` 加一。删除数据、重建汇总层时，`data_version` 加一，并通过 NOTIFY 广播。
 - Plausible 完全没有结果缓存（R03 §11），这是 Rivu 在 v1 基础上新增的优化。多节点 api 部署时，先接受各节点各自缓存；确实出现不一致问题后再引入 Valkey，与 v1 一致。
 
+### 6.10 维度可信度
+
+`brief-p1.md` 要求写明平台约束下哪些维度可信。放在 §6 而不是 §8：这些限制最终出现在维度报表和 API 的 `meta` 上，看板与公开 API 的文档引用同一张表；成因在 §4.2、§4.4。数字出自三份富化研究（`docs/research/enrich-ua.md`、`enrich-geo.md`、`enrich-source.md`，下称 UA、Geo、Source 研究），都是实测值。
+
+可信度含义：高 = 可直接使用；中 = 有系统性偏差，解读时要注意；低 = 默认配置下没有可用数据，或不能据此下结论。
+
+| 维度 | 可信度 | 原因与数字 | 看板与 API 的要求 |
+|---|---|---|---|
+| `visit:referrer`，`visit:source`（来自 referrer 时） | 中 | 浏览器默认 Referrer Policy 是 `strict-origin-when-cross-origin`：跨站只发送 origin，路径丢失；站点可设 `no-referrer`，隐私插件也会剥离，这些访问落入 Direct。内部引荐不作来源（§4.2）。路径级来源（`x.com/i/grok`、`google.com/products`）因 `SourceInput` 只有 host 无法区分，记为 `X (Twitter)`、`Google`（Source 研究 §6） | 不承诺 referrer 带路径；文档把 Direct 解释为「没有可用的来源信号」，不是「用户直接输入网址」 |
+| `visit:channel`，`visit:utm_*`，`visit:source`（来自 `utm_source` 时） | 中，取决于投放方的 UTM 规范程度 | 规则靠 `utm_medium` / `utm_source` 的写法。写错 medium 的流量不报错：有来源落 `Referral`，没有来源落 `Direct`（没有 `Unassigned`，§10 Q19）。广告平台回传的字段（来源平台、广告网络类型、广告系列类型）采集端拿不到，Google Ads 自动标记只能靠 `gclid` 等 click id 推断到 `Paid Search`，分不出 Paid Shopping、Paid Video、Display、Cross-network（Source 研究 §3.4）。`fbclid` 会附在 Facebook 的任何外链点击上，不算付费证据；`twclid`、`li_fat_id` 只推断来源。社交类只收常见站点，长尾落 `Referral` 并保留域名。与 Google 官方来源清单对照：视频 44/46、购物 51/52、搜索 113/129，社交 215/592（有意不跟长尾，Source-D8；Source 研究 §7.3） | 付费细分渠道以投放方打的 UTM 为准；文档给出推荐的 UTM 写法 |
+| `visit:browser`，`visit:browser_version` | 高（主版本）；取值基数不受控 | UA 精简后浏览器主版本仍真实（`Chrome/126.0.0.0`），次版本恒为 0，所以 `browser_version` 里的 `.0` 没有信息量。uap-core 的兜底规则会把任意 token 当家族名，随机 UA 可造出任意多的 `browser` 值（UA 研究 §4、§7） | 该维度一律 top-N 加「其它」，不列全部取值 |
+| `visit:os` | 高 | uap-core 自带测试集 100% 通过（UA 研究 §6.1） | |
+| `visit:os_version` | 低 | Windows 10 与 11 不可区分（UA 恒为 `NT 10.0`），记 `10`，含义是 Windows 10 / 11；只有 Client Hints 的 `platformVersion` 能区分，tracker 目前不发送。macOS `10.15`（Chrome 90 起冻结）、`Android 10; K)`（Android 精简形状）、ChromeOS 的版本不可得，一律报空串。iOS Safari 26+ 的 UA 里 iOS 版本冻结在 18_6，改取 `Version/` 里的版本（§10 Q22） | 看板在 Windows 版本旁注明「10 代表 10 和 11」；空串显示为「未知」，不补值 |
+| `visit:device` | desktop、mobile 中；tablet 偏低 | iPadOS 13+ Safari 默认发桌面 UA，与 Mac Safari 不可区分：iPad 被计为 macOS + desktop，`tablet` 被低估、`desktop` 被高估，服务端不处理（§10 Q23）。Android 只看 `Mobile` 记号；无该记号的手机 WebView、Chrome「桌面版网站」会与 Plausible 有差异；电视、游戏机、车机、未知归 desktop。规则是启发式，没有外部 ground truth，只有 18 条手工断言，真实流量上的准确率要等访问日志对账（UA 研究 §5、§11） | 文档与看板说明 tablet 偏低；与 Plausible 并行回放时，device 的差异先归因到这几类 |
+| `visit:country` | 中高 | DB-IP Lite 是完整库的子集（“reduced coverage and accuracy”），按月更新。与五个 RIR 的公开分配记录对照，国家一致率 **90.99%**（6369/7000）：IPv4 按块 90.16%，按地址数加权 93.84%；IPv6 93.05%；RIPE NCC 最低（83.06%），LACNIC 最高（99.20%）。RIR 记录的是**注册国**，不是使用地，跨国使用的块（云、托管）本来就会不同，所以这是一致率，不是准确率（Geo 研究 §5.2） | 显示署名（§4.4）；不把这个数字说成准确率 |
+| `visit:region`，`visit:city` | 默认配置下无数据 | DB-IP Lite 没有 ISO 3166-2 代码和 GeoNames id（§10 Q24）：`region_code` 恒空，`city_geoname_id` 恒为 0（7000 个地址实测 0 个非空）。MaxMind 库下这两个字段有值，但本项目没有对它的定位准确度做外部对照，官方测试库只证明字段解码正确（Geo 研究 §4、§5.3） | 见下「地理精度提示」 |
+| 机器人过滤（`dropped_bot`） | 中 | 检测率 84.58%（1793/2120）是对 crawler-user-agents 名单的数字，不代表线上流量；名字表有一部分是看过名单的漏检项后补的，不是盲测（补之前 69.6%）。未命中的 327 个多是几乎不执行 JS 的小众爬虫，对 tracker 影响小；要紧的是会执行 JS 的机器人（无头浏览器、合成监控），靠已知答案探针和访问日志核对，目前只有单元测试，没有端到端验证。非 Spider 语料里浏览器形态 UA 10389 条只有 9 条判为机器人，全是真机器人，但语料偏旧，不代表 2026 年的真实流量。数据中心 CIDR 不在 `rivu-ua` 范围（UA 研究 §6.2、§6.3、§11） | 不把 `dropped_bot` 的比例读作「机器人占比」 |
+| 访问数本身（拦截插件） | 偏低，维度不失真 | 拦截插件让整条事件缺失，服务端无法识别，也不进 `ingest_counters`；只能靠边缘日志与 `ingest_counters` 对账（`brief-p1.md` 验收）。站点可配置第一方 `endpoint` 反代（`tracker-and-protocol.md` §1.2） | 不修正，不估算 |
+
+**地理精度提示（`geo_level`）**：站点 `geo_level` 为 `region` 或 `city`，而查询返回的 `meta.geo_capability` 低于它时（默认 DB-IP Lite 恒为 `country`；MaxMind Country 版也是）：
+
+- 站点设置里选择该精度的位置显示提示：「当前地理库只提供国家级数据，地区与城市报表为空；需要的话配置 MaxMind GeoLite2 City 或同结构的自定义库」；
+- 地区、城市报表的空状态显示同一句话，不写「没有数据」；
+- 查询照常执行，`region_code` 为空的行归入「未知」。
+
+`geo_capability` 取自实际加载的库：来源为 `dbip-lite`，或库类型含 `Country` → `country`；其余（MaxMind City、自定义 City 库）→ `city`（含区域）。自定义库若缺子区划代码，地区报表仍为空，提示不会触发，这是已知盲区。
+
 ---
 
 ## 7. 容量与性能
@@ -818,7 +875,8 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 | 项 | 估算或目标 | 依据 |
 |---|---|---|
 | 写入 | 5000 事件/s 约等于每秒 1 次 INSERT、每次 5000 行；RowBinary 约 2 MB/s | §4.7 |
-| collector CPU | 每个事件 ≤50 µs（JSON 解析约 5 µs，UA 缓存命中约 1 µs、未命中 50–200 µs，地理查询约 2 µs，SipHash ×3 可忽略），5000 事件/s 约 0.25 核 | 需压测 |
+| collector CPU | 每个事件 ≤50 µs（JSON 解析约 5 µs，UA 缓存命中约 1 µs、未命中 50–200 µs，地理查询约 2 µs，SipHash ×3 可忽略），5000 事件/s 约 0.25 核。UA 的实测（Windows，release，单线程，690 条 uap-core 样本）：缓存命中均值约 150 ns，未命中均值约 22 µs（p99 约 130–180 µs），都在预算内；来源与渠道 `classify` 约 143 ns/次；`UaParser::embedded()`（解析 222 KB YAML、编译全部正则）约 130 ms，只在启动时一次 | 需压测（并发与 Linux 数字未测；`docs/research/enrich-ua.md` §9、`enrich-source.md` §7.4） |
+| GeoIP 内存 | 库读入内存，每个加载库的进程各占一份：City 约 121 MiB，Country 约 8 MiB；热加载期间新旧并存，刷新校验时再临时读一份。UA 缓存键上界约 50 MB（§4.3）。内存紧张的部署选 DB-IP country | §4.3、§10 Q25 |
 | 事件可见 | p95 < 2 s（Lite），< 2.5 s（Reliable），v1 目标 5 s | §4.7、§4.8 |
 | 会话内存 | 常态几十 MB；上限 `max_sessions` 200 万 × 约 350 B（含平均不到 1 个别名 key）≈ 700 MB。理论最坏是每个会话 8 个 key、约 650 B，合计约 1.3 GB，实际不会出现，因为多个别名需要会话跨多个午夜 | §4.6 |
 | 磁盘 | 按 v1 估算的每事件 60–150 B（需实测），`sessions` 约再加 30–50%，保留 731 天。日均 1000 万事件：7.31 十亿事件，事件表约 0.44–1.1 TB，加 `sessions` 后约 0.6–1.6 TB，超出 v1 单机 500 GB 的参考配置：这个规模应把 `RIVU_RETENTION_DAYS` 调低到 180 天（约 0.14–0.4 TB）或扩容磁盘。日均 100 万事件：约 60–165 GB。按月分区整块删除，实际占用最多再多约一个月（§5.6） | v1 第七节 |
@@ -861,7 +919,7 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 
 ## 10. 已决问题（2026-10-22）
 
-Q1–Q8 于 2026-10-22 定案；Q9–Q18 是 P1 动工前给指标口径写 brief 时发现的文档间冲突（见 [`../brief-p1.md`](../brief-p1.md)），同日采纳建议后定案。决定都已写入各节正文。
+Q1–Q8 于 2026-10-22 定案；Q9–Q18 是 P1 动工前给指标口径写 brief 时发现的文档间冲突（见 [`../brief-p1.md`](../brief-p1.md)），同日采纳建议后定案。Q19–Q28 于 2026-10-23 定案，来自三份富化研究（[`enrich-ua.md`](../research/enrich-ua.md)、[`enrich-geo.md`](../research/enrich-geo.md)、[`enrich-source.md`](../research/enrich-source.md)）：研究把 §4.4 的规范落成代码并用外部数据实测，发现的事实与偏离在此定案。决定都已写入各节正文。
 
 | # | 问题 | 决定 | 影响 |
 |---|---|---|---|
@@ -883,6 +941,16 @@ Q1–Q8 于 2026-10-22 定案；Q9–Q18 是 P1 动工前给指标口径写 brie
 | Q16 | 写缓冲默认值 | 变量名取 `platform-and-ops.md` 的，默认值以 §4.7 为准：1000 ms、20000 行、8388608 字节、channel 20 万条；P2 压测后再调 | §4.7；`platform-and-ops.md` §7 |
 | Q17 | `visitors` 是否统计 engagement 事件 | 排除，与 `realtime` 同口径 | §5.5；§6.5 |
 | Q18 | 线协议的错误词表与测试清单 | 词表补一条 `has an invalid format`，用于 `s` 格式错、`n` 含控制字符、`$` 字段格式错；`u` 不限长，超长 query 被丢弃、pathname 截断到 1024 字节，不回 400 | `tracker-and-protocol.md` §6.2、§11.1 |
+| Q19 | 渠道取值集合与中英文名 | 取 GA4 默认渠道分组的 19 个渠道，**不含 `Unassigned`**：没有来源归 `Direct`，有来源但 medium 不认识归 `Referral`（偏离 Google 的 Unassigned，Source-D9）。英文标识写入 ClickHouse `channel` 列，发布后不改：`Direct` `Cross-network` `Paid Search` `Paid Social` `Paid Video` `Paid Shopping` `Paid Other` `Display` `Organic Search` `Organic Social` `Organic Video` `Organic Shopping` `AI Assistant` `Email` `Affiliates` `Audio` `SMS` `Mobile Push Notifications` `Referral`。中文名取 Google 官方简体中文帮助页，由 UI 按标识映射，不入库：直接、跨广告网络、付费搜索、付费社交媒体广告、付费视频、付费购物、其他付费渠道、展示广告、自然搜索、自然社交、自然视频、自然购物、AI 助理、邮件、联属营销方、音频、短信、移动推送通知、引荐。规则是 `rivu-source` 里一张 21 条的有序表（先匹配先赢，顺序以 GA4 帮助页为准，Display 在付费搜索 / 社交 / 视频之后，AI Assistant 在 Organic Search 之前）；规则、取值或来源数据任何一处变化，`RULES_VERSION` 加一，并用离线 mutation 回填历史数据 | §4.2 第 8 步；§5.2 `channel` 列；`docs/research/enrich-source.md` §3；看板维护 19 个中文名映射；P4 兼容层要做 `AI Assistant` ↔ `AI Assistants` 映射（Source-D1）；新增或改名取值走 `RULES_VERSION` 加回填；Google Ads 等广告平台规则采集端拿不到，不实现（§6.10） |
+| Q20 | 来源数据用哪份，优先级怎样 | 来源名数据用 Matomo `searchengine-and-social-list`（CC0-1.0，固定 commit `4254b8d`，放在 `crates/source/data/matomo/`）加自维护补充表 `supplement.yml`（135 条，每条写明依据：`GA4-LIST`、`FACT`、`CONVENTION`）。**Snowplow `referers.yml` 不用**：其 README 写明数据按 GPL-3.0 提供，不能随 MIT 项目分发。Google GA4 来源清单无许可声明，只作对照不入库；Plausible 的 `custom_sources.json` 等在 AGPL-3.0 仓库里，不拷贝。数据在构建时核对 SHA-256 并编译成排序静态表，升级要同时改哈希、`PROVENANCE.md`、`RULES_VERSION`。来源优先级：`utm_source`（含 `source`、`ref` 回退）> referrer host > click id 推断；内部引荐由接入层判定后传 `None` | §4.2 第 8 步；§4.4 来源行；`platform-and-ops.md` §6 `sources_update`（来源库不在线更新）；`docs/research/enrich-source.md` §4、§5；Snowplow 的增量要先取得许可或自行核实后才能补 |
+| Q21 | 空 UA 与 `BotKind` | **空 UA（或只有空白）视为机器人**（`BotKind::Empty`），丢弃并记 `dropped_bot`。浏览器的 `fetch` / `sendBeacon` 一定带 `User-Agent`，空 UA 只来自脚本或被剥头的转发链。这是对 Plausible 的刻意偏离：它不解析不丢弃，事件入库（R01 §8.1）。`BotKind`（`spider` `headless` `automation` `empty`）只用于统计与排错，不进 `ingest_counters.metric`；将来要保守，只需在调用处忽略 `Empty` | §4.2 第 5 步；§4.4 机器人行；附录 C（UA-1）；`docs/research/enrich-ua.md` §4.2 |
+| Q22 | UA 精简与冻结值怎么处理 | 精简或冻结的值不是数据，**报空串，不补值**：macOS `10.15`（Chrome 90 起封顶）、ChromeOS、`Android 10; K)` 这个形状（带真实型号的 Android 10 保留 `10`）的 `os_version` 都为空串，真实的 macOS 10.13 等老版本保留（代价：真实的 10.15 用户也被置空）。Windows 的 `NT 10.0` 记 `10`，含义是 **Windows 10 / 11**，文档与看板必须注明。iOS Safari 26+ 且 UA 里 iOS 主版本为 18 时，`os_version` 取 `Version/` 的 major.minor（真实的 Safari 18.6 不改写）。Android 的设备类别只看 `Mobile` 记号（有则 mobile，没有则 tablet，电视、游戏机记号除外），不用型号。版本一律取 major.minor | §4.2 第 7 步；§6.10；附录 C（UA-2、UA-3）；`docs/research/enrich-ua.md` §5、§7。用 Client Hints `platformVersion` 区分 Windows 10 / 11 要 tracker 配合，P2 以后再议 |
+| Q23 | iPadOS 默认发桌面 UA，平板怎么办 | **服务端不处理，写进已知局限**：iPadOS 13+ Safari 默认「请求桌面网站」，UA 与 Mac Safari 不可区分，iPad 被计为 macOS + desktop，`device = tablet` 被低估，`desktop` 被高估。UA 含 `iPad;` 才判为 tablet（用户关闭「请求桌面网站」时，或 `CriOS` + `iPad;`）；Chrome / Firefox 在 iPad 上是否也发桌面 UA 未核实。可选改进（P2 以后）：tracker 在 `Macintosh` UA 上附带 `navigator.maxTouchPoints`，服务端据此改判；该判据只见于 Apple 论坛回帖，非官方文档，要采用须先实测 | §6.10 `visit:device` 行；`tracker-and-protocol.md` 附录；`docs/research/enrich-ua.md` §7 |
+| Q24 | 默认来源没有地区和城市怎么办 | DB-IP Lite（默认来源）的 City 库只有英文州省名和城市名，**没有 ISO 3166-2 子区划码，也没有城市的 GeoNames id**（7000 个地址实测 0 个非空）。`rivu-geo` 不拿名称拼凑代码：默认配置下 `region_code` 恒为 `""`、`city_geoname_id` 恒为 `0`，`geo_level` 设为 region / city 等同 country。需要地区与城市，须配置 MaxMind GeoLite2 City 或同结构的自定义库。看板在 `geo_level` 高于数据能力时必须提示（`meta.geo_capability`，要求见 §6.10）。用 GeoNames 的 `admin1CodesASCII.txt`、`cities500.txt` 做「（国家，英文名）→ 代码」映射：同名城市有歧义、要人工核对，不在本期，单独评估 | §4.4（数据能力表、地名行）；§4.2 第 6 步；§6.10；`docs/research/enrich-geo.md` §5.3、§7 第 2 条；站点设置 `geo_level` 的提示文案 |
+| Q25 | GeoIP 库怎么载入 | **读入内存，不用 mmap**：`maxminddb` 的 mmap 入口 `Reader::open_mmap` 是 `unsafe fn`，工作区 `unsafe_code = "forbid"`。City 约 121 MiB、Country 约 8 MiB，每个加载库的进程各占一份；热加载时新旧并存，旧库在途查询结束后释放；刷新校验时还要临时再读一份。我们的替换是「写临时文件再 rename」，对 mmap 本来也安全，风险只在运维者原地改写库文件。内存紧张的部署选 DB-IP country | §4.3；§4.4 替换行；§7 GeoIP 内存行；`docs/research/enrich-geo.md` §6 |
+| Q26 | 国家码占位值与非公网地址 | 国家码只接受两个 ASCII 字母；`ZZ`、`XX` 与 `A1` `A2` `T1` 等占位码视为未知（与 Plausible 一致）；没有国家时区域与城市也为空。区域码为 `<国家>-<第一级子区划代码>`，子区划部分 1–3 位字母数字，只取第一级。私有、回环、链路本地、CGNAT（100.64/10）、文档、基准测试、组播、保留（240/4），以及 IPv6 的 ULA、链路本地、文档、丢弃、IPv4 兼容地址，不查库，直接返回空值；IPv4-mapped IPv6 先转 IPv4 | §4.2 第 6 步；`docs/research/enrich-geo.md` §6 |
+| Q27 | MaxMind 下载接口与认证 | 只实现现行接口：`https://download.maxmind.com/geoip/databases/<edition>/download?suffix=tar.gz`，HTTP Basic（Account ID + license key），返回 `tar.gz`，要解 tar 取 `.mmdb`。旧的 `/app/geoip_download?license_key=` 接口仍在，但只认 key、官方文档已不提，不实现。`RIVU_MAXMIND_ACCOUNT_ID` 在设置 license key 时必填，配置校验报错但不回显 key。Basic 认证只发给 API 域名，跨源重定向不带 `Authorization`。带凭据的真实下载、重定向目标对条件请求的反应**没有验证**（没有账号）：实现不依赖这些，有校验头就带，服务器忽略就整文件下载，再按解压后 mmdb 的 SHA-256 与 meta 比较，相同不替换。拿到账号后验证一次；若条件 GET 不被支持或占用每日 30 次额度，改为先 `HEAD` 比较 `Last-Modified`（`HEAD` 不计额度） | §4.4 优先级表第 2 行；`platform-and-ops.md` §7 `RIVU_MAXMIND_*`；`docs/research/enrich-geo.md` §3、§7 第 3、9 条 |
+| Q28 | 没有 meta 的库文件要不要刷新 | 看配置：默认来源（DB-IP Lite）时直接使用、**不自动刷新**，否则 24 小时后会被 DB-IP 的库覆盖；配置了 `RIVU_GEOIP_DB_URL` 或 `RIVU_MAXMIND_LICENSE_KEY` 时视为没有本地副本，立即下载，新库校验通过前旧文件继续用。meta 的 `build_epoch` 与库不一致时 meta 作废，署名退回手工署名。有本地副本时，第一次条件 GET 安排在 meta 最近检查时间加一个（带抖动的）刷新周期，已过期则立即 | §4.4「文件与元数据」「生命周期」；`platform-and-ops.md` §6 `geoip_refresh`；`docs/research/enrich-geo.md` §6、§7 第 4、5 条 |
 
 ---
 
@@ -915,3 +983,34 @@ Q1–Q8 于 2026-10-22 定案；Q9–Q18 是 P1 动工前给指标口径写 brie
 | [R03 统计查询](../research/plausible/03-stats-query-engine.md) | API、DSL、执行流程、指标、过滤、时区、性能、imported、缓存 |
 | [R04 平台与运维](../research/plausible/04-platform-and-ops.md) | PG 模型、权限、Oban、配置、CE/EE、可观测性、部署 |
 | [ClickHouse 语义核实](../research/clickhouse-verification.md) | 去重 token、MV、聚合状态、TTL、参数化查询等 |
+| [富化：UA 与机器人](../research/enrich-ua.md) | `rivu-ua`：uap-core 一致性、机器人检测率与误判率、设备类别、UA 精简与 iPadOS |
+| [富化：GeoIP](../research/enrich-geo.md) | `rivu-geo`：DB-IP / MaxMind 的许可、下载接口核实、与 RIR 的一致率、DB-IP 的字段缺口 |
+| [富化：来源与渠道](../research/enrich-source.md) | `rivu-source`：GA4 渠道规则、来源数据许可、匹配规则、刻意偏离 D1–D12 |
+
+## 附录 C：刻意偏离清单索引
+
+Rivu 与 Plausible（或 GA4）有意不同的行为，逐条登记在各研究文档里，这里只做索引，不复制全文。`brief-p1.md` 的验收要求「并行回放的所有差异都能对应到刻意偏离清单」，对照以这里为入口。
+
+Source 研究自己的编号 D1–D12 与 §0.2 的 D1–D12 不是一套，下文加前缀 `Source-`。`plausible_parity` 测试逐条检查 Source-D1–D12 都写在该文档里。
+
+| 编号 | 主题 | Rivu 的做法 | 出处 |
+|---|---|---|---|
+| Source-D1 | AI 渠道名 | `AI Assistant`（GA4 名；Plausible 为 `AI Assistants`） | `enrich-source.md` §6 |
+| Source-D2 | Display 与 click id 的顺序 | 显式 `display` medium 优先于 click id，只有一份实现，顺序随 GA4 | 同上 |
+| Source-D3 | `medium=organic` | 归 Organic Search | 同上 |
+| Source-D4 | `medium=ai-assistant` | 归 AI Assistant | 同上 |
+| Source-D5 | Email 的范围 | 包含匹配（含 `newsletter`），网页邮箱的 referrer 归 Email | 同上 |
+| Source-D6 | 只有 click id | 推断来源，并推断 Paid Search / Paid Social | 同上 |
+| Source-D7 | `(direct)` 标签 | `utm_source=(direct)` 配空 medium 归 Direct | 同上 |
+| Source-D8 | 社交来源的覆盖面 | 只收常见站点，长尾落 Referral 并保留域名 | 同上 |
+| Source-D9 | `Unassigned` | 没有这个取值，有来源归 Referral，没有归 Direct（Q19） | 同上 |
+| Source-D10 | AI Assistant 的位置 | 在 Organic Search 之前 | 同上 |
+| Source-D11 | TikTok 的类别 | 社交（取 Google 来源清单，不取说明页） | 同上 |
+| Source-D12 | 付费来源别名 | `fb-ads`、`google_ads` 等 31 个别名本身是付费证据 | 同上 |
+| UA-1 | 空 UA | 视为机器人（Q21） | `enrich-ua.md` §4.2 |
+| UA-2 | 冻结的 OS 版本 | macOS `10.15`、`Android 10; K)`、ChromeOS 报空串（Q22） | `enrich-ua.md` §7 |
+| UA-3 | iOS Safari 26+ 的 OS 版本 | 取 `Version/` 里的版本，不取冻结的 18_6（Q22） | 同上 |
+| UA-4 | WebView | 单列为 `WebView`，不并入 Mobile App | `enrich-ua.md` §8 |
+| UA-5 | 车机浏览器 | 不单列，归 desktop（Plausible 归 tablet）；`enrich-ua.md` §5 提到，其 §10 的清单未列 | `enrich-ua.md` §5 |
+
+另有两处不属于渠道规则：路径条目（Matomo 的 `x.com/i/grok` 等 14 条）因接口只有 host 而不使用；内部引荐按站点 hostname 白名单判定，Plausible 要求 host 全等（`enrich-source.md` §6 末尾）。`enrich-geo.md` 没有与 Plausible 行为不同的刻意偏离：国家码规则与 Plausible 一致。
