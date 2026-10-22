@@ -1,7 +1,12 @@
-//! 后台任务。P1 只有 `salts_rotate`，直接在进程内定时执行；PG 任务队列、cron leader、
+//! 后台任务。P1 有 `salts_rotate` 与 `geoip_refresh`，直接在进程内定时执行；PG 任务队列、cron leader、
 //! 日汇总层构建等留到以后（`platform-and-ops.md` §6）。
 //!
 //! 写盐需要 PG 写权限，所以只有 `worker` 和 `all` 角色运行（`Role::runs_jobs`），collector 不运行。
+//! `geoip_refresh` 见 [`geoip`]：下载并原子替换 GeoIP 库，collector 只读共享目录、自己热加载。
+
+pub mod geoip;
+
+pub use geoip::{GeoRefreshJob, GeoRefreshSnapshot, GeoRefreshState, spawn_geoip_refresh};
 
 use std::time::Duration;
 
