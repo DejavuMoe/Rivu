@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -46,7 +47,7 @@ impl Role {
         matches!(self, Role::Api | Role::All)
     }
 
-    /// 是否运行后台任务（目前只有 `salts_rotate`）：worker、all。
+    /// 是否运行后台任务（`salts_rotate`、`geoip_refresh`）：worker、all。
     pub fn runs_jobs(self) -> bool {
         matches!(self, Role::Worker | Role::All)
     }
@@ -233,6 +234,184 @@ impl Default for QueryTimeouts {
 /// 站点缓存的全量重载周期默认值（`RIVU_SITE_CACHE_REFRESH_SECS`）。
 pub const DEFAULT_SITE_CACHE_REFRESH_SECS: u64 = 10;
 
+/// `RIVU_DBIP_EDITION`：DB-IP Lite 的版本。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DbIpEdition {
+    City,
+    Country,
+}
+
+impl DbIpEdition {
+    /// 下载文件名里的版本片段：`dbip-<city|country>-lite-<YYYY-MM>.mmdb.gz`。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DbIpEdition::City => "city",
+            DbIpEdition::Country => "country",
+        }
+    }
+}
+
+/// GeoIP 数据源（`system-design.md` §4.4「GeoIP 数据源、更新与署名」）。
+///
+/// 只启用优先级最高的一个：`RIVU_GEOIP_DB_URL` > `RIVU_MAXMIND_LICENSE_KEY` > DB-IP Lite。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GeoSource {
+    /// 自定义 mmdb 直链（`.mmdb` 或 `.mmdb.gz`）。URL 可能带令牌，所以是 [`Secret`]。
+    Custom { url: Secret },
+    /// MaxMind GeoLite2：HTTP Basic，用户名是 Account ID，密码是 License Key。
+    MaxMind {
+        account_id: String,
+        license_key: Secret,
+        /// `GeoLite2-City` 或 `GeoLite2-Country`
+        edition: String,
+    },
+    /// DB-IP Lite（默认）。
+    DbIp { edition: DbIpEdition },
+}
+
+impl GeoSource {
+    /// 来源类别，也是署名里的 `source` 和指标里的 `source` 标签。
+    pub fn kind(&self) -> &'static str {
+        match self {
+            GeoSource::Custom { .. } => "custom",
+            GeoSource::MaxMind { .. } => "maxmind-geolite2",
+            GeoSource::DbIp { .. } => "dbip-lite",
+        }
+    }
+
+    /// 来源标识，写进 meta.json；与当前配置不一致时视为没有本地副本。
+    /// 不含任何凭据：自定义 URL 只保留 scheme、主机、路径。
+    pub fn id(&self) -> String {
+        match self {
+            GeoSource::Custom { url } => format!("custom:{}", redact_url(url.expose())),
+            GeoSource::MaxMind { edition, .. } => format!("maxmind-geolite2:{edition}"),
+            GeoSource::DbIp { edition } => format!("dbip-lite:{}", edition.as_str()),
+        }
+    }
+
+    /// 用户显式选择的来源（URL 或 MaxMind key）；默认的 DB-IP 不算。
+    pub fn is_explicit(&self) -> bool {
+        !matches!(self, GeoSource::DbIp { .. })
+    }
+}
+
+/// GeoIP 配置。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeoConfig {
+    /// `RIVU_DATA_DIR`
+    pub data_dir: PathBuf,
+    /// `RIVU_GEOIP_DB_PATH`：所有来源都落在这个文件；旁边是 `<文件名>.meta.json`。
+    pub db_path: PathBuf,
+    pub source: GeoSource,
+    /// 配置了更高优先级来源而被忽略的变量名，用于启动时的 `warn`。
+    pub ignored: Vec<&'static str>,
+    /// `RIVU_GEOIP_REFRESH_INTERVAL`；`None` 表示 `0`（不定期刷新，只在没有本地副本时下载一次）。
+    pub refresh_interval: Option<Duration>,
+    /// `RIVU_GEOIP_ATTRIBUTION_TEXT`：自定义来源与手工放置文件的署名文本。
+    pub attribution_text: Option<String>,
+    /// `RIVU_GEOIP_ATTRIBUTION_URL`
+    pub attribution_url: Option<String>,
+}
+
+impl GeoConfig {
+    pub const DEFAULT_DATA_DIR: &'static str = "/var/lib/rivu";
+    pub const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 3600);
+    pub const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(3600);
+    pub const DEFAULT_MAXMIND_EDITION: &'static str = "GeoLite2-City";
+
+    /// 默认配置：DB-IP Lite city，24 小时刷新，库放在 `data_dir/geoip/geoip.mmdb`。
+    pub fn new(data_dir: impl Into<PathBuf>) -> Self {
+        let data_dir = data_dir.into();
+        GeoConfig {
+            db_path: data_dir.join("geoip").join("geoip.mmdb"),
+            data_dir,
+            source: GeoSource::DbIp {
+                edition: DbIpEdition::City,
+            },
+            ignored: Vec::new(),
+            refresh_interval: Some(Self::DEFAULT_REFRESH_INTERVAL),
+            attribution_text: None,
+            attribution_url: None,
+        }
+    }
+
+    /// 启动时应当记 `warn` 的配置问题（校验已通过，只是值得提醒）。
+    pub fn warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if !self.ignored.is_empty() {
+            let winner = match &self.source {
+                GeoSource::Custom { .. } => "RIVU_GEOIP_DB_URL",
+                GeoSource::MaxMind { .. } => "RIVU_MAXMIND_LICENSE_KEY",
+                GeoSource::DbIp { .. } => "DB-IP Lite",
+            };
+            out.push(format!(
+                "同时配置了多个 GeoIP 来源：只使用 {winner}（优先级 RIVU_GEOIP_DB_URL > RIVU_MAXMIND_LICENSE_KEY > DB-IP Lite），忽略 {}",
+                self.ignored.join("、")
+            ));
+        }
+        if let GeoSource::Custom { url } = &self.source
+            && url.expose().len() >= 7
+            && url.expose()[..7].eq_ignore_ascii_case("http://")
+        {
+            out.push(format!(
+                "RIVU_GEOIP_DB_URL（{}）使用明文 http：下载内容与其中的令牌可能被窃听或篡改，建议改用 https",
+                redact_url(url.expose())
+            ));
+        }
+        out
+    }
+}
+
+/// 去掉 URL 里的用户信息、查询串和片段，只留 scheme、主机、路径，用于日志与来源标识。
+/// 不依赖 `url` crate；无法识别 scheme 时返回占位符，绝不原样回显。
+pub fn redact_url(raw: &str) -> String {
+    let raw = raw.trim();
+    let Some((scheme, rest)) = raw.split_once("://") else {
+        return "<invalid-url>".into();
+    };
+    if scheme.is_empty()
+        || !scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
+    {
+        return "<invalid-url>".into();
+    }
+    // 先砍掉查询串和片段，再拆 authority 与路径
+    let rest = rest.split(['?', '#']).next().unwrap_or("");
+    let (authority, path) = match rest.find('/') {
+        Some(i) => rest.split_at(i),
+        None => (rest, ""),
+    };
+    let host = authority.rsplit('@').next().unwrap_or("");
+    if host.is_empty() {
+        return "<invalid-url>".into();
+    }
+    format!("{}://{host}{path}", scheme.to_ascii_lowercase())
+}
+
+/// 解析 `RIVU_GEOIP_REFRESH_INTERVAL`：`0`，或「整数 + s/m/h/d」（如 `24h`、`90m`）。
+fn parse_interval(raw: &str) -> Result<Duration, String> {
+    let raw = raw.trim();
+    if raw == "0" {
+        return Ok(Duration::ZERO);
+    }
+    let split = raw
+        .find(|c: char| !c.is_ascii_digit())
+        .ok_or_else(|| "缺少单位（s、m、h、d）".to_string())?;
+    let (num, unit) = raw.split_at(split);
+    let n: u64 = num.parse().map_err(|_| "数字部分无效".to_string())?;
+    let secs_per = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86_400,
+        _ => return Err(format!("单位 `{unit}` 无效，可选 s、m、h、d")),
+    };
+    n.checked_mul(secs_per)
+        .map(Duration::from_secs)
+        .ok_or_else(|| "数值过大".to_string())
+}
+
 /// 校验通过后的配置。
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -255,6 +434,8 @@ pub struct Config {
     pub query_timeouts: QueryTimeouts,
     /// `RIVU_SITE_CACHE_REFRESH_SECS`：站点快照全量重载周期（P1 没有增量刷新和 LISTEN/NOTIFY）。
     pub site_cache_refresh: Duration,
+    /// GeoIP 数据源、刷新与署名（`migrate` 不校验，取默认值）。
+    pub geo: GeoConfig,
 }
 
 impl Config {
@@ -420,6 +601,13 @@ impl Config {
             1..=3600,
         );
 
+        // GeoIP 变量对 migrate 没有意义：解析但丢弃问题，避免无关变量挡住迁移。
+        let problems_before_geo = l.problems.len();
+        let geo = l.geo();
+        if role == Role::Migrate {
+            l.problems.truncate(problems_before_geo);
+        }
+
         if !l.problems.is_empty() {
             return Err(ConfigError {
                 problems: l.problems,
@@ -450,6 +638,7 @@ impl Config {
             },
             query_timeouts,
             site_cache_refresh: Duration::from_secs(site_cache_refresh_secs),
+            geo,
         })
     }
 }
@@ -612,6 +801,124 @@ impl Loader<'_> {
                     default
                 }
             },
+        }
+    }
+
+    /// 读取全部 GeoIP 变量（`system-design.md` §4.4、`platform-and-ops.md` §7）。
+    fn geo(&mut self) -> GeoConfig {
+        let data_dir = self
+            .optional("RIVU_DATA_DIR")
+            .unwrap_or_else(|| GeoConfig::DEFAULT_DATA_DIR.into());
+        let mut cfg = GeoConfig::new(&data_dir);
+        if let Some(p) = self.optional("RIVU_GEOIP_DB_PATH") {
+            cfg.db_path = PathBuf::from(p);
+        }
+        if cfg.db_path.file_name().is_none() {
+            self.problems
+                .push("RIVU_GEOIP_DB_PATH 必须指向一个文件（不能是目录）".into());
+        }
+
+        // 来源与优先级。三组变量都先读出来，这样格式问题一次性报告，被忽略的来源也要校验。
+        let url = self.optional("RIVU_GEOIP_DB_URL");
+        if let Some(u) = &url {
+            self.check_http_url("RIVU_GEOIP_DB_URL", u);
+        }
+        let license_key = self.optional("RIVU_MAXMIND_LICENSE_KEY");
+        let account_id = self.optional("RIVU_MAXMIND_ACCOUNT_ID");
+        let mm_edition = self.optional("RIVU_MAXMIND_EDITION");
+        if let Some(e) = &mm_edition
+            && !matches!(e.as_str(), "GeoLite2-City" | "GeoLite2-Country")
+        {
+            self.problems.push(format!(
+                "RIVU_MAXMIND_EDITION=`{e}` 无效，可选 GeoLite2-City | GeoLite2-Country"
+            ));
+        }
+        if let Some(id) = &account_id
+            && (id.is_empty() || id.chars().any(|c| c.is_whitespace() || c == ':'))
+        {
+            self.problems.push(
+                "RIVU_MAXMIND_ACCOUNT_ID 不能包含空白或冒号（它是 HTTP Basic 的用户名）".into(),
+            );
+        }
+        let dbip_edition = match self.optional("RIVU_DBIP_EDITION").as_deref() {
+            None => DbIpEdition::City,
+            Some(v) if v.eq_ignore_ascii_case("city") => DbIpEdition::City,
+            Some(v) if v.eq_ignore_ascii_case("country") => DbIpEdition::Country,
+            Some(other) => {
+                self.problems.push(format!(
+                    "RIVU_DBIP_EDITION=`{other}` 无效，可选 city | country"
+                ));
+                DbIpEdition::City
+            }
+        };
+
+        let maxmind = license_key.map(|key| (key, account_id));
+        let mm_source = |l: &mut Self, key: String, account: Option<String>| match account {
+            Some(account_id) => Some(GeoSource::MaxMind {
+                account_id,
+                license_key: Secret(key),
+                edition: mm_edition
+                    .clone()
+                    .unwrap_or_else(|| GeoConfig::DEFAULT_MAXMIND_EDITION.into()),
+            }),
+            None => {
+                l.problems.push(
+                    "设置了 RIVU_MAXMIND_LICENSE_KEY 就必须同时设置 RIVU_MAXMIND_ACCOUNT_ID：MaxMind 现行下载接口用 HTTP Basic（用户名 Account ID，密码 License Key）"
+                        .into(),
+                );
+                None
+            }
+        };
+        match (url, maxmind) {
+            (Some(u), mm) => {
+                cfg.source = GeoSource::Custom { url: Secret(u) };
+                if mm.is_some() {
+                    cfg.ignored.push("RIVU_MAXMIND_LICENSE_KEY");
+                }
+            }
+            (None, Some((key, account))) => {
+                if let Some(s) = mm_source(self, key, account) {
+                    cfg.source = s;
+                }
+            }
+            (None, None) => {
+                cfg.source = GeoSource::DbIp {
+                    edition: dbip_edition,
+                }
+            }
+        }
+
+        // 刷新周期
+        if let Some(raw) = self.optional("RIVU_GEOIP_REFRESH_INTERVAL") {
+            match parse_interval(&raw) {
+                Ok(d) if d.is_zero() => cfg.refresh_interval = None,
+                Ok(d) if d >= GeoConfig::MIN_REFRESH_INTERVAL => cfg.refresh_interval = Some(d),
+                Ok(_) => self.problems.push(format!(
+                    "RIVU_GEOIP_REFRESH_INTERVAL=`{raw}` 小于下限 1h（设为 0 表示不定期刷新）"
+                )),
+                Err(e) => self.problems.push(format!(
+                    "RIVU_GEOIP_REFRESH_INTERVAL=`{raw}` 无效：{e}；期望 0 或 整数加 s/m/h/d，例如 24h"
+                )),
+            }
+        }
+
+        // 署名（自定义来源与手工放置文件使用）
+        cfg.attribution_text = self.optional("RIVU_GEOIP_ATTRIBUTION_TEXT");
+        cfg.attribution_url = self.optional("RIVU_GEOIP_ATTRIBUTION_URL");
+        if let Some(u) = cfg.attribution_url.clone() {
+            self.check_http_url("RIVU_GEOIP_ATTRIBUTION_URL", &u);
+        }
+        cfg
+    }
+
+    /// 要求 `http://` 或 `https://` 且带主机；不回显 value（URL 里可能有令牌）。
+    fn check_http_url(&mut self, name: &str, value: &str) {
+        self.check_scheme(name, value, &["http://", "https://"]);
+        if (value.starts_with("http://") || value.starts_with("https://"))
+            && (redact_url(value) == "<invalid-url>" || value.chars().any(char::is_whitespace))
+        {
+            self.problems
+                .push(format!("{name} 不是有效的 URL（缺少主机或含空白字符）"));
         }
     }
 
@@ -968,5 +1275,266 @@ mod tests {
         let err = Config::from_env(Role::All, &env).unwrap_err();
         assert_eq!(err.problems.len(), 3, "{err}");
         assert!(!err.to_string().contains("mysql://x"), "不能回显连接串");
+    }
+
+    // --- GeoIP（system-design §4.4、platform-and-ops §7） ---
+
+    #[test]
+    fn geo_defaults_to_dbip_city_with_daily_refresh() {
+        let cfg = with_env(&[]).unwrap().geo;
+        assert_eq!(cfg.data_dir, PathBuf::from("/var/lib/rivu"));
+        assert_eq!(
+            cfg.db_path,
+            PathBuf::from("/var/lib/rivu")
+                .join("geoip")
+                .join("geoip.mmdb")
+        );
+        assert_eq!(
+            cfg.source,
+            GeoSource::DbIp {
+                edition: DbIpEdition::City
+            }
+        );
+        assert_eq!(cfg.source.kind(), "dbip-lite");
+        assert_eq!(cfg.source.id(), "dbip-lite:city");
+        assert_eq!(cfg.refresh_interval, Some(Duration::from_secs(86_400)));
+        assert!(cfg.ignored.is_empty());
+        assert!(cfg.warnings().is_empty());
+        assert_eq!(cfg.attribution_text, None);
+    }
+
+    #[test]
+    fn geo_data_dir_derives_default_db_path_and_path_overrides() {
+        let cfg = with_env(&[("RIVU_DATA_DIR", "/srv/rivu")]).unwrap().geo;
+        assert_eq!(
+            cfg.db_path,
+            PathBuf::from("/srv/rivu").join("geoip").join("geoip.mmdb")
+        );
+        let cfg = with_env(&[
+            ("RIVU_DATA_DIR", "/srv/rivu"),
+            ("RIVU_GEOIP_DB_PATH", "/mnt/geo/my.mmdb"),
+        ])
+        .unwrap()
+        .geo;
+        assert_eq!(cfg.db_path, PathBuf::from("/mnt/geo/my.mmdb"));
+    }
+
+    #[test]
+    fn geo_dbip_edition() {
+        let cfg = with_env(&[("RIVU_DBIP_EDITION", "country")]).unwrap().geo;
+        assert_eq!(cfg.source.id(), "dbip-lite:country");
+        let err = with_env(&[("RIVU_DBIP_EDITION", "isp")]).unwrap_err();
+        assert_eq!(err.problems.len(), 1, "{err}");
+        assert!(err.problems[0].contains("RIVU_DBIP_EDITION"));
+    }
+
+    #[test]
+    fn geo_source_priority_url_over_maxmind_over_dbip() {
+        // 只有 MaxMind
+        let cfg = with_env(&[
+            ("RIVU_MAXMIND_LICENSE_KEY", "k3y"),
+            ("RIVU_MAXMIND_ACCOUNT_ID", "123456"),
+        ])
+        .unwrap()
+        .geo;
+        assert_eq!(
+            cfg.source,
+            GeoSource::MaxMind {
+                account_id: "123456".into(),
+                license_key: Secret::new("k3y"),
+                edition: "GeoLite2-City".into(),
+            }
+        );
+        assert_eq!(cfg.source.id(), "maxmind-geolite2:GeoLite2-City");
+        assert!(cfg.ignored.is_empty());
+        // MaxMind 与 DB-IP 版本变量并存：MaxMind 胜出，DB-IP 的版本变量不算「来源」，不报警告
+        let cfg = with_env(&[
+            ("RIVU_MAXMIND_LICENSE_KEY", "k3y"),
+            ("RIVU_MAXMIND_ACCOUNT_ID", "1"),
+            ("RIVU_MAXMIND_EDITION", "GeoLite2-Country"),
+            ("RIVU_DBIP_EDITION", "country"),
+        ])
+        .unwrap()
+        .geo;
+        assert_eq!(cfg.source.id(), "maxmind-geolite2:GeoLite2-Country");
+        // URL 与 MaxMind 同时配置：URL 胜出，忽略 MaxMind，并有 warn
+        let cfg = with_env(&[
+            (
+                "RIVU_GEOIP_DB_URL",
+                "https://example.test/geo.mmdb.gz?token=SECRET",
+            ),
+            ("RIVU_MAXMIND_LICENSE_KEY", "k3y"),
+            ("RIVU_MAXMIND_ACCOUNT_ID", "1"),
+        ])
+        .unwrap()
+        .geo;
+        assert_eq!(cfg.source.kind(), "custom");
+        assert_eq!(cfg.ignored, vec!["RIVU_MAXMIND_LICENSE_KEY"]);
+        let warnings = cfg.warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("RIVU_GEOIP_DB_URL"));
+        assert!(warnings[0].contains("RIVU_MAXMIND_LICENSE_KEY"));
+    }
+
+    #[test]
+    fn geo_maxmind_key_requires_account_id_and_valid_edition() {
+        let err = with_env(&[("RIVU_MAXMIND_LICENSE_KEY", "k3y")]).unwrap_err();
+        assert_eq!(err.problems.len(), 1, "{err}");
+        assert!(err.problems[0].contains("RIVU_MAXMIND_ACCOUNT_ID"));
+        assert!(!err.to_string().contains("k3y"), "不能回显 license key");
+        let err = with_env(&[
+            ("RIVU_MAXMIND_LICENSE_KEY", "k3y"),
+            ("RIVU_MAXMIND_ACCOUNT_ID", "1"),
+            ("RIVU_MAXMIND_EDITION", "GeoLite2-ASN"),
+        ])
+        .unwrap_err();
+        assert!(
+            err.problems
+                .iter()
+                .any(|p| p.contains("RIVU_MAXMIND_EDITION"))
+        );
+        // 带冒号的 Account ID 会破坏 Basic 认证
+        let err = with_env(&[
+            ("RIVU_MAXMIND_LICENSE_KEY", "k3y"),
+            ("RIVU_MAXMIND_ACCOUNT_ID", "1:2"),
+        ])
+        .unwrap_err();
+        assert!(
+            err.problems
+                .iter()
+                .any(|p| p.contains("RIVU_MAXMIND_ACCOUNT_ID"))
+        );
+    }
+
+    #[test]
+    fn geo_url_is_validated_redacted_and_supports_file() {
+        for bad in ["ftp://x/y.mmdb", "geo.mmdb", "https://", "https://a b/c"] {
+            let err = with_env(&[("RIVU_GEOIP_DB_URL", bad)]).unwrap_err();
+            assert_eq!(err.problems.len(), 1, "{bad}: {err}");
+            assert!(err.problems[0].contains("RIVU_GEOIP_DB_URL"));
+        }
+        // 令牌来自文件，Debug 与来源标识里都不出现
+        let path = temp_file(
+            "geourl",
+            "  https://u:pw@git.example/dejavu/GeoLite.mmdb?t=SECRET\n",
+        );
+        let mut env = Env::from_pairs(base_pairs());
+        env.vars.insert(
+            "RIVU_GEOIP_DB_URL_FILE".into(),
+            path.to_string_lossy().into_owned(),
+        );
+        let cfg = Config::from_env(Role::All, &env).unwrap();
+        let dbg = format!("{:?}", cfg.geo);
+        assert!(!dbg.contains("SECRET") && !dbg.contains("pw@"), "{dbg}");
+        assert_eq!(
+            cfg.geo.source.id(),
+            "custom:https://git.example/dejavu/GeoLite.mmdb"
+        );
+        // 同时设置值和 _FILE 是冲突
+        env.vars
+            .insert("RIVU_GEOIP_DB_URL".into(), "https://x.test/a.mmdb".into());
+        let err = Config::from_env(Role::All, &env).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("RIVU_GEOIP_DB_URL 和 RIVU_GEOIP_DB_URL_FILE")
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn geo_plain_http_url_warns() {
+        let cfg = with_env(&[("RIVU_GEOIP_DB_URL", "http://10.0.0.5/geo.mmdb?t=SECRET")])
+            .unwrap()
+            .geo;
+        let w = cfg.warnings();
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("http://10.0.0.5/geo.mmdb"));
+        assert!(!w[0].contains("SECRET"), "警告里不能带查询串");
+        assert!(
+            with_env(&[("RIVU_GEOIP_DB_URL", "https://10.0.0.5/geo.mmdb")])
+                .unwrap()
+                .geo
+                .warnings()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn geo_refresh_interval_parse_and_limits() {
+        let ok = |v: &str| {
+            with_env(&[("RIVU_GEOIP_REFRESH_INTERVAL", v)])
+                .unwrap()
+                .geo
+                .refresh_interval
+        };
+        assert_eq!(ok("24h"), Some(Duration::from_secs(86_400)));
+        assert_eq!(ok("1h"), Some(Duration::from_secs(3600)));
+        assert_eq!(ok("60m"), Some(Duration::from_secs(3600)));
+        assert_eq!(ok("3600s"), Some(Duration::from_secs(3600)));
+        assert_eq!(ok("7d"), Some(Duration::from_secs(7 * 86_400)));
+        assert_eq!(ok("0"), None, "0 = 不定期刷新");
+        for bad in [
+            "59m",
+            "3599s",
+            "1",
+            "h",
+            "1.5h",
+            "-1h",
+            "1w",
+            "forever",
+            "99999999999999999999h",
+        ] {
+            let err = with_env(&[("RIVU_GEOIP_REFRESH_INTERVAL", bad)]).unwrap_err();
+            assert_eq!(err.problems.len(), 1, "{bad}: {err}");
+            assert!(
+                err.problems[0].contains("RIVU_GEOIP_REFRESH_INTERVAL"),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn geo_attribution_variables_are_read_and_url_checked() {
+        let cfg = with_env(&[
+            ("RIVU_GEOIP_ATTRIBUTION_TEXT", "Geo data by Example"),
+            ("RIVU_GEOIP_ATTRIBUTION_URL", "https://example.test/geo"),
+        ])
+        .unwrap()
+        .geo;
+        assert_eq!(cfg.attribution_text.as_deref(), Some("Geo data by Example"));
+        assert_eq!(
+            cfg.attribution_url.as_deref(),
+            Some("https://example.test/geo")
+        );
+        let err = with_env(&[("RIVU_GEOIP_ATTRIBUTION_URL", "javascript:alert(1)")]).unwrap_err();
+        assert!(err.problems[0].contains("RIVU_GEOIP_ATTRIBUTION_URL"));
+    }
+
+    #[test]
+    fn geo_variables_do_not_block_migrate() {
+        let env = Env::from_pairs([
+            ("RIVU_DATABASE_URL", "postgres://u:p@localhost/rivu"),
+            ("RIVU_CLICKHOUSE_URL", "http://localhost:8123"),
+            ("RIVU_CH_MIGRATOR_USER", "m"),
+            ("RIVU_CH_MIGRATOR_PASSWORD", "m"),
+            ("RIVU_GEOIP_REFRESH_INTERVAL", "1m"),
+            ("RIVU_MAXMIND_LICENSE_KEY", "k"),
+        ]);
+        assert!(Config::from_env(Role::Migrate, &env).is_ok());
+        assert!(Config::from_env(Role::Collector, &env).is_err());
+    }
+
+    #[test]
+    fn redact_url_drops_credentials_query_and_fragment() {
+        assert_eq!(
+            redact_url("https://user:pw@Example.COM:8443/a/b.mmdb.gz?token=x#frag"),
+            "https://Example.COM:8443/a/b.mmdb.gz"
+        );
+        assert_eq!(redact_url("http://h"), "http://h");
+        assert_eq!(redact_url("HTTPS://h/p"), "https://h/p");
+        assert_eq!(redact_url("https://tok@h?x=1"), "https://h");
+        assert_eq!(redact_url("not a url"), "<invalid-url>");
+        assert_eq!(redact_url("https://"), "<invalid-url>");
+        assert_eq!(redact_url("https://?token=SECRET"), "<invalid-url>");
     }
 }

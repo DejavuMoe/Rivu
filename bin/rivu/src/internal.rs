@@ -1,5 +1,6 @@
 //! 内部端口（`RIVU_INTERNAL_ADDR`）：`/healthz`、`/readyz`、`/metrics`。不经反向代理对外暴露。
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -12,7 +13,9 @@ use metrics_exporter_prometheus::PrometheusHandle;
 use rivu_common::build_info;
 use rivu_common::config::Role;
 use rivu_common::migration::{self, Store};
+use rivu_geo::GeoDb;
 use rivu_ingest::pipeline::{SaltCache, SiteSnapshot, utc_today};
+use rivu_jobs::GeoRefreshState;
 use serde_json::{Value, json};
 
 /// 单项检查的超时：依赖卡住时 `/readyz` 也要及时返回 503，而不是挂起。
@@ -52,11 +55,22 @@ pub struct CollectorReadiness {
     pub salts: Arc<SaltCache>,
 }
 
+/// `/readyz` 里 geoip 项的数据来源。**只报告状态，永远不判失败**：库可能还在后台下载
+/// （City 版约 60 MB 压缩、127 MB 解压，远超预热预算），下载完成前事件的位置字段为空（`system-design.md` §4.4）。
+pub struct GeoReadiness {
+    /// 当前进程持有的库（collector / all）。
+    pub db: Option<Arc<GeoDb>>,
+    /// `geoip_refresh` 的状态（worker / all）。
+    pub refresh: Option<Arc<GeoRefreshState>>,
+    pub db_path: PathBuf,
+}
+
 pub struct InternalState {
     pub role: Role,
     pub probe: Probe,
     /// 只有 collector / all 有。
     pub collector: Option<CollectorReadiness>,
+    pub geo: GeoReadiness,
     pub metrics: PrometheusHandle,
     pub started: Instant,
 }
@@ -121,6 +135,30 @@ fn salts_check(salts: &SaltCache, today_utc: jiff::civil::Date) -> (bool, Value)
     )
 }
 
+/// GeoIP 状态：只报告，`ok` 恒为 true，不参与 `ready` 的计算。
+fn geoip_check(geo: &GeoReadiness) -> Value {
+    let mut v = json!({ "ok": true, "file_present": geo.db_path.is_file() });
+    if let Some(db) = &geo.db {
+        let s = db.status();
+        v["loaded"] = json!(s.loaded);
+        v["source"] = json!(s.source);
+        v["database_type"] = json!(s.database_type);
+        v["build_epoch"] = json!(s.build_epoch);
+        v["age_seconds"] = json!(s.age_seconds);
+    }
+    if let Some(r) = &geo.refresh {
+        let s = r.snapshot();
+        v["refresh"] = json!({
+            "schedule": s.schedule,
+            "last_attempt_at": s.last_attempt_at,
+            "last_result": s.last_result,
+            "last_error": s.last_error,
+            "consecutive_failures": s.consecutive_failures,
+        });
+    }
+    v
+}
+
 async fn readyz(State(state): State<Arc<InternalState>>) -> impl IntoResponse {
     let p = &state.probe;
     let (pg, ch, pg_version, ch_version) = tokio::join!(
@@ -150,6 +188,7 @@ async fn readyz(State(state): State<Arc<InternalState>>) -> impl IntoResponse {
         checks["sites"] = sites;
         checks["salts"] = salts;
     }
+    checks["geoip"] = geoip_check(&state.geo);
 
     let body = json!({
         "status": if ready { "ready" } else { "not_ready" },
@@ -242,6 +281,42 @@ mod tests {
         m.insert(date(2026, 3, 30), [1u8; 16]);
         salts.replace(m);
         assert!(salts_check(&salts, today).0);
+    }
+
+    #[test]
+    fn geoip_check_only_reports_and_never_fails() {
+        // 库还没下载：loaded=false，但 ok 仍为 true（不影响 /readyz 的判断）
+        let geo = GeoReadiness {
+            db: Some(Arc::new(GeoDb::new())),
+            refresh: Some(Arc::new(GeoRefreshState::default())),
+            db_path: std::path::PathBuf::from("/definitely/not/here.mmdb"),
+        };
+        let v = geoip_check(&geo);
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["loaded"], false);
+        assert_eq!(v["file_present"], false);
+        assert_eq!(v["source"], Value::Null);
+        assert_eq!(v["refresh"]["schedule"], "not_started");
+        assert_eq!(v["refresh"]["consecutive_failures"], 0);
+        // worker 没有库对象，只报告刷新状态与文件是否存在
+        let worker = GeoReadiness {
+            db: None,
+            refresh: Some(Arc::new(GeoRefreshState::default())),
+            db_path: std::path::PathBuf::from("/definitely/not/here.mmdb"),
+        };
+        let v = geoip_check(&worker);
+        assert_eq!(v["ok"], true);
+        assert!(v.get("loaded").is_none());
+        // api 两样都没有
+        let api = GeoReadiness {
+            db: None,
+            refresh: None,
+            db_path: std::path::PathBuf::from("/x"),
+        };
+        assert_eq!(
+            geoip_check(&api),
+            json!({"ok": true, "file_present": false})
+        );
     }
 
     #[test]

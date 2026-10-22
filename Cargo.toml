@@ -5,13 +5,16 @@ members = [
     "crates/bus",
     "crates/common",
     "crates/domain",
+    "crates/geo",
     "crates/ingest",
     "crates/jobs",
     "crates/query",
     "crates/reference",
     "crates/session",
+    "crates/source",
     "crates/storage-ch",
     "crates/storage-pg",
+    "crates/ua",
     "crates/writer",
 ]
 
@@ -29,11 +32,14 @@ unsafe_code = "forbid"
 # 工作区内部 crate
 rivu-common = { path = "crates/common" }
 rivu-domain = { path = "crates/domain" }
+rivu-geo = { path = "crates/geo" }
 rivu-ingest = { path = "crates/ingest" }
 rivu-jobs = { path = "crates/jobs" }
 rivu-query = { path = "crates/query" }
 rivu-reference = { path = "crates/reference" }
 rivu-session = { path = "crates/session" }
+rivu-source = { path = "crates/source" }
+rivu-ua = { path = "crates/ua" }
 rivu-writer = { path = "crates/writer" }
 rivu-storage-pg = { path = "crates/storage-pg" }
 rivu-storage-ch = { path = "crates/storage-ch" }
@@ -42,6 +48,18 @@ rivu-storage-ch = { path = "crates/storage-ch" }
 anyhow = "1"
 arc-swap = "1"
 jiff = "0.2"
+# GeoIP（rivu-geo）：mmdb 读取、下载（reqwest 关闭默认 TLS 后端，由我们注入 ring + webpki-roots，
+# 与 clickhouse 的选择一致，避免引入 aws-lc）、gzip / tar.gz 解压。
+maxminddb = "0.32"
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "system-proxy"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
+flate2 = "1"
+tar = { version = "0.4", default-features = false }
+# UA 解析（rivu-ua）：uap-core 官方 Rust 实现、纯 Rust YAML 解析、UA 结果缓存。
+moka = { version = "0.12", default-features = false, features = ["sync"] }
+serde-saphyr = "2"
+ua-parser = "0.2"
 parking_lot = "0.12"
 percent-encoding = "2"
 proptest = "1"

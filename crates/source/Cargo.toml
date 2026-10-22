@@ -1,0 +1,27 @@
+[package]
+name = "rivu-source"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+rivu-domain.workspace = true
+
+# build.rs 在编译期把 data/ 里的 YAML 转成静态表：运行时没有解析、没有启动成本，
+# 数据文件的 SHA-256 在构建时核对，被悄悄改动就构建失败。
+[build-dependencies]
+serde.workspace = true
+serde-saphyr.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+# 数据驱动测试直接读取 data/ 里的 YAML 作为期望值。
+serde.workspace = true
+serde-saphyr.workspace = true
