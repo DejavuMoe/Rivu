@@ -8,7 +8,7 @@ use jiff::tz::TimeZone;
 use rand::Rng;
 use sqlx::{PgPool, Row, postgres::PgRow};
 
-/// `site_key` 的字母表：base32 小写（`^[a-z2-7]{12}$`，system-design §10.1 Q11）。
+/// `site_key` 的字母表：base32 小写（`^[a-z2-7]{12}$`，system-design §10 Q11）。
 const SITE_KEY_ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 const SITE_KEY_LEN: usize = 12;
 /// 随机 key 撞车时的重试次数。32^12 的空间里撞车几乎不可能，这里只是兜底。
@@ -83,7 +83,7 @@ pub struct NewSite<'a> {
     /// IANA 时区名，建站时校验。
     pub timezone: &'a str,
     /// hostname 白名单，至少一项；第一项是主域名。调用方负责按 hostname 规则规范化。
-    /// 白名单为空时 collector 丢弃全部事件（§10.1 Q12），所以建站时必须给出主域名。
+    /// 白名单为空时 collector 丢弃全部事件（§10 Q12），所以建站时必须给出主域名。
     pub hostnames: &'a [String],
 }
 
@@ -126,7 +126,7 @@ pub fn validate_hostname_pattern(pattern: &str) -> Result<()> {
 ///
 /// - 没有任何组织时先建一个名为 `default` 的组织；已有组织时用 id 最小的那个；
 /// - `site_key` 是随机的 12 位 base32 小写，撞车时重新生成；
-/// - 白名单就是 `hostnames`（含主域名）：建站时自动加入主域名，白名单不会是空的（§10.1 Q12）。
+/// - 白名单就是 `hostnames`（含主域名）：建站时自动加入主域名，白名单不会是空的（§10 Q12）。
 pub async fn create_site(pool: &PgPool, new: &NewSite<'_>) -> Result<CreatedSite> {
     let name = new.name.trim();
     if name.is_empty() {

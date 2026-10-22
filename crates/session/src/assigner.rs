@@ -68,10 +68,9 @@ pub enum Assignment {
 /// 盖到事件上的会话级字段。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Stamp {
-    /// 现行 §4.6：会话的原始 ID（`keys[0]`）。Q9 定案后可能改用 [`Stamp::own_visitor_id`]。
+    /// 事件自己的 `visitor_id`（用事件本地日期的盐算出），盖章不改写（§10 Q9）；
+    /// 跨午夜的会话只靠 `session_id` 串起来。
     pub visitor_id: u64,
-    /// 事件自己的 `visitor_id`（用事件本地日期的盐算出）。
-    pub own_visitor_id: u64,
     pub session_id: u64,
     pub session_start_ms: i64,
     /// 会话第一个 pageview 的 pathname；在它之前为空串。
@@ -277,8 +276,7 @@ impl Shard {
         self.next_tick += 1;
         let old_tick = std::mem::replace(&mut s.tick, self.next_tick);
         let stamp = Stamp {
-            visitor_id: s.keys[0],
-            own_visitor_id: ev.visitor_id,
+            visitor_id: ev.visitor_id,
             session_id: s.id,
             session_start_ms: s.started_at,
             entry_pathname: Arc::clone(&s.entry),
@@ -487,8 +485,7 @@ mod tests {
         for d in 1..8 {
             let s = stamped(a.assign(&day(d)));
             assert_eq!(s.session_id, first.session_id);
-            assert_eq!(s.visitor_id, 100, "盖章用会话的原始 ID");
-            assert_eq!(s.own_visitor_id, 100 + d as u64);
+            assert_eq!(s.visitor_id, 100 + d as u64, "盖章保留事件自己的 ID（Q9）");
         }
         let view = a.peek(SITE, ROUTING, 107).unwrap();
         assert_eq!(view.key_count, MAX_KEYS);
@@ -519,7 +516,7 @@ mod tests {
         // 跨午夜：新 ID 11，前一天的 ID 是 10。
         let s1 = stamped(a.assign(&ev(11, Some(10), 5 * MIN, EventKind::Pageview, "/b")));
         assert_eq!(s1.session_id, s0.session_id);
-        assert_eq!((s1.visitor_id, s1.own_visitor_id), (10, 11));
+        assert_eq!(s1.visitor_id, 11, "盖章保留事件自己的 ID（Q9）");
         assert_eq!(a.peek(SITE, ROUTING, 11).unwrap().key_count, 2);
         // 乱序的前一天事件仍能查到会话。
         let s2 = stamped(a.assign(&ev(10, Some(9), 4 * MIN, EventKind::Pageview, "/c")));

@@ -35,21 +35,21 @@
 ## 2. 嵌入方式
 ### 2.1 站点专属脚本（推荐）
 ```html
-<script defer src="https://stats.example.com/js/k7Qm2xV9aTbR4cLd.js"></script>
+<script defer src="https://stats.example.com/js/k7qm2xv5atbr.js"></script>
 ```
 
 页面若要在脚本加载前调用手动 API，先放队列桩（也可省略，省略时早于加载的调用会丢失）：
 
 ```html
 <script>window.rivu=window.rivu||function(){(rivu.q=rivu.q||[]).push(arguments)}</script>
-<script defer src="https://stats.example.com/js/k7Qm2xV9aTbR4cLd.js"></script>
+<script defer src="https://stats.example.com/js/k7qm2xv5atbr.js"></script>
 <script>rivu('event','Signup',{props:{plan:'pro'}})</script>
 ```
 
 ### 2.2 通用 `t.js`（静态/CDN 托管）
 ```html
 <script defer src="https://cdn.example.net/rivu/t.js"
-        data-site="k7Qm2xV9aTbR4cLd" data-api="https://stats.example.com/api/event"></script>
+        data-site="k7qm2xv5atbr" data-api="https://stats.example.com/api/event"></script>
 ```
 
 `t.js` 与 `full` 构建字节相同，站点无关。`data-site` 必填；`data-api` 缺省取脚本 `src` 的 origin + `/api/event`（`t.js` 由 Rivu 自己托管时可省，同 `[00 §7]` 的「默认取脚本源，允许覆盖」）；缺 `data-site` 时脚本不做任何事。
@@ -70,7 +70,7 @@
 `GET /js/<site_key>.js` 的响应 = 前缀 + 构建产物。前缀由服务端从站点配置的**唯一映射函数**生成（该函数有测试，防止库中开关与脚本脱节 `[01 §0 #7]` `[01 §11.2 #12]`）：
 
 ```js
-window.rivu=window.rivu||function(){(rivu.q=rivu.q||[]).push(arguments)};rivu.c={"site":"k7Qm2xV9aTbR4cLd","endpoint":"https://stats.example.com/api/event","hash":false,"engagement":true,"outbound":true,"downloads":["pdf","zip"],"forms":false,"tagged":true};
+window.rivu=window.rivu||function(){(rivu.q=rivu.q||[]).push(arguments)};rivu.c={"site":"k7qm2xv5atbr","endpoint":"https://stats.example.com/api/event","hash":false,"engagement":true,"outbound":true,"downloads":["pdf","zip"],"forms":false,"tagged":true};
 ```
 
 规则：`endpoint` 来自服务端配置项 `public_base_url`，不得取请求的 `Host`（防止 CDN 缓存被污染）；字符串用 JSON 转义并额外转义 `<`、U+2028/2029；`site_key` 仅含 `[A-Za-z0-9_-]`。`t.js` 无前缀，配置来自 `data-*`。
@@ -241,7 +241,7 @@ rivu('event', 'Video Play', { interactive: false })   // 发 i:false，不影响
 |---|---|---|---|---|---|---|
 | `v` | integer | 是 | 全部 | 当前仅 `1`（N−1 见第 8 节） | 不支持 → 400 `v` | 决策 4 |
 | `sv` | integer | 否 | 全部 | 0–999999 | 非法/缺失按 0，**永不 400**；只作计数标签，不影响行为 | `[01 §4.1]` |
-| `s` | string | 是 | 全部 | `^[A-Za-z0-9_-]{8,32}$` | 格式错 → 400；未知 → 202+计数 | 决策 3 |
+| `s` | string | 是 | 全部 | `^[A-Za-z0-9_-]{8,32}$` | 格式错 → 400 `s: has an invalid format`；格式合法但不存在 → 202+计数（`unknown_site`）。实际生成的 key 是 12 位 base32 小写（`^[a-z2-7]{12}$`，PG 迁移与 `platform-and-ops.md` §3.3），线协议的正则故意更宽松：它只是向前兼容的语法检查，将来调整 key 的生成格式时，已发布的脚本和协议都不用改 | 决策 3；`system-design.md` §10 Q11 |
 | `n` | string | 是 | 全部 | trim 后非空，≤120 **字符**，不含控制字符 | `pageview`、`engagement` 为系统事件名，其余为自定义 | `[01 §2.2]` |
 | `u` | string | 是 | 全部 | 只受请求体 8 KB 上限约束；scheme 仅 `http`/`https` | 规范化见第 7 节。超长不回 400：先丢弃白名单以外的 query 参数，再把 pathname 截断到 1024 字节。Plausible 对超过 2000 字节的 URL 回 400，会丢掉整条 pageview，而长 URL 多数是广告和跟踪参数造成的。无法解析或 scheme 不合法时仍回 400 | `[01 §4.1]` |
 | `r` | string 或 null | 否 | 主要 pageview | ≤2000 **字符** | null/空串视为缺失；超长**截断**不报错；其余类型 → 400 | `[01 §2.2]` |
@@ -258,19 +258,19 @@ rivu('event', 'Video Play', { interactive: false })   // 发 i:false，不影响
 示例 1：pageview（服务端据此得到 hostname=`example.com`、pathname=`/pricing`、`utm_source=newsletter`、`utm_medium=email`；`token`、`#plans` 丢弃；referrer 存为 `news.example.org/post/42`）
 
 ```json
-{"v":1,"sv":3,"s":"k7Qm2xV9aTbR4cLd","n":"pageview","u":"https://www.Example.com/pricing?utm_source=newsletter&utm_medium=email&token=abc123#plans","r":"https://news.example.org/post/42?id=7"}
+{"v":1,"sv":3,"s":"k7qm2xv5atbr","n":"pageview","u":"https://www.Example.com/pricing?utm_source=newsletter&utm_medium=email&token=abc123#plans","r":"https://news.example.org/post/42?id=7"}
 ```
 
 示例 2：自定义事件（带属性与收入；`i` 缺省即 `true`；`$` 在第 4 阶段前被服务端忽略）
 
 ```json
-{"v":1,"sv":3,"s":"k7Qm2xV9aTbR4cLd","n":"Purchase","u":"https://example.com/checkout/done","p":{"plan":"pro","seats":"5"},"$":{"a":"29.00","c":"USD"}}
+{"v":1,"sv":3,"s":"k7qm2xv5atbr","n":"Purchase","u":"https://example.com/checkout/done","p":{"plan":"pro","seats":"5"},"$":{"a":"29.00","c":"USD"}}
 ```
 
 示例 3：engagement（用户滚到 72%，自上次上报起参与 18.45 秒）
 
 ```json
-{"v":1,"sv":3,"s":"k7Qm2xV9aTbR4cLd","n":"engagement","u":"https://example.com/pricing","sd":72,"e":18450}
+{"v":1,"sv":3,"s":"k7qm2xv5atbr","n":"engagement","u":"https://example.com/pricing","sd":72,"e":18450}
 ```
 
 ## 6. HTTP 契约
@@ -291,12 +291,13 @@ rivu('event', 'Video Play', { interactive: false })   // 发 i:false，不影响
 | `202` | 事件被接受，或被过滤（机器人、未知站点、站点停用、限流、hostname 不在白名单、屏蔽规则、无会话的 engagement 等） | 空 | 有丢弃时 `x-rivu-dropped: 1`（本端点一请求一事件，值恒为 1；保留数量语义供批量端点使用） |
 | `400` | JSON 不合法、非对象、缺必填、类型错、超长、`v` 不支持、`s` 格式错、engagement 缺 `sd`/`e`、`u` 非法 | `{"errors":{"字段":["消息"]}}`，`application/json` | — |
 | `404`/`405` | 路径/方法错误 | 空 | `Allow`（405） |
+| `408` | 读请求体超过 5 s | 空 | `Connection: close` |
 | `413` | 请求体 > 8192 B | `{"errors":{"body":["is too large (max 8192 bytes)"]}}` | `Connection: close` |
 | `414`/`431` | HTTP 层 | 空 | — |
 | `503` | 写缓冲满，或 JetStream 不可用 | 空 | `Retry-After: <秒>`（1–10 随机抖动）；客户端不重试，供代理与监控使用 |
 | `500` | 未预期错误 | 空 | 计数 `internal_error`，不得泄露细节 |
 
-错误消息固定词表：`is required`、`must be a string`、`must be an integer`、`must be a boolean`、`must be an object`、`must be a JSON object`、`is not valid JSON`、`is too long (max N)`、`has too many keys (max 30)`、`is not supported`、`must be a valid url`、`scheme is not allowed`、`at least one of sd or e is required`。其中请求体整体错误的键为 `body`。
+错误消息固定词表：`is required`、`must be a string`、`must be an integer`、`must be a boolean`、`must be an object`、`must be a JSON object`、`is not valid JSON`、`is too long (max N)`、`has too many keys (max 30)`、`is not supported`、`has an invalid format`、`must be a valid url`、`scheme is not allowed`、`at least one of sd or e is required`。其中请求体整体错误的键为 `body`。`has an invalid format` 用于 `s` 格式错、`n` 含控制字符、`$` 字段格式错（`a`、`c` 不符合格式）；`is not supported` 只用于 `v`（`system-design.md` §10 Q18）。
 
 ### 6.3 CORS 与预检
 | 场景 | 行为 |
@@ -308,16 +309,17 @@ rivu('event', 'Video Play', { interactive: false })   // 发 i:false，不影响
 ### 6.4 Collector 处理次序与响应映射（衔接 `[v1 §2]`，其中「返回 204」以本规范 `202` 为准）
 | # | 阶段 | 失败结果 | 内部计数 |
 |---|---|---|---|
-| 1 | 方法/路径、体积（413） | `413` | `rejected_body_size` |
-| 2 | 解析 JSON 与字段校验、`u` 解析（400） | `400` | `rejected_<field>`，维度含 `sv`，**不含**站点 |
-| 3 | 站点配置（进程内缓存，不查 PG）：未知 `s` | `202`+dropped | `dropped_unknown_site` |
-| 4 | 站点状态、配额、限流 | `202`+dropped | `dropped_disabled` / `dropped_throttle` |
-| 5 | hostname 白名单（第 7 节） | `202`+dropped | `dropped_hostname` |
-| 6 | 屏蔽规则、垃圾引荐、机器人 | `202`+dropped | `dropped_shield_*` / `dropped_spam_referrer` / `dropped_bot` |
-| 7 | engagement 先查会话（在昂贵的 UA/地理富化之前） | `202`+dropped | `dropped_no_session_for_engagement` |
-| 8 | 富化、写缓冲/JetStream | `503` | `overload` |
+| 1 | 方法/路径、体积（413）、读体超时（408） | `413` / `408` | `rejected_body_size`（413，只进 Prometheus） |
+| 2 | 解析 JSON 与字段校验、`u` 解析（400） | `400` | `rejected_<field>`，只进 Prometheus，维度含 `sv`，**不含**站点，不进 `ingest_counters` |
+| 3 | 站点配置（进程内缓存，不查 PG）：未知 `s`（已删除的站点从快照摘除后同样如此） | `202`+dropped | `dropped_unknown_site`（`site_id = 0`） |
+| 4 | 站点状态、配额、限流 | `202`+dropped | `dropped_site_disabled` / `dropped_rate_limited` |
+| 5 | hostname 白名单（第 7 节） | `202`+dropped | `dropped_hostname_not_allowed` |
+| 6 | 屏蔽规则、垃圾引荐、机器人、国家 | `202`+dropped | `dropped_ip_blocked` / `dropped_page_blocked` / `dropped_spam_referrer` / `dropped_bot` / `dropped_datacenter_ip` / `dropped_country_blocked` |
+| 7 | 身份：事件的站点本地日期没有盐（collector 不现场生成盐） | `202`+dropped | `dropped_salt_missing` |
+| 8 | engagement 先查会话（在昂贵的 UA/地理富化之前） | `202`+dropped | `dropped_no_session` |
+| 9 | 富化、写缓冲/JetStream | `503` | `dropped_overloaded` |
 
-计数维度：`{10 秒桶, 指标, site_key, sv, v}`；未知 `site_key` 统一计入 `_unknown_`，避免用户可控标签撑爆基数 `[01 §10.1]`。丢弃原因枚举参照 `[01 §5.3]`，仅内部可见。
+`ingest_counters` 的维度为 `{分钟, 指标, site_id, script_version}`（进程内按 10 秒桶累加，桶用接收请求时的墙钟）；`sv` 超出 UInt16 的钳到 65535。未知站点统一记 `site_id = 0`，避免用户可控标签撑爆基数 `[01 §10.1]`。丢弃原因以 Rust 枚举 `DropReason` 为唯一来源（`system-design.md` §4.2、§10 Q13），指标名为 `dropped_<原因>`，仅内部可见。
 
 ## 7. 服务端规范化规则
 | 对象 | 规则 | 依据 |
@@ -406,7 +408,7 @@ rivu('event', 'Video Play', { interactive: false })   // 发 i:false，不影响
 |---|---|
 | 状态码 | 合法 → 202 空体；未知 `s`/hostname 不在白名单/机器人 UA → 202 + `x-rivu-dropped: 1`；各 400 场景逐一断言 JSON 体键与消息；`503` 带 `Retry-After`（注入写缓冲满/JetStream 故障） |
 | 体积边界 | 8192 B 通过、8193 B → 413；分块无 `Content-Length` 超限 → 413；非 UTF-8、非对象、`null`、嵌套超深 → 400 |
-| 字段边界 | `n` 120/121 字符（含多字节）；`u` 2000/2001 字节；`r` 超长截断；30/31 个属性；键 300/301 B；值 2000/2001 B；`p` 值为数字/布尔被转换，为 `null`/数组/对象 → 400 |
+| 字段边界 | `n` 120/121 字符（含多字节）；`u` 超长 query 被丢弃、pathname 截断到 1024 字节，不回 400；`r` 超长截断；30/31 个属性；键 300/301 B；值 2000/2001 B；`p` 值为数字/布尔被转换，为 `null`/数组/对象 → 400 |
 | engagement | 仅 `sd`、仅 `e`、两者皆缺 → 400；`sd=101` 夹为 100；`e` ≥ 30 天 → 0；`sd:null`；无会话 → 202 + 计数；非 engagement 的 `sd/e` 被忽略 |
 | 规范化 | `www.`/大小写/尾点/端口/punycode；`*.example.com` 不匹配根域；空白名单 fail-closed；`%zz`、`%2F`、`%00`、非 UTF-8 转义保留；hash 模式 `?`、`#access_token=` 处理；`?utm_source=&ref=x` 取 `ref`；click id 只存名；非白名单参数不出现在任何落库/日志字段 |
 | 头与版本 | `text/plain;charset=UTF-8`、`application/json`、缺失、`*/*` 均可解析；`Set-Cookie` 永不出现；`v=1` 通过，`v=0/2/"1"` → 400；`sv` 非法按 0 不 400 |
@@ -442,6 +444,6 @@ rivu('event', 'Video Play', { interactive: false })   // 发 i:false，不影响
 ## 附录：待拍板问题
 1. `full` 估算仅余约 18 B；超预算时是否允许把预算提到 2.5 KB，还是按 3.2 顺序削功能。
 2. `r` 超长是截断（本稿，同 Plausible）还是按决策 2 的「超长」返回 400。
-3. `u` 超 2000 B 返回 400 会丢整条 pageview（长 OAuth/搜索 URL）；是否允许客户端对超长 URL 先剥离 query/fragment 再发。
+3. ~~`u` 超 2000 B 返回 400 会丢整条 pageview~~：已定，服务端对超长 `u` 不回 400，先丢弃白名单以外的 query，再把 pathname 截断到 1024 字节（§5.1、`system-design.md` §10 Q18）；客户端不需要预先剥离。
 4. 兼容层 `d` 含逗号（多站点扇出）按 400 拒绝，是否可接受。
 5. 白名单为空 fail-closed、`*.example.com` 不含根域；`r` 仅文档首个 pageview 携带（偏离 Plausible）；DNT/GPC 是否进入后续阶段。

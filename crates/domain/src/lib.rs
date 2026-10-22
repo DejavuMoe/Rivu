@@ -91,7 +91,7 @@ pub struct SessionAttrs {
     pub os_version: String,
 }
 
-/// 事件被过滤的原因（`system-design.md` §4.2；标识符见 §10.1 Q13）。
+/// 事件被过滤的原因（`system-design.md` §4.2；标识符见 §10 Q13）。
 ///
 /// 写入 `ingest_counters.metric` 时取 [`DropReason::metric`]，即 `dropped_<原因>`。
 /// 原因只进计数，不出现在 HTTP 响应里。
@@ -177,7 +177,7 @@ impl fmt::Display for DropReason {
 /// 被接受的事件在 `ingest_counters.metric` 里的取值。
 pub const METRIC_ACCEPTED: &str = "accepted";
 
-/// 未知站点在 `ingest_counters.site_id` 里的取值（§10.1 Q13）。PG 的 identity 从 1 开始，不会冲突。
+/// 未知站点在 `ingest_counters.site_id` 里的取值（§10 Q13）。PG 的 identity 从 1 开始，不会冲突。
 pub const UNKNOWN_SITE_ID: u64 = 0;
 
 #[cfg(test)]

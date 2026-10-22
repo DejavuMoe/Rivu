@@ -14,10 +14,10 @@ CREATE TABLE IF NOT EXISTS {{database}}.events
     ts               DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)),
     event_id         UUID,                          -- UUIDv7，由 collector 生成
     name             LowCardinality(String),        -- pageview / engagement / 自定义事件名
-    visitor_id       UInt64,                        -- 会话的 visitor_id（跨午夜保持不变）
+    visitor_id       UInt64,                        -- 事件当天的 visitor_id（按站点本地日的盐算出，不跨午夜）
     session_id       UInt64,
     session_start    DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)),
-    ingest_partition UInt8,                         -- Reliable 分区号；Lite 为 0
+    ingest_partition UInt8,                         -- routing % 32（Reliable 的分区号；Lite 的分片号）
     hostname         LowCardinality(String),
     pathname         String CODEC(ZSTD(3)),
     entry_pathname   String CODEC(ZSTD(3)),         -- 盖章：会话入口页

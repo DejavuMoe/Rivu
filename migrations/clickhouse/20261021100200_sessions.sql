@@ -2,13 +2,18 @@
 -- 会话行由 mv_sessions 在 events 的同一个 INSERT 内同步生成，应用不直接写 sessions。
 -- 聚合状态列的类型已用 toTypeName(argMinIfState(...)) 在 25.8 上核对：
 --   AggregateFunction(argMinIf, Tuple(String, String), DateTime64(3, 'UTC'), UInt8)
+-- last_visitor_id 同样用 toTypeName(argMaxState(visitor_id, ts)) 核对过：
+--   AggregateFunction(argMax, UInt64, DateTime64(3, 'UTC'))
+-- 排序键里没有 visitor_id（system-design §10 Q9）：事件保留自己当天的 visitor_id，会话只靠 session_id 串联，
+-- 所以一个跨午夜的会话在 sessions 里仍是一行。last_visitor_id 是会话最后一个事件（含 engagement）的当天 ID，
+-- 从 ClickHouse 预热时用它建索引 key（§4.6「预热」）。
 
 CREATE TABLE IF NOT EXISTS {{database}}.sessions
 (
     site_id            UInt64,
     start_date         Date,                    -- toDate(session_start)，UTC
-    visitor_id         UInt64,
     session_id         UInt64,
+    last_visitor_id    AggregateFunction(argMax, UInt64, DateTime64(3, 'UTC')),  -- 会话最后一个事件的当天 visitor_id
     ingest_partition   SimpleAggregateFunction(any, UInt8),
     started_at         SimpleAggregateFunction(min, DateTime64(3, 'UTC')),
     last_event_at      SimpleAggregateFunction(max, DateTime64(3, 'UTC')),  -- 不含 engagement
@@ -40,8 +45,8 @@ CREATE TABLE IF NOT EXISTS {{database}}.sessions
 )
 ENGINE = AggregatingMergeTree
 PARTITION BY toYYYYMM(start_date)
-ORDER BY (site_id, start_date, visitor_id, session_id)
-SAMPLE BY visitor_id
+ORDER BY (site_id, start_date, session_id)
+SAMPLE BY session_id
 TTL start_date + INTERVAL 731 DAY DELETE
 SETTINGS ttl_only_drop_parts = 1, non_replicated_deduplication_window = 1000;
 
@@ -54,8 +59,8 @@ AS
 SELECT
     site_id,
     toDate(session_start)                                              AS start_date,
-    visitor_id,
     session_id,
+    argMaxState(visitor_id, ts)                                        AS last_visitor_id,
     any(ingest_partition)                                              AS ingest_partition,
     min(session_start)                                                 AS started_at,
     maxIf(ts, name != 'engagement')                                    AS last_event_at,
@@ -84,4 +89,4 @@ SELECT
     any(os)                                                            AS os,
     any(os_version)                                                    AS os_version
 FROM {{database}}.events
-GROUP BY site_id, start_date, visitor_id, session_id;
+GROUP BY site_id, start_date, session_id;

@@ -15,20 +15,17 @@ use jiff::civil::Date;
 use jiff::tz::TimeZone;
 use serde::Deserialize;
 
-/// 看板查询的执行时限（秒）。§6.8：看板 10 s（§10.1 Q14：按调用方分档，P1 只有内部查询）。
-const MAX_EXECUTION_TIME_SECS: &str = "10";
-
 /// 核心指标（§6.5）。
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Overview {
-    /// `uniq(visitor_id)`，不含 engagement 事件（§10.1 Q17）。
+    /// `uniq(visitor_id)`，不含 engagement 事件（§10 Q17）。
     pub visitors: u64,
     /// 区间内活跃的会话数。
     pub visits: u64,
     pub pageviews: u64,
     /// 0–1。
     pub bounce_rate: f64,
-    /// 秒，不含 engagement 时间（§10.1 Q2）。
+    /// 秒，不含 engagement 时间（§10 Q2）。
     pub visit_duration: f64,
     /// 秒，只统计 `engagement_ms > 0` 的会话。
     pub engaged_duration: f64,
@@ -86,11 +83,13 @@ pub fn bounds(tz: &TimeZone, from: Date, to: Date) -> Result<Bounds> {
     })
 }
 
-/// 把 `Bounds` 和站点绑到查询上。所有 SQL 共用同一组参数名。
+/// 把 `Bounds`、站点和执行时限绑到查询上。所有 SQL 共用同一组参数名。
+/// 时限按调用方分三档（§6.8、§10 Q14），由调用方传入，不得大于 `rivu_reader` 配额里的上限。
 fn bind(
     q: clickhouse::query::Query,
     site_id: u64,
     b: &Bounds,
+    timeout_secs: u64,
     what: &str,
 ) -> clickhouse::query::Query {
     q.param("site", site_id)
@@ -98,7 +97,7 @@ fn bind(
         .param("to_date", b.last_date.to_string())
         .param("from_ms", b.start_ms)
         .param("to_ms", b.end_ms)
-        .with_setting("max_execution_time", MAX_EXECUTION_TIME_SECS)
+        .with_setting("max_execution_time", timeout_secs.to_string())
         .with_setting(
             "log_comment",
             format!(r#"{{"route":"{what}","site":{site_id}}}"#),
@@ -131,7 +130,7 @@ WHERE site_id = {site:UInt64}
 
 /// 会话指标：两级聚合（§5.3 的代价）。
 ///
-/// 内层按完整排序键合并 AggregatingMergeTree 里尚未合并的部分行，并保留「区间内活跃」的会话：
+/// 内层按完整排序键 `(site_id, start_date, session_id)`（Q9）合并 AggregatingMergeTree 里尚未合并的部分行，并保留「区间内活跃」的会话：
 /// `last_event_at ≥ 起点 AND started_at < 终点`；`start_date ≥ from_date − 7` 依赖 7 天的会话上限（§4.6、§6.5）。
 /// 外层算比率，`ifNotFinite` 防除零。内层别名与列名刻意不同，避免聚合函数嵌套歧义。
 const SESSIONS_SQL: &str = "
@@ -140,7 +139,7 @@ SELECT count() AS visits,
        ifNotFinite(avg(dur_ms) / 1000, 0) AS visit_duration,
        ifNotFinite(sumIf(s_eng, s_eng > 0) / 1000 / countIf(s_eng > 0), 0) AS engaged_duration
 FROM (
-    SELECT site_id, start_date, visitor_id, session_id,
+    SELECT site_id, start_date, session_id,
            min(started_at) AS s_start,
            max(last_event_at) AS s_last,
            sum(pageviews) AS s_pv,
@@ -150,24 +149,38 @@ FROM (
     FROM sessions
     WHERE site_id = {site:UInt64}
       AND start_date >= {from_date:Date} - 7 AND start_date <= {to_date:Date}
-    GROUP BY site_id, start_date, visitor_id, session_id
+    GROUP BY site_id, start_date, session_id
     HAVING s_last >= fromUnixTimestamp64Milli({from_ms:Int64}, 'UTC')
        AND s_start <  fromUnixTimestamp64Milli({to_ms:Int64}, 'UTC')
 )";
 
-/// 站点本地日期范围 `[from, to]`（含）的核心指标。`reader` 用 `rivu_reader` 账号构造。
+/// 站点本地日期范围 `[from, to]`（含）的核心指标。`reader` 用 `rivu_reader` 账号构造，
+/// `timeout_secs` 是执行时限（看板 / API / 公开看板各一档，§10 Q14）。
 pub async fn overview(
     reader: &Client,
     site_id: u64,
     tz: &TimeZone,
     from: Date,
     to: Date,
+    timeout_secs: u64,
 ) -> Result<Overview> {
     let b = bounds(tz, from, to)?;
-    let events =
-        bind(reader.query(EVENTS_SQL), site_id, &b, "overview.events").fetch_one::<EventAgg>();
-    let sessions = bind(reader.query(SESSIONS_SQL), site_id, &b, "overview.sessions")
-        .fetch_one::<SessionAgg>();
+    let events = bind(
+        reader.query(EVENTS_SQL),
+        site_id,
+        &b,
+        timeout_secs,
+        "overview.events",
+    )
+    .fetch_one::<EventAgg>();
+    let sessions = bind(
+        reader.query(SESSIONS_SQL),
+        site_id,
+        &b,
+        timeout_secs,
+        "overview.sessions",
+    )
+    .fetch_one::<SessionAgg>();
     let (e, s) = tokio::try_join!(events, sessions).context("查询 overview 失败")?;
     Ok(Overview {
         visitors: e.visitors,
@@ -201,6 +214,7 @@ ORDER BY visitors DESC, pageviews DESC, pathname ASC
 LIMIT {limit:UInt32}";
 
 /// 页面榜：浏览过该页的访客数与浏览次数，按访客数降序（同数按浏览次数、路径）。
+/// `timeout_secs` 同 [`overview`]。
 pub async fn top_pages(
     reader: &Client,
     site_id: u64,
@@ -208,13 +222,20 @@ pub async fn top_pages(
     from: Date,
     to: Date,
     limit: u32,
+    timeout_secs: u64,
 ) -> Result<Vec<PageStat>> {
     let b = bounds(tz, from, to)?;
-    let rows = bind(reader.query(TOP_PAGES_SQL), site_id, &b, "top_pages")
-        .param("limit", limit)
-        .fetch_all::<PageAgg>()
-        .await
-        .context("查询 top_pages 失败")?;
+    let rows = bind(
+        reader.query(TOP_PAGES_SQL),
+        site_id,
+        &b,
+        timeout_secs,
+        "top_pages",
+    )
+    .param("limit", limit)
+    .fetch_all::<PageAgg>()
+    .await
+    .context("查询 top_pages 失败")?;
     Ok(rows
         .into_iter()
         .map(|r| PageStat {
