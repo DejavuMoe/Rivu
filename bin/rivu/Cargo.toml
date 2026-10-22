@@ -23,11 +23,17 @@ anyhow.workspace = true
 axum.workspace = true
 clap.workspace = true
 clickhouse.workspace = true
+jiff.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
+rand.workspace = true
 rivu-common.workspace = true
+rivu-ingest.workspace = true
+rivu-jobs.workspace = true
+rivu-query.workspace = true
 rivu-storage-ch.workspace = true
 rivu-storage-pg.workspace = true
+rivu-writer.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
@@ -35,7 +41,11 @@ tracing.workspace = true
 
 [dev-dependencies]
 clickhouse = { workspace = true, features = ["time", "uuid"] }
+rivu-domain.workspace = true
+rivu-reference.workspace = true
+rivu-session.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 time.workspace = true
 uuid.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -11,6 +11,9 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
-clickhouse.workspace = true
+# `time`、`uuid`：行结构体里 DateTime64 与 UUID 列的 serde 适配
+clickhouse = { workspace = true, features = ["time", "uuid"] }
 rivu-common.workspace = true
 serde.workspace = true
+time.workspace = true
+uuid.workspace = true

@@ -1,0 +1,14 @@
+[package]
+name = "rivu-reference"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+jiff.workspace = true
+rivu-domain.workspace = true

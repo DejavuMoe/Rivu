@@ -1,5 +1,7 @@
 //! ClickHouse 访问（官方 `clickhouse` crate，HTTP + RowBinary + LZ4）：客户端、迁移记录表与迁移执行。
 
+pub mod rows;
+
 use anyhow::{Context, Result};
 use clickhouse::{Client, Compression, Row};
 use rivu_common::config::ChAccount;
@@ -20,6 +22,12 @@ pub fn client(url: &str, account: &ChAccount, database: Option<&str>) -> Client 
         c = c.with_database(db);
     }
     c
+}
+
+/// 写入账号（`rivu_writer`）的客户端：请求体用 LZ4 压缩（RowBinary + LZ4，`system-design.md` §4.7）。
+/// writer 账号不是 readonly，可以压缩；reader 账号不能，见 [`client`]。
+pub fn writer_client(url: &str, account: &ChAccount, database: &str) -> Client {
+    client(url, account, Some(database)).with_compression(Compression::Lz4)
 }
 
 /// `SELECT 1`。
