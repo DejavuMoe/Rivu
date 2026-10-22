@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
+use std::time::Duration;
 
 use crate::telemetry::check_level;
 
@@ -43,6 +44,11 @@ impl Role {
     /// 是否挂载 api 的公共路由（`/api/*`）。
     pub fn serves_api(self) -> bool {
         matches!(self, Role::Api | Role::All)
+    }
+
+    /// 是否运行后台任务（目前只有 `salts_rotate`）：worker、all。
+    pub fn runs_jobs(self) -> bool {
+        matches!(self, Role::Worker | Role::All)
     }
 
     fn needs_ch_writer(self) -> bool {
@@ -161,6 +167,43 @@ impl FromStr for Cidr {
     }
 }
 
+/// 写缓冲（BatchWriter）的参数（`system-design.md` §4.7、§10.1 Q16）。
+///
+/// 默认值取 §4.7：1 s、2 万行、8 MiB，channel 容量 20 万条（变量名取 `platform-and-ops.md` §7）。
+/// 压测（P2）后再调。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BufferConfig {
+    /// `RIVU_BUFFER_FLUSH_INTERVAL_MS`：距上一次 flush 最多等多久。
+    pub flush_interval: Duration,
+    /// `RIVU_BUFFER_MAX_ROWS`：单批行数上限。
+    pub max_rows: usize,
+    /// `RIVU_BUFFER_MAX_BYTES`：单批字节数上限（估算值）。
+    pub max_bytes: usize,
+    /// `RIVU_BUFFER_CHANNEL_CAPACITY`：有界 channel 的容量，满了 `POST /api/event` 回 `503`。
+    pub channel_capacity: usize,
+}
+
+impl BufferConfig {
+    pub const DEFAULT_FLUSH_INTERVAL_MS: u64 = 1000;
+    pub const DEFAULT_MAX_ROWS: usize = 20_000;
+    pub const DEFAULT_MAX_BYTES: usize = 8_388_608;
+    pub const DEFAULT_CHANNEL_CAPACITY: usize = 200_000;
+}
+
+impl Default for BufferConfig {
+    fn default() -> Self {
+        BufferConfig {
+            flush_interval: Duration::from_millis(Self::DEFAULT_FLUSH_INTERVAL_MS),
+            max_rows: Self::DEFAULT_MAX_ROWS,
+            max_bytes: Self::DEFAULT_MAX_BYTES,
+            channel_capacity: Self::DEFAULT_CHANNEL_CAPACITY,
+        }
+    }
+}
+
+/// 站点缓存的全量重载周期默认值（`RIVU_SITE_CACHE_REFRESH_SECS`）。
+pub const DEFAULT_SITE_CACHE_REFRESH_SECS: u64 = 10;
+
 /// 校验通过后的配置。
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -179,6 +222,9 @@ pub struct Config {
     pub log_level: String,
     pub mode: Mode,
     pub trusted_proxies: Vec<Cidr>,
+    pub buffer: BufferConfig,
+    /// `RIVU_SITE_CACHE_REFRESH_SECS`：站点快照全量重载周期（P1 没有增量刷新和 LISTEN/NOTIFY）。
+    pub site_cache_refresh: Duration,
 }
 
 impl Config {
@@ -295,6 +341,38 @@ impl Config {
             }
         }
 
+        let flush_interval_ms = l.parse_in_range(
+            "RIVU_BUFFER_FLUSH_INTERVAL_MS",
+            BufferConfig::DEFAULT_FLUSH_INTERVAL_MS,
+            10..=60_000,
+        );
+        let max_rows = l.parse_in_range(
+            "RIVU_BUFFER_MAX_ROWS",
+            BufferConfig::DEFAULT_MAX_ROWS,
+            // 上限取 ClickHouse 的 max_insert_block_size（默认 1048449）以下：每个 INSERT 只产生一个 block（§4.7）。
+            1..=1_000_000,
+        );
+        let max_bytes = l.parse_in_range(
+            "RIVU_BUFFER_MAX_BYTES",
+            BufferConfig::DEFAULT_MAX_BYTES,
+            1024..=268_435_456,
+        );
+        let channel_capacity = l.parse_in_range(
+            "RIVU_BUFFER_CHANNEL_CAPACITY",
+            BufferConfig::DEFAULT_CHANNEL_CAPACITY,
+            1..=10_000_000,
+        );
+        if channel_capacity < max_rows {
+            l.problems.push(format!(
+                "RIVU_BUFFER_CHANNEL_CAPACITY={channel_capacity} 不能小于 RIVU_BUFFER_MAX_ROWS={max_rows}：缓冲装不下一整批"
+            ));
+        }
+        let site_cache_refresh_secs = l.parse_in_range(
+            "RIVU_SITE_CACHE_REFRESH_SECS",
+            DEFAULT_SITE_CACHE_REFRESH_SECS,
+            1..=3600,
+        );
+
         if !l.problems.is_empty() {
             return Err(ConfigError {
                 problems: l.problems,
@@ -317,6 +395,13 @@ impl Config {
             log_level,
             mode,
             trusted_proxies,
+            buffer: BufferConfig {
+                flush_interval: Duration::from_millis(flush_interval_ms),
+                max_rows,
+                max_bytes,
+                channel_capacity,
+            },
+            site_cache_refresh: Duration::from_secs(site_cache_refresh_secs),
         })
     }
 }
@@ -453,6 +538,35 @@ impl Loader<'_> {
         }
     }
 
+    /// 读取整数变量并检查取值范围（闭区间）。未设置取默认值；非法时记录问题并回退默认值。
+    fn parse_in_range<T>(&mut self, name: &str, default: T, range: std::ops::RangeInclusive<T>) -> T
+    where
+        T: FromStr + PartialOrd + fmt::Display + Copy,
+    {
+        match self.optional(name) {
+            None => default,
+            Some(raw) => match raw.parse::<T>() {
+                Ok(v) if range.contains(&v) => v,
+                Ok(_) => {
+                    self.problems.push(format!(
+                        "{name}=`{raw}` 超出范围，期望 {} 到 {} 之间的整数",
+                        range.start(),
+                        range.end()
+                    ));
+                    default
+                }
+                Err(_) => {
+                    self.problems.push(format!(
+                        "{name}=`{raw}` 无效，期望 {} 到 {} 之间的整数",
+                        range.start(),
+                        range.end()
+                    ));
+                    default
+                }
+            },
+        }
+    }
+
     fn check_scheme(&mut self, name: &str, value: &str, schemes: &[&str]) {
         if !schemes.iter().any(|s| value.starts_with(s)) {
             // 不回显 value：PG 连接串里可能带密码
@@ -505,6 +619,88 @@ mod tests {
         assert_eq!(cfg.log_level, "info");
         assert_eq!(cfg.mode, Mode::Lite);
         assert!(cfg.trusted_proxies.is_empty());
+        // 写缓冲默认值取 system-design §4.7（§10.1 Q16）
+        assert_eq!(cfg.buffer.flush_interval, Duration::from_millis(1000));
+        assert_eq!(cfg.buffer.max_rows, 20_000);
+        assert_eq!(cfg.buffer.max_bytes, 8_388_608);
+        assert_eq!(cfg.buffer.channel_capacity, 200_000);
+        assert_eq!(cfg.site_cache_refresh, Duration::from_secs(10));
+    }
+
+    fn with_env(extra: &[(&str, &str)]) -> Result<Config, ConfigError> {
+        let mut env = Env::from_pairs(base_pairs());
+        for (k, v) in extra {
+            env.vars.insert((*k).into(), (*v).into());
+        }
+        Config::from_env(Role::All, &env)
+    }
+
+    #[test]
+    fn buffer_variables_are_read() {
+        let cfg = with_env(&[
+            ("RIVU_BUFFER_FLUSH_INTERVAL_MS", "250"),
+            ("RIVU_BUFFER_MAX_ROWS", "5000"),
+            ("RIVU_BUFFER_MAX_BYTES", "1048576"),
+            ("RIVU_BUFFER_CHANNEL_CAPACITY", "20000"),
+            ("RIVU_SITE_CACHE_REFRESH_SECS", "3"),
+        ])
+        .unwrap();
+        assert_eq!(cfg.buffer.flush_interval, Duration::from_millis(250));
+        assert_eq!(cfg.buffer.max_rows, 5000);
+        assert_eq!(cfg.buffer.max_bytes, 1_048_576);
+        assert_eq!(cfg.buffer.channel_capacity, 20_000);
+        assert_eq!(cfg.site_cache_refresh, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn buffer_variables_are_validated() {
+        for (name, bad) in [
+            ("RIVU_BUFFER_FLUSH_INTERVAL_MS", "0"),
+            ("RIVU_BUFFER_FLUSH_INTERVAL_MS", "9"),
+            ("RIVU_BUFFER_FLUSH_INTERVAL_MS", "60001"),
+            ("RIVU_BUFFER_FLUSH_INTERVAL_MS", "fast"),
+            ("RIVU_BUFFER_MAX_ROWS", "0"),
+            ("RIVU_BUFFER_MAX_ROWS", "1000001"),
+            ("RIVU_BUFFER_MAX_BYTES", "100"),
+            ("RIVU_BUFFER_MAX_BYTES", "-1"),
+            ("RIVU_BUFFER_CHANNEL_CAPACITY", "0"),
+            ("RIVU_SITE_CACHE_REFRESH_SECS", "0"),
+            ("RIVU_SITE_CACHE_REFRESH_SECS", "3601"),
+        ] {
+            let err = with_env(&[(name, bad)]).unwrap_err();
+            assert_eq!(err.problems.len(), 1, "{name}={bad}: {err}");
+            assert!(err.problems[0].contains(name), "{name}={bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn channel_must_hold_a_whole_batch() {
+        let err = with_env(&[
+            ("RIVU_BUFFER_MAX_ROWS", "5000"),
+            ("RIVU_BUFFER_CHANNEL_CAPACITY", "4999"),
+        ])
+        .unwrap_err();
+        assert_eq!(err.problems.len(), 1, "{err}");
+        assert!(err.problems[0].contains("RIVU_BUFFER_CHANNEL_CAPACITY"));
+        // 相等可以
+        assert!(
+            with_env(&[
+                ("RIVU_BUFFER_MAX_ROWS", "5000"),
+                ("RIVU_BUFFER_CHANNEL_CAPACITY", "5000"),
+            ])
+            .is_ok()
+        );
+        // 只调大 max_rows、没有同时调大容量：默认容量 20 万足够
+        assert!(with_env(&[("RIVU_BUFFER_MAX_ROWS", "200000")]).is_ok());
+    }
+
+    #[test]
+    fn only_worker_and_all_run_jobs() {
+        assert!(Role::All.runs_jobs());
+        assert!(Role::Worker.runs_jobs());
+        assert!(!Role::Collector.runs_jobs());
+        assert!(!Role::Api.runs_jobs());
+        assert!(!Role::Migrate.runs_jobs());
     }
 
     #[test]

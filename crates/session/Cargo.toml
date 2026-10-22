@@ -9,3 +9,13 @@ license.workspace = true
 [lints]
 workspace = true
 
+[dependencies]
+jiff.workspace = true
+parking_lot.workspace = true
+rand.workspace = true
+rivu-domain.workspace = true
+siphasher.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+rivu-reference.workspace = true
