@@ -353,7 +353,7 @@ partition         = SipHash-2-4(routing_secret,       site_id ‖ len‖ip ‖ l
 | 查找 | 先按 `visitor_id` 查，查不到再按 `prev_visitor_id` 查。两次都查不到就是新会话 |
 | 续期 | `ts - last_seen_at ≤ 30 min`，且 `ts - started_at ≤ 7 d`（§10 Q7）。7 天上限是新增的：Plausible 没有上限，却在查询里假设会话不超过 7 天（R03 §8.2、§12.2 #11），Rivu 把这个假设变成写入侧的硬约束，查询的回溯范围因此固定为 7 天（§6.5）。超过上限的事件开新会话 |
 | 新会话 | 生成新 `session_id`，事件属性成为会话属性，`keys` 只含当前 `visitor_id` |
-| 别名 key | 事件是通过 `prev_visitor_id` 续上会话的，也就是它自己的 `visitor_id` 不在该会话的 `keys` 里：把当前 `visitor_id` 加进 `keys` 并建立索引。访客 ID 在每个本地午夜轮换，7 天的会话最多跨 7 个午夜，所以最多 8 个 key。旧 key 保留到会话过期，迟到或乱序的前一天事件仍然能查到会话。已满 8 个时不再添加，事件照常续期，并累加 `session_alias_cap_hit`（正常情况不会发生，站点改时区时可能出现） |
+| 别名 key | 事件是通过 `prev_visitor_id` 续上会话的，也就是它自己的 `visitor_id` 不在该会话的 `keys` 里：把当前 `visitor_id` 加进 `keys` 并建立索引。访客 ID 在每个本地午夜轮换，7 天的会话最多跨 7 个午夜，所以最多 8 个 key。旧 key 保留到会话过期，迟到或乱序的前一天事件仍然能查到会话。已满 8 个时不再添加，事件照常续期，并累加 `session_alias_cap_hit`（站点改时区时可能出现；另外春季 DST 切换日只有 23 小时，7 天会话最多能跨 9 个本地日期，也会触发。此时第 9 天的事件仍能经 `prev_visitor_id` 命中第 8 个 key，会话切分不受影响，已由差分测试覆盖） |
 | 盖章 | 事件写入 `session_id`、`session_start`、`entry_pathname` 和全部会话属性；`visitor_id` 改写为会话的原始 ID（`keys[0]`），因此跨午夜后 ID 保持不变 |
 | engagement | 没有会话就丢弃（`no_session`）；有会话就推进 `last_seen_at`，事件照常写入（用于停留时长和滚动深度），但不计入 pageviews/events |
 
@@ -610,6 +610,8 @@ ORDER BY (site_id, minute, metric, script_version)
 TTL minute + INTERVAL 90 DAY DELETE;
 ```
 
+计数批次与事件批次一样带 `insert_deduplication_token` 重试，所以表上也要开 `non_replicated_deduplication_window`（迁移 `20261022100000_ingest_counters_dedup`）；否则「写入成功但响应丢失」后的重试会重复累加，破坏与请求数的对账。
+
 做法沿用 Plausible（R01 §10、R02 §5.4）：进程内按 10 秒分桶累加，只刷出已结束的桶，关停时强制刷出。这些计数有三个用途：
 
 - 看板上的「接入诊断」：为什么数据少了，按原因拆分；
@@ -648,7 +650,7 @@ TTL minute + INTERVAL 90 DAY DELETE;
 2. 存放导入数据，例如 Plausible 导出的 CSV，它天然对应这些表，迁移路径因此很直接（P4）；
 3. 作为大站长时间范围的加速层（§6.4）。
 
-**访客数跨天直接求和**：访客 ID 每天轮换，原始层跨多天算 `uniq(visitor_id)` 本来就约等于各天 UV 之和（R03 §12.2 #16、v1 第四节）。所以日汇总层只存每日精确去重的访客数，跨天相加与原始层口径一致，不需要 HLL 状态。
+**访客数跨天直接求和**（Q7 之后这条前提不再严格成立，见 §10.1 Q9）：访客 ID 每天轮换，原始层跨多天算 `uniq(visitor_id)` 本来就约等于各天 UV 之和（R03 §12.2 #16、v1 第四节）。所以日汇总层只存每日精确去重的访客数，跨天相加与原始层口径一致，不需要 HLL 状态。
 
 ### 5.6 删除与保留
 
@@ -862,6 +864,23 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 | Q6 | 是否做 `SAMPLE` 采样 | 暂不做，用日汇总层的自动分层代替；DDL 里保留 `SAMPLE BY visitor_id` | §2.6；§5.2；§6.4 |
 | Q7 | 会话最长时长 | 7 天（原为 24 小时）。续期条件：`ts − last_seen_at ≤ 30 min` 且 `ts − started_at ≤ 7 d`。跨午夜靠会话的别名 key，最多 8 个 | §4.6（规则、并发、内存、预热、失败语义）；§4.5；§6.5 `visits` 回溯 7 天；§7 内存；§8 |
 | Q8 | Reliable 的分区数 P | P = 32，安装时固定；以后要改，必须先排空队列再迁移 | §4.8；`platform-and-ops.md` 的 `RIVU_PARTITIONS` |
+
+### 10.1 待决问题（P1 动工前发现，2026-10-22）
+
+下列问题是在给 P1 写指标口径时发现的文档间冲突（见 [`../brief-p1.md`](../brief-p1.md)）。「P1 暂行」一列是 P1 最细链路采用的做法，定案前可以推翻；定案后改写各节正文，并把该行移到上表。
+
+| # | 冲突 | 证据 | 建议 | P1 暂行 |
+|---|---|---|---|---|
+| Q9 | 盖章改写 `visitor_id` 让访客数在单日和跨天都失真 | §4.6「盖章」把跨本地午夜续上的事件的 `visitor_id` 改写为会话的原始 ID（前一天的 ID）。设某人有一个跨过 d/d+1 午夜的会话：(a) 当天 d+1 他又开了一个新会话，新会话用 d+1 的 ID，于是 d+1 当天被算成 2 个访客，**单日也多算**；(b) 如果 d+1 没有新会话，两天的范围里 `uniq(visitor_id)` 只算 1，而日汇总层把每天的 UV 相加算 2（§5.5 的前提不成立），规划器换层时数字会跳。在盖章后的 ID 上换任何一种 `uniq` 写法都修不好，因为丢失了「这个事件属于哪一天的 ID」 | 不再改写：事件保留自己当天的 `visitor_id`，会话只靠 `session_id` 串起来。`sessions` 的分组改为 `(site_id, start_date, session_id)`，`visitor_id` 改成聚合列（取会话第一个事件的 ID），`SAMPLE BY` 改为 `session_id`。这样任意范围的 `uniq(visitor_id)` 都等于「各本地日不同访客数之和」，与日汇总层相加严格相等，事件表里也不再有跨天可关联的 ID。代价：改 `sessions` DDL（尚未发布，可以就地改） | 先按现行 §4.6 实现；参考实现按「各本地日不同的人数之和」定义真值，差分测试把这个偏差作为已知用例固定下来，定案后翻转 |
+| Q10 | 原始层近似去重、汇总层精确去重 | §6.5 `visitors = uniq(visitor_id)`（ClickHouse 的 `uniq` 是自适应采样的近似算法）；§5.5 说日汇总层存「每日精确去重」的访客数。两层算法不同，同一天的数字可能不一致 | 两层用同一个函数，日汇总层存的就是按同样方法算出的每日值。容差写进指标口径文档；小基数下 `uniq` 的实际误差在锁定的 ClickHouse 版本上实测后写明 | 用 `uniq`；参考实现的差分测试只用小数据集 |
+| Q11 | `site_key` 格式 | PG 迁移与 `platform-and-ops.md` §3.3：`^[a-z2-7]{12}$`；`tracker-and-protocol.md` §5.1：`^[A-Za-z0-9_-]{8,32}$`，示例是 16 位大小写混合 | 生成格式以 PG 为准（12 位 base32 小写）；线协议保持宽松的正则，作为向前兼容的语法检查，不合法的 key 只会落到 `unknown_site`。改写 `tracker-and-protocol.md` 的示例 | 采用建议 |
+| Q12 | hostname 白名单为空时怎么处理 | PG 迁移注释与 `platform-and-ops.md` §3.3：「白名单为空表示不校验」；`tracker-and-protocol.md` §7、偏离 #17：fail-closed，全部丢弃 | fail-closed，同时建站时自动加入主域名（`platform-and-ops.md` §3.3 已有这条）。PG 迁移的注释随下一次 schema 变更修正 | fail-closed |
+| Q13 | 丢弃原因的标识符 | §4.2：`unknown_site` `site_disabled` `hostname_not_allowed` `rate_limited` `no_session` `overloaded` 等；`tracker-and-protocol.md` §6.4：`dropped_disabled` `dropped_hostname` `dropped_throttle` `dropped_no_session_for_engagement` 等；§2.2 还有 `buffered`；未知站点在 `ingest_counters.site_id UInt64` 里怎样表示也没写 | Rust 里一个枚举作为唯一来源。`ingest_counters.metric` 取 `accepted` 或 `dropped_<§4.2 的原因名>`；400 错误按 `rejected_<字段>` 只进 Prometheus，不进 `ingest_counters`；未知站点记 `site_id = 0` | 采用建议 |
+| Q14 | 查询超时 | §6.8：看板 10 s、API 20 s、公开或共享链接 5 s；`platform-and-ops.md` §4.4、§7：`RIVU_QUERY_TIMEOUT_SECS=15`、`RIVU_PUBLIC_QUERY_TIMEOUT_SECS=8` | 按调用方分三档，默认值取 §6.8，配置变量改成三个；`platform-and-ops.md` 随之修改 | P1 只有内部查询，不涉及 |
+| Q15 | Lite 从 ClickHouse 预热时找不到分片 | §4.6：Lite 的分片号取 routing 哈希对 64 取模，输入是 IP 和 UA；预热第 2 步从 `sessions` 表重建会话，表里只有 `visitor_id`，没有 routing 哈希，Lite 的 `ingest_partition` 又固定写 0，所以重建出的会话不知道该放进哪个分片，之后的事件查不到它 | Lite 也把 `routing mod 32` 写进 `ingest_partition`，分片数固定为 32，与 Reliable 的 P 相同；预热按 `ingest_partition` 放回分片。只多持久化 5 bit，Reliable 本来就存 | 分片数 32，写入 `ingest_partition`；预热本身留到后续步骤 |
+| Q16 | 写缓冲默认值 | §4.7：1 s、2 万行或 8 MB，channel 容量 20 万条；`platform-and-ops.md` §7：`RIVU_BUFFER_MAX_ROWS=5000`、`RIVU_BUFFER_CHANNEL_CAPACITY=20000` | 变量名用 `platform-and-ops.md` 的，默认值以本文 §4.7 为准（本文优先），压测（P2）后再调；`platform-and-ops.md` 随之修改 | 采用建议 |
+| Q17 | `visitors` 是否统计 engagement 事件 | §6.5 的 `visitors = uniq(visitor_id)` 没写过滤条件，只有 `realtime` 明写 `name != 'engagement'` | 排除 engagement，与 `realtime` 同口径：engagement 只是已有页面浏览的附属信号，不代表一次到访。§6.5 写明 | 排除 |
+| Q18 | 线协议的错误词表与测试清单 | `tracker-and-protocol.md` §6.2 的固定词表没有「格式不对」「含控制字符」这类消息；§11.1 测试清单要求测 `u` 的 2000/2001 字节边界，但 §5.1 规定 `u` 只受 8 KB 请求体上限约束、超长时截断而不是 400 | 词表补一条 `has an invalid format`，用于 `s` 格式错、`n` 含控制字符、`$` 字段格式错；删掉 §11.1 的 `u` 长度用例，改成「超长 query 被丢弃、pathname 截断到 1024 字节，不回 400」 | 暂用 `is not supported`；`u` 不限长 |
 
 ---
 
