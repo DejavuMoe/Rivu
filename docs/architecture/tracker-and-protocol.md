@@ -331,8 +331,8 @@ rivu('event', 'Video Play', { interactive: false })   // 发 i:false，不影响
 | hash 模式 | 仅 `h=1` 且 fragment 非空：取 fragment，**在首个 `?` 处截断**（hash 路由里的 query 同样视为敏感）；若不以 `/` 或 `!/` 开头且含 `=`（形如 `#access_token=…`）则丢弃；其余追加 `"#" + 安全解码(fragment)`。截去的 `?` 部分按下一行规则仅提取白名单参数，且优先级低于真实 query | `[01 §2.6]` `[01 §4.1]` |
 | query 白名单 | 用 `form_urlencoded` 解析（非法转义原样保留，非 UTF-8 以 U+FFFD 替换，不报错）。取 `utm_source`、`utm_medium`、`utm_campaign`、`utm_content`、`utm_term`；来源回退键 `source`、`ref`（顺序 `utm_source` → `source` → `ref`）。键区分大小写；同名取首个；值 trim、去控制字符、截断 255 字符。**其余参数一律丢弃**，不存储、不写日志 | 决策 5；`[01 §4.5]` |
 | 空串即缺失 | 上述所有参数、`r`、`p` 的键/值，空串（trim 后）视为缺失，不压过回退项：`?utm_source=&ref=x` 取 `ref=x`；`utm_medium=` 为空则按未设置 | 决策 5；`[01 §4.5]` `[01 §11.2 #5]` |
-| click id | 按顺序取第一个**值非空**的参数，**只存参数名**：`gclid`、`gbraid`、`wbraid`、`msclkid`、`fbclid`、`twclid`、`ttclid`、`li_fat_id`（前 6 项同 `[01 §4.5]`，后 2 项为 Rivu 追加）。medium 推断（如 `gclid`→`(gclid)`）属富化阶段，不在本规范 | 决策 5；`[01 §4.5]` `[01 §8.4]` |
-| referrer | 先按字符截断到 2000；解析为 URL，scheme 须为 `http`/`https`/`android-app`，host 非空；host 按 hostname 规则规范化；**若 host 命中本站白名单则视为内部**（不作来源；Plausible 为 host 全等，子域互跳算外部 `[01 §8.3]` `[01 §11.2 #6]`）。存储形态：`host + path`（去结尾 `/`，无 query、无 fragment） | `[01 §8.3]` |
+| click id | 按顺序取第一个**值非空**的参数，**只存参数名**：`gclid`、`gbraid`、`wbraid`、`msclkid`、`fbclid`、`twclid`、`ttclid`、`li_fat_id`（前 6 项同 `[01 §4.5]`，后 2 项为 Rivu 追加）。来源与渠道推断（只有 click id 时按参数名推断来源，`gclid` `gbraid` `wbraid` `msclkid` `ttclid` 配同平台来源算付费证据；不像 Plausible 那样改写 medium）属富化阶段，不在本规范（`system-design.md` §4.2、§10 Q20） | 决策 5；`[01 §4.5]` `[01 §8.4]` |
+| referrer | 先按字符截断到 2000；解析为 URL，scheme 须为 `http`/`https`/`android-app`，host 非空；host 按 hostname 规则规范化；**若 host 命中本站白名单则视为内部**（不作来源；Plausible 为 host 全等，子域互跳算外部 `[01 §8.3]` `[01 §11.2 #6]`）。存储形态：`host + path`（去结尾 `/`，无 query、无 fragment）。浏览器默认 Referrer Policy 下跨站 referrer 只有 origin，所以 path 通常为空（可信度见 `system-design.md` §6.10） | `[01 §8.3]` |
 | props | 键 trim；空键/空值丢弃；number/boolean 转字符串（布尔为 `true`/`false`）；null/数组/对象 → 400；> 30 键 → 400（不静默截断）；键 > 300 B 或值 > 2000 B → 400。保留 JSON 对象顺序，同名键后者覆盖 | 决策 4；`[01 §4.2]` `[01 §11.2 #4]` |
 | 事件名 | trim；≤120 字符；含控制字符 → 400；不改大小写 | `[01 §4.1]` |
 | interactive | `pageview`/`engagement` 恒 `true`；自定义事件仅 `i === false` 为 false | `[01 §2.2]` |
@@ -447,3 +447,4 @@ rivu('event', 'Video Play', { interactive: false })   // 发 i:false，不影响
 3. ~~`u` 超 2000 B 返回 400 会丢整条 pageview~~：已定，服务端对超长 `u` 不回 400，先丢弃白名单以外的 query，再把 pathname 截断到 1024 字节（§5.1、`system-design.md` §10 Q18）；客户端不需要预先剥离。
 4. 兼容层 `d` 含逗号（多站点扇出）按 400 拒绝，是否可接受。
 5. 白名单为空 fail-closed、`*.example.com` 不含根域；`r` 仅文档首个 pageview 携带（偏离 Plausible）；DNT/GPC 是否进入后续阶段。
+6. 可选的新字段（新增可选字段不升版，§8）：在 `Macintosh` UA 上附带 `navigator.maxTouchPoints` 可把 iPadOS 桌面 UA 改判为平板；高熵 Client Hints 的 `platformVersion` 可区分 Windows 10 / 11。两者都会让 tracker 多发数据或多读一个 API，不属于 P1，P2 以后再议（`system-design.md` §10 Q22、Q23）。
