@@ -112,7 +112,7 @@ impl HostnamePatterns {
             .any(|(pos, _)| pos > 0 && self.wildcard_suffixes.contains(&host[pos..]))
     }
 
-    /// 没有任何有效模式。调用方必须 fail-closed：全部丢弃（`system-design.md` §10.1 Q12）。
+    /// 没有任何有效模式。调用方必须 fail-closed：全部丢弃（`system-design.md` §10 Q12）。
     pub fn is_empty(&self) -> bool {
         self.exact.is_empty() && self.wildcard_suffixes.is_empty()
     }

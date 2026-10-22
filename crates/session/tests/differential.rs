@@ -172,7 +172,6 @@ fn assert_matches_reference(
     // 盖章字段。
     for rs in &reference {
         let first = rs.event_indices[0];
-        let first_own = identity_of(&events[first], tz).0;
         let mut entry = String::new();
         for &i in &rs.event_indices {
             let Assignment::Stamped(s) = &assignments[i] else {
@@ -183,8 +182,10 @@ fn assert_matches_reference(
                 entry = events[i].pathname.clone();
             }
             assert_eq!(s.session_start_ms, rs.started_at_ms);
-            assert_eq!(s.visitor_id, first_own, "visitor_id 是会话的原始 ID");
-            assert_eq!(s.own_visitor_id, own);
+            assert_eq!(
+                s.visitor_id, own,
+                "visitor_id 是事件自己的 ID，不被盖章改写（Q9）"
+            );
             assert_eq!(&*s.entry_pathname, entry, "入口页");
             assert_eq!(
                 s.attrs.browser,
@@ -202,7 +203,7 @@ fn assert_matches_reference(
     reference
 }
 
-/// 用 Stamp 的 id 按 (站点, 本地日, id) 去重得到每个站点的访客数（`use_own` 选哪个 id）。
+/// 范围内某站点非 engagement 事件的 `Stamp::visitor_id` 的不同值个数，即查询里的 `uniq(visitor_id)`。
 fn stamp_visitors(
     events: &[RawEvent],
     tz: &TimeZone,
@@ -210,7 +211,6 @@ fn stamp_visitors(
     site: u64,
     from: Date,
     to: Date,
-    use_own: bool,
 ) -> u64 {
     let mut set = HashSet::new();
     for (e, a) in events.iter().zip(assignments) {
@@ -220,14 +220,7 @@ fn stamp_visitors(
         }
         let d = identity::local_date(e.ts_ms, tz);
         if d >= from && d <= to {
-            set.insert((
-                d,
-                if use_own {
-                    s.own_visitor_id
-                } else {
-                    s.visitor_id
-                },
-            ));
+            set.insert(s.visitor_id);
         }
     }
     set.len() as u64
@@ -250,8 +243,8 @@ proptest! {
         let to = identity::local_date(events[events.len() - 1].ts_ms, &tz);
         for site in 1..=2u64 {
             let m = metrics(&events, &reference, site, &tz, from, to);
-            // 访客真值 = 各本地日不同人数之和；用事件自己的 visitor_id 按 (本地日, id) 去重应当相等。
-            prop_assert_eq!(m.visitors, stamp_visitors(&events, &tz, &assignments, site, from, to, true));
+            // 访客真值 = 各本地日不同人数之和；Q9 定案后直接对 visitor_id 去重就严格相等。
+            prop_assert_eq!(m.visitors, stamp_visitors(&events, &tz, &assignments, site, from, to));
             // 整个范围内所有该站点的会话都是活跃的。
             prop_assert_eq!(m.visits, reference.iter().filter(|s| s.site_id == site).count() as u64);
             prop_assert!((0.0..=1.0).contains(&m.bounce_rate));

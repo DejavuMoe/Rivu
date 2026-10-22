@@ -25,6 +25,7 @@ struct SessionAgg {
     engagement_ms: u64,
     entry: (String, String),
     exit: (String, String),
+    last_visitor_id: u64,
 }
 
 fn var(name: &str) -> Option<String> {
@@ -106,14 +107,15 @@ async fn insert_batch(
         .expect("写入 events");
 }
 async fn session_aggregates(reader: &Client, site_id: u64) -> Vec<SessionAgg> {
-    // 内层按完整排序键 GROUP BY：合并 AggregatingMergeTree 里尚未合并的部分行
+    // 内层按完整排序键 `(site_id, start_date, session_id)` GROUP BY（§10 Q9）：合并 AggregatingMergeTree 里尚未合并的部分行
     reader
         .query(
             "SELECT sum(pageviews) AS pageviews, sum(events) AS events, \
                     sum(interactive_events) AS interactive_events, sum(engagement_ms) AS engagement_ms, \
-                    argMinIfMerge(entry_page) AS entry, argMaxIfMerge(exit_page) AS exit \
+                    argMinIfMerge(entry_page) AS entry, argMaxIfMerge(exit_page) AS exit, \
+                    argMaxMerge(last_visitor_id) AS last_visitor_id \
              FROM rivu.sessions WHERE site_id = {site:UInt64} \
-             GROUP BY site_id, start_date, visitor_id, session_id",
+             GROUP BY site_id, start_date, session_id",
         )
         .param("site", site_id)
         .fetch_all::<SessionAgg>()
@@ -183,7 +185,7 @@ async fn session_mv_aggregates_and_dedups() {
     let nanos = now.unix_timestamp_nanos();
     let site_id = 9_000_000_000_000_000_000u64 + (nanos % 1_000_000_000_000) as u64;
     let session_id = (nanos as u64) | 1;
-    let rows = vec![
+    let mut rows = vec![
         event(site_id, session_id, base, 0, "pageview", "/", 0),
         event(site_id, session_id, base, 10, "pageview", "/pricing", 0),
         event(
@@ -196,6 +198,10 @@ async fn session_mv_aggregates_and_dedups() {
             7000,
         ),
     ];
+    // 事件保留自己当天的 visitor_id（Q9）：最后一个事件（含 engagement）的 ID 就是 last_visitor_id，
+    // 供预热建 key；这里让它与前两个事件不同，以验证取的是时间最晚的那个。
+    let last_visitor_id = session_id ^ 0x1234;
+    rows[2].visitor_id = last_visitor_id;
 
     insert_batch(
         &writer,
@@ -212,6 +218,7 @@ async fn session_mv_aggregates_and_dedups() {
         engagement_ms: 7000,
         entry: ("example.test".into(), "/".into()),
         exit: ("example.test".into(), "/pricing".into()),
+        last_visitor_id,
     };
     let sessions = session_aggregates(&reader, site_id).await;
     assert_eq!(sessions, vec![expected], "首次写入后的会话聚合");
@@ -260,6 +267,7 @@ async fn session_mv_aggregates_and_dedups() {
     assert_eq!(sessions[0].pageviews, 4);
     assert_eq!(sessions[0].events, 4);
     assert_eq!(sessions[0].engagement_ms, 14000);
+    assert_eq!(sessions[0].last_visitor_id, last_visitor_id);
 
     // 清理测试数据（尽力而为；mutation 异步执行）
     for table in ["events", "sessions"] {

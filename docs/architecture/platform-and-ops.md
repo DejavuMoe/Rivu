@@ -171,7 +171,7 @@ CREATE TABLE site_hostnames (
 );
 CREATE UNIQUE INDEX site_hostnames_site_pattern ON site_hostnames (site_id, pattern) WHERE deleted_at IS NULL;
 CREATE INDEX site_hostnames_updated ON site_hostnames (updated_at);
--- `*.example.com` 匹配任意深度子域，不含 apex（apex 另加一条）；建站时自动加入主域；白名单为空表示不校验。命中逻辑见 system-design.md
+-- `*.example.com` 匹配任意深度子域，不含 apex（apex 另加一条）；建站时自动加入主域名，所以白名单不会为空；万一为空，collector fail-closed：丢弃全部事件（`hostname_not_allowed`，`system-design.md` §10 Q12）。命中逻辑见 system-design.md
 CREATE TABLE shield_rules (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   site_id bigint NOT NULL REFERENCES sites(id),
@@ -231,8 +231,8 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 ```
 
 设计说明：
-- **站点删除是多阶段流程**（借鉴 04§9.9 的「提醒、撤销窗口、执行前复核」与 04§3.2 `ClickhouseCleanSites` 的分批清理）：`sites.deleted_at` 置位后缓存立即摘除，collector 以 `site_deleted` 丢弃；宽限期（`RIVU_SITE_DELETE_GRACE_DAYS`，默认 7）内可恢复；到期后 `site_delete_schedule` 插入 `scope='site'` 意图，由 `ch_delete_batch` 按分区执行。日期范围删除立即插入 `scope='date_range'` 意图，完成后触发受影响日期的 rollup 重建（见 `system-design.md`）。
-- **盐**：事件用**站点本地日期**对应的盐，各进程每 60 秒从 PG 刷新；缺盐则丢弃事件并计入 `salt_missing`，绝不在 collector 现场生成（避免多副本分歧）。只缺前一天的盐时，不计算 `prev_visitor_id`（这次不续会话），事件照常接收。Reliable 下访客 ID 在入队前计算，JetStream 积压不依赖盐的保留期。任务见第 6 节 `salts_rotate`。
+- **站点删除是多阶段流程**（借鉴 04§9.9 的「提醒、撤销窗口、执行前复核」与 04§3.2 `ClickhouseCleanSites` 的分批清理）：`sites.deleted_at` 置位后缓存立即摘除，此后 collector 按 `unknown_site` 丢弃（`system-design.md` §10 Q13）；宽限期（`RIVU_SITE_DELETE_GRACE_DAYS`，默认 7）内可恢复；到期后 `site_delete_schedule` 插入 `scope='site'` 意图，由 `ch_delete_batch` 按分区执行。日期范围删除立即插入 `scope='date_range'` 意图，完成后触发受影响日期的 rollup 重建（见 `system-design.md`）。
+- **盐**：事件用**站点本地日期**对应的盐，各进程每 60 秒从 PG 刷新；缺盐则丢弃事件并计入 `dropped_salt_missing`，绝不在 collector 现场生成（避免多副本分歧）。只缺前一天的盐时，不计算 `prev_visitor_id`（这次不续会话），事件照常接收。Reliable 下访客 ID 在入队前计算，JetStream 积压不依赖盐的保留期。任务见第 6 节 `salts_rotate`。
 
 ## 4. 权限模型
 ### 4.1 角色 × 动作矩阵
@@ -287,7 +287,7 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 | 登录 | IP 与账号各一桶 | 5 次/60 秒（沿用 04§2.4） | 429，统一提示 |
 | `/api/event` | 站点与全局 | 见 `system-design.md` | — |
 
-限额挂在 org 而非 key，同 org 多把 key 共享（04§2.3、04§9.3；Plausible 的 key 级限额列已被迁移删除）。shared link 与公开看板的 ClickHouse 查询用更低超时 `RIVU_PUBLIC_QUERY_TIMEOUT_SECS`（默认 8），登录用户为 `RIVU_QUERY_TIMEOUT_SECS`（默认 15，与 Plausible 的 15s 同量级，04§4.2）。
+限额挂在 org 而非 key，同 org 多把 key 共享（04§2.3、04§9.3；Plausible 的 key 级限额列已被迁移删除）。ClickHouse 查询的超时按调用方分三档（`system-design.md` §6.8、§10 Q14）：看板（登录会话）`RIVU_QUERY_TIMEOUT_SECS`（默认 10）；公开 API（API key）`RIVU_API_QUERY_TIMEOUT_SECS`（默认 20，与 Plausible 的 20s 同量级，04§4.2）；公开看板与 shared link `RIVU_PUBLIC_QUERY_TIMEOUT_SECS`（默认 5，最低）。三档都必须不大于 `rivu_reader` 配额里的 `max_execution_time` 上限（第 8 节）。
 
 ## 5. 认证与会话安全
 | 项 | 规则 |
@@ -313,7 +313,7 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 
 | 任务 `kind` | 触发 | 频率 | 幂等性 |
 |---|---|---|---|
-| `salts_rotate` | cron + 进程启动补跑 | 每日 00:05 UTC | 生成 `today+1` 的盐（`ON CONFLICT DO NOTHING`），删除 `day < today-2`；启动时确保 `today-1`、`today`、`today+1` 存在（UTC 以西站点的本地日期可能还是 `today-1`）。依据：站点本地日期相对 UTC 日期在 −1 到 +1 天内，多留 1 天覆盖迟到事件 |
+| `salts_rotate` | 进程启动补跑 + 定时 | 启动时一次，之后每小时一次（P1 实现为进程内定时器，没有 cron；原定每日 00:05 UTC，改为每小时是因为盐只需「提前一天存在」，不必卡在固定时刻） | 确保存在 `today-1`、`today`、`today+1` 的盐（`ON CONFLICT DO NOTHING`；UTC 以西站点的本地日期可能还是 `today-1`），删除 `day < today-2`。依据：站点本地日期相对 UTC 日期在 −1 到 +1 天内，多留 1 天覆盖迟到事件 |
 | `auth_sessions_cleanup` | cron | 每小时 | 删除过期/撤销行，可重复 |
 | `invitations_expire` | cron | 每日 | 删除过期邀请（04§3.2 `CleanInvitations`） |
 | `ch_delete_batch` | cron + 删除请求入队 | 每 5 分钟 | 领取 `pending_stats_deletions`（`not_before <= now()`，`SKIP LOCKED`），按分区做轻量删除，完成分区记入 `partitions_done`，崩溃续跑；重复删除无副作用。Plausible 为每周批处理（04§3.2 `ClickhouseCleanSites`），Rivu 缩短周期以满足删除请求时效。细节见 `system-design.md` |
@@ -351,14 +351,14 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 | `RIVU_NATS_URL`、`RIVU_NATS_STREAM_MAX_AGE` | reliable 必填；`72h` | JetStream 地址与积压保留窗口 |
 | `RIVU_TRUSTED_PROXIES` | 空（不信任任何代理） | 逗号分隔 CIDR；compose 设为网络子网 |
 | `RIVU_BUFFER_FLUSH_INTERVAL_MS` | `1000` | flush 间隔（Plausible 默认 5000，04§4.2） |
-| `RIVU_BUFFER_MAX_ROWS`、`RIVU_BUFFER_MAX_BYTES` | `5000`、`8388608` | 单批上限，压测起点（对应 04§4.2 `CLICKHOUSE_MAX_BUFFER_SIZE_BYTES`） |
-| `RIVU_BUFFER_CHANNEL_CAPACITY` | `20000` | 有界 channel，满则 503 背压 |
+| `RIVU_BUFFER_MAX_ROWS`、`RIVU_BUFFER_MAX_BYTES` | `20000`、`8388608` | 单批上限，取 `system-design.md` §4.7 的值，压测（P2）后再调（对应 04§4.2 `CLICKHOUSE_MAX_BUFFER_SIZE_BYTES`）；`MAX_ROWS` 范围 1–1000000 |
+| `RIVU_BUFFER_CHANNEL_CAPACITY` | `200000` | 有界 channel，满则 503 背压；不得小于 `RIVU_BUFFER_MAX_ROWS` |
 | `RIVU_CH_INGEST_POOL_SIZE` | `5` | 写入连接数（04§4.2 `CLICKHOUSE_INGEST_POOL_SIZE`） |
 | `RIVU_VISIT_SESSION_TIMEOUT` | `30m` | 访问会话超时（区别于登录会话）。会话最长 7 天，固定不可配置：查询回溯 7 天依赖它（`system-design.md` §4.6、§6.5） |
 | `RIVU_PARTITIONS` | `32`（仅 reliable） | JetStream 分区数 P，只在首次创建流时读取，之后以流元数据里记录的值为准，不一致则拒绝启动；安装后不可改（`system-design.md` §4.8） |
 | `RIVU_RETENTION_DAYS` | `731` | 原始数据保留上限（连续两个自然年，含一个闰年），站点可在其内调小。ClickHouse 表 TTL 同为 731 天，调高需要迁移；日均千万级事件的部署建议调低（`system-design.md` §7） |
 | `RIVU_SITE_DELETE_GRACE_DAYS` | `7` | 站点删除撤销窗口 |
-| `RIVU_SITE_CACHE_REFRESH_SECS` | `10` | 站点缓存增量刷新周期（另有 `pg_notify` 主动失效） |
+| `RIVU_SITE_CACHE_REFRESH_SECS` | `10` | 站点缓存刷新周期。P1 每个周期全量重载；按 `updated_at` 水位的增量刷新与 `pg_notify` 主动失效尚未实现（`system-design.md` §4.3） |
 | `RIVU_GEOIP_DB_PATH` | `${RIVU_DATA_DIR}/geoip/geoip.mmdb` | 当前生效的 mmdb。所有来源都落在这个文件，旁边有 `.meta.json` 记录来源、ETag、署名 |
 | `RIVU_GEOIP_DB_URL` | 空 | 自定义 mmdb 直链（http/https，`.mmdb` 或 `.mmdb.gz`），优先级最高；支持 `_FILE`。许可由运维者负责 |
 | `RIVU_MAXMIND_LICENSE_KEY`、`RIVU_MAXMIND_EDITION` | 空；`GeoLite2-City` | 配置 key 后使用 MaxMind GeoLite2 并自动更新；优先级低于 `RIVU_GEOIP_DB_URL`。下载接口若还要求 Account ID，则新增 `RIVU_MAXMIND_ACCOUNT_ID`（实现时核对） |
@@ -368,7 +368,7 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 | `RIVU_DATA_DIR` | `/var/lib/rivu` | GeoIP 与本地导出 |
 | `RIVU_JOBS`、`RIVU_JOBS_CONCURRENCY` | 见 1.1；`4` | 任务开关与同进程并发数 |
 | `RIVU_API_RATE_PER_HOUR`、`RIVU_API_BURST` | `10000`、`60` | org 默认小时配额与令牌桶容量 |
-| `RIVU_QUERY_TIMEOUT_SECS`、`RIVU_PUBLIC_QUERY_TIMEOUT_SECS` | `15`、`8` | 须不大于 reader 配额上限 |
+| `RIVU_QUERY_TIMEOUT_SECS`、`RIVU_API_QUERY_TIMEOUT_SECS`、`RIVU_PUBLIC_QUERY_TIMEOUT_SECS` | `10`、`20`、`5` | 看板、公开 API、公开看板与共享链接各一档（取值 1–300）；须不大于 reader 配额上限（第 8 节） |
 | `RIVU_SHIELD_MAX_RULES_PER_SITE` | `500` | 每站规则上限 |
 | `RIVU_REGISTRATION`、`RIVU_SETUP_TOKEN` | `invite_only`；可选 | 注册策略；首次 `/setup` 令牌 |
 | `RIVU_LOG_FORMAT`、`RIVU_LOG_LEVEL` | `json`、`info` | `json` \| `pretty` |

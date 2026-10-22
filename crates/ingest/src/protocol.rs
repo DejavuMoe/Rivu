@@ -38,6 +38,7 @@ const MUST_BE_OBJECT: &str = "must be an object";
 const MUST_BE_JSON_OBJECT: &str = "must be a JSON object";
 const NOT_VALID_JSON: &str = "is not valid JSON";
 const NOT_SUPPORTED: &str = "is not supported";
+const INVALID_FORMAT: &str = "has an invalid format";
 const MUST_BE_URL: &str = "must be a valid url";
 const SCHEME_NOT_ALLOWED: &str = "scheme is not allowed";
 const ENGAGEMENT_NEEDS_SD_OR_E: &str = "at least one of sd or e is required";
@@ -167,8 +168,7 @@ fn parse_site_key(obj: &Map<String, Value>, errs: &mut ProtocolErrors) -> Option
     if is_valid_site_key(s) {
         Some(s.to_owned())
     } else {
-        // 词表里没有「格式错」专用消息，沿用 `is not supported`。
-        errs.add("s", NOT_SUPPORTED);
+        errs.add("s", INVALID_FORMAT);
         None
     }
 }
@@ -180,7 +180,7 @@ fn parse_name(raw: &str, errs: &mut ProtocolErrors) -> Option<String> {
     } else if name.chars().count() > MAX_EVENT_NAME_CHARS {
         errs.add("n", too_long(MAX_EVENT_NAME_CHARS));
     } else if name.chars().any(char::is_control) {
-        errs.add("n", NOT_SUPPORTED);
+        errs.add("n", INVALID_FORMAT);
     } else {
         return Some(name.to_owned());
     }
@@ -320,7 +320,7 @@ fn validate_revenue(v: &Value, errs: &mut ProtocolErrors) {
                     is_valid_currency(s)
                 };
                 if !ok {
-                    errs.add("$", NOT_SUPPORTED);
+                    errs.add("$", INVALID_FORMAT);
                 }
             }
             Some(_) => errs.add("$", MUST_BE_STRING),
@@ -618,7 +618,7 @@ mod tests {
             e.to_json(),
             json!({"errors": {
                 "v": ["is not supported"],
-                "s": ["is not supported"],
+                "s": ["has an invalid format"],
                 "n": ["is required"],
                 "u": ["must be a valid url"],
                 "p": ["must be an object"],
@@ -717,7 +717,7 @@ mod tests {
             "abcdefgh\n",
             "",
         ] {
-            assert_single_error(&with(base(), "s", json!(bad)), "s", "is not supported");
+            assert_single_error(&with(base(), "s", json!(bad)), "s", "has an invalid format");
         }
     }
 
@@ -774,7 +774,7 @@ mod tests {
             assert_single_error(&with(base(), "n", json!(empty)), "n", "is required");
         }
         for bad in ["a\u{0}b", "a\nb", "a\tb", "a\u{7f}b", "a\u{85}b"] {
-            assert_single_error(&with(base(), "n", json!(bad)), "n", "is not supported");
+            assert_single_error(&with(base(), "n", json!(bad)), "n", "has an invalid format");
         }
         assert_single_error(&with(base(), "n", json!(5)), "n", "must be a string");
         assert_single_error(&without(base(), "n"), "n", "is required");
@@ -1283,7 +1283,7 @@ mod tests {
             ("12", "ÜSD"),
         ] {
             let v = with(custom(), "$", json!({"a": a, "c": c}));
-            assert_single_error(&v, "$", "is not supported");
+            assert_single_error(&v, "$", "has an invalid format");
         }
     }
 
@@ -1333,6 +1333,7 @@ mod tests {
             "is not valid JSON",
             "has too many keys (max 30)",
             "is not supported",
+            "has an invalid format",
             "must be a valid url",
             "scheme is not allowed",
             "at least one of sd or e is required",

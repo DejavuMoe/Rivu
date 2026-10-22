@@ -86,7 +86,7 @@ Rivu 保留这三个抽象，但替换 Plausible 最脆弱的一环。Plausible 
 | 请求解析 | 检查必填和长度，规范化 URL，生成服务端时间戳（截断到秒） | `Request.build`，协议错误返回 `400` | R01 §4 |
 | 预检 | 先查垃圾引荐，再过 GateKeeper：站点缓存、`accept_traffic_until`、固定窗口限流 | 只读 ETS，未命中直接 `not_found` | R01 §5.1、§6 |
 | 管线 | 18 步：头部判定 → shield（hostname/page/IP）→ 地理 → 国家 shield → UA/机器人 → 基础字段 → 来源/UTM → props → salt → user_id → 校验 → 会话 | 每一步返回 `Continue` 或 `Drop(reason)`，并计时 | R01 §5.2 |
-| 计数 | 按「域名 × 脚本版本 × 分钟」记录 `buffered` 和 `dropped_<reason>`，写入 `ingest_counters` | 10 秒一个桶，只刷出已结束的桶 | R01 §10 |
+| 计数 | 按「域名 × 脚本版本 × 分钟」记录 `accepted` 和 `dropped_<原因>`（Rivu 的标识符见 §4.2、§10 Q13），写入 `ingest_counters` | 10 秒一个桶，只刷出已结束的桶 | R01 §10 |
 | 响应 | 被过滤的事件一律回 `202 ok`，加 `x-plausible-dropped` 头 | 只有协议错误才回 `400` | R01 §3 |
 
 不变量：
@@ -224,8 +224,9 @@ api × M ─► ClickHouse（只读账号）/ PostgreSQL          jobs：运行�
 |---|---|---|
 | 接受 | `202`，空响应体 | Lite：已进入有界缓冲；Reliable：已收到 PubAck |
 | 被过滤（机器人、未知站点、限流、规则命中、没有会话的 engagement） | `202` + `x-rivu-dropped: <数量>` | 不暴露原因，原因只进 `ingest_counters` |
-| 协议错误（JSON 不合法、缺字段、超长） | `400` + `{"errors":{…}}` | 不计入 dropped |
-| 请求体超过 8 KB | `413` | |
+| 协议错误（JSON 不合法、缺字段、超长、格式不对） | `400` + `{"errors":{…}}` | 不计入 dropped，也不进 `ingest_counters`；按 `rejected_<字段>` 只进 Prometheus（§10 Q13） |
+| 请求体超过 8 KB | `413` + `Connection: close` | |
+| 读请求体超时（5 s） | `408` + `Connection: close` | |
 | 过载（缓冲满、JetStream 不可用） | `503` + `Retry-After` | 计入 `dropped_overloaded` |
 
 浏览器端不重试（R01 §2.5），所以「等 ClickHouse 确认后再回复」对数据完整性没有帮助，只会拉长请求时间、增加并发连接（D6）。
@@ -234,21 +235,22 @@ api × M ─► ClickHouse（只读账号）/ PostgreSQL          jobs：运行�
 
 | # | 阶段 | 作用 | 丢弃原因 | 数据源 |
 |---|---|---|---|---|
-| 0 | 传输层 | Axum/tower：只接受 POST；请求体 ≤8 KB；超时 5 s；CORS `*`，不带凭证 | 返回 413 / 405 | 无 |
+| 0 | 传输层 | Axum/tower：只接受 POST；请求体 ≤8 KB；读体超时 5 s；CORS `*`，不带凭证 | 返回 413 / 405 / 408 | 无 |
 | 1 | 解析 | 必须是 JSON 对象；必填 `s`、`n`、`u`；检查长度；规范化 URL、hostname、pathname；只保留白名单内的 query 参数；生成服务端毫秒时间戳 | 返回 400 | 无 |
 | 2 | 客户端上下文 | TCP 对端属于 `RIVU_TRUSTED_PROXIES` 时才读 `X-Forwarded-For`，从右往左取第一个不可信的地址；IP 规范化（IPv4-mapped 转为 IPv4，IPv6 转为小写压缩形式） | 无 | 配置 |
-| 3 | 准入 | 用 `site_key` 在内存快照中查 `SiteConfig`；检查站点是否停用、hostname 是否在白名单、令牌桶限流、垃圾引荐 | `unknown_site` `site_disabled` `hostname_not_allowed` `rate_limited` `spam_referrer` | SiteSnapshot、垃圾引荐表 |
+| 3 | 准入 | 用 `site_key` 在内存快照中查 `SiteConfig`；检查站点是否停用、hostname 是否在白名单（白名单为空时全部丢弃，fail-closed，§10 Q12）、令牌桶限流、垃圾引荐 | `unknown_site` `site_disabled` `hostname_not_allowed` `rate_limited` `spam_referrer` | SiteSnapshot、垃圾引荐表 |
 | 4 | 规则 | IP/CIDR 规则、页面通配规则 | `ip_blocked` `page_blocked` | SiteConfig |
 | 5 | 机器人 | UA 机器人模式、Headless、自动化工具；可选数据中心 CIDR 表 | `bot` `datacenter_ip` | UA 规则库、CIDR 表 |
 | 6 | 地理 | 查 mmdb 得到 country、region、city，再过国家规则 | `country_blocked` | GeoIP 库 |
 | 7 | UA 富化 | 浏览器和系统（取 major.minor）、设备类型；结果按 UA 字符串缓存 | 无 | UA 库 |
 | 8 | 来源 | referrer → source（host 命中站点白名单的视为内部引荐）；UTM（空串视为缺失）；click id 只记参数名；渠道分类（只有一份 Rust 实现，规则带版本号） | 无 | 来源库、渠道规则 |
 | 9 | 属性 | 规范化 props；可选的站点 props 白名单；收入（P4） | 无 | SiteConfig |
-| 10 | 身份 | 计算 `visitor_id`、`prev_visitor_id`、`partition`（§4.5） | 无 | salts |
+| 10 | 身份 | 计算 `visitor_id`、`prev_visitor_id`、`partition`（§4.5） | `salt_missing` | salts |
 | 11 | 交接 | Lite：交给 SessionAssigner，再交给 BatchWriter；Reliable：发布到 JetStream | `no_session`（engagement）、`overloaded` | 无 |
 
 - **顺序原则**与 Plausible 相同（R01 §5.2）：先做便宜的判断，昂贵的 UA 解析和地理查询放在规则之后。
 - **每个阶段**都记录耗时直方图 `rivu_ingest_stage_seconds{stage}`；每个丢弃原因都计入 `ingest_counters`（§5.4）。
+- **丢弃原因的标识符**（§10 Q13）以 Rust 枚举 `DropReason`（`rivu-domain`）为唯一来源，共 13 个：`unknown_site` `site_disabled` `hostname_not_allowed` `rate_limited` `spam_referrer` `ip_blocked` `page_blocked` `bot` `datacenter_ip` `country_blocked` `no_session` `salt_missing` `overloaded`。`ingest_counters.metric` 取 `accepted` 或 `dropped_<原因>`；未知站点记 `site_id = 0`；已删除的站点从快照摘除后，同样按 `unknown_site` 计。`salt_missing` 表示事件的站点本地日期没有盐：collector 不现场生成盐（`platform-and-ops.md` §3.3）。
 - **可选优化（仅 Lite）**：续期会话的事件最终会被盖上会话属性，所以第 5–8 步的结果会被覆盖。可以在第 10 步之后先查会话，命中时跳过这几步。
 - **渠道分类**只在 Rust 里实现一份，并带规则版本号。Plausible 的 Elixir 版和 SQL 版分支顺序不一致，是反面教训（R01 §8.4）。规则变更后，用离线 mutation 回填历史数据。
 - **内部引荐的判定**改为「referrer 的 host 命中站点 hostname 白名单」。Plausible 要求 host 完全相等，同站子域名之间互相跳转会被当成外部来源（R01 §8.3）。
@@ -324,13 +326,13 @@ salt(d)           = salts 表中日期 d 的 16 字节随机数（只存在 PG�
 local_date        = date(ts in site.timezone)
 visitor_id        = SipHash-2-4(salt(local_date),     site_id ‖ len‖ip ‖ len‖ua) → u64
 prev_visitor_id   = SipHash-2-4(salt(local_date - 1), site_id ‖ len‖ip ‖ len‖ua) → u64
-partition         = SipHash-2-4(routing_secret,       site_id ‖ len‖ip ‖ len‖ua) mod P   （Reliable 的分区号；Lite 用同一个哈希取分片号，不落库）
+partition         = SipHash-2-4(routing_secret,       site_id ‖ len‖ip ‖ len‖ua) mod 32  （P = 32：Reliable 的分区号，Lite 的分片号；两种模式都写入 `ingest_partition`，§10 Q8、Q15）
 ```
 
 - **按站点本地日期选盐**（D5）。Plausible 在 UTC 午夜轮换全局盐，对 UTC+8 的站点来说 ID 在本地 08:00 切换。同一个人 07:30 来一次、09:00 再来一次，当天会被算成 2 个访客。
 - **盐的数量**：全球时区横跨 UTC−12 到 +14，任意时刻需要保留 `utc_date-2 … utc_date+1` 共 4 份盐。后台任务提前生成次日的盐，删除更早的盐（见 `platform-and-ops.md`）。
 - **输入用长度前缀拼接**。Plausible 直接拼接、没有分隔符，存在边界歧义（R01 §11.2 #18）。哈希输入用 `site_id` 而不用域名：站点就是隐私边界，改域名也不会让访客 ID 断开。
-- **`partition` 用长期不变的 `routing_secret`**，不随盐轮换。所以跨午夜时，`prev_visitor_id` 对应的会话和新事件仍在同一个分区。持久化的只有分区号（几个 bit），不能识别个人。
+- **`partition` 用长期不变的 `routing_secret`**，不随盐轮换。所以跨午夜时，`prev_visitor_id` 对应的会话和新事件仍在同一个分区。持久化的只有分区号（5 bit），不能识别个人。
 - **原始 IP 和 UA 不进入** ClickHouse、JetStream、日志和错误上报。Plausible 把整个 Request 放进了 Sentry 上下文（R01 §8.2），这是反例。
 
 ### 4.6 SessionAssigner
@@ -340,7 +342,7 @@ partition         = SipHash-2-4(routing_secret,       site_id ‖ len‖ip ‖ l
 | 字段 | 说明 |
 |---|---|
 | `session_id` | 随机 u64 |
-| `keys` | 会话的全部 visitor_id，最多 8 个。第一个是会话的原始 ID（盖章用），其余是别名 |
+| `keys` | 会话的全部 visitor_id，最多 8 个。第一个是会话开始时的 ID，其余是别名；只用于查找，不写入事件 |
 | `started_at`、`last_seen_at` | 毫秒；`last_seen_at` 取 max，乱序事件不会让它倒退（Plausible 直接覆盖，R02 §11.2 #6） |
 | `entry`（hostname、pathname） | 会话中的第一个 pageview；在它之前为空 |
 | `attrs` | 首个事件的 referrer、source、channel、utm×5、click_id_param、country、region、city、device、browser(+ver)、os(+ver)，字符串做驻留 |
@@ -354,12 +356,12 @@ partition         = SipHash-2-4(routing_secret,       site_id ‖ len‖ip ‖ l
 | 续期 | `ts - last_seen_at ≤ 30 min`，且 `ts - started_at ≤ 7 d`（§10 Q7）。7 天上限是新增的：Plausible 没有上限，却在查询里假设会话不超过 7 天（R03 §8.2、§12.2 #11），Rivu 把这个假设变成写入侧的硬约束，查询的回溯范围因此固定为 7 天（§6.5）。超过上限的事件开新会话 |
 | 新会话 | 生成新 `session_id`，事件属性成为会话属性，`keys` 只含当前 `visitor_id` |
 | 别名 key | 事件是通过 `prev_visitor_id` 续上会话的，也就是它自己的 `visitor_id` 不在该会话的 `keys` 里：把当前 `visitor_id` 加进 `keys` 并建立索引。访客 ID 在每个本地午夜轮换，7 天的会话最多跨 7 个午夜，所以最多 8 个 key。旧 key 保留到会话过期，迟到或乱序的前一天事件仍然能查到会话。已满 8 个时不再添加，事件照常续期，并累加 `session_alias_cap_hit`（站点改时区时可能出现；另外春季 DST 切换日只有 23 小时，7 天会话最多能跨 9 个本地日期，也会触发。此时第 9 天的事件仍能经 `prev_visitor_id` 命中第 8 个 key，会话切分不受影响，已由差分测试覆盖） |
-| 盖章 | 事件写入 `session_id`、`session_start`、`entry_pathname` 和全部会话属性；`visitor_id` 改写为会话的原始 ID（`keys[0]`），因此跨午夜后 ID 保持不变 |
+| 盖章 | 事件写入 `session_id`、`session_start`、`entry_pathname` 和全部会话属性。**不改写 `visitor_id`**：事件保留自己当天的 ID，会话只靠 `session_id` 串联，所以跨午夜的会话在 `events` 里带两个不同的 `visitor_id`（§10 Q9） |
 | engagement | 没有会话就丢弃（`no_session`）；有会话就推进 `last_seen_at`，事件照常写入（用于停留时长和滚动深度），但不计入 pageviews/events |
 
 **并发**
 
-- Lite：64 个分片，每个是 `parking_lot::Mutex<HashMap<…>>`，分片号取 routing 哈希（§4.5）对 64 取模。routing 哈希不随盐轮换，所以同一访客的所有 key（原始、别名、前一天）总在同一个分片，一次加锁就能完成查找和加别名。临界区只有查找、更新、盖章，不做任何 IO，也没有 `.await`。没有调用超时，所以不会出现 Plausible 的幽灵执行。
+- Lite：32 个分片，每个是 `parking_lot::Mutex<HashMap<…>>`，分片号取 routing 哈希（§4.5）对 32 取模，并写入事件的 `ingest_partition`（§10 Q15）。routing 哈希不随盐轮换，所以同一访客的所有 key（原始、别名、前一天）总在同一个分片，一次加锁就能完成查找和加别名。临界区只有查找、更新、盖章，不做任何 IO，也没有 `.await`。没有调用超时，所以不会出现 Plausible 的幽灵执行。
 - Reliable：每个分区由一个任务顺序处理，不需要锁。
 
 **过期**
@@ -373,14 +375,16 @@ partition         = SipHash-2-4(routing_secret,       site_id ‖ len‖ip ‖ l
 **预热**（替代 TinySock）
 
 1. 优雅关停时，把状态写到 `${DATA_DIR}/sessions.snapshot`，带格式版本号和结构哈希，这一点借鉴 Plausible 的版本门控（R02 §4.1）。快照包含每个会话的全部 key。启动时，如果快照不超过 30 分钟且版本一致，就直接加载。
-2. 否则从 ClickHouse 的 `sessions` 表重建最近 31 分钟内活跃的会话。每个会话只能按表里存的原始 `visitor_id` 建 key，别名无法恢复。Reliable 模式下按 `ingest_partition` 分区过滤，并以分区内最新事件时间为准。
+2. 否则从 ClickHouse 的 `sessions` 表重建最近 31 分钟内活跃的会话。每个会话按 `last_visitor_id`（会话最后一个事件的当天 ID，§5.3）建一个 key，别名无法恢复，也不需要（见「失败语义」）。分片号取 `ingest_partition`，Lite 和 Reliable 都是 `routing % 32`（§10 Q15）；Reliable 模式下按 `ingest_partition` 分区过滤，并以分区内最新事件时间为准。
 3. 预热完成之前 `/readyz` 返回未就绪；Reliable 模式下，预热完成前不消费该分区。
 
 **失败语义**
 
 状态丢失只会让会话被切开，访问数和跳出率略高。不会产生孤儿行，聚合结果也不会损坏，因为根本没有 `-1` 行。
 
-崩溃后从 ClickHouse 预热（含 Reliable 的故障恢复）只有原始 key，所以已经跨过 2 个及以上本地午夜的多日会话，在恢复后的下一个事件处可能被切开：这个事件的 `prev_visitor_id` 对应的是已丢失的别名。只跨过 1 个午夜的会话不受影响，因为前一天的 ID 就是原始 ID；恢复后续上的会话会重新建立别名。这个代价可以接受。优雅关停的快照保留全部 key，不受影响。
+崩溃后从 ClickHouse 预热（含 Reliable 的故障恢复）只恢复一个 key：`last_visitor_id`。多日会话不会因此被切开：会话的下一个事件与最后一个事件相隔不超过 30 min，所以至多跨过一个本地午夜，它的 `visitor_id`（同一本地日）或 `prev_visitor_id`（刚过午夜）必有一个等于这个 key，会话照常续上，别名在恢复后的事件上重新建立。仍会被切开的只有迟到、乱序的更早日期的事件：它们的 ID 不是最新的 key，查不到会话，代价同上，可以接受。优雅关停的快照保留全部 key，不受影响。
+
+写缓冲满（`503`）的事件已经推进了会话状态（`last_seen_at`、入口页、别名），却没有写入 ClickHouse，与「状态丢失只会切开会话」同类：内存状态与库里的会话行可能在入口页等字段上略有出入，不会产生孤儿行，聚合结果也不会损坏。
 
 ### 4.7 写入（Lite：BatchWriter）
 
@@ -389,8 +393,8 @@ partition         = SipHash-2-4(routing_secret,       site_id ‖ len‖ip ‖ l
 | 结构 | collector 把事件放进有界 `mpsc`（默认容量 20 万条），由单独的写入任务组批 |
 | 触发 | 1 s，或 2 万行，或 8 MB，先到先写（可配置）。Plausible 是 5 s 或 100 KB（R02 §5.2） |
 | 格式 | 官方 `clickhouse` crate：HTTP + RowBinary + LZ4。显式设置 `async_insert=0`，因为 26.2 起它默认开启（核实报告 #12）。库名用 `with_database` 绑定，表名只传 `events`：crate 会把 `rivu.events` 整体转义成一个标识符。开启校验时，行结构体必须包含所有没有 DEFAULT 的列（E5、E6） |
-| 去重 | 每批生成 `insert_deduplication_token = {node_id}:{batch_seq}`，重试时 token 不变。token 要逐批用 `client.insert().with_setting(…)` 传入；如果设在 `Inserter` 上，自动切出的多个批次会共用同一个 token，彼此误判为重复（#13）。`events` 和 `sessions` 都要开启 `non_replicated_deduplication_window`。每个 INSERT 只产生一个 block，即不超过 `max_insert_block_size`，且不跨月分区（#1） |
-| 失败 | 指数退避重试，从 0.5 s 增加到 30 s，最长持续 5 分钟，期间这一批一直留在内存。channel 满了就回 `503`，并计入 `overloaded`。Plausible 是插入失败就让进程崩溃并丢弃这一批（R02 §5.3） |
+| 去重 | 每批生成 `insert_deduplication_token = {node_id}:{batch_seq}`，重试时 token 不变。token 要逐批用 `client.insert().with_setting(…)` 传入；如果设在 `Inserter` 上，自动切出的多个批次会共用同一个 token，彼此误判为重复（#13）。`events` 和 `sessions` 都要开启 `non_replicated_deduplication_window`。一批跨两个月的事件会按月分区拆成两个 block，ClickHouse 给每个 block 派生确定的子 token，重试时拆分结果不变，所以仍然幂等；单批行数上限取 `max_insert_block_size`（默认 1048449）以下（#1） |
+| 失败 | 指数退避重试，从 0.5 s 增加到 30 s，最长持续 5 分钟，期间这一批一直留在内存。channel 满了就回 `503`，并计入 `dropped_overloaded`；这些事件已经推进了会话状态（§4.6 失败语义）。Plausible 是插入失败就让进程崩溃并丢弃这一批（R02 §5.3） |
 | 可见性 | flush 间隔不超过 1 s，加上插入约 0.1–0.5 s，事件可见时间 p95 < 2 s。v1 的目标是 < 5 s |
 | 关停 | 先停止接收新请求（Caddy 用 `lb_try_duration` 把请求排队），排空 channel，flush，再写会话快照 |
 | 保证 | 至多一次，损失有上界：崩溃时丢失 channel 中的数据和正在写的那一批，约等于几秒的流量，都会计入指标 |
@@ -466,10 +470,10 @@ CREATE TABLE rivu.events
     ts               DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)),
     event_id         UUID,                          -- UUIDv7，由 collector 生成
     name             LowCardinality(String),        -- pageview / engagement / 自定义事件名
-    visitor_id       UInt64,                        -- 会话的 visitor_id（跨午夜保持不变）
+    visitor_id       UInt64,                        -- 事件当天的 visitor_id（按站点本地日的盐算出，不跨午夜）
     session_id       UInt64,
     session_start    DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)),
-    ingest_partition UInt8,                         -- Reliable 分区号；Lite 为 0
+    ingest_partition UInt8,                         -- routing % 32（Reliable 的分区号；Lite 的分片号）
     hostname         LowCardinality(String),
     pathname         String CODEC(ZSTD(3)),
     entry_pathname   String CODEC(ZSTD(3)),         -- 盖章：会话入口页
@@ -509,7 +513,7 @@ SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1, non_replicated_dedup
 ```
 
 - 排序键沿用 Plausible 的 `(site_id, 日期, name, user_id, ts)`（R02 §8.3）：所有查询都先限定站点和日期；`name` 用于按目标过滤和排除 engagement 事件；`visitor_id` 让 `SAMPLE` 和 `uniq` 更友好。主键去掉末尾的 `ts`，稀疏索引更小。
-- 暂不使用 `SAMPLE` 采样（§10 Q6），大站的长时间范围由日汇总层回答（§6.4）。`SAMPLE BY visitor_id` 仍保留在 DDL 里，将来要采样时不用改表。`sessions` 同理。
+- 暂不使用 `SAMPLE` 采样（§10 Q6），大站的长时间范围由日汇总层回答（§6.4）。`SAMPLE BY visitor_id` 仍保留在 DDL 里，将来要采样时不用改表。`sessions` 同理（它的采样键是 `session_id`）。
 - 不再把 v1 的 `site_day` 放进排序键（D4）。
 - 会话属性和 `entry_pathname` 已经盖章到事件上，所以大部分 `visit:*` 过滤可以直接在 `events` 上做，不需要 JOIN。只有 exit page 和会话聚合值（例如停留时长）需要关联 `sessions`。Plausible 的入口页过滤也要 JOIN（R03 §3.4）。
 - `props` 用 `Map(LowCardinality(String), String)`。每个事件最多 30 个键，`props['k']` 的线性查找代价可以接受；只读键或只读值时，可以用 `props.keys`、`props.values` 子列。常用属性可以提升为独立列。`JSON` 类型从 25.3 起可用于生产，但属性集合有上限时，Map 更简单（#15）。
@@ -521,8 +525,8 @@ CREATE TABLE rivu.sessions
 (
     site_id            UInt64,
     start_date         Date,                    -- toDate(session_start)，UTC
-    visitor_id         UInt64,
     session_id         UInt64,
+    last_visitor_id    AggregateFunction(argMax, UInt64, DateTime64(3, 'UTC')),  -- 会话最后一个事件的当天 visitor_id（供预热建 key）
     ingest_partition   SimpleAggregateFunction(any, UInt8),
     started_at         SimpleAggregateFunction(min, DateTime64(3, 'UTC')),
     last_event_at      SimpleAggregateFunction(max, DateTime64(3, 'UTC')),  -- 不含 engagement
@@ -547,8 +551,8 @@ CREATE TABLE rivu.sessions
 )
 ENGINE = AggregatingMergeTree
 PARTITION BY toYYYYMM(start_date)
-ORDER BY (site_id, start_date, visitor_id, session_id)
-SAMPLE BY visitor_id
+ORDER BY (site_id, start_date, session_id)
+SAMPLE BY session_id
 TTL start_date + INTERVAL 731 DAY DELETE
 SETTINGS ttl_only_drop_parts = 1, non_replicated_deduplication_window = 1000;
 
@@ -556,7 +560,8 @@ CREATE MATERIALIZED VIEW rivu.mv_sessions TO rivu.sessions
 DEFINER = CURRENT_USER SQL SECURITY DEFINER   -- 必须显式写，见核实报告 E3
 AS
 SELECT
-    site_id, toDate(session_start) AS start_date, visitor_id, session_id,
+    site_id, toDate(session_start) AS start_date, session_id,
+    argMaxState(visitor_id, ts)                                        AS last_visitor_id,
     any(ingest_partition)                                              AS ingest_partition,
     min(session_start)                                                 AS started_at,
     maxIf(ts, name != 'engagement')                                    AS last_event_at,
@@ -572,7 +577,7 @@ SELECT
     any(country_code) AS country_code, any(region_code) AS region_code,
     any(city_geoname_id) AS city_geoname_id, any(device) AS device /* … */
 FROM rivu.events
-GROUP BY site_id, start_date, visitor_id, session_id;
+GROUP BY site_id, start_date, session_id;
 ```
 
 **派生指标**在查询时计算，语义与 Plausible 一致（R02 §2.3）：
@@ -587,11 +592,12 @@ GROUP BY site_id, start_date, visitor_id, session_id;
 - `min`、`max`、`any`、`argMin`、`argMax` 都是幂等的。重复投递只会影响计数类指标，而这些指标在 `events` 表上同样受影响，可以用同一个去重机制（§4.8）一并解决。
 - engagement 事件可以推进 `last_seen_at`、累加 `engagement_ms`。Plausible 因为受 version 列约束，这两件事都做不了。
 
-**代价**：查询需要两级聚合。内层按 `GROUP BY site_id, start_date, visitor_id, session_id` 合并部分行，外层再算指标。
+**代价**：查询需要两级聚合。内层按 `GROUP BY site_id, start_date, session_id` 合并部分行，外层再算指标。
 
-- 内层的分组键就是完整排序键，开启 `optimize_aggregation_in_order=1`（默认关闭）后可以流式聚合；分组时如果跳过 `visitor_id`，就只能部分按序（#6）。
+- 内层的分组键就是完整排序键，开启 `optimize_aggregation_in_order=1`（默认关闭）后可以流式聚合；分组时如果跳过排序键里的列，就只能部分按序（#6）。
 - 不同版本在这里修过结果错误的 bug，要在目标版本上用 `EXPLAIN PIPELINE` 验证。
-- MV 中聚合状态的列类型，要用 `toTypeName()` 核对（#4）。
+- MV 中聚合状态的列类型，要用 `toTypeName()` 核对（#4）。`last_visitor_id` 已在 25.8 上核对：`toTypeName(argMaxState(visitor_id, ts))` 为 `AggregateFunction(argMax, UInt64, DateTime64(3, 'UTC'))`。
+- `sessions` 没有 `visitor_id` 列（§10 Q9）：事件保留自己当天的 ID，一个跨午夜的会话在这里仍是一行。`last_visitor_id` 只给预热建 key 用（§4.6），不能用来数访客，也无法关联前一天；所以访客数一律从 `events` 计算（§6.4、§6.5）。
 
 ### 5.4 `ingest_counters`
 
@@ -612,7 +618,7 @@ TTL minute + INTERVAL 90 DAY DELETE;
 
 计数批次与事件批次一样带 `insert_deduplication_token` 重试，所以表上也要开 `non_replicated_deduplication_window`（迁移 `20261022100000_ingest_counters_dedup`）；否则「写入成功但响应丢失」后的重试会重复累加，破坏与请求数的对账。
 
-做法沿用 Plausible（R01 §10、R02 §5.4）：进程内按 10 秒分桶累加，只刷出已结束的桶，关停时强制刷出。这些计数有三个用途：
+做法沿用 Plausible（R01 §10、R02 §5.4）：进程内按 10 秒分桶累加，只刷出已结束的桶，关停时强制刷出。桶用接收请求时的墙钟，不是事件时间：计数描述的是「接收」这件事。`script_version` 是 UInt16，而协议里 `sv` 最大 999999，超出的钳到 65535。这些计数有三个用途：
 
 - 看板上的「接入诊断」：为什么数据少了，按原因拆分；
 - 查询规划器估算一次查询要扫描的行数（§6.4）；
@@ -650,7 +656,7 @@ TTL minute + INTERVAL 90 DAY DELETE;
 2. 存放导入数据，例如 Plausible 导出的 CSV，它天然对应这些表，迁移路径因此很直接（P4）；
 3. 作为大站长时间范围的加速层（§6.4）。
 
-**访客数跨天直接求和**（Q7 之后这条前提不再严格成立，见 §10.1 Q9）：访客 ID 每天轮换，原始层跨多天算 `uniq(visitor_id)` 本来就约等于各天 UV 之和（R03 §12.2 #16、v1 第四节）。所以日汇总层只存每日精确去重的访客数，跨天相加与原始层口径一致，不需要 HLL 状态。
+**访客数跨天直接求和**：访客 ID 每个本地日轮换，而事件保留自己当天的 `visitor_id`（盖章不改写，§4.6、§10 Q9），所以原始层任意范围的 `uniq(visitor_id)` 严格等于各本地日去重访客数之和（R03 §12.2 #16、v1 第四节），与日汇总层逐日相加一致。日汇总层只存每日去重的访客数，不需要 HLL 状态。两层都排除 engagement，并用同一个 `uniq`，日汇总层存的就是按同样方法算出的每日值（§6.5、§10 Q10、Q17）。
 
 ### 5.6 删除与保留
 
@@ -716,7 +722,8 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 |---|---|
 | `pageviews` `events` `time_on_page` `scroll_depth` 收入 | events |
 | `visits` `bounce_rate` `visit_duration` `engaged_duration` `views_per_visit` `exit_rate` | sessions |
-| `visitors`、各种比率 | events 和 sessions 都可以 |
+| `visitors` | 只从 events 计算：`sessions` 没有 `visitor_id`（§10 Q9） |
+| 各种比率 | 按分子、分母各自的归属 |
 | `event:*` 维度和过滤 | events |
 | `visit:exit_page` | 只在 sessions |
 | 其他 `visit:*`（含 `entry_page`） | events 和 sessions 都可以（因为已盖章） |
@@ -755,7 +762,7 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 
 | 指标 | 定义 |
 |---|---|
-| `visitors` | `uniq(visitor_id)` |
+| `visitors` | `uniqIf(visitor_id, name != 'engagement')`，只读 `events`。排除 engagement，与 `realtime` 同口径：engagement 只是已有页面浏览的附属信号，不代表一次到访（§10 Q17）。事件保留当天的 ID，所以任意范围的值等于各本地日访客数之和（§10 Q9） |
 | `visits` | 区间内活跃的会话数：内层聚合后 `last_event_at ≥ from AND started_at ≤ to`，并且 `start_date ≥ from_date − 7`（依赖 7 天的会话上限，§4.6）。代价是多读 7 天的会话行，排序键含 `start_date`，按范围裁剪 |
 | `pageviews` / `events` | `countIf(name='pageview')` / `countIf(name != 'engagement')` |
 | `bounce_rate` | `countIf(pageviews ≤ 1 AND interactive_events = 0) / visits`；带 `event:page` 过滤时，只统计入口页匹配的会话（§6.6） |
@@ -768,6 +775,8 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 | `conversion_rate` | 完成目标的访客数 / 同范围、去掉目标和 props 过滤后的访客数 |
 | `percentage` | 本行访客数 / 去掉维度后的访客总数 |
 | `realtime` | `uniq(visitor_id)`，取最近 5 分钟、`name != 'engagement'` 的事件 |
+
+**`uniq` 与容差**（§10 Q10）：原始层和日汇总层用同一个 `uniq`（ClickHouse 的自适应采样近似算法），日汇总层存的就是按同样方法算出的每日值，不另做精确去重；两层的差异只来自 `uniq` 本身。容差写进指标口径文档（`meta.metric_semantics`）。在 ClickHouse 25.8 上实测（`uniq` 对不同值个数的结果）：1000、10000 个不同值时与精确值相等；65536 个时为 65535；65537 个时为 65852（+0.5%）；10 万个时为 100022（+0.02%）；100 万个时为 1002001（+0.2%）。所以单日访客数在 6.5 万以内与精确值至多差 1，超过后误差在 1% 以内。
 
 所有比率都用 `ifNotFinite(…, 0)` 包一层，防止除零产生无穷值。Rivu 没有 `-1` 行，不需要 Plausible 那种 `greatest(…, 0)` 兜底。
 
@@ -792,7 +801,7 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 | 跨租户读取 | SQL 构建器的每个 `FROM` 都必须传入 `TenantScope`，类型系统强制，所有子查询都会重复注入 `site_id` |
 | 注入 | 字段和函数来自枚举；取值一律通过 ClickHouse 服务端参数 `{name:Type}` 传入（Rust crate 的 `.param()`），不使用客户端转义的 `.bind()`（#10、#13） |
 | 正则 | `matches` 每个过滤最多 10 个模式，每个 ≤256 字符。`max_hyperscan_regexp_length` 和 `max_hyperscan_regexp_total_length` 默认是 0（不限制），必须在 `rivu_reader` 的 profile 中显式设置（#11）。通配符在服务端转成转义后的正则 |
-| 慢查询 | `max_execution_time` 按调用方区分：看板 10 s、API 20 s、公开或共享链接 5 s；设置 `max_memory_usage`；每个组织的并发信号量（默认 4），排队超时后返回 `429` |
+| 慢查询 | `max_execution_time` 按调用方分三档：看板 10 s、API 20 s、公开或共享链接 5 s，对应三个配置变量（`platform-and-ops.md` §7，§10 Q14），每档都不得大于 `rivu_reader` 配额里的上限；设置 `max_memory_usage`；每个组织的并发信号量（默认 4），排队超时后返回 `429` |
 | 被滥用 | 公开 API 按组织限流（小时配额加突发令牌桶）；共享链接和公开看板按 IP 加链接限流。Plausible 的内部 API 完全没有限流（R03 §12.2 #15） |
 | 排障 | 每条查询都带 `log_comment`（JSON：路由、站点、用户、trace_id），可以在 `system.query_log` 中直接追溯（R03 §8.3） |
 
@@ -829,7 +838,7 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 | 原则 | 落实 |
 |---|---|
 | 无持久标识 | 不读写 Cookie；tracker 不写任何存储，唯一的读取是站点所有者手动设置的 `localStorage.rivu_ignore`，只读，不用于标识（§10 Q3）；访客 ID 按站点本地日轮换，盐 2 天后删除，跨天无法关联同一个人（会话连续的情形见下一行） |
-| 跨天连续性 | 访客 ID 跨天保持不变的唯一情形是同一会话持续活跃：活动间隔始终不超过 30 min，且最长 7 天。别名 key 只存在于内存和关停快照，不落库；间隔超过 30 min 后无法再关联（§4.6） |
+| 跨天连续性 | 事件表里没有跨天可关联的 ID：每个事件只带自己本地日的 `visitor_id`，盐 2 天后删除。跨天只剩 `session_id` 能把同一会话的事件串起来，前提是活动间隔始终不超过 30 min，且最长 7 天。别名 key 只存在于内存和关停快照，不落库；`sessions.last_visitor_id` 只是会话最后一个事件的当天 ID，无法关联到前一天（§4.6、§5.3、§10 Q9） |
 | 数据最小化 | IP 和 UA 只在内存中短暂使用，不进入 ClickHouse、JetStream、日志和错误上报；query 参数只保留 UTM 和 click id 参数名；props 有长度限制，可选白名单；地理精度可按站点设为国家、地区或城市 |
 | `site_key` 不是密钥 | 它是公开的，只用来路由。真实性靠 hostname 白名单、限流和机器人过滤，只能提高门槛，不能保证每个事件都真实（与 v1 相同） |
 | 租户隔离 | `TenantScope`、服务端参数、只读账号、按租户的超时和并发上限（§6.8） |
@@ -852,7 +861,7 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 
 ## 10. 已决问题（2026-10-22）
 
-下列问题原为开放问题，现已定案，决定已写入各节正文。
+Q1–Q8 于 2026-10-22 定案；Q9–Q18 是 P1 动工前给指标口径写 brief 时发现的文档间冲突（见 [`../brief-p1.md`](../brief-p1.md)），同日采纳建议后定案。决定都已写入各节正文。
 
 | # | 问题 | 决定 | 影响 |
 |---|---|---|---|
@@ -864,23 +873,16 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 | Q6 | 是否做 `SAMPLE` 采样 | 暂不做，用日汇总层的自动分层代替；DDL 里保留 `SAMPLE BY visitor_id` | §2.6；§5.2；§6.4 |
 | Q7 | 会话最长时长 | 7 天（原为 24 小时）。续期条件：`ts − last_seen_at ≤ 30 min` 且 `ts − started_at ≤ 7 d`。跨午夜靠会话的别名 key，最多 8 个 | §4.6（规则、并发、内存、预热、失败语义）；§4.5；§6.5 `visits` 回溯 7 天；§7 内存；§8 |
 | Q8 | Reliable 的分区数 P | P = 32，安装时固定；以后要改，必须先排空队列再迁移 | §4.8；`platform-and-ops.md` 的 `RIVU_PARTITIONS` |
-
-### 10.1 待决问题（P1 动工前发现，2026-10-22）
-
-下列问题是在给 P1 写指标口径时发现的文档间冲突（见 [`../brief-p1.md`](../brief-p1.md)）。「P1 暂行」一列是 P1 最细链路采用的做法，定案前可以推翻；定案后改写各节正文，并把该行移到上表。
-
-| # | 冲突 | 证据 | 建议 | P1 暂行 |
-|---|---|---|---|---|
-| Q9 | 盖章改写 `visitor_id` 让访客数在单日和跨天都失真 | §4.6「盖章」把跨本地午夜续上的事件的 `visitor_id` 改写为会话的原始 ID（前一天的 ID）。设某人有一个跨过 d/d+1 午夜的会话：(a) 当天 d+1 他又开了一个新会话，新会话用 d+1 的 ID，于是 d+1 当天被算成 2 个访客，**单日也多算**；(b) 如果 d+1 没有新会话，两天的范围里 `uniq(visitor_id)` 只算 1，而日汇总层把每天的 UV 相加算 2（§5.5 的前提不成立），规划器换层时数字会跳。在盖章后的 ID 上换任何一种 `uniq` 写法都修不好，因为丢失了「这个事件属于哪一天的 ID」 | 不再改写：事件保留自己当天的 `visitor_id`，会话只靠 `session_id` 串起来。`sessions` 的分组改为 `(site_id, start_date, session_id)`，`visitor_id` 改成聚合列（取会话第一个事件的 ID），`SAMPLE BY` 改为 `session_id`。这样任意范围的 `uniq(visitor_id)` 都等于「各本地日不同访客数之和」，与日汇总层相加严格相等，事件表里也不再有跨天可关联的 ID。代价：改 `sessions` DDL（尚未发布，可以就地改） | 先按现行 §4.6 实现；参考实现按「各本地日不同的人数之和」定义真值，差分测试把这个偏差作为已知用例固定下来，定案后翻转 |
-| Q10 | 原始层近似去重、汇总层精确去重 | §6.5 `visitors = uniq(visitor_id)`（ClickHouse 的 `uniq` 是自适应采样的近似算法）；§5.5 说日汇总层存「每日精确去重」的访客数。两层算法不同，同一天的数字可能不一致 | 两层用同一个函数，日汇总层存的就是按同样方法算出的每日值。容差写进指标口径文档；小基数下 `uniq` 的实际误差在锁定的 ClickHouse 版本上实测后写明 | 用 `uniq`；参考实现的差分测试只用小数据集 |
-| Q11 | `site_key` 格式 | PG 迁移与 `platform-and-ops.md` §3.3：`^[a-z2-7]{12}$`；`tracker-and-protocol.md` §5.1：`^[A-Za-z0-9_-]{8,32}$`，示例是 16 位大小写混合 | 生成格式以 PG 为准（12 位 base32 小写）；线协议保持宽松的正则，作为向前兼容的语法检查，不合法的 key 只会落到 `unknown_site`。改写 `tracker-and-protocol.md` 的示例 | 采用建议 |
-| Q12 | hostname 白名单为空时怎么处理 | PG 迁移注释与 `platform-and-ops.md` §3.3：「白名单为空表示不校验」；`tracker-and-protocol.md` §7、偏离 #17：fail-closed，全部丢弃 | fail-closed，同时建站时自动加入主域名（`platform-and-ops.md` §3.3 已有这条）。PG 迁移的注释随下一次 schema 变更修正 | fail-closed |
-| Q13 | 丢弃原因的标识符 | §4.2：`unknown_site` `site_disabled` `hostname_not_allowed` `rate_limited` `no_session` `overloaded` 等；`tracker-and-protocol.md` §6.4：`dropped_disabled` `dropped_hostname` `dropped_throttle` `dropped_no_session_for_engagement` 等；§2.2 还有 `buffered`；未知站点在 `ingest_counters.site_id UInt64` 里怎样表示也没写 | Rust 里一个枚举作为唯一来源。`ingest_counters.metric` 取 `accepted` 或 `dropped_<§4.2 的原因名>`；400 错误按 `rejected_<字段>` 只进 Prometheus，不进 `ingest_counters`；未知站点记 `site_id = 0` | 采用建议 |
-| Q14 | 查询超时 | §6.8：看板 10 s、API 20 s、公开或共享链接 5 s；`platform-and-ops.md` §4.4、§7：`RIVU_QUERY_TIMEOUT_SECS=15`、`RIVU_PUBLIC_QUERY_TIMEOUT_SECS=8` | 按调用方分三档，默认值取 §6.8，配置变量改成三个；`platform-and-ops.md` 随之修改 | P1 只有内部查询，不涉及 |
-| Q15 | Lite 从 ClickHouse 预热时找不到分片 | §4.6：Lite 的分片号取 routing 哈希对 64 取模，输入是 IP 和 UA；预热第 2 步从 `sessions` 表重建会话，表里只有 `visitor_id`，没有 routing 哈希，Lite 的 `ingest_partition` 又固定写 0，所以重建出的会话不知道该放进哪个分片，之后的事件查不到它 | Lite 也把 `routing mod 32` 写进 `ingest_partition`，分片数固定为 32，与 Reliable 的 P 相同；预热按 `ingest_partition` 放回分片。只多持久化 5 bit，Reliable 本来就存 | 分片数 32，写入 `ingest_partition`；预热本身留到后续步骤 |
-| Q16 | 写缓冲默认值 | §4.7：1 s、2 万行或 8 MB，channel 容量 20 万条；`platform-and-ops.md` §7：`RIVU_BUFFER_MAX_ROWS=5000`、`RIVU_BUFFER_CHANNEL_CAPACITY=20000` | 变量名用 `platform-and-ops.md` 的，默认值以本文 §4.7 为准（本文优先），压测（P2）后再调；`platform-and-ops.md` 随之修改 | 采用建议 |
-| Q17 | `visitors` 是否统计 engagement 事件 | §6.5 的 `visitors = uniq(visitor_id)` 没写过滤条件，只有 `realtime` 明写 `name != 'engagement'` | 排除 engagement，与 `realtime` 同口径：engagement 只是已有页面浏览的附属信号，不代表一次到访。§6.5 写明 | 排除 |
-| Q18 | 线协议的错误词表与测试清单 | `tracker-and-protocol.md` §6.2 的固定词表没有「格式不对」「含控制字符」这类消息；§11.1 测试清单要求测 `u` 的 2000/2001 字节边界，但 §5.1 规定 `u` 只受 8 KB 请求体上限约束、超长时截断而不是 400 | 词表补一条 `has an invalid format`，用于 `s` 格式错、`n` 含控制字符、`$` 字段格式错；删掉 §11.1 的 `u` 长度用例，改成「超长 query 被丢弃、pathname 截断到 1024 字节，不回 400」 | 暂用 `is not supported`；`u` 不限长 |
+| Q9 | 盖章是否改写 `visitor_id` | 不改写：事件保留自己当天的 `visitor_id`，会话只靠 `session_id` 串联。`sessions` 排序键去掉 `visitor_id`，改为 `(site_id, start_date, session_id)`，`SAMPLE BY session_id`；新增聚合列 `last_visitor_id`（`argMax(visitor_id, ts)`，会话最后一个事件的当天 ID）取代 `visitor_id`。任意范围的 `uniq(visitor_id)` 因此严格等于各本地日访客数之和 | §4.6（盖章、预热、失败语义）；§5.2、§5.3（DDL、MV、两级聚合）；§5.5 访客数跨天求和；§6.4 `visitors` 只从 `events` 计算；§6.5；§8 跨天连续性；迁移 `…100100_events.sql`、`…100200_sessions.sql` 就地修改（尚未发布） |
+| Q10 | 原始层近似去重、汇总层精确去重 | 两层用同一个 `uniq`，日汇总层存的就是按同样方法算出的每日值；容差写进指标口径文档，实测误差见 §6.5 | §5.5；§6.5 |
+| Q11 | `site_key` 的格式 | 生成格式以 PG 为准（12 位 base32 小写，`^[a-z2-7]{12}$`）；线协议保持宽松的 `^[A-Za-z0-9_-]{8,32}$`，只作向前兼容的语法检查，格式合法但不存在的 key 落到 `unknown_site` | `tracker-and-protocol.md` §5.1 示例改为合法的 12 位 key |
+| Q12 | hostname 白名单为空时怎么处理 | fail-closed：全部丢弃（`hostname_not_allowed`）；建站时自动加入主域名 | §4.2 第 3 步；`platform-and-ops.md` §3.3；迁移 `…100000_core_tables.sql` 的注释就地修正；`tracker-and-protocol.md` §7 |
+| Q13 | 丢弃原因的标识符 | Rust 枚举 `DropReason` 为唯一来源。`ingest_counters.metric` 取 `accepted` 或 `dropped_<原因>`（含 `salt_missing`）；400 按 `rejected_<字段>` 只进 Prometheus，不进 `ingest_counters`；未知站点记 `site_id = 0`；已删除的站点从快照摘除后按 `unknown_site` 计 | §2.2；§4.1；§4.2；§5.4；`tracker-and-protocol.md` §6.4；`platform-and-ops.md` §3 站点删除 |
+| Q14 | 查询超时 | 按调用方分三档：看板 `RIVU_QUERY_TIMEOUT_SECS`（默认 10）、公开 API `RIVU_API_QUERY_TIMEOUT_SECS`（默认 20）、公开看板与共享链接 `RIVU_PUBLIC_QUERY_TIMEOUT_SECS`（默认 5）；每档不得大于 reader 配额上限 | §6.8；`platform-and-ops.md` §4.4、§7 |
+| Q15 | Lite 从 ClickHouse 预热时找不到分片 | Lite 也把 `routing % 32` 写入 `ingest_partition`，分片数固定为 32，与 Reliable 的 P 相同；预热按 `ingest_partition` 放回分片 | §4.5；§4.6（并发、预热）；§5.2 DDL 注释；迁移 `…100100_events.sql` 注释 |
+| Q16 | 写缓冲默认值 | 变量名取 `platform-and-ops.md` 的，默认值以 §4.7 为准：1000 ms、20000 行、8388608 字节、channel 20 万条；P2 压测后再调 | §4.7；`platform-and-ops.md` §7 |
+| Q17 | `visitors` 是否统计 engagement 事件 | 排除，与 `realtime` 同口径 | §5.5；§6.5 |
+| Q18 | 线协议的错误词表与测试清单 | 词表补一条 `has an invalid format`，用于 `s` 格式错、`n` 含控制字符、`$` 字段格式错；`u` 不限长，超长 query 被丢弃、pathname 截断到 1024 字节，不回 400 | `tracker-and-protocol.md` §6.2、§11.1 |
 
 ---
 

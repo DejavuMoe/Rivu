@@ -167,7 +167,7 @@ impl FromStr for Cidr {
     }
 }
 
-/// 写缓冲（BatchWriter）的参数（`system-design.md` §4.7、§10.1 Q16）。
+/// 写缓冲（BatchWriter）的参数（`system-design.md` §4.7、§10 Q16）。
 ///
 /// 默认值取 §4.7：1 s、2 万行、8 MiB，channel 容量 20 万条（变量名取 `platform-and-ops.md` §7）。
 /// 压测（P2）后再调。
@@ -201,6 +201,35 @@ impl Default for BufferConfig {
     }
 }
 
+/// ClickHouse 查询的执行时限，按调用方分三档（`system-design.md` §6.8、§10 Q14）。
+///
+/// 每档都必须不大于 `rivu_reader` profile 里 `max_execution_time` 的上限（该约束由 ClickHouse 强制）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryTimeouts {
+    /// `RIVU_QUERY_TIMEOUT_SECS`：看板（登录会话）。
+    pub dashboard_secs: u64,
+    /// `RIVU_API_QUERY_TIMEOUT_SECS`：公开 API（API key）。
+    pub api_secs: u64,
+    /// `RIVU_PUBLIC_QUERY_TIMEOUT_SECS`：公开看板与共享链接。
+    pub public_secs: u64,
+}
+
+impl QueryTimeouts {
+    pub const DEFAULT_DASHBOARD_SECS: u64 = 10;
+    pub const DEFAULT_API_SECS: u64 = 20;
+    pub const DEFAULT_PUBLIC_SECS: u64 = 5;
+}
+
+impl Default for QueryTimeouts {
+    fn default() -> Self {
+        QueryTimeouts {
+            dashboard_secs: Self::DEFAULT_DASHBOARD_SECS,
+            api_secs: Self::DEFAULT_API_SECS,
+            public_secs: Self::DEFAULT_PUBLIC_SECS,
+        }
+    }
+}
+
 /// 站点缓存的全量重载周期默认值（`RIVU_SITE_CACHE_REFRESH_SECS`）。
 pub const DEFAULT_SITE_CACHE_REFRESH_SECS: u64 = 10;
 
@@ -223,6 +252,7 @@ pub struct Config {
     pub mode: Mode,
     pub trusted_proxies: Vec<Cidr>,
     pub buffer: BufferConfig,
+    pub query_timeouts: QueryTimeouts,
     /// `RIVU_SITE_CACHE_REFRESH_SECS`：站点快照全量重载周期（P1 没有增量刷新和 LISTEN/NOTIFY）。
     pub site_cache_refresh: Duration,
 }
@@ -367,6 +397,23 @@ impl Config {
                 "RIVU_BUFFER_CHANNEL_CAPACITY={channel_capacity} 不能小于 RIVU_BUFFER_MAX_ROWS={max_rows}：缓冲装不下一整批"
             ));
         }
+        let query_timeouts = QueryTimeouts {
+            dashboard_secs: l.parse_in_range(
+                "RIVU_QUERY_TIMEOUT_SECS",
+                QueryTimeouts::DEFAULT_DASHBOARD_SECS,
+                1..=300,
+            ),
+            api_secs: l.parse_in_range(
+                "RIVU_API_QUERY_TIMEOUT_SECS",
+                QueryTimeouts::DEFAULT_API_SECS,
+                1..=300,
+            ),
+            public_secs: l.parse_in_range(
+                "RIVU_PUBLIC_QUERY_TIMEOUT_SECS",
+                QueryTimeouts::DEFAULT_PUBLIC_SECS,
+                1..=300,
+            ),
+        };
         let site_cache_refresh_secs = l.parse_in_range(
             "RIVU_SITE_CACHE_REFRESH_SECS",
             DEFAULT_SITE_CACHE_REFRESH_SECS,
@@ -401,6 +448,7 @@ impl Config {
                 max_bytes,
                 channel_capacity,
             },
+            query_timeouts,
             site_cache_refresh: Duration::from_secs(site_cache_refresh_secs),
         })
     }
@@ -619,12 +667,21 @@ mod tests {
         assert_eq!(cfg.log_level, "info");
         assert_eq!(cfg.mode, Mode::Lite);
         assert!(cfg.trusted_proxies.is_empty());
-        // 写缓冲默认值取 system-design §4.7（§10.1 Q16）
+        // 写缓冲默认值取 system-design §4.7（§10 Q16）
         assert_eq!(cfg.buffer.flush_interval, Duration::from_millis(1000));
         assert_eq!(cfg.buffer.max_rows, 20_000);
         assert_eq!(cfg.buffer.max_bytes, 8_388_608);
         assert_eq!(cfg.buffer.channel_capacity, 200_000);
         assert_eq!(cfg.site_cache_refresh, Duration::from_secs(10));
+        // 查询超时按调用方分三档（§6.8、§10 Q14）
+        assert_eq!(
+            cfg.query_timeouts,
+            QueryTimeouts {
+                dashboard_secs: 10,
+                api_secs: 20,
+                public_secs: 5
+            }
+        );
     }
 
     fn with_env(extra: &[(&str, &str)]) -> Result<Config, ConfigError> {
@@ -670,6 +727,35 @@ mod tests {
             let err = with_env(&[(name, bad)]).unwrap_err();
             assert_eq!(err.problems.len(), 1, "{name}={bad}: {err}");
             assert!(err.problems[0].contains(name), "{name}={bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn query_timeout_variables_are_read_and_validated() {
+        let cfg = with_env(&[
+            ("RIVU_QUERY_TIMEOUT_SECS", "12"),
+            ("RIVU_API_QUERY_TIMEOUT_SECS", "1"),
+            ("RIVU_PUBLIC_QUERY_TIMEOUT_SECS", "300"),
+        ])
+        .unwrap();
+        assert_eq!(
+            cfg.query_timeouts,
+            QueryTimeouts {
+                dashboard_secs: 12,
+                api_secs: 1,
+                public_secs: 300
+            }
+        );
+        for name in [
+            "RIVU_QUERY_TIMEOUT_SECS",
+            "RIVU_API_QUERY_TIMEOUT_SECS",
+            "RIVU_PUBLIC_QUERY_TIMEOUT_SECS",
+        ] {
+            for bad in ["0", "301", "-1", "slow"] {
+                let err = with_env(&[(name, bad)]).unwrap_err();
+                assert_eq!(err.problems.len(), 1, "{name}={bad}: {err}");
+                assert!(err.problems[0].contains(name), "{name}={bad}: {err}");
+            }
         }
     }
 
