@@ -17,7 +17,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use clickhouse::Client;
-use jiff::Timestamp;
 use jiff::civil::{Date, date};
 use jiff::tz::TimeZone;
 use rivu::migrate;
@@ -25,7 +24,7 @@ use rivu_common::config::{BufferConfig, ChAccount, Cidr, Config, Env, Role, Secr
 use rivu_domain::{DropReason, EventKind};
 use rivu_ingest::pipeline::{Outcome, Pipeline, RequestCtx, SaltCache, SiteSnapshot};
 use rivu_query::Overview;
-use rivu_reference::{Metrics, RawEvent, RefSession, metrics, sessionize};
+use rivu_reference::{Metrics, RawEvent, metrics, sessionize};
 use rivu_storage_ch::rows::{EventRow, IngestCounterRow};
 use rivu_storage_pg::sites::NewSite;
 use rivu_writer::{BatchSink, BatchWriter, ChSink, WriterOptions};
@@ -36,6 +35,8 @@ use tokio::sync::OnceCell;
 
 const HOST: &str = "example.test";
 const EPS: f64 = 1e-9;
+/// 看板档的查询超时（秒）。
+const QUERY_TIMEOUT_SECS: u64 = 10;
 
 fn var(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
@@ -137,13 +138,6 @@ fn at(d: Date, h: i8, m: i8) -> i64 {
         .expect("本地时间有效")
         .timestamp()
         .as_millisecond()
-}
-
-fn local_date(ts_ms: i64) -> Date {
-    Timestamp::from_millisecond(ts_ms)
-        .unwrap()
-        .to_zoned(berlin())
-        .date()
 }
 
 /// 一个「真实的人」：不同的 (X-Forwarded-For, UA)。
@@ -281,7 +275,7 @@ fn close(a: f64, b: f64) -> bool {
     (a - b).abs() <= EPS
 }
 
-fn assert_same_metrics(name: &str, q: &Overview, t: &Metrics, visitor_deviation: i64) {
+fn assert_same_metrics(name: &str, q: &Overview, t: &Metrics) {
     assert_eq!(q.visits, t.visits, "{name}: visits");
     assert_eq!(q.pageviews, t.pageviews, "{name}: pageviews");
     assert!(
@@ -302,36 +296,8 @@ fn assert_same_metrics(name: &str, q: &Overview, t: &Metrics, visitor_deviation:
         q.engaged_duration,
         t.engaged_duration
     );
-    // visitors：没有 Q9 情形的范围必须相等；有的范围 = 真值 + 已知偏差（见调用处的注释）。
-    assert_eq!(
-        i64::try_from(q.visitors).unwrap(),
-        i64::try_from(t.visitors).unwrap() + visitor_deviation,
-        "{name}: visitors 查询值应 = 真值 {} + 已知偏差 {visitor_deviation}",
-        t.visitors
-    );
-}
-
-/// §10.1 Q9 暂行口径下，系统应当给出的 visitors，由参考实现的会话独立推出：
-/// 盖章后每个非 engagement 事件的 `visitor_id` 是「会话原始 ID」，即 (人, 会话起始事件的本地日期)
-/// 的哈希；范围内不同 ID 的个数就是 `uniq(visitor_id)`。
-fn q9_visitors(
-    events: &[RawEvent],
-    sessions: &[RefSession],
-    site_id: u64,
-    from: Date,
-    to: Date,
-) -> u64 {
-    let mut ids: HashSet<(u64, Date)> = HashSet::new();
-    for s in sessions.iter().filter(|s| s.site_id == site_id) {
-        for &i in &s.event_indices {
-            let e = &events[i];
-            let d = local_date(e.ts_ms);
-            if e.kind != EventKind::Engagement && d >= from && d <= to {
-                ids.insert((s.person, local_date(s.started_at_ms)));
-            }
-        }
-    }
-    ids.len() as u64
+    // visitors：Q9 定案后（事件保留自己当天的 ID）所有范围都与真值严格相等。
+    assert_eq!(q.visitors, t.visitors, "{name}: visitors");
 }
 
 async fn count(client: &Client, table: &str, site_id: u64) -> u64 {
@@ -350,7 +316,7 @@ async fn merged_sessions(client: &Client, site_id: u64) -> u64 {
     client
         .query(
             "SELECT count() FROM (SELECT 1 FROM sessions WHERE site_id = {site:UInt64} \
-             GROUP BY site_id, start_date, visitor_id, session_id)",
+             GROUP BY site_id, start_date, session_id)",
         )
         .param("site", site_id)
         .fetch_one::<u64>()
@@ -512,14 +478,14 @@ async fn pipeline_to_clickhouse_matches_the_reference() {
     sim.pv(&p2, at(d30, 9, 0), "/blog");
 
     // P3：跨本地午夜（3/28 23:50 -> 3/29 00:10）续上同一个会话，午夜后还有 engagement；
-    // 3/29 05:00 又开一个新会话 —— §10.1 Q9 的情形 (a)：3/29 当天按盖章后的 ID 会多算一个访客
+    // 3/29 05:00 又开一个新会话 —— Q9 的情形 (a)：3/29 当天两个会话的事件都带 3/29 的 ID，只算 1 个访客
     sim.pv(&p3, at(d28, 23, 50), "/");
     sim.pv(&p3, at(d29, 0, 10), "/docs");
     sim.eng(&p3, at(d29, 0, 12), "/docs", 5000, 30, true);
     sim.pv(&p3, at(d29, 5, 0), "/pricing");
 
     // P4：夏令时切换日。01:50 CET 与 03:10 CEST 只隔 20 分钟（中间跳过 02:00–03:00），属于同一个会话；
-    // 23:40 又开一个会话并跨午夜到 3/30 00:05 —— Q9 的情形 (b)：跨天范围里这个人只算一次
+    // 23:40 又开一个会话并跨午夜到 3/30 00:05 —— Q9 的情形 (b)：跨天范围里这个人算两次（3/29、3/30 各一次）
     sim.pv(&p4, at(d29, 1, 50), "/dst");
     sim.pv(&p4, at(d29, 3, 10), "/dst2");
     sim.pv(&p4, at(d29, 23, 40), "/late");
@@ -628,28 +594,23 @@ async fn pipeline_to_clickhouse_matches_the_reference() {
     );
 
     // ---- 各范围的指标对比 -------------------------------------------------------------------------
-    // 最后一列是 visitors 的已知偏差（查询值 − 真值），来自 §10.1 Q9：盖章把跨午夜续上的事件的 visitor_id
-    // 改写成会话起始日的 ID。本场景里：
-    //   P3 在 3/29 有两个会话（00:10 续上 3/28 的，05:00 新开的），按盖章后的 ID 当天算 2 个人（真值 1）：+1；
-    //   P4 的会话 3/29 23:40 -> 3/30 00:05，3/30 的事件仍是 3/29 的 ID，跨过两天的范围里只算 1 次（真值 2）：−1。
-    //   R2 [3/29]：+1；R4 [3/28,3/29]：P3 两个 ID 恰好对应两天，P4 只在 3/29 —— 0；
-    //   R5 [3/29,3/30]：+1 −1 = 0；R6 [3/28,3/30]：只剩 P4 的 −1。Q9 定案（不再改写 ID）后这一列应当全部变成 0。
-    let ranges: [(&str, Date, Date, i64); 8] = [
-        ("R1 3/28", d28, d28, 0),
-        ("R2 3/29（夏令时切换日，23 小时）", d29, d29, 1),
-        ("R3 3/30", d30, d30, 0),
-        ("R4 3/28-3/29（跨午夜两天）", d28, d29, 0),
-        ("R5 3/29-3/30（P3 的 +1 与 P4 的 −1 抵消）", d29, d30, 0),
-        ("R6 3/28-3/30（整个范围）", d28, d30, -1),
-        ("R7 3/27（无数据）", d27, d27, 0),
-        ("R8 3/31（无数据）", d31, d31, 0),
+    // visitors 也与参考实现的真值（各本地日不同人数之和）严格相等（Q9 定案）。
+    let ranges: [(&str, Date, Date); 8] = [
+        ("R1 3/28", d28, d28),
+        ("R2 3/29（夏令时切换日，23 小时）", d29, d29),
+        ("R3 3/30", d30, d30),
+        ("R4 3/28-3/29（跨午夜两天）", d28, d29),
+        ("R5 3/29-3/30", d29, d30),
+        ("R6 3/28-3/30（整个范围）", d28, d30),
+        ("R7 3/27（无数据）", d27, d27),
+        ("R8 3/31（无数据）", d31, d31),
     ];
     let tz = berlin();
     let mut overviews = Vec::new();
     println!("范围 | 真值 visitors/visits/pageviews/bounce/duration/engaged | 查询值");
-    for (name, from, to, deviation) in ranges {
+    for (name, from, to) in ranges {
         let truth = metrics(&raw, &ref_sessions, site_id, &tz, from, to);
-        let q = rivu_query::overview(&reader, site_id, &tz, from, to)
+        let q = rivu_query::overview(&reader, site_id, &tz, from, to, QUERY_TIMEOUT_SECS)
             .await
             .expect("overview");
         println!(
@@ -667,13 +628,7 @@ async fn pipeline_to_clickhouse_matches_the_reference() {
             q.visit_duration,
             q.engaged_duration,
         );
-        assert_same_metrics(name, &q, &truth, deviation);
-        // 暂行口径的独立推导：Q9 的 visitors 由参考实现的会话独立推出，应与查询值一致
-        assert_eq!(
-            q.visitors,
-            q9_visitors(&raw, &ref_sessions, site_id, from, to),
-            "{name}: visitors = 按盖章 ID 数出的不同访客数"
-        );
+        assert_same_metrics(name, &q, &truth);
         overviews.push(q);
     }
     // 空范围：全零
@@ -684,7 +639,7 @@ async fn pipeline_to_clickhouse_matches_the_reference() {
     assert!(overviews[5].visits == 15 && overviews[5].pageviews == 22);
 
     // 页面榜：3/28 浏览最多的页面
-    let top = rivu_query::top_pages(&reader, site_id, &tz, d28, d28, 3)
+    let top = rivu_query::top_pages(&reader, site_id, &tz, d28, d28, 3, QUERY_TIMEOUT_SECS)
         .await
         .expect("top_pages");
     assert_eq!(top.len(), 3);
@@ -743,7 +698,7 @@ async fn pipeline_to_clickhouse_matches_the_reference() {
         sessions_rows_before,
         "重放后 sessions 的部分聚合行数不变（MV 去重生效）"
     );
-    let replayed = rivu_query::overview(&reader, site_id, &tz, d28, d30)
+    let replayed = rivu_query::overview(&reader, site_id, &tz, d28, d30, QUERY_TIMEOUT_SECS)
         .await
         .expect("overview");
     assert_eq!(replayed, overviews[5], "重放后整个范围的指标不变");
@@ -765,10 +720,10 @@ async fn pipeline_to_clickhouse_matches_the_reference() {
         "重放后 ingest_counters 不变"
     );
 
-    // 对照：换一个 token 就是新的一批，应该被计入（证明上面不是因为什么都没写进去）
+    // 对照：换一个 token 就是新的一批，应该被计入（证明上面不是因为什么都没写进去）。\n    // token 带上 site_id：ClickHouse 的去重日志会记住 token，固定字符串在连续两次运行之间会被当成重复而判成假失败。
     let (_, first_rows) = &batches[0];
     sink.inner
-        .insert_events(first_rows, "e2e-control-token")
+        .insert_events(first_rows, &format!("e2e-control-token-{site_id}"))
         .await
         .expect("新 token");
     assert_eq!(

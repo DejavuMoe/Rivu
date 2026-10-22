@@ -80,8 +80,11 @@ pub async fn stats(config: &Config, args: StatsArgs) -> Result<ExitCode> {
         rivu_storage_ch::client(&config.clickhouse_url, account, Some(&config.ch_database));
 
     let (from, to): (Date, Date) = (args.from, args.to);
-    let overview = rivu_query::overview(&reader, site.id, &tz, from, to).await?;
-    let pages = rivu_query::top_pages(&reader, site.id, &tz, from, to, TOP_PAGES_LIMIT).await?;
+    // `rivu stats` 等同看板查询，用看板档的超时（§10 Q14）。
+    let timeout = config.query_timeouts.dashboard_secs;
+    let overview = rivu_query::overview(&reader, site.id, &tz, from, to, timeout).await?;
+    let pages =
+        rivu_query::top_pages(&reader, site.id, &tz, from, to, TOP_PAGES_LIMIT, timeout).await?;
 
     let out = json!({
         "site_key": site.site_key,

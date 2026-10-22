@@ -79,7 +79,7 @@ CREATE INDEX sites_org ON sites (organization_id) WHERE deleted_at IS NULL;
 CREATE INDEX sites_updated ON sites (updated_at);
 
 -- ------------------------------------------------------------ site_hostnames
--- `*.example.com` 匹配任意深度子域，不含 apex（apex 另加一条）；白名单为空表示不校验。
+-- `*.example.com` 匹配任意深度子域，不含 apex（apex 另加一条）；白名单为空时 collector 丢弃全部事件（fail-closed，system-design §10 Q12）；建站时自动加入主域名。
 CREATE TABLE site_hostnames (
     id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     site_id    bigint NOT NULL REFERENCES sites (id),

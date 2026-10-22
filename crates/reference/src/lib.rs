@@ -7,7 +7,7 @@
 //! 口径来源：
 //! - 会话切分：`docs/architecture/system-design.md` §4.6（续期 ≤ 30 min 且距开始 ≤ 7 d）与 §10 Q7；
 //! - 会话聚合列：§5.3；派生指标：§5.3、§6.5；
-//! - `visitors` 的真值：§10.1 Q9 的定义，即「各站点本地日的不同人数之和」。
+//! - `visitors` 的真值：§10 Q9 的定义，即「各站点本地日的不同人数之和」。
 //!
 //! 为了保证它简单到不会错，这里宁可 O(n log n) 排序、整体遍历，也不做任何增量或索引优化。
 
@@ -184,7 +184,7 @@ fn day_start_ms(date: Date, tz: &TimeZone) -> i64 {
 
 /// 范围 = 站点本地日期 `[from, to]`（含），时区 `tz`。
 ///
-/// - `visitors`：Σ 每个本地日（该日有**非 engagement** 事件的不同 `person` 数），即 §10.1 Q9 的真值。
+/// - `visitors`：Σ 每个本地日（该日有**非 engagement** 事件的不同 `person` 数），即 §10 Q9 的真值。
 ///   §6.5 写的是 `uniq(visitor_id)`，没有说是否排除 engagement；engagement 只会落在已有会话里，
 ///   会话里一定有更早的非 engagement 事件，但那个事件可能在前一天，所以排除与否会影响跨午夜的数字。
 ///   这里按「访客 = 访问过的人」排除 engagement，与 `realtime`（§6.5）同口径。

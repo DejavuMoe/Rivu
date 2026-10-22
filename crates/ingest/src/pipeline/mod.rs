@@ -7,7 +7,7 @@
 //! 组装 `EventRow` → 交给 BatchWriter（缓冲满则 `Overloaded`，同时计 `dropped_overloaded`）。
 //!
 //! 每个结果都计入 `ingest_counters`：`accepted` 或 `dropped_<原因>`；未知站点记在 `site_id = 0`。
-//! 400 不进 `ingest_counters`，只进 Prometheus `rivu_ingest_rejected_total{field}`（§10.1 Q13）。
+//! 400 不进 `ingest_counters`，只进 Prometheus `rivu_ingest_rejected_total{field}`（§10 Q13）。
 //!
 //! 时间由调用方传入（`RequestCtx::now_ms`），所以测试可以把事件放到任意时刻。
 
@@ -67,7 +67,7 @@ pub struct Pipeline {
     writer: WriterHandle,
     trusted_proxies: Vec<Cidr>,
     /// 分片号用的长期密钥。Lite 不持久化它：重启后随机重新生成，内存里的会话也随之清空
-    /// （从 ClickHouse 预热留到以后，§4.6「预热」、§10.1 Q15）。
+    /// （从 ClickHouse 预热留到以后，§4.6「预热」、§10 Q15）。
     routing_secret: Salt,
 }
 
@@ -136,7 +136,7 @@ impl Pipeline {
             return self.dropped(site_id, &ev, DropReason::SiteDisabled);
         }
 
-        // 5. hostname 白名单；空白名单 fail-closed（§10.1 Q12）
+        // 5. hostname 白名单；空白名单 fail-closed（§10 Q12）
         if site.hostnames.is_empty() || !site.hostnames.matches(&ev.hostname) {
             return self.dropped(site_id, &ev, DropReason::HostnameNotAllowed);
         }
@@ -285,7 +285,7 @@ fn event_id(ts_ms: i64) -> Uuid {
 
 /// 组装 `events` 的一行。
 ///
-/// `visitor_id` 用 `Stamp::visitor_id`（现行 §4.6：会话的原始 ID，跨午夜保持不变；§10.1 Q9 未定案），
+/// `visitor_id` 用 `Stamp::visitor_id`（事件自己当天的 ID，盖章不改写，会话靠 `session_id` 串联；§10 Q9），
 /// `ingest_partition` 用 `Stamp::partition`（Q15：`routing % 32`）。
 fn build_row(site_id: u64, ev: NormalizedEvent, stamp: &Stamp, ts_ms: i64) -> EventRow {
     let a = &*stamp.attrs;
@@ -635,7 +635,7 @@ mod tests {
     }
 
     #[test]
-    fn session_continues_across_local_midnight_and_keeps_the_original_visitor_id() {
+    fn session_continues_across_local_midnight_and_each_event_keeps_its_own_visitor_id() {
         let mut r = rig(10);
         let d = date(2026, 3, 28);
         let c = |t| ctx("203.0.113.9", "UA", t);
@@ -645,9 +645,9 @@ mod tests {
         let (a, b) = (r.rx.try_recv().unwrap(), r.rx.try_recv().unwrap());
         assert_eq!(a.session_id, b.session_id);
         assert_eq!(a.session_start, b.session_start);
-        assert_eq!(
+        assert_ne!(
             a.visitor_id, b.visitor_id,
-            "现行 §4.6：盖章保持会话的原始 ID（Q9）"
+            "Q9：盖章不改写 visitor_id，事件保留自己当天的 ID"
         );
         assert_eq!(b.entry_pathname, "/a");
     }
