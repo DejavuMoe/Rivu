@@ -1,4 +1,7 @@
-//! PostgreSQL 访问（sqlx）：连接池、迁移记录表与迁移执行。
+//! PostgreSQL 访问（sqlx）：连接池、迁移记录表与迁移执行，以及站点与盐。
+
+pub mod salts;
+pub mod sites;
 
 use std::time::Duration;
 

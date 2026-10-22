@@ -83,3 +83,5 @@ jobs:
         run: ./target/debug/rivu migrate status
       - name: 集成测试
         run: cargo test -p rivu --test clickhouse_sessions -- --nocapture
+      - name: 端到端测试（管线 -> ClickHouse -> 查询，与参考实现对比）
+        run: cargo test -p rivu --test e2e_lite -- --nocapture

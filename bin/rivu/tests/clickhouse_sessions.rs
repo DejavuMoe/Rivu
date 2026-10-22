@@ -12,51 +12,10 @@ use std::collections::HashMap;
 use clickhouse::{Client, Row};
 use rivu::migrate;
 use rivu_common::config::{ChAccount, Config, Env, Role, Secret};
-use serde::{Deserialize, Serialize};
+use rivu_storage_ch::rows::{EventRow, insert_events};
+use serde::Deserialize;
 use time::OffsetDateTime;
 use uuid::Uuid;
-
-/// 与 `events` 表的全部列一一对应（官方 crate 默认校验：没有 DEFAULT 的列必须都出现）。
-#[derive(Row, Serialize, Clone)]
-struct EventRow {
-    site_id: u64,
-    #[serde(with = "clickhouse::serde::time::datetime64::millis")]
-    ts: OffsetDateTime,
-    #[serde(with = "clickhouse::serde::uuid")]
-    event_id: Uuid,
-    name: String,
-    visitor_id: u64,
-    session_id: u64,
-    #[serde(with = "clickhouse::serde::time::datetime64::millis")]
-    session_start: OffsetDateTime,
-    ingest_partition: u8,
-    hostname: String,
-    pathname: String,
-    entry_pathname: String,
-    referrer: String,
-    referrer_source: String,
-    channel: String,
-    utm_source: String,
-    utm_medium: String,
-    utm_campaign: String,
-    utm_content: String,
-    utm_term: String,
-    click_id_param: String,
-    country_code: [u8; 2],
-    region_code: String,
-    city_geoname_id: u32,
-    device: String,
-    browser: String,
-    browser_version: String,
-    os: String,
-    os_version: String,
-    interactive: bool,
-    props: HashMap<String, String>,
-    scroll_depth: u8,
-    engagement_ms: u32,
-    revenue_amount: Option<i64>,
-    revenue_currency: String,
-}
 
 #[derive(Row, Deserialize, Debug, PartialEq)]
 struct SessionAgg {
@@ -134,31 +93,18 @@ fn event(
     }
 }
 
-/// 与 `rivu_storage_ch` 的写入约定一致：显式 async_insert=0、稳定的去重 token、
-/// 显式开启 MV 去重。`deduplicate_insert` 是 26.2 才有的设置，只在服务端支持时才设置。
+/// 写入约定见 `rivu_storage_ch::rows`：显式 async_insert=0、稳定的去重 token、显式开启 MV 去重，
+/// `deduplicate_insert` 只在服务端支持时才设置。
 async fn insert_batch(
     writer: &Client,
     rows: &[EventRow],
     token: &str,
     has_deduplicate_insert: bool,
 ) {
-    let mut insert = writer
-        .insert::<EventRow>("events")
+    insert_events(writer, rows, token, has_deduplicate_insert)
         .await
-        .expect("开始 INSERT")
-        .with_setting("async_insert", "0")
-        .with_setting("insert_deduplicate", "1")
-        .with_setting("insert_deduplication_token", token)
-        .with_setting("deduplicate_blocks_in_dependent_materialized_views", "1");
-    if has_deduplicate_insert {
-        insert = insert.with_setting("deduplicate_insert", "enable");
-    }
-    for row in rows {
-        insert.write(row).await.expect("写入行");
-    }
-    insert.end().await.expect("结束 INSERT");
+        .expect("写入 events");
 }
-
 async fn session_aggregates(reader: &Client, site_id: u64) -> Vec<SessionAgg> {
     // 内层按完整排序键 GROUP BY：合并 AggregatingMergeTree 里尚未合并的部分行
     reader

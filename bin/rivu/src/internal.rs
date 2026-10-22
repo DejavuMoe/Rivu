@@ -12,6 +12,7 @@ use metrics_exporter_prometheus::PrometheusHandle;
 use rivu_common::build_info;
 use rivu_common::config::Role;
 use rivu_common::migration::{self, Store};
+use rivu_ingest::pipeline::{SaltCache, SiteSnapshot, utc_today};
 use serde_json::{Value, json};
 
 /// 单项检查的超时：依赖卡住时 `/readyz` 也要及时返回 503，而不是挂起。
@@ -44,9 +45,18 @@ impl Probe {
     }
 }
 
+/// collector 角色的就绪条件：站点快照已加载、盐已加载（今天前后各一天）。
+#[derive(Clone)]
+pub struct CollectorReadiness {
+    pub sites: Arc<SiteSnapshot>,
+    pub salts: Arc<SaltCache>,
+}
+
 pub struct InternalState {
     pub role: Role,
     pub probe: Probe,
+    /// 只有 collector / all 有。
+    pub collector: Option<CollectorReadiness>,
     pub metrics: PrometheusHandle,
     pub started: Instant,
 }
@@ -96,6 +106,21 @@ fn schema_json(required: u64, applied: &Result<u64, String>) -> (bool, Value) {
     }
 }
 
+/// 站点快照至少加载成功过一次（站点数可以是 0）。
+fn sites_check(sites: &SiteSnapshot) -> (bool, Value) {
+    let ok = sites.is_loaded();
+    (ok, json!({ "ok": ok, "loaded": ok, "sites": sites.len() }))
+}
+
+/// 盐缓存覆盖 UTC 的 `today-1 ..= today+1`：站点本地日期相对 UTC 日期在 ±1 天内，缺任何一天都会丢事件。
+fn salts_check(salts: &SaltCache, today_utc: jiff::civil::Date) -> (bool, Value) {
+    let ok = salts.covers(today_utc);
+    (
+        ok,
+        json!({ "ok": ok, "loaded": salts.is_loaded(), "today": today_utc.to_string() }),
+    )
+}
+
 async fn readyz(State(state): State<Arc<InternalState>>) -> impl IntoResponse {
     let p = &state.probe;
     let (pg, ch, pg_version, ch_version) = tokio::join!(
@@ -107,22 +132,31 @@ async fn readyz(State(state): State<Arc<InternalState>>) -> impl IntoResponse {
 
     let (pg_schema_ok, pg_schema) = schema_json(p.required_pg, &pg_version);
     let (ch_schema_ok, ch_schema) = schema_json(p.required_ch, &ch_version);
-    let ready = pg.is_ok() && ch.is_ok() && pg_schema_ok && ch_schema_ok;
+    let mut ready = pg.is_ok() && ch.is_ok() && pg_schema_ok && ch_schema_ok;
+
+    let mut checks = json!({
+        "postgres": check_json(&pg),
+        "clickhouse": check_json(&ch),
+        "schema": {
+            "ok": pg_schema_ok && ch_schema_ok,
+            "postgres": pg_schema,
+            "clickhouse": ch_schema,
+        },
+    });
+    if let Some(c) = &state.collector {
+        let (sites_ok, sites) = sites_check(&c.sites);
+        let (salts_ok, salts) = salts_check(&c.salts, utc_today());
+        ready = ready && sites_ok && salts_ok;
+        checks["sites"] = sites;
+        checks["salts"] = salts;
+    }
 
     let body = json!({
         "status": if ready { "ready" } else { "not_ready" },
         "version": build_info::VERSION,
         "commit": build_info::GIT_COMMIT,
         "role": state.role.as_str(),
-        "checks": {
-            "postgres": check_json(&pg),
-            "clickhouse": check_json(&ch),
-            "schema": {
-                "ok": pg_schema_ok && ch_schema_ok,
-                "postgres": pg_schema,
-                "clickhouse": ch_schema,
-            },
-        },
+        "checks": checks,
     });
     let status = if ready {
         StatusCode::OK
@@ -178,6 +212,36 @@ mod tests {
         assert!(!ok);
         assert_eq!(v["ok"], false);
         assert!(v["error"].as_str().unwrap().contains("relation"));
+    }
+
+    #[test]
+    fn sites_check_requires_a_completed_load() {
+        let sites = SiteSnapshot::new();
+        let (ok, v) = sites_check(&sites);
+        assert!(!ok);
+        assert_eq!(v["loaded"], false);
+        sites.replace(Default::default());
+        let (ok, v) = sites_check(&sites);
+        assert!(ok, "加载过但没有站点也算就绪");
+        assert_eq!(v["sites"], 0);
+    }
+
+    #[test]
+    fn salts_check_requires_yesterday_today_and_tomorrow() {
+        use jiff::civil::date;
+        let salts = SaltCache::new();
+        let today = date(2026, 3, 29);
+        assert!(!salts_check(&salts, today).0);
+        let mut m = std::collections::HashMap::new();
+        m.insert(date(2026, 3, 28), [1u8; 16]);
+        m.insert(date(2026, 3, 29), [1u8; 16]);
+        salts.replace(m.clone());
+        let (ok, v) = salts_check(&salts, today);
+        assert!(!ok, "缺 today+1");
+        assert_eq!(v["loaded"], true);
+        m.insert(date(2026, 3, 30), [1u8; 16]);
+        salts.replace(m);
+        assert!(salts_check(&salts, today).0);
     }
 
     #[test]

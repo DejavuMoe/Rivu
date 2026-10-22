@@ -8,6 +8,7 @@ members = [
     "crates/ingest",
     "crates/jobs",
     "crates/query",
+    "crates/reference",
     "crates/session",
     "crates/storage-ch",
     "crates/storage-pg",
@@ -27,11 +28,26 @@ unsafe_code = "forbid"
 [workspace.dependencies]
 # 工作区内部 crate
 rivu-common = { path = "crates/common" }
+rivu-domain = { path = "crates/domain" }
+rivu-ingest = { path = "crates/ingest" }
+rivu-jobs = { path = "crates/jobs" }
+rivu-query = { path = "crates/query" }
+rivu-reference = { path = "crates/reference" }
+rivu-session = { path = "crates/session" }
+rivu-writer = { path = "crates/writer" }
 rivu-storage-pg = { path = "crates/storage-pg" }
 rivu-storage-ch = { path = "crates/storage-ch" }
 
 # 第三方依赖：只加 P0 用到的（async-nats 留到 P3）
 anyhow = "1"
+arc-swap = "1"
+jiff = "0.2"
+parking_lot = "0.12"
+percent-encoding = "2"
+proptest = "1"
+rand = "0.9"
+siphasher = "1"
+url = "2"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 clap = { version = "4", features = ["derive", "string"] }
 clickhouse = { version = "0.15", default-features = false, features = ["lz4", "rustls-tls-ring", "rustls-tls-webpki-roots"] }
