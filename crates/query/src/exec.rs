@@ -40,6 +40,9 @@ pub struct ExecOptions {
     pub now: Timestamp,
     /// `log_comment` 里的路由名，如 `api.query`、`dashboard.overview`。
     pub route: String,
+    /// 额外写进 `log_comment` 的字段（只放 id 一类的标识，如 `org`、`api_key_id`；不放邮箱、IP、过滤值）。
+    /// 与保留字段（`route`、`site`、`part`、`tier`）同名时以保留字段为准。
+    pub comment: BTreeMap<String, Value>,
 }
 
 impl ExecOptions {
@@ -48,7 +51,14 @@ impl ExecOptions {
             timeout_secs,
             now: Timestamp::now(),
             route: "query".to_owned(),
+            comment: BTreeMap::new(),
         }
+    }
+
+    /// 给 `log_comment` 加一个字段（见 [`ExecOptions::comment`]）。
+    pub fn with_comment(mut self, key: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.comment.insert(key.into(), value.into());
+        self
     }
 
     pub fn with_now(mut self, now: Timestamp) -> Self {
@@ -91,6 +101,20 @@ struct Ctx<'a> {
     scope: &'a TenantScope,
     opts: &'a ExecOptions,
     deadline: Deadline,
+}
+
+/// 每条查询的 `log_comment`（JSON，只含 id 与固定标签）：调用方的额外字段在前，保留字段 `route`、`site`、`part`、`tier` 覆盖同名项。
+fn log_comment(opts: &ExecOptions, site_id: u64, part: &str) -> String {
+    let mut comment: serde_json::Map<String, Value> = opts
+        .comment
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    comment.insert("route".into(), json!(opts.route));
+    comment.insert("site".into(), json!(site_id));
+    comment.insert("part".into(), json!(part));
+    comment.insert("tier".into(), json!("raw"));
+    Value::Object(comment).to_string()
 }
 
 fn ch_code(text: &str) -> Option<u32> {
@@ -162,13 +186,7 @@ impl Ctx<'_> {
             )));
         }
         let secs = self.deadline.remaining_secs()?;
-        let comment = json!({
-            "route": self.opts.route,
-            "site": self.scope.site_id(),
-            "part": part,
-            "tier": "raw",
-        })
-        .to_string();
+        let comment = log_comment(self.opts, self.scope.site_id(), part);
         let q = bind(self.reader.query(sql), params)
             .with_setting("max_execution_time", secs.to_string())
             .with_setting("log_comment", comment);
@@ -648,4 +666,37 @@ pub async fn execute(
         meta,
         query,
     })
+}
+
+#[cfg(test)]
+mod log_comment_tests {
+    use super::*;
+
+    #[test]
+    fn log_comment_has_route_site_and_the_callers_ids() {
+        let opts = ExecOptions::new(5)
+            .with_route("api.query")
+            .with_comment("org", 4)
+            .with_comment("api_key_id", 9);
+        let v: Value = serde_json::from_str(&log_comment(&opts, 77, "main")).unwrap();
+        assert_eq!(
+            v,
+            json!({"route": "api.query", "site": 77, "part": "main", "tier": "raw",
+                   "org": 4, "api_key_id": 9})
+        );
+    }
+
+    #[test]
+    fn reserved_fields_cannot_be_overridden_by_the_caller() {
+        let opts = ExecOptions::new(5)
+            .with_route("real")
+            .with_comment("route", "forged")
+            .with_comment("site", 1)
+            .with_comment("tier", "forged");
+        let v: Value = serde_json::from_str(&log_comment(&opts, 77, "compare")).unwrap();
+        assert_eq!(v["route"], "real");
+        assert_eq!(v["site"], 77);
+        assert_eq!(v["part"], "compare");
+        assert_eq!(v["tier"], "raw");
+    }
 }

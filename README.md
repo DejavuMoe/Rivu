@@ -11,20 +11,21 @@ Rivu 是开源、自托管的网站分析系统（Plausible 的替代品）：�
 | 已有 | 还没有（后续阶段） |
 |---|---|
 | Cargo workspace 和单个二进制 `rivu`（`collector \| worker \| api \| migrate \| all`，另有 `site add`、`shield add\|list\|remove`、`apikey create\|list\|revoke`、`stats`） | tracker `full` 变体（`core` 已实现）、管理后台（等待 `designs/` 原型审批） |
-| 配置加载与集中校验（`RIVU_*`，支持 `*_FILE`），含写缓冲与站点缓存参数 | `/api/*` 查询路由（库 API 已就绪，路由待挂）、日汇总层与规划器选层（P2） |
+| 配置加载与集中校验（`RIVU_*`，支持 `*_FILE`），含写缓冲与站点缓存参数 | 内部看板端点 `/api/internal/*`（需要登录会话）、日汇总层与规划器选层（P2） |
 | `rivu migrate`：PG 与 ClickHouse 迁移按版本号交织执行 | 数据中心 IP 表 |
 | 内部端口 `/healthz` `/readyz` `/metrics`；`/readyz` 含站点快照与盐是否已加载 | JetStream、worker 的会话分配与批量写入、Reliable 模式（P3） |
 | `POST /api/event`：协议解析、站点快照与 hostname 白名单、每日盐的访客 ID、SessionAssigner、BatchWriter（带去重 token 的重试）、`ingest_counters` | 会话状态的快照与预热 |
 | 接入准入与规则：按站点令牌桶限流（`site_settings.ingest_rate_limit_per_min`，缺省用 `RIVU_INGEST_RATE_LIMIT_PER_MIN`）、垃圾引荐（Matomo referrer-spam-list，公有领域，按 host 后缀匹配）、屏蔽规则（IP / CIDR / 国家 / 页面通配 / hostname，`rivu shield`，每站上限 `RIVU_SHIELD_MAX_RULES_PER_SITE`） | 规则的看板管理界面 |
-| 公开 API 组件（`rivu-auth`、`rivu-ratelimit`）：API key（`rivu_` + 32 字节随机数，库里只存 SHA-256）、`Authorization: Bearer` 鉴权、scope 与角色、站点访问判定、按组织限流（小时配额 + 突发令牌桶 + 并发信号量，`RIVU_API_RATE_PER_HOUR` / `RIVU_API_BURST` / `RIVU_API_MAX_CONCURRENCY` / `RIVU_API_QUEUE_TIMEOUT_MS`）；`rivu apikey create\|list\|revoke` | `/api/v1/query` 路由挂载（P2） |
+| 公开 API 组件（`rivu-auth`、`rivu-ratelimit`）：API key（`rivu_` + 32 字节随机数，库里只存 SHA-256）、`Authorization: Bearer` 鉴权、scope 与角色、站点访问判定、按组织限流（小时配额 + 突发令牌桶 + 并发信号量，`RIVU_API_RATE_PER_HOUR` / `RIVU_API_BURST` / `RIVU_API_MAX_CONCURRENCY` / `RIVU_API_QUEUE_TIMEOUT_MS`）；`rivu apikey create\|list\|revoke` | 共享链接与公开看板的查询入口 |
 | 接入富化：机器人（含空 UA）、GeoIP（按站点 `geo_level` 截断）、UA、来源与渠道（`rivu-ua` / `rivu-geo` / `rivu-source`），各阶段耗时直方图 `rivu_ingest_stage_seconds{stage}` | 站点增量刷新与 `LISTEN/NOTIFY` |
 | 统一查询内核 `rivu-query`（`QuerySpec` → 解析 → 校验 → 规划 → SQL → 执行；12 个指标、维度、过滤树、日期范围、时间序列、对比期；`overview` / `breakdown` 是它的预设）；独立参考实现 `rivu-reference` 与差分测试（`bin/rivu/tests/query_differential.rs`） | |
+| 公开查询 API（api / all 角色）：`POST /api/v1/query`（API key `stats:read`，按组织限流，请求体 ≤ 1 MiB，超时 `RIVU_API_QUERY_TIMEOUT_SECS`，不开 CORS，响应 `Cache-Control: no-store`）与 `GET /api/v1/query/schema.json`（公开，`ETag`，`max-age=3600`）；指标 `rivu_api_requests_total{route,status}`、`rivu_query_seconds{route}`；ClickHouse 的 `log_comment` 带 route / site / org / api_key_id | |
 | `GET /js/<site_key>.js`：配置前缀 + tracker `core.js`（`RIVU_TRACKER_DIR`，默认 `apps/tracker/dist`；缺失时 503，`/readyz` 报告但不判失败；生产镜像应放入 CI 构建的 `dist/`），`RIVU_PUBLIC_BASE_URL` 决定脚本里的采集端点 | |
 | 后台任务 `salts_rotate`（`all`、`worker`） | |
 | 初始 schema：PG 业务表，ClickHouse `events` / `sessions` / `mv_sessions` / `ingest_counters` | |
 | `deploy/compose.dev.yml`、CI 工作流 | |
 
-公共端口上的 `POST /api/event` 已实现；其余 `/api/*` 仍返回 `501`（标注 P2）。路线图见 [`docs/architecture/system-design.md` §9](docs/architecture/system-design.md)，P1 的任务与验收见 [`docs/brief-p1.md`](docs/brief-p1.md)。
+公共端口上的 `POST /api/event` 与公开查询 API（`POST /api/v1/query`、`GET /api/v1/query/schema.json`，api / all 角色）已实现；其余 `/api/*`（内部看板端点）仍返回 `501`（标注 P2）。路线图见 [`docs/architecture/system-design.md` §9](docs/architecture/system-design.md)，P1 的任务与验收见 [`docs/brief-p1.md`](docs/brief-p1.md)。
 ## 目录结构
 
 ```
@@ -123,6 +124,17 @@ curl.exe -i -X POST http://127.0.0.1:8080/api/event -H "Content-Type: text/plain
 cargo run -p rivu -- stats --site <site_key> --from 2026-10-22 --to 2026-10-22  # 日期是站点本地日期
 ```
 
+用公开查询 API 查询（api key 属于站点所在的组织：先建用户与成员关系，再 `cargo run -p rivu -- apikey create --org <slug> --name demo`，明文只显示一次）：
+
+```powershell
+# 请求体就是 QuerySpec，`site` 必填；PowerShell 里用文件传 JSON 最省引号
+'{"site":"<site_key>","metrics":["visitors","pageviews"],"dimensions":["event:page"],"date_range":"day"}' | Set-Content q.json -NoNewline
+curl.exe -i -X POST http://127.0.0.1:8080/api/v1/query -H "Authorization: Bearer <key>" -H "Content-Type: application/json" --data-binary "@q.json"
+curl.exe -i http://127.0.0.1:8080/api/v1/query/schema.json     # 无需 key
+```
+
+错误体都是 `{"error":"<代码>","message":"..."}`；400 另有 `errors:[{"path":"filters[0][2]","message":"..."}]`；站点不存在与无权访问都是同一个 404。
+
 bash：
 
 ```bash
@@ -142,12 +154,14 @@ cargo clippy --all-targets -- -D warnings
 cargo test                      # 集成测试在缺少 RIVU_TEST_* 变量时跳过并打印原因
 ```
 
-加载 `.env.example` 后（里面带了 `RIVU_TEST_*`），`cargo test` 会连真实的 PostgreSQL 和 ClickHouse 跑两个集成测试：
+加载 `.env.example` 后（里面带了 `RIVU_TEST_*`），`cargo test` 会连真实的 PostgreSQL 和 ClickHouse 跑这些集成测试：
 
 - `bin/rivu/tests/clickhouse_sessions.rs`：迁移后写入一个会话的 3 个事件，校验 `mv_sessions` 的聚合，并用同一个 `insert_deduplication_token` 重放，确认 `events` 和 `sessions` 都不重复计数。
 - `bin/rivu/tests/e2e_lite.rs`：事件经管线、会话分配、批量写入进入 ClickHouse（事件放在 2026-03-28..30，覆盖夏令时切换日与跨午夜会话），用 `rivu_query::overview` 查询多个日期范围，与 `rivu-reference` 在同一批事件上算出的真值逐项比较，并对账 `ingest_counters`、验证去重重放；另有一个经真实 HTTP 的用例（含 `/js/<site_key>.js`），以及一个富化用例：真实浏览器 UA（取自 uap-core 测试集）、机器人 UA、MaxMind 官方测试库里的 IP（经受信代理的 XFF）、不同 referrer / utm / click id，每个维度（页面、来源、渠道、国家、设备）的 `breakdown` 与参考实现逐行相等。
 
 - `bin/rivu/tests/shield_and_apikey.rs`：建站与屏蔽规则（IP、CIDR、allow 例外、页面通配、国家）、站点令牌桶限流、垃圾引荐、机器人、hostname，经管线处理一组事件后，`ingest_counters` 里 `accepted` 与各 `dropped_*` 逐项等于预期、`events` 行数等于 `accepted`；每站规则上限在并发添加下不超限；API key 全链路（创建、401、403、404、429 的小时配额与并发排队、`last_used_at` 节流、吊销与各种失效）；`shield` / `apikey` 命令的校验与副作用。
+
+- `bin/rivu/tests/public_api.rs`：公开查询 API 的端到端测试（真实 PG / ClickHouse、真实本地端口，路由由 `public::router_full` 装配）。两个站点（UTC；Asia/Kathmandu + 周日起始）经管线写入固定的历史事件，17 个 `QuerySpec`（overview、维度、过滤、compare、time_labels、分页、realtime、相对范围、周桶）的 HTTP 响应与直接调用 `rivu_query::execute` 的结果逐字节相等；400（非法 JSON、未知字段、非法过滤的 path）、401、403、404（不存在、别的组织、scope 不含该站点：响应体完全相同）、429（组织小时配额，`Retry-After` 与 `X-RateLimit-*`）、405、其余 `/api/*` 的 501、schema.json（200 / 304）；`rivu_api_requests_total` 与 `rivu_query_seconds` 的计数。
 
 另有两个查询内核的集成测试：`bin/rivu/tests/query_differential.rs` 用确定性随机生成器造两个站点（Europe/Berlin、Asia/Kathmandu）的事件，经真实管线写入后，随机生成数百个 `QuerySpec`（`RIVU_DIFF_SEED` 改种子、`RIVU_DIFF_CASES` 改个数，默认 500），逐个与 `rivu_reference::query` 比较，失败时打印最小化后的请求；`bin/rivu/tests/query_security.rs` 用恶意取值（引号、反斜杠、`{x:String}`、注释、换行）验证没有注入、站点之间互不可见。SQL 与 JSON Schema 的 insta 快照在 `crates/query/src/snapshots/`（`INSTA_UPDATE=always cargo test -p rivu-query` 更新）。
 
