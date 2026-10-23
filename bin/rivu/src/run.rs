@@ -34,6 +34,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::api_auth;
+use crate::dash_api::{self, DashApi};
 use crate::internal::{self, CollectorReadiness, GeoReadiness, InternalState, Probe};
 use crate::public;
 use crate::query_api::{self, QueryApi};
@@ -228,6 +229,7 @@ pub async fn run(config: Config) -> Result<ExitCode> {
     rivu_ingest::pipeline::describe_metrics();
     rivu_geo::describe_metrics();
     query_api::describe_metrics();
+    dash_api::describe_metrics();
 
     // 先绑定端口：端口被占用时不应该留下已经启动的后台任务。
     let internal_listener = TcpListener::bind(config.internal_addr)
@@ -303,13 +305,40 @@ pub async fn run(config: Config) -> Result<ExitCode> {
             Some(&config.ch_database),
         );
         let guard = api_auth::build_guard(&config, pg.clone());
-        Some(query_api::router(Arc::new(QueryApi::new(
-            guard,
-            pg.clone(),
-            reader,
-            geo_db.clone(),
-            config.query_timeouts.api_secs,
-        ))))
+        if !config.base_url_explicit {
+            tracing::warn!(
+                base_url = %config.base_url,
+                "未设置 RIVU_BASE_URL：内部端点的 CSRF 按 Origin == http://<RIVU_LISTEN_ADDR> 校验，只适合开发；生产必须设置为对外的 https 地址"
+            );
+        }
+        if !config.cookie_secure {
+            tracing::warn!(
+                "会话 cookie 不带 Secure（RIVU_BASE_URL 是 http 或 RIVU_COOKIE_SECURE=off）：只适合开发"
+            );
+        }
+        match rivu_storage_pg::users::any_user_exists(&pg).await {
+            Ok(false) => tracing::warn!(
+                token_required = config.setup_token.is_some(),
+                "实例还没有用户：POST /api/internal/setup 或 `rivu setup` 可以创建首个用户（建议设置 RIVU_SETUP_TOKEN）"
+            ),
+            Ok(true) => {}
+            Err(e) => tracing::warn!(error = %format!("{e:#}"), "检查实例是否已初始化失败"),
+        }
+        let dash = Arc::new(
+            DashApi::new(&config, pg.clone(), reader.clone(), geo_db.clone())
+                .context("装配内部端点失败")?,
+        );
+        background.push(dash_api::spawn_maintenance(pg.clone(), bg_stop_rx.clone()));
+        Some(
+            query_api::router(Arc::new(QueryApi::new(
+                guard,
+                pg.clone(),
+                reader,
+                geo_db.clone(),
+                config.query_timeouts.api_secs,
+            )))
+            .merge(dash_api::router(dash)),
+        )
     } else {
         None
     };

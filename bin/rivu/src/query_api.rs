@@ -149,47 +149,59 @@ impl<S: AuthStore> QueryApi<S> {
 
     /// 站点上下文：时区与周起始日来自 PG，地理署名与能力来自进程里的库。站点此刻已不存在返回 `NotFound`。
     async fn site_context(&self, site_id: u64, site_key: &str) -> Result<SiteContext, Fail> {
-        let settings = match rivu_storage_pg::sites::find_query_settings(&self.pg, site_id).await {
-            Ok(Some(s)) => s,
-            Ok(None) => return Err(ApiError::NotFound.into()),
-            Err(e) => {
-                tracing::error!(site_id, error = %format!("{e:#}"), "读取站点的查询设置失败");
-                return Err(ApiError::Internal.into());
-            }
-        };
-        let timezone = TimeZone::get(&settings.timezone).map_err(|e| {
-            tracing::error!(site_id, timezone = %settings.timezone, error = %e, "站点时区无法解析");
-            Fail::from(ApiError::Internal)
-        })?;
-        let week_starts_on = i8::try_from(settings.week_starts_on)
-            .ok()
-            .and_then(|w| Weekday::from_sunday_zero_offset(w).ok())
-            .ok_or_else(|| {
-                tracing::error!(
-                    site_id,
-                    week_starts_on = settings.week_starts_on,
-                    "站点的周起始日不合法"
-                );
-                Fail::from(ApiError::Internal)
-            })?;
-        Ok(SiteContext {
-            site_id,
-            site_key: Some(site_key.to_owned()),
-            timezone,
-            week_starts_on,
-            geo_attribution: self.geo.as_ref().and_then(|g| g.attribution()),
-            geo_capability: self.geo.as_ref().and_then(|g| g.capability()),
-        })
+        load_site_context(&self.pg, self.geo.as_deref(), site_id, site_key)
+            .await
+            .map_err(Fail::from)
     }
 }
 
+/// 站点上下文（公开 API 与看板的内部端点共用）：时区与周起始日读 PG（不用 collector 的快照，原因见模块文档），
+/// 地理署名与能力取自进程里的库。站点此刻已不存在返回 `NotFound`。
+pub(crate) async fn load_site_context(
+    pg: &PgPool,
+    geo: Option<&GeoDb>,
+    site_id: u64,
+    site_key: &str,
+) -> Result<SiteContext, ApiError> {
+    let settings = match rivu_storage_pg::sites::find_query_settings(pg, site_id).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return Err(ApiError::NotFound),
+        Err(e) => {
+            tracing::error!(site_id, error = %format!("{e:#}"), "读取站点的查询设置失败");
+            return Err(ApiError::Internal);
+        }
+    };
+    let timezone = TimeZone::get(&settings.timezone).map_err(|e| {
+        tracing::error!(site_id, timezone = %settings.timezone, error = %e, "站点时区无法解析");
+        ApiError::Internal
+    })?;
+    let week_starts_on = i8::try_from(settings.week_starts_on)
+        .ok()
+        .and_then(|w| Weekday::from_sunday_zero_offset(w).ok())
+        .ok_or_else(|| {
+            tracing::error!(
+                site_id,
+                week_starts_on = settings.week_starts_on,
+                "站点的周起始日不合法"
+            );
+            ApiError::Internal
+        })?;
+    Ok(SiteContext {
+        site_id,
+        site_key: Some(site_key.to_owned()),
+        timezone,
+        week_starts_on,
+        geo_attribution: geo.and_then(|g| g.attribution()),
+        geo_capability: geo.and_then(|g| g.capability()),
+    })
+}
 // ------------------------------------------------------------------------------------------
 // 错误
 // ------------------------------------------------------------------------------------------
 
 /// 处理函数里的失败，统一转成响应。
 #[derive(Debug)]
-enum Fail {
+pub(crate) enum Fail {
     /// 鉴权与站点访问的错误（`rivu-auth` 已定义响应）。
     Auth(ApiError),
     Query(QueryError),
@@ -211,7 +223,7 @@ impl From<QueryError> for Fail {
     }
 }
 
-fn no_store(resp: &mut Response) {
+pub(crate) fn no_store(resp: &mut Response) {
     resp.headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
 }
@@ -240,7 +252,7 @@ fn invalid_query_body(errors: &[(&str, &str)]) -> Value {
 }
 
 /// 指标 `rivu_query_errors_total` 的 `kind` 标签。
-fn error_kind(e: &QueryError) -> &'static str {
+pub(crate) fn error_kind(e: &QueryError) -> &'static str {
     match e {
         QueryError::Validation { .. } => "validation",
         QueryError::Timeout => "timeout",
@@ -250,7 +262,7 @@ fn error_kind(e: &QueryError) -> &'static str {
 }
 
 /// `QueryError` → 响应，状态码取自 [`QueryError::http_status_hint`]。内部错误不泄露细节，只记日志。
-fn query_error_response(e: &QueryError, timeout_secs: Option<u64>) -> Response {
+pub(crate) fn query_error_response(e: &QueryError, timeout_secs: Option<u64>) -> Response {
     let status =
         StatusCode::from_u16(e.http_status_hint()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let mut resp = match e {
@@ -291,7 +303,7 @@ fn query_error_response(e: &QueryError, timeout_secs: Option<u64>) -> Response {
 }
 
 /// 解析 / 读体 / 站点判定之外的失败的响应。`timeout_secs` 只用于超时提示文字。
-fn fail_response(f: Fail, timeout_secs: u64) -> Response {
+pub(crate) fn fail_response(f: Fail, timeout_secs: u64) -> Response {
     let mut resp = match f {
         Fail::Auth(e) => e.into_response(),
         Fail::Query(e) => query_error_response(&e, Some(timeout_secs)),
@@ -333,16 +345,16 @@ fn fail_response(f: Fail, timeout_secs: u64) -> Response {
 // ------------------------------------------------------------------------------------------
 
 /// 读请求体：声明的长度超限直接拒绝；分块按流累计，超过上限即停止。
-async fn read_body(req: Request) -> Result<axum::body::Bytes, Fail> {
+pub(crate) async fn read_body(req: Request, max_bytes: usize) -> Result<axum::body::Bytes, Fail> {
     let declared = req
         .headers()
         .get(header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.trim().parse::<u64>().ok());
-    if declared.is_some_and(|n| n > MAX_BODY_BYTES as u64) {
+    if declared.is_some_and(|n| n > max_bytes as u64) {
         return Err(Fail::TooLarge);
     }
-    match tokio::time::timeout(BODY_READ_TIMEOUT, to_bytes(req.into_body(), MAX_BODY_BYTES)).await {
+    match tokio::time::timeout(BODY_READ_TIMEOUT, to_bytes(req.into_body(), max_bytes)).await {
         Ok(Ok(bytes)) => Ok(bytes),
         Ok(Err(e)) => {
             let over_limit = std::error::Error::source(&e).is_some_and(|s| {
@@ -364,7 +376,7 @@ async fn run_query<S: AuthStore>(
     ctx: &AuthContext,
     req: Request,
 ) -> Result<QueryResult, Fail> {
-    let bytes = read_body(req).await?;
+    let bytes = read_body(req, MAX_BODY_BYTES).await?;
     let text = std::str::from_utf8(&bytes)
         .map_err(|_| QueryError::validation("", "the body is not valid UTF-8"))?;
     let spec = QuerySpec::parse_str(text)?;
@@ -495,7 +507,7 @@ async fn schema_method_not_allowed() -> Response {
 // ------------------------------------------------------------------------------------------
 
 #[derive(Clone, Copy)]
-struct Instrument {
+pub(crate) struct Instrument {
     route: &'static str,
     /// 响应没有自己的 `Cache-Control` 时补 `no-store`（公开查询的所有响应都不可缓存）。
     default_no_store: bool,

@@ -1,9 +1,13 @@
 //! PostgreSQL 访问（sqlx）：连接池、迁移记录表与迁移执行，以及站点与盐。
 
+pub mod access;
 pub mod api_keys;
 pub mod salts;
+pub mod sessions;
+pub mod shared_links;
 pub mod shield;
 pub mod sites;
+pub mod users;
 
 use std::time::Duration;
 
