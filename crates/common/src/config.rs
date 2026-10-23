@@ -490,6 +490,17 @@ pub struct Config {
     pub public_base_url: String,
     /// `RIVU_PUBLIC_BASE_URL` 是否显式设置；否则启动时提醒（生产必须设置）。
     pub public_base_url_explicit: bool,
+    /// `RIVU_BASE_URL`（去掉结尾的 `/`）：看板的外部地址，内部端点的 CSRF 用它校验 `Origin`（`platform-and-ops.md` §5、§7）。
+    /// 文档写必填；这里与 `RIVU_PUBLIC_BASE_URL` 一样在未设置时取 `http://<RIVU_LISTEN_ADDR>`（只适合开发，启动时打 warn），
+    /// 这样既有的开发与测试环境不必改动。
+    pub base_url: String,
+    /// `RIVU_BASE_URL` 是否显式设置。
+    pub base_url_explicit: bool,
+    /// `RIVU_COOKIE_SECURE`（`auto` | `on` | `off`）的结果：会话 cookie 是否带 `Secure`（与 `__Host-` 前缀）。
+    /// `auto`（默认）跟随 `RIVU_BASE_URL` 的协议：`https` 开，`http`（开发）关。
+    pub cookie_secure: bool,
+    /// `RIVU_SETUP_TOKEN`：设置后首次初始化（`POST /api/internal/setup`）必须携带；至少 16 个字符。未设置则不要求（文档如此）。
+    pub setup_token: Option<Secret>,
     /// `RIVU_TRACKER_DIR`：tracker 构建产物目录（`core.js`、`meta.json`），启动时读入并缓存。
     /// 默认 `apps/tracker/dist`（相对进程工作目录）；生产镜像把 CI 构建的 `dist/` 放进该目录。
     pub tracker_dir: PathBuf,
@@ -703,6 +714,34 @@ impl Config {
         let public_base_url = public_base_url
             .map(|u| u.trim_end_matches('/').to_owned())
             .unwrap_or_else(|| format!("http://{listen_addr}"));
+        let base_url = l.optional("RIVU_BASE_URL");
+        if let Some(u) = &base_url {
+            l.check_http_url("RIVU_BASE_URL", u);
+        }
+        let base_url_explicit = base_url.is_some();
+        let base_url = base_url
+            .map(|u| u.trim_end_matches('/').to_owned())
+            .unwrap_or_else(|| format!("http://{listen_addr}"));
+        let cookie_secure = match l.optional("RIVU_COOKIE_SECURE").as_deref() {
+            None | Some("auto") => base_url.starts_with("https://"),
+            Some("on") => true,
+            Some("off") => false,
+            Some(other) => {
+                l.problems.push(format!(
+                    "RIVU_COOKIE_SECURE=`{other}` 无效，可选 auto | on | off"
+                ));
+                true
+            }
+        };
+        let setup_token = l.optional("RIVU_SETUP_TOKEN");
+        if let Some(t) = &setup_token
+            && t.chars().count() < 16
+        {
+            // 不回显取值
+            l.problems
+                .push("RIVU_SETUP_TOKEN 至少 16 个字符（它挡住的是新实例被抢注）".into());
+        }
+        let setup_token = setup_token.map(Secret);
         let tracker_dir = PathBuf::from(
             l.optional("RIVU_TRACKER_DIR")
                 .unwrap_or_else(|| DEFAULT_TRACKER_DIR.into()),
@@ -750,6 +789,10 @@ impl Config {
             site_cache_refresh: Duration::from_secs(site_cache_refresh_secs),
             public_base_url,
             public_base_url_explicit,
+            base_url,
+            base_url_explicit,
+            cookie_secure,
+            setup_token,
             tracker_dir,
             geo,
         })
@@ -1135,6 +1178,49 @@ mod tests {
                 .any(|p| p.contains("RIVU_PUBLIC_BASE_URL")),
             "{err}"
         );
+    }
+
+    #[test]
+    fn base_url_cookie_secure_and_setup_token_have_dev_defaults_and_are_validated() {
+        let cfg = with_env(&[]).unwrap();
+        assert_eq!(cfg.base_url, "http://127.0.0.1:8080");
+        assert!(!cfg.base_url_explicit);
+        assert!(!cfg.cookie_secure, "auto：明文 http 的开发地址不带 Secure");
+        assert!(cfg.setup_token.is_none());
+
+        let cfg = with_env(&[
+            ("RIVU_BASE_URL", "https://stats.example.com/"),
+            ("RIVU_SETUP_TOKEN", "0123456789abcdef"),
+        ])
+        .unwrap();
+        assert_eq!(cfg.base_url, "https://stats.example.com");
+        assert!(cfg.base_url_explicit);
+        assert!(cfg.cookie_secure, "auto：https 带 Secure");
+        assert_eq!(cfg.setup_token.unwrap().expose(), "0123456789abcdef");
+
+        // 显式覆盖 auto
+        let cfg = with_env(&[("RIVU_COOKIE_SECURE", "on")]).unwrap();
+        assert!(cfg.cookie_secure);
+        let cfg = with_env(&[
+            ("RIVU_BASE_URL", "https://stats.example.com"),
+            ("RIVU_COOKIE_SECURE", "off"),
+        ])
+        .unwrap();
+        assert!(!cfg.cookie_secure);
+
+        for (name, bad) in [
+            ("RIVU_BASE_URL", "stats.example.com"),
+            ("RIVU_COOKIE_SECURE", "maybe"),
+            ("RIVU_SETUP_TOKEN", "short"),
+        ] {
+            let err = with_env(&[(name, bad)]).unwrap_err();
+            assert_eq!(err.problems.len(), 1, "{name}: {err}");
+            assert!(err.problems[0].contains(name), "{name}: {err}");
+            assert!(
+                !err.to_string().contains(bad) || name == "RIVU_COOKIE_SECURE",
+                "不回显取值：{err}"
+            );
+        }
     }
 
     #[test]

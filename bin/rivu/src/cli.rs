@@ -1,4 +1,5 @@
-//! 命令行：`rivu collector | worker | api | migrate | all | site add | shield add|list|remove | apikey create|list|revoke | stats`。
+//! 命令行：`rivu collector | worker | api | migrate | all | site add | shield add|list|remove | apikey create|list|revoke | stats |
+//! setup | user add|disable|enable|list | org create | org member add | share create|list|revoke`。
 
 use std::process::ExitCode;
 
@@ -8,7 +9,7 @@ use rivu_common::build_info;
 use rivu_common::config::{Config, Role};
 use rivu_common::telemetry;
 
-use crate::{admin, apikey_cmd, migrate, run, shield_cmd};
+use crate::{admin, apikey_cmd, migrate, run, shield_cmd, user_cmd};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -41,6 +42,176 @@ pub enum Command {
     Shield(ShieldArgs),
     /// 公开 API 的 API key 管理
     Apikey(ApikeyArgs),
+    /// 首次初始化：创建首个用户（实例管理员）、首个组织与 owner 关系（只在 users 为空时可用）
+    Setup(SetupArgs),
+    /// 用户管理：add | disable | enable | list
+    User(UserArgs),
+    /// 组织管理：create | member add
+    Org(OrgArgs),
+    /// 共享链接管理：create | list | revoke
+    Share(ShareArgs),
+}
+
+/// 密码来源。**没有命令行明文密码参数**（会进 shell 历史与进程列表）。
+#[derive(Debug, Args, Clone, Default)]
+pub struct PasswordArgs {
+    /// 从文件读密码（去掉结尾的一个换行）
+    #[arg(long, value_name = "PATH", conflicts_with = "password_stdin")]
+    pub password_file: Option<std::path::PathBuf>,
+    /// 从标准输入读密码（第一行）
+    #[arg(long)]
+    pub password_stdin: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct SetupArgs {
+    /// 首个用户的邮箱
+    #[arg(long)]
+    pub email: String,
+    /// 首个组织的名称（1 到 100 个字符）
+    #[arg(long)]
+    pub org_name: String,
+    /// 首个用户的显示名（可选）
+    #[arg(long)]
+    pub name: Option<String>,
+    #[command(flatten)]
+    pub password: PasswordArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct UserArgs {
+    #[command(subcommand)]
+    pub action: UserAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum UserAction {
+    /// 创建用户（密码 12–128 个字符）
+    Add(UserAddArgs),
+    /// 禁用用户：他的登录会话立即失效
+    Disable(UserEmailArgs),
+    /// 重新启用用户（不恢复已撤销的会话）
+    Enable(UserEmailArgs),
+    /// 列出用户
+    List,
+}
+
+#[derive(Debug, Args)]
+pub struct UserAddArgs {
+    /// 邮箱
+    #[arg(long)]
+    pub email: String,
+    /// 显示名（可选）
+    #[arg(long)]
+    pub name: Option<String>,
+    /// 设为实例管理员（只管用户与实例设置，不能据此读取任意站点的统计）
+    #[arg(long)]
+    pub instance_admin: bool,
+    #[command(flatten)]
+    pub password: PasswordArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct UserEmailArgs {
+    /// 用户的邮箱
+    #[arg(long)]
+    pub email: String,
+}
+
+#[derive(Debug, Args)]
+pub struct OrgArgs {
+    #[command(subcommand)]
+    pub action: OrgAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum OrgAction {
+    /// 创建组织
+    Create(OrgCreateArgs),
+    /// 组织成员管理
+    #[command(subcommand)]
+    Member(OrgMemberAction),
+}
+
+#[derive(Debug, Args)]
+pub struct OrgCreateArgs {
+    /// 组织名称（1 到 100 个字符）
+    #[arg(long)]
+    pub name: String,
+    /// slug（省略则由名称生成）
+    #[arg(long)]
+    pub slug: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum OrgMemberAction {
+    /// 把用户加入组织，或改他的角色（至少保留一名 owner）
+    Add(OrgMemberAddArgs),
+}
+
+/// 组织角色。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum OrgRoleArg {
+    Owner,
+    Admin,
+    Editor,
+    Viewer,
+}
+
+#[derive(Debug, Args)]
+pub struct OrgMemberAddArgs {
+    /// 组织 slug
+    #[arg(long)]
+    pub org: String,
+    /// 用户的邮箱
+    #[arg(long)]
+    pub email: String,
+    /// 角色
+    #[arg(long, value_enum, default_value = "viewer")]
+    pub role: OrgRoleArg,
+}
+
+#[derive(Debug, Args)]
+pub struct ShareArgs {
+    #[command(subcommand)]
+    pub action: ShareAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ShareAction {
+    /// 创建共享链接：slug 只在这里与 `list` 里显示
+    Create(ShareCreateArgs),
+    /// 列出站点的共享链接
+    List(ShareListArgs),
+    /// 吊销共享链接（立即失效，已签发的访问凭证一并删除）
+    Revoke(ShareRevokeArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ShareCreateArgs {
+    /// 站点的 site_key
+    #[arg(long)]
+    pub site: String,
+    /// 可选的链接密码（argon2id；同样只能从文件或标准输入来）
+    #[command(flatten)]
+    pub password: PasswordArgs,
+    /// 过期时间：时长（7d、12h、30m）、RFC 3339 时刻或日期；省略则不过期
+    #[arg(long)]
+    pub expires: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct ShareListArgs {
+    /// 站点的 site_key
+    #[arg(long)]
+    pub site: String,
+}
+
+#[derive(Debug, Args)]
+pub struct ShareRevokeArgs {
+    /// 链接的 id（`share list` 的第一列）
+    #[arg(long)]
+    pub id: i64,
 }
 
 #[derive(Debug, Args)]
@@ -238,9 +409,14 @@ impl Command {
             Command::Migrate(_) => Role::Migrate,
             Command::All => Role::All,
             // 管理命令连 PG（应用账号）和 ClickHouse（reader），按 api 角色校验配置
-            Command::Site(_) | Command::Stats(_) | Command::Shield(_) | Command::Apikey(_) => {
-                Role::Api
-            }
+            Command::Site(_)
+            | Command::Stats(_)
+            | Command::Shield(_)
+            | Command::Apikey(_)
+            | Command::Setup(_)
+            | Command::User(_)
+            | Command::Org(_)
+            | Command::Share(_) => Role::Api,
         }
     }
 }
@@ -273,6 +449,10 @@ pub async fn main() -> ExitCode {
         Command::Stats(args) => admin::stats(&config, args).await,
         Command::Shield(ShieldArgs { action }) => shield_cmd::run(&config, action).await,
         Command::Apikey(ApikeyArgs { action }) => apikey_cmd::run(&config, action).await,
+        Command::Setup(args) => user_cmd::setup(&config, args).await,
+        Command::User(args) => user_cmd::user(&config, args).await,
+        Command::Org(args) => user_cmd::org(&config, args).await,
+        Command::Share(args) => user_cmd::share(&config, args).await,
         _ => run::run(config).await,
     };
     match result {
@@ -546,6 +726,155 @@ mod tests {
             })
         ));
         assert!(Cli::try_parse_from(["rivu", "apikey", "revoke", "--id", "x"]).is_err());
+    }
+
+    #[test]
+    fn parses_setup_user_org_and_share_commands() {
+        let p = |args: &[&str]| {
+            Cli::try_parse_from(std::iter::once("rivu").chain(args.iter().copied()))
+        };
+        // setup：密码只来自文件或标准输入，没有明文参数
+        let cli = p(&[
+            "setup",
+            "--email",
+            "a@b.co",
+            "--org-name",
+            "Acme",
+            "--password-file",
+            "pw.txt",
+        ])
+        .unwrap();
+        assert_eq!(cli.command.role(), Role::Api);
+        let Command::Setup(a) = cli.command else {
+            panic!("不是 setup");
+        };
+        assert_eq!(
+            (
+                a.email.as_str(),
+                a.org_name.as_str(),
+                a.password.password_stdin
+            ),
+            ("a@b.co", "Acme", false)
+        );
+        assert!(a.password.password_file.is_some());
+        assert!(
+            p(&[
+                "setup",
+                "--email",
+                "a@b.co",
+                "--org-name",
+                "x",
+                "--password-stdin"
+            ])
+            .is_ok()
+        );
+        assert!(
+            p(&[
+                "setup",
+                "--email",
+                "a@b.co",
+                "--org-name",
+                "x",
+                "--password",
+                "hunter2hunter2"
+            ])
+            .is_err()
+        );
+        assert!(
+            p(&[
+                "setup",
+                "--email",
+                "a@b.co",
+                "--org-name",
+                "x",
+                "--password-file",
+                "f",
+                "--password-stdin"
+            ])
+            .is_err(),
+            "两个来源互斥"
+        );
+        assert!(p(&["setup", "--email", "a@b.co"]).is_err());
+
+        // user
+        let cli = p(&[
+            "user",
+            "add",
+            "--email",
+            "u@b.co",
+            "--instance-admin",
+            "--password-stdin",
+        ])
+        .unwrap();
+        let Command::User(UserArgs {
+            action: UserAction::Add(a),
+        }) = cli.command
+        else {
+            panic!("不是 user add");
+        };
+        assert!(a.instance_admin && a.password.password_stdin);
+        assert!(p(&["user", "disable", "--email", "u@b.co"]).is_ok());
+        assert!(p(&["user", "enable", "--email", "u@b.co"]).is_ok());
+        assert!(p(&["user", "list"]).is_ok());
+        assert!(p(&["user", "add", "--email", "u@b.co", "--password", "x"]).is_err());
+
+        // org
+        assert!(p(&["org", "create", "--name", "Acme"]).is_ok());
+        let cli = p(&[
+            "org", "member", "add", "--org", "acme", "--email", "u@b.co", "--role", "editor",
+        ])
+        .unwrap();
+        let Command::Org(OrgArgs {
+            action: OrgAction::Member(OrgMemberAction::Add(a)),
+        }) = cli.command
+        else {
+            panic!("不是 org member add");
+        };
+        assert_eq!(a.role, OrgRoleArg::Editor);
+        let cli = p(&["org", "member", "add", "--org", "acme", "--email", "u@b.co"]).unwrap();
+        let Command::Org(OrgArgs {
+            action: OrgAction::Member(OrgMemberAction::Add(a)),
+        }) = cli.command
+        else {
+            panic!();
+        };
+        assert_eq!(a.role, OrgRoleArg::Viewer, "角色默认 viewer");
+        assert!(
+            p(&[
+                "org", "member", "add", "--org", "a", "--email", "u@b.co", "--role", "root"
+            ])
+            .is_err()
+        );
+
+        // share
+        let cli = p(&[
+            "share",
+            "create",
+            "--site",
+            "abcdefghijkl",
+            "--password-file",
+            "pw",
+            "--expires",
+            "7d",
+        ])
+        .unwrap();
+        let Command::Share(ShareArgs {
+            action: ShareAction::Create(a),
+        }) = cli.command
+        else {
+            panic!("不是 share create");
+        };
+        assert_eq!(
+            (a.site.as_str(), a.expires.as_deref()),
+            ("abcdefghijkl", Some("7d"))
+        );
+        assert!(
+            p(&["share", "create", "--site", "abcdefghijkl"]).is_ok(),
+            "密码可选"
+        );
+        assert!(p(&["share", "list", "--site", "x"]).is_ok());
+        assert!(p(&["share", "revoke", "--id", "3"]).is_ok());
+        assert!(p(&["share", "revoke", "--id", "x"]).is_err());
     }
 
     #[test]
