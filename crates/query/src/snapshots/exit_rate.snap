@@ -1,0 +1,38 @@
+---
+source: crates/query/src/sql_tests.rs
+expression: "render(&sql, &params)"
+---
+SELECT d0, sum(c_pageviews) AS m0, ifNotFinite(sum(c_x_exits) / sum(c_pageviews), 0) AS m1
+FROM (
+  SELECT toString(pathname) AS d0, countIf(name = 'pageview') AS c_pageviews, toUInt64(0) AS c_x_exits
+  FROM (
+    SELECT *
+    FROM events
+    WHERE site_id = {site:UInt64} AND toDate(ts) >= {from_date:Date} AND toDate(ts) <= {to_date:Date} AND ts >= fromUnixTimestamp64Milli({from_ms:Int64}, 'UTC') AND ts < fromUnixTimestamp64Milli({to_ms:Int64}, 'UTC') AND name != 'engagement' AND toString(country_code) IN {p0:Array(String)}) AS e
+  GROUP BY d0
+  UNION ALL SELECT toString(s_exit_path) AS d0, toUInt64(0) AS c_pageviews, count() AS c_x_exits
+  FROM (
+    SELECT session_id, min(started_at) AS s_start, max(last_event_at) AS s_last, sum(pageviews) AS s_pv, toString(any(country_code)) AS a_country, tupleElement(argMaxIfMerge(exit_page), 2) AS s_exit_path
+    FROM sessions
+    WHERE site_id = {site:UInt64} AND start_date >= {s_from:Date} AND start_date <= {to_date:Date}
+    GROUP BY site_id, start_date, session_id
+    HAVING s_last >= fromUnixTimestamp64Milli({from_ms:Int64}, 'UTC') AND s_start < fromUnixTimestamp64Milli({to_ms:Int64}, 'UTC'))
+  WHERE a_country IN {p1:Array(String)} AND s_pv > 0
+  GROUP BY d0)
+GROUP BY d0
+ORDER BY m0 DESC, d0 ASC
+LIMIT {p2:UInt64} OFFSET {p3:UInt64}
+
+-- params
+site: UInt64 = 4242
+from_ms: Int64 = 1792101600000
+to_ms: Int64 = 1792706400000
+from_date: Date = "2026-10-15"
+to_date: Date = "2026-10-22"
+s_from: Date = "2026-10-08"
+tz: String = "Europe/Berlin"
+wk: UInt8 = 7
+p0: Array(String) = ["US"]
+p1: Array(String) = ["US"]
+p2: UInt64 = 10000
+p3: UInt64 = 0

@@ -1,0 +1,47 @@
+---
+source: crates/query/src/sql_tests.rs
+expression: "render(&sql, &params)"
+---
+SELECT d0, d1, sum(c_visitors) AS m0, ifNotFinite(sum(c_b_bounces) / sum(c_b_n), 0) AS m1
+FROM (
+  SELECT toString(toString(country_code)) AS d0, toString(device) AS d1, uniq(visitor_id) AS c_visitors, toUInt64(0) AS c_b_n, toUInt64(0) AS c_b_bounces
+  FROM (
+    SELECT *
+    FROM events
+    WHERE site_id = {site:UInt64} AND toDate(ts) >= {from_date:Date} AND toDate(ts) <= {to_date:Date} AND ts >= fromUnixTimestamp64Milli({from_ms:Int64}, 'UTC') AND ts < fromUnixTimestamp64Milli({to_ms:Int64}, 'UTC') AND name != 'engagement') AS e
+  WHERE (d0, d1) IN (
+    SELECT t.1, t.2
+    FROM (
+      SELECT arrayJoin(arrayZip({p0:Array(String)}, {p1:Array(String)})) AS t))
+  GROUP BY d0, d1
+  UNION ALL SELECT toString(a_country) AS d0, toString(a_device) AS d1, toUInt64(0) AS c_visitors, count() AS c_b_n, countIf(s_pv <= 1 AND s_inter = 0) AS c_b_bounces
+  FROM (
+    SELECT session_id, min(started_at) AS s_start, max(last_event_at) AS s_last, sum(pageviews) AS s_pv, sum(interactive_events) AS s_inter, sum(engagement_ms) AS s_eng, toString(any(country_code)) AS a_country, any(device) AS a_device
+    FROM sessions
+    WHERE site_id = {site:UInt64} AND start_date >= {s_from:Date} AND start_date <= {to_date:Date}
+    GROUP BY site_id, start_date, session_id
+    HAVING s_last >= fromUnixTimestamp64Milli({from_ms:Int64}, 'UTC') AND s_start < fromUnixTimestamp64Milli({to_ms:Int64}, 'UTC'))
+  WHERE (d0, d1) IN (
+    SELECT t.1, t.2
+    FROM (
+      SELECT arrayJoin(arrayZip({p2:Array(String)}, {p3:Array(String)})) AS t))
+  GROUP BY d0, d1)
+GROUP BY d0, d1
+ORDER BY m0 DESC, d0 ASC, d1 ASC
+LIMIT {p4:UInt64} OFFSET {p5:UInt64}
+
+-- params
+site: UInt64 = 4242
+from_ms: Int64 = 1791496800000
+to_ms: Int64 = 1792101600000
+from_date: Date = "2026-10-08"
+to_date: Date = "2026-10-15"
+s_from: Date = "2026-10-01"
+tz: String = "Europe/Berlin"
+wk: UInt8 = 7
+p0: Array(String) = ["DE", ""]
+p1: Array(String) = ["desktop", "mobile"]
+p2: Array(String) = ["DE", ""]
+p3: Array(String) = ["desktop", "mobile"]
+p4: UInt64 = 2
+p5: UInt64 = 0

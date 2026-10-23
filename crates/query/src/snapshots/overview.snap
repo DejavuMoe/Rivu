@@ -1,0 +1,32 @@
+---
+source: crates/query/src/sql_tests.rs
+expression: "render(&sql, &params)"
+---
+SELECT sum(c_visitors) AS m0, sum(c_visits) AS m1, sum(c_pageviews) AS m2, ifNotFinite(sum(c_b_bounces) / sum(c_b_n), 0) AS m3, ifNotFinite(sum(c_s_dur) / sum(c_s_n) / 1000, 0) AS m4, ifNotFinite(sum(c_s_eng_ms) / 1000 / sum(c_s_eng_n), 0) AS m5
+FROM (
+  SELECT uniq(visitor_id) AS c_visitors, countIf(name = 'pageview') AS c_pageviews, toUInt64(0) AS c_visits, toUInt64(0) AS c_s_n, toUInt64(0) AS c_s_dur, toUInt64(0) AS c_s_eng_ms, toUInt64(0) AS c_s_eng_n, toUInt64(0) AS c_b_n, toUInt64(0) AS c_b_bounces
+  FROM (
+    SELECT *
+    FROM events
+    WHERE site_id = {site:UInt64} AND toDate(ts) >= {from_date:Date} AND toDate(ts) <= {to_date:Date} AND ts >= fromUnixTimestamp64Milli({from_ms:Int64}, 'UTC') AND ts < fromUnixTimestamp64Milli({to_ms:Int64}, 'UTC') AND name != 'engagement') AS e
+  UNION ALL SELECT toUInt64(0) AS c_visitors, toUInt64(0) AS c_pageviews, count() AS c_visits, count() AS c_s_n, sum(toUInt64(toUnixTimestamp64Milli(s_last) - toUnixTimestamp64Milli(s_start))) AS c_s_dur, sumIf(s_eng, s_eng > 0) AS c_s_eng_ms, countIf(s_eng > 0) AS c_s_eng_n, count() AS c_b_n, countIf(s_pv <= 1 AND s_inter = 0) AS c_b_bounces
+  FROM (
+    SELECT session_id, min(started_at) AS s_start, max(last_event_at) AS s_last, sum(pageviews) AS s_pv, sum(interactive_events) AS s_inter, sum(engagement_ms) AS s_eng
+    FROM sessions
+    WHERE site_id = {site:UInt64} AND start_date >= {s_from:Date} AND start_date <= {to_date:Date}
+    GROUP BY site_id, start_date, session_id
+    HAVING s_last >= fromUnixTimestamp64Milli({from_ms:Int64}, 'UTC') AND s_start < fromUnixTimestamp64Milli({to_ms:Int64}, 'UTC')))
+ORDER BY m0 DESC
+LIMIT {p0:UInt64} OFFSET {p1:UInt64}
+
+-- params
+site: UInt64 = 4242
+from_ms: Int64 = 1774652400000
+to_ms: Int64 = 1774908000000
+from_date: Date = "2026-03-27"
+to_date: Date = "2026-03-30"
+s_from: Date = "2026-03-20"
+tz: String = "Europe/Berlin"
+wk: UInt8 = 7
+p0: UInt64 = 10000
+p1: UInt64 = 0

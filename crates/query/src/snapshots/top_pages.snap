@@ -1,0 +1,44 @@
+---
+source: crates/query/src/sql_tests.rs
+expression: "render(&sql, &params)"
+---
+SELECT d0, sum(c_visitors) AS m0, sum(c_visits) AS m1, sum(c_pageviews) AS m2, ifNotFinite(sum(c_b_bounces) / sum(c_b_n), 0) AS m3, ifNotFinite(sum(c_tp_ms) / 1000 / sum(c_tp_n), 0) AS m4, ifNotFinite(sum(c_sc_sum) / sum(c_sc_n), 0) AS m5, count() OVER () AS total_rows
+FROM (
+  SELECT toString(pathname) AS d0, uniq(visitor_id) AS c_visitors, countIf(name = 'pageview') AS c_pageviews, uniq(session_id) AS c_visits, toUInt64(0) AS c_b_n, toUInt64(0) AS c_b_bounces, toUInt64(0) AS c_tp_ms, toUInt64(0) AS c_tp_n, toUInt64(0) AS c_sc_sum, toUInt64(0) AS c_sc_n
+  FROM (
+    SELECT *
+    FROM events
+    WHERE site_id = {site:UInt64} AND toDate(ts) >= {from_date:Date} AND toDate(ts) <= {to_date:Date} AND ts >= fromUnixTimestamp64Milli({from_ms:Int64}, 'UTC') AND ts < fromUnixTimestamp64Milli({to_ms:Int64}, 'UTC') AND name != 'engagement') AS e
+  GROUP BY d0
+  UNION ALL SELECT toString(s_entry_path) AS d0, toUInt64(0) AS c_visitors, toUInt64(0) AS c_pageviews, toUInt64(0) AS c_visits, count() AS c_b_n, countIf(s_pv <= 1 AND s_inter = 0) AS c_b_bounces, toUInt64(0) AS c_tp_ms, toUInt64(0) AS c_tp_n, toUInt64(0) AS c_sc_sum, toUInt64(0) AS c_sc_n
+  FROM (
+    SELECT session_id, min(started_at) AS s_start, max(last_event_at) AS s_last, sum(pageviews) AS s_pv, sum(interactive_events) AS s_inter, sum(engagement_ms) AS s_eng, tupleElement(argMinIfMerge(entry_page), 2) AS s_entry_path
+    FROM sessions
+    WHERE site_id = {site:UInt64} AND start_date >= {s_from:Date} AND start_date <= {to_date:Date}
+    GROUP BY site_id, start_date, session_id
+    HAVING s_last >= fromUnixTimestamp64Milli({from_ms:Int64}, 'UTC') AND s_start < fromUnixTimestamp64Milli({to_ms:Int64}, 'UTC'))
+  GROUP BY d0
+  UNION ALL SELECT d0, toUInt64(0) AS c_visitors, toUInt64(0) AS c_pageviews, toUInt64(0) AS c_visits, toUInt64(0) AS c_b_n, toUInt64(0) AS c_b_bounces, sum(e_ms) AS c_tp_ms, count() AS c_tp_n, sumIf(e_sd, e_sdc > 0) AS c_sc_sum, countIf(e_sdc > 0) AS c_sc_n
+  FROM (
+    SELECT toString(pathname) AS d0, session_id, sum(engagement_ms) AS e_ms, maxIf(scroll_depth, scroll_depth <= 100) AS e_sd, countIf(scroll_depth <= 100) AS e_sdc
+    FROM (
+      SELECT *
+      FROM events
+      WHERE site_id = {site:UInt64} AND toDate(ts) >= {from_date:Date} AND toDate(ts) <= {to_date:Date} AND ts >= fromUnixTimestamp64Milli({from_ms:Int64}, 'UTC') AND ts < fromUnixTimestamp64Milli({to_ms:Int64}, 'UTC') AND name = 'engagement') AS e
+    GROUP BY d0, session_id)
+  GROUP BY d0)
+GROUP BY d0
+ORDER BY m0 DESC, d0 ASC
+LIMIT {p0:UInt64} OFFSET {p1:UInt64}
+
+-- params
+site: UInt64 = 4242
+from_ms: Int64 = 1790114400000
+to_ms: Int64 = 1792706400000
+from_date: Date = "2026-09-22"
+to_date: Date = "2026-10-22"
+s_from: Date = "2026-09-15"
+tz: String = "Europe/Berlin"
+wk: UInt8 = 7
+p0: UInt64 = 100
+p1: UInt64 = 20
