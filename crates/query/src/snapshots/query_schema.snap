@@ -341,7 +341,7 @@ expression: "crate::schema_json()"
       }
     },
     "site": {
-      "description": "`site_key`。给出时必须与鉴权上下文里的站点一致（路由层负责返回 404；这里的 resolve 也会核对）。",
+      "description": "`site_key`。公开 API（`POST /api/v1/query`）必填，缺失返回 400；看板内部端点由路径给出站点时可以省略。",
       "type": [
         "string",
         "null"
