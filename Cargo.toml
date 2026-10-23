@@ -20,6 +20,7 @@ members = [
     "crates/storage-pg",
     "crates/ua",
     "crates/writer",
+    "tools/loadgen",
 ]
 
 [workspace.package]

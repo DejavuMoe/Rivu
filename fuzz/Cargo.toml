@@ -1,0 +1,59 @@
+[package]
+name = "rivu-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# cargo-fuzz 的独立 crate：不属于根工作区（根 Cargo.toml 的 `exclude`），有自己的 Cargo.lock 与 target。
+# 不继承工作区 lints：`fuzz_target!` 宏展开里有 unsafe。
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+jiff = "0.2"
+serde_json = "1"
+rivu-domain = { path = "../crates/domain" }
+rivu-ingest = { path = "../crates/ingest" }
+rivu-query = { path = "../crates/query" }
+rivu-source = { path = "../crates/source" }
+rivu-storage-pg = { path = "../crates/storage-pg" }
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "parse_event"
+path = "fuzz_targets/parse_event.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "query_spec"
+path = "fuzz_targets/query_spec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hostname"
+path = "fuzz_targets/hostname.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "shield_diff"
+path = "fuzz_targets/shield_diff.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "source_classify"
+path = "fuzz_targets/source_classify.rs"
+test = false
+doc = false
+bench = false

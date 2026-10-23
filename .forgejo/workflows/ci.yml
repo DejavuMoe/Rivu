@@ -27,6 +27,48 @@ jobs:
       - name: cargo test（集成测试在没有 RIVU_TEST_* 变量时自动跳过）
         run: cargo test --workspace
 
+  # 可选的短时模糊测试（cargo-fuzz / libFuzzer，目标与说明见 docs/research/fuzzing.md）。不阻塞合并：
+  # `continue-on-error: true`。它要求 runner 满足三个条件，缺任何一个这个 job 会失败（但不影响其余 job）：
+  #   1. 能装 nightly 工具链（cargo-fuzz 用 `-Zsanitizer`、`-Cpasses` 等 nightly 才有的编译选项；
+  #      stable 的 rust-toolchain.toml 只管仓库里其余部分，这里显式用 `+nightly`）；
+  #   2. 有 C++ 编译器（libfuzzer-sys 编译自带的 libFuzzer；`build-essential` 或 `clang` 都行）；
+  #   3. 能访问 crates.io（`cargo install cargo-fuzz`）。
+  # 每个目标只跑 FUZZ_SECONDS 秒：它抓的是「刚引入的、几秒内就能撞出来的」崩溃，长跑（每目标 10 分钟以上）
+  # 在开发机上手工做，命令见 fuzz/run.sh。尚未在真实的 Forgejo runner 上运行过。
+  fuzz-smoke:
+    runs-on: docker
+    needs: lint-and-unit
+    continue-on-error: true
+    env:
+      FUZZ_SECONDS: "60"
+    steps:
+      - uses: actions/checkout@v4
+      - name: nightly 工具链
+        run: rustup toolchain install nightly --profile minimal
+      - name: 安装 cargo-fuzz
+        run: cargo +nightly install cargo-fuzz --locked
+      - name: 构建全部模糊目标
+        run: cargo +nightly fuzz build
+      - name: 每个目标跑 ${{ env.FUZZ_SECONDS }} 秒（种子语料 fuzz/corpus，新语料写到临时目录）
+        shell: bash
+        run: |
+          work="${RUNNER_TEMP:-/tmp}/rivu-fuzz-corpus"
+          for t in parse_event query_spec hostname shield_diff source_classify; do
+            echo "::group::$t"
+            mkdir -p "$work/$t"
+            dict=()
+            [ -f "fuzz/dicts/$t.dict" ] && dict=("-dict=fuzz/dicts/$t.dict")
+            cargo +nightly fuzz run "$t" "$work/$t" "fuzz/corpus/$t" -- \
+              -max_total_time="$FUZZ_SECONDS" -max_len=16384 "${dict[@]}"
+            echo "::endgroup::"
+          done
+      - name: 保存崩溃输入
+        if: failure()
+        uses: actions/upload-artifact@v3
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+
   migrate-and-integration:
     runs-on: docker
     needs: lint-and-unit

@@ -1,0 +1,1 @@
+{"metrics":["visitors","visits","pageviews","bounce_rate","time_on_page","scroll_depth"],"date_range":"30d","dimensions":["event:page"],"include":{"total_rows":true},"pagination":{"limit":100,"offset":20}}

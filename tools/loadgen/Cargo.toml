@@ -1,0 +1,28 @@
+[package]
+name = "loadgen"
+description = "Rivu 开环（固定到达率）压测生成器：POST /api/event 与 POST /api/v1/query，HdrHistogram 从计划发送时刻起算延迟"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap = { workspace = true, features = ["env"] }
+hdrhistogram = { version = "7", default-features = false }
+rand.workspace = true
+reqwest.workspace = true
+# reqwest 用 rustls-no-provider：要自己安装 ring 提供者（与 rivu-geo 的选择一致），否则建 Client 会 panic。
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde-saphyr.workspace = true
+tokio = { workspace = true, features = ["io-util"] }
+
+[dev-dependencies]
+# 生成的事件必须能通过 rivu 自己的线协议解析（model.rs 的测试）。
+rivu-ingest.workspace = true
