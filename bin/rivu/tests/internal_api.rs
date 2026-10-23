@@ -154,10 +154,13 @@ fn config(env: &TestEnv, extra: &[(&str, &str)]) -> Config {
 fn loose() -> DashLimits {
     DashLimits {
         login_attempts: 100_000,
+        login_ip_attempts: 100_000,
         login_window: Duration::from_secs(60),
         view_per_min: 1_000_000,
         view_burst: 100_000,
         password_per_min: 100_000,
+        account_fail_alert: u32::MAX,
+        global_fail_alert: u32::MAX,
     }
 }
 
@@ -1670,32 +1673,7 @@ async fn login_is_rate_limited_per_ip_and_per_account() {
     let victim = make_user(&pg, Some((&org, "owner"))).await;
     let bystander = make_user(&pg, Some((&org, "viewer"))).await;
 
-    // 同一个 IP：5 次（每次换账号，账号桶互不影响）后第 6 次 429，之后连正确的密码也 429
-    for i in 0..5 {
-        let r = login(
-            http,
-            &format!("nobody{i}-{}@example.test", unique("x")),
-            "wrong password here",
-            "198.51.100.10",
-        )
-        .await;
-        assert_eq!(r.status, 401, "第 {i} 次");
-    }
-    let limited = login(http, &bystander.email, PASSWORD, "198.51.100.10").await;
-    assert_eq!(limited.status, 429, "{}", limited.body);
-    let retry: u64 = limited.header("retry-after").unwrap().parse().unwrap();
-    assert!((1..=60).contains(&retry), "{retry}");
-    assert_eq!(limited.json()["error"], "rate_limited");
-    assert!(limited.all("set-cookie").is_empty());
-    // 另一个 IP 的同一个账号：没有被前面的 IP 拖累
-    assert_eq!(
-        login(http, &bystander.email, PASSWORD, "198.51.100.11")
-            .await
-            .status,
-        200
-    );
-
-    // 同一个账号：换 5 个 IP 各试一次错误密码，第 6 个 IP 带着正确密码也被账号桶挡住；
+    // (账号, IP) 组合：同一来源对同一账号 5 次错误后第 6 次 429，之后连正确的密码也 429；
     // 账号大小写不同算同一个账号
     for i in 0..5 {
         let email = if i % 2 == 0 {
@@ -1703,34 +1681,155 @@ async fn login_is_rate_limited_per_ip_and_per_account() {
         } else {
             victim.email.clone()
         };
-        let r = login(
-            http,
-            &email,
-            "wrong password here",
-            &format!("198.51.100.{}", 20 + i),
-        )
-        .await;
+        let r = login(http, &email, "wrong password here", "198.51.100.10").await;
         assert_eq!(r.status, 401, "第 {i} 次");
     }
-    let blocked = login(http, &victim.email, PASSWORD, "198.51.100.30").await;
+    let blocked = login(http, &victim.email, PASSWORD, "198.51.100.10").await;
     assert_eq!(blocked.status, 429, "{}", blocked.body);
+    let retry: u64 = blocked.header("retry-after").unwrap().parse().unwrap();
+    assert!((1..=60).contains(&retry), "{retry}");
+    assert_eq!(blocked.json()["error"], "rate_limited");
+    assert!(blocked.all("set-cookie").is_empty());
+    // 同一个 IP 的另一个账号：不受影响（组合桶，且 IP 桶还有余量）
+    assert_eq!(
+        login(http, &bystander.email, PASSWORD, "198.51.100.10")
+            .await
+            .status,
+        200
+    );
+
+    // 锁号回归：攻击者从 5 个不同 IP 各打满受害者的 5 次错误密码（共 25 次失败），
+    // 真用户从自己的 IP 仍然能登录（没有单纯按账号的阻断桶）
+    for ip in 0..5 {
+        for i in 0..5 {
+            let r = login(
+                http,
+                &victim.email,
+                "wrong password here",
+                &format!("198.51.100.{}", 20 + ip),
+            )
+            .await;
+            assert_eq!(r.status, 401, "攻击 IP {ip} 第 {i} 次：{}", r.body);
+        }
+        // 每个攻击 IP 自己的组合桶打满后才 429
+        assert_eq!(
+            login(
+                http,
+                &victim.email,
+                "wrong password here",
+                &format!("198.51.100.{}", 20 + ip)
+            )
+            .await
+            .status,
+            429
+        );
+    }
+    let real = login(http, &victim.email, PASSWORD, "198.51.100.99").await;
+    assert_eq!(real.status, 200, "真用户被攻击者锁住了：{}", real.body);
 
     // 不存在的账号：同样的限流，同样的响应（限流本身不泄露账号是否存在）
     let ghost = format!("ghost-{}@example.test", unique("g"));
     for i in 0..5 {
-        let r = login(
-            http,
-            &ghost,
-            "wrong password here",
-            &format!("198.51.100.{}", 40 + i),
-        )
-        .await;
-        assert_eq!(r.status, 401);
+        let r = login(http, &ghost, "wrong password here", "198.51.100.50").await;
+        assert_eq!(r.status, 401, "第 {i} 次");
     }
     let ghost_blocked = login(http, &ghost, PASSWORD, "198.51.100.50").await;
     assert_eq!(ghost_blocked.status, 429);
     assert_eq!(ghost_blocked.json()["error"], blocked.json()["error"]);
     assert_eq!(ghost_blocked.json()["message"], blocked.json()["message"]);
+
+    // 每 IP 桶：同一个 IP 对 20 个不同账号（每个只试一次，组合桶不触发）后第 21 次 429，正确的密码也一样
+    for i in 0..20 {
+        let r = login(
+            http,
+            &format!("spray{i}-{}@example.test", unique("s")),
+            "wrong password here",
+            "198.51.100.60",
+        )
+        .await;
+        assert_eq!(r.status, 401, "第 {i} 个账号");
+    }
+    let sprayed = login(http, &bystander.email, PASSWORD, "198.51.100.60").await;
+    assert_eq!(sprayed.status, 429, "{}", sprayed.body);
+    assert!(sprayed.header("retry-after").is_some());
+    // 别的 IP 不受影响
+    assert_eq!(
+        login(http, &bystander.email, PASSWORD, "198.51.100.61")
+            .await
+            .status,
+        200
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn login_failure_alerts_count_but_never_block() {
+    let Some(env) = test_env("login_failure_alerts") else {
+        return;
+    };
+    migrate_once(&env).await;
+    let buf = init_logging();
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let metrics = recorder.handle();
+    let _metrics_guard = metrics::set_default_local_recorder(&recorder);
+    let pg = rivu_storage_pg::connect(&env.pg_url, 4).await.unwrap();
+    // 账号阈值 3、全局阈值 6；阻断桶放宽：只看告警
+    let limits = DashLimits {
+        account_fail_alert: 3,
+        global_fail_alert: 6,
+        ..loose()
+    };
+    let server = start(&env, &pg, &config(&env, &[]), limits).await;
+    let http = &server.http;
+    let org = make_org(&pg).await;
+    let victim = make_user(&pg, Some((&org, "owner"))).await;
+    let ghost = format!("alert-ghost-{}@example.test", unique("g"));
+
+    // 受害者 5 次失败：第 3 次达到账号阈值告警一次，之后同一窗口不再重复；全程都是 401，没有 429
+    for i in 0..5 {
+        let r = login(http, &victim.email, "wrong password here", "203.0.113.211").await;
+        assert_eq!(r.status, 401, "第 {i} 次：{}", r.body);
+    }
+    let text = metrics.render();
+    assert_eq!(
+        sample(&text, "rivu_auth_login_alerts_total{kind=\"account\"}"),
+        Some(1.0),
+        "{text}"
+    );
+    assert_eq!(
+        sample(&text, "rivu_auth_login_alerts_total{kind=\"global\"}"),
+        None,
+        "5 次失败还没到全局阈值：{text}"
+    );
+    // 不存在的账号也计数；全局第 6 次失败触发全局告警，之后不再重复
+    for i in 0..3 {
+        let r = login(http, &ghost, "wrong password here", "203.0.113.212").await;
+        assert_eq!(r.status, 401, "第 {i} 次：{}", r.body);
+    }
+    let text = metrics.render();
+    assert_eq!(
+        sample(&text, "rivu_auth_login_alerts_total{kind=\"global\"}"),
+        Some(1.0),
+        "{text}"
+    );
+    assert_eq!(
+        sample(&text, "rivu_auth_login_alerts_total{kind=\"account\"}"),
+        Some(2.0),
+        "不存在的账号第 3 次失败也达到账号阈值：{text}"
+    );
+    // 超过阈值之后真用户仍然能登录（只告警不阻断）
+    let ok = login(http, &victim.email, PASSWORD, "203.0.113.213").await;
+    assert_eq!(ok.status, 200, "{}", ok.body);
+
+    // 告警日志不带邮箱与 IP
+    let logs = String::from_utf8_lossy(&buf.0.lock().unwrap()).into_owned();
+    assert!(logs.contains("达到告警阈值"), "应有告警日志");
+    for (what, secret) in [
+        ("受害者邮箱", victim.email.as_str()),
+        ("不存在账号的邮箱", ghost.as_str()),
+        ("客户端 IP", "203.0.113.211"),
+    ] {
+        assert!(!logs.contains(secret), "日志里出现了{what}");
+    }
 }
 
 // ================================================================== 看板查询与站点访问
@@ -2748,6 +2847,21 @@ async fn shared_links_passwords_expiry_revocation_scope_and_segments() {
     cleanup(&env, &[site.id, other_site.id]).await;
 }
 
+/// 反复发请求直到出现 429（至多 20 次）；返回那个 429 响应。
+async fn until_429<F, Fut>(mut send: F) -> Resp
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Resp>,
+{
+    for _ in 0..20 {
+        let r = send().await;
+        if r.status == 429 {
+            return r;
+        }
+    }
+    panic!("连续 20 次请求都没有被限流");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn public_and_shared_access_is_rate_limited() {
     let Some(env) = test_env("public_rate_limit") else {
@@ -2763,19 +2877,20 @@ async fn public_and_shared_access_is_rate_limited() {
     let private = make_site(&pg, &org, false).await;
     let spec = json!({"metrics": ["visitors"], "date_range": "day"});
 
-    // 公开看板：按 (IP, 站点)，突发 10，之后 429 + Retry-After；另一个 IP、另一个站点各有自己的桶
+    // 公开看板：按 (IP, 站点)，突发 60（默认 300 次/分钟），之后 429 + Retry-After；另一个 IP、另一个站点各有自己的桶
     // 突发用只读库的入口信息来耗（快，补充的令牌可以忽略）；入口、查询与实时共用同一个 (IP, 站点) 桶
     let info_path = format!("/api/internal/public/{}", public.key);
-    for i in 0..10 {
+    for i in 0..60 {
         let r = http.get(&info_path).ip("192.0.2.10").send().await;
         assert_eq!(r.status, 200, "第 {i} 次：{}", r.body);
     }
-    let r = http
-        .post(&query_path(public.id), &spec)
-        .ip("192.0.2.10")
-        .send()
-        .await;
-    assert_eq!(r.status, 429, "{}", r.body);
+    // 满 60 个令牌耗尽后，请求的间隔内可能补回 1 个令牌（每 0.2 秒一个）：在前几个请求内必须出现 429
+    let r = until_429(|| {
+        http.post(&query_path(public.id), &spec)
+            .ip("192.0.2.10")
+            .send()
+    })
+    .await;
     assert_eq!(
         http.get(&realtime_path(public.id))
             .ip("192.0.2.10")
@@ -2791,8 +2906,8 @@ async fn public_and_shared_access_is_rate_limited() {
     assert_eq!(r.json()["error"], "rate_limited");
     let retry: u64 = r.header("retry-after").unwrap().parse().unwrap();
     assert!(
-        (1..=3).contains(&retry),
-        "30 次/分钟 = 每 2 秒一个令牌：{retry}"
+        (1..=2).contains(&retry),
+        "300 次/分钟 = 每 0.2 秒一个令牌，Retry-After 向上取整为 1 秒：{retry}"
     );
     assert_eq!(
         http.post(&query_path(public.id), &spec)
@@ -2842,17 +2957,17 @@ async fn public_and_shared_access_is_rate_limited() {
         .await
         .unwrap();
     let link_info = format!("/api/internal/shared/{}", link.slug);
-    for i in 0..10 {
+    for i in 0..60 {
         let r = http.get(&link_info).ip("192.0.2.20").send().await;
         assert_eq!(r.status, 200, "第 {i} 次：{}", r.body);
     }
-    let r = http
-        .post(&query_path(private.id), &spec)
-        .share(&link.slug)
-        .ip("192.0.2.20")
-        .send()
-        .await;
-    assert_eq!(r.status, 429);
+    let r = until_429(|| {
+        http.post(&query_path(private.id), &spec)
+            .share(&link.slug)
+            .ip("192.0.2.20")
+            .send()
+    })
+    .await;
     assert!(r.header("retry-after").is_some());
     assert_eq!(
         http.post(&query_path(private.id), &spec)
@@ -2875,7 +2990,7 @@ async fn public_and_shared_access_is_rate_limited() {
     );
     // 乱猜 slug 也要消耗配额（限流在查库之前）
     let guess = "g".repeat(43);
-    for _ in 0..10 {
+    for _ in 0..60 {
         assert_eq!(
             http.get(&format!("/api/internal/shared/{guess}"))
                 .ip("192.0.2.30")
@@ -2885,14 +3000,12 @@ async fn public_and_shared_access_is_rate_limited() {
             404
         );
     }
-    assert_eq!(
+    until_429(|| {
         http.get(&format!("/api/internal/shared/{guess}"))
             .ip("192.0.2.30")
             .send()
-            .await
-            .status,
-        429
-    );
+    })
+    .await;
 
     // 共享链接的密码尝试：5 次 / 分钟（按 IP 加链接），超限后连正确的密码也 429
     let locked = user_cmd::issue_link(&pg, &private.key, Some("link password 123"), None)

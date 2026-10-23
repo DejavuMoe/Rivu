@@ -1000,7 +1000,7 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 
 ## 10. 已决问题（2026-10-22）
 
-Q1–Q8 于 2026-10-22 定案；Q9–Q18 是 P1 动工前给指标口径写 brief 时发现的文档间冲突（见 [`../brief-p1.md`](../brief-p1.md)），同日采纳建议后定案。Q19–Q28 于 2026-10-23 定案，来自三份富化研究（[`enrich-ua.md`](../research/enrich-ua.md)、[`enrich-geo.md`](../research/enrich-geo.md)、[`enrich-source.md`](../research/enrich-source.md)）：研究把 §4.4 的规范落成代码并用外部数据实测，发现的事实与偏离在此定案。决定都已写入各节正文。
+Q1–Q8 于 2026-10-22 定案；Q9–Q18 是 P1 动工前给指标口径写 brief 时发现的文档间冲突（见 [`../brief-p1.md`](../brief-p1.md)），同日采纳建议后定案。Q19–Q28 于 2026-10-23 定案，来自三份富化研究（[`enrich-ua.md`](../research/enrich-ua.md)、[`enrich-geo.md`](../research/enrich-geo.md)、[`enrich-source.md`](../research/enrich-source.md)）：研究把 §4.4 的规范落成代码并用外部数据实测，发现的事实与偏离在此定案。Q29 于 2026-10-24 定案（看板与登录限流口径）。决定都已写入各节正文。
 
 | # | 问题 | 决定 | 影响 |
 |---|---|---|---|
@@ -1032,6 +1032,7 @@ Q1–Q8 于 2026-10-22 定案；Q9–Q18 是 P1 动工前给指标口径写 brie
 | Q26 | 国家码占位值与非公网地址 | 国家码只接受两个 ASCII 字母；`ZZ`、`XX` 与 `A1` `A2` `T1` 等占位码视为未知（与 Plausible 一致）；没有国家时区域与城市也为空。区域码为 `<国家>-<第一级子区划代码>`，子区划部分 1–3 位字母数字，只取第一级。私有、回环、链路本地、CGNAT（100.64/10）、文档、基准测试、组播、保留（240/4），以及 IPv6 的 ULA、链路本地、文档、丢弃、IPv4 兼容地址，不查库，直接返回空值；IPv4-mapped IPv6 先转 IPv4 | §4.2 第 6 步；`docs/research/enrich-geo.md` §6 |
 | Q27 | MaxMind 下载接口与认证 | 只实现现行接口：`https://download.maxmind.com/geoip/databases/<edition>/download?suffix=tar.gz`，HTTP Basic（Account ID + license key），返回 `tar.gz`，要解 tar 取 `.mmdb`。旧的 `/app/geoip_download?license_key=` 接口仍在，但只认 key、官方文档已不提，不实现。`RIVU_MAXMIND_ACCOUNT_ID` 在设置 license key 时必填，配置校验报错但不回显 key。Basic 认证只发给 API 域名，跨源重定向不带 `Authorization`。带凭据的真实下载、重定向目标对条件请求的反应**没有验证**（没有账号）：实现不依赖这些，有校验头就带，服务器忽略就整文件下载，再按解压后 mmdb 的 SHA-256 与 meta 比较，相同不替换。拿到账号后验证一次；若条件 GET 不被支持或占用每日 30 次额度，改为先 `HEAD` 比较 `Last-Modified`（`HEAD` 不计额度） | §4.4 优先级表第 2 行；`platform-and-ops.md` §7 `RIVU_MAXMIND_*`；`docs/research/enrich-geo.md` §3、§7 第 3、9 条 |
 | Q28 | 没有 meta 的库文件要不要刷新 | 看配置：默认来源（DB-IP Lite）时直接使用、**不自动刷新**，否则 24 小时后会被 DB-IP 的库覆盖；配置了 `RIVU_GEOIP_DB_URL` 或 `RIVU_MAXMIND_LICENSE_KEY` 时视为没有本地副本，立即下载，新库校验通过前旧文件继续用。meta 的 `build_epoch` 与库不一致时 meta 作废，署名退回手工署名。有本地副本时，第一次条件 GET 安排在 meta 最近检查时间加一个（带抖动的）刷新周期，已过期则立即 | §4.4「文件与元数据」「生命周期」；`platform-and-ops.md` §6 `geoip_refresh`；`docs/research/enrich-geo.md` §6、§7 第 4、5 条 |
+| Q29 | 看板与登录限流口径 | 2026-10-24 定案。（1）公开看板与共享链接的限流默认改为 300 次/分钟、突发 60（`RIVU_PUBLIC_VIEW_RATE_PER_MIN`、`RIVU_PUBLIC_VIEW_BURST`，可配置）：一个看板页加载就并发约 10 个查询（概览、时间序列、各维度分解），再加实时轮询，原 30 次/分钟、突发 10 第一次打开就会 429。（2）登录不再有单纯按账号的阻断桶：任何人不停用受害者的邮箱登录就能让真用户一直 429（锁号）。改为每 IP 20 次/60 秒（防喷洒）加每 `(账号, IP)` 5 次/60 秒（防同一来源爆破），再加**只告警不阻断**的失败统计：同一账号 1 小时内失败达 50 次、全实例每分钟失败达 300 次时 `warn` 并累加 `rivu_auth_login_alerts_total{kind}`，同一窗口只告警一次。代价：分布式爆破（很多 IP 各试几次）不再被挡住，由 Argon2 成本、告警与后续的 TOTP 兜底 | `platform-and-ops.md` §4.4 限流表、§5 登录防护、§7 配置表、§10 指标；`bin/rivu/src/dash_api.rs` |
 
 ---
 

@@ -308,8 +308,8 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 | 维度 | 键 | 规则 | 超限 |
 |---|---|---|---|
 | API（key；会话用户的内部 API 尚未接入） | `organization_id` | 三道闸，见下：小时配额 `RIVU_API_RATE_PER_HOUR`（可被 `organizations.api_hourly_limit` 覆盖）→ 突发令牌桶 `RIVU_API_BURST`（默认 60）→ 每组织并发信号量 `RIVU_API_MAX_CONCURRENCY`（默认 4） | 429 + `Retry-After`、`X-RateLimit-*` |
-| shared link 与公开看板 | `(客户端 IP, link_id 或 site_id)` | 30 次/分钟、突发 10；密码尝试 5 次/分钟 | 429 |
-| 登录 | IP 与账号各一桶 | 5 次/60 秒（沿用 04§2.4） | 429，统一提示 |
+| shared link 与公开看板 | `(客户端 IP, link_id 或 site_id)` | 默认 300 次/分钟、突发 60（`RIVU_PUBLIC_VIEW_RATE_PER_MIN`、`RIVU_PUBLIC_VIEW_BURST`；一个看板页加载并发约 10 个查询，再加实时轮询）；密码尝试 5 次/分钟 | 429 |
+| 登录 | 每客户端 IP 一桶；每 `(账号, 客户端 IP)` 一桶；**没有单纯按账号的阻断桶** | IP 20 次/60 秒（防同一 IP 对多个账号喷洒）；`(账号, IP)` 5 次/60 秒（防同一来源爆破一个账号）；IPv6 按 /64 归并。账号失败告警见下 | 429，统一提示 |
 | `/api/event` | `site_id` | 每站令牌桶：站点 `ingest_rate_limit_per_min`，否则 `RIVU_INGEST_RATE_LIMIT_PER_MIN`（默认 300000，`0` 不限流）；多副本 collector 各自本地限流（`system-design.md` §4.2） | `202` + `x-rivu-dropped`，记 `dropped_rate_limited` |
 
 **API 限流的三道闸**（`rivu-ratelimit::ApiLimiter`，按此顺序检查）：
@@ -338,7 +338,7 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 | Cookie | `__Host-rivu_session`：`HttpOnly; Secure; SameSite=Lax; Path=/`，Max-Age 14 天随续期刷新；`http://localhost` 属安全上下文，开发无需额外开关（Plausible 按 `BASE_URL` 推断 Secure，04§4.2） |
 | 会话轮换 | 登录、改密、改邮箱时签发新会话并撤销其他会话；登出删除当前会话；提供「退出所有设备」 |
 | CSRF | 变更请求只接受 `Content-Type: application/json` 并校验 `Origin` 的 host 等于 `RIVU_BASE_URL`；无表单提交；同源部署不开 CORS |
-| 登录防护 | 限流见 4.4；用户不存在与密码错误的响应和耗时一致；失败日志只记账号 id 与结果，不记 IP（`RIVU_LOG_FAILED_LOGINS`，默认 off，对应 04§4.2） |
+| 登录防护 | 限流见 4.4（按 `(账号, IP)` 与 IP 阻断，不按单纯账号阻断，避免被用来锁号）；用户不存在与密码错误的响应和耗时一致；失败日志只记账号 id 与结果，不记 IP（`RIVU_LOG_FAILED_LOGINS`，默认 off，对应 04§4.2）。**失败告警（只告警不阻断）**：只计失败（被限流拒绝的不算），同一账号 1 小时内失败达 50 次、全实例每分钟失败达 300 次时各打一条 `warn`（只记存在时的用户 id，不记邮箱与 IP）并累加 `rivu_auth_login_alerts_total{kind=account\|global}`，同一窗口同一对象只告警一次；账号计数表有上限（10 万），内存有界 |
 | shared link 密码 | 通过后签发绑定 `link_id` 的短时（12h）HttpOnly cookie，免重复输入 |
 | 清理 | `auth_sessions_cleanup` 每小时清理过期与撤销行（Plausible 每 2 小时，04§3.2）；读取路径始终校验 `expires_at`，清理滞后不影响安全 |
 | TOTP（第 4 阶段） | 密钥用 `RIVU_SECRET_KEY` 经 HKDF 派生的 AES-256-GCM 加密；轮换期用 `RIVU_SECRET_KEY_FALLBACK` 解旧数据；恢复码 10 个只存摘要、用后移除；`last_step` 防重放（04§2.4、04§4.2 `TOTP_VAULT_KEY_FALLBACK`）；org 级强制 2FA 属状态规则 |
@@ -409,6 +409,7 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 | `RIVU_DATA_DIR` | `/var/lib/rivu` | GeoIP 与本地导出 |
 | `RIVU_JOBS`、`RIVU_JOBS_CONCURRENCY` | 见 1.1；`4` | 任务开关与同进程并发数 |
 | `RIVU_API_RATE_PER_HOUR`、`RIVU_API_BURST` | `10000`、`60`（范围 1–100000000、1–1000000） | org 默认小时配额（`organizations.api_hourly_limit` 可覆盖）与突发令牌桶容量，实际容量为 `min(RIVU_API_BURST, 配额)`（§4.4） |
+| `RIVU_PUBLIC_VIEW_RATE_PER_MIN`、`RIVU_PUBLIC_VIEW_BURST` | `300`、`60`（范围都是 1–1000000） | 公开看板与共享链接每个 `(客户端 IP, 站点或链接)` 的每分钟请求数与突发令牌桶容量，实际容量为 `min(RIVU_PUBLIC_VIEW_BURST, 每分钟次数)`（§4.4） |
 | `RIVU_API_MAX_CONCURRENCY`、`RIVU_API_QUEUE_TIMEOUT_MS` | `4`、`2000`（范围 1–1024、1–60000） | 每个 org 同时在途的公开 API 请求数；超出的排队，等待超过该毫秒数返回 429（§4.4） |
 | `RIVU_INGEST_RATE_LIMIT_PER_MIN` | `300000`（范围 0–100000000） | 站点没有自己的 `ingest_rate_limit_per_min` 时的每站每分钟事件数，300000 即 5000/s 的系统峰值目标（`system-design.md` §7）；`0` 表示不限流；站点设置优先；多副本 collector 各自本地限流（`system-design.md` §4.2） |
 | `RIVU_QUERY_TIMEOUT_SECS`、`RIVU_API_QUERY_TIMEOUT_SECS`、`RIVU_PUBLIC_QUERY_TIMEOUT_SECS` | `10`、`20`、`5` | 看板、公开 API、公开看板与共享链接各一档（取值 1–300）；须不大于 reader 配额上限（第 8 节） |
@@ -484,7 +485,7 @@ PG 与 ClickHouse 迁移放在同一目录、同一版本序列（14 位时间�
 | 查询耗时 | `rivu_query_seconds`（固定桶直方图） | `route` |
 | 查询失败 | `rivu_query_errors_total` | `route`、`kind`（`validation` / `timeout` / `resource_limit` / `internal`） |
 | 缓存命中率 | `cache_hits_total`、`cache_misses_total`、`cache_entries`、`cache_refresh_seconds` | `cache`（site/session/query/salt） |
-| 限流与认证 | `ratelimit_rejected_total`、`auth_login_failures_total` | `scope` |
+| 限流与认证 | `ratelimit_rejected_total`、`auth_login_failures_total`、`rivu_auth_login_alerts_total` | `scope`；`kind`（`account` / `global`，登录失败告警，只告警不阻断） |
 | 后台任务 | `jobs_total`、`job_seconds`、`jobs_queue_age_seconds`、`jobs_leader` | `kind`、`state` |
 | GeoIP | `geoip_refresh_total`；`geoip_db_age_seconds`（按库的 `build_epoch`）、`geoip_loaded`（0/1） | 只有 `geoip_refresh_total` 带标签：`source`（dbip-lite/maxmind-geolite2/custom）、`result`（updated/not_modified/failed）；另两个无标签（来源切换后旧标签的序列会残留）。后两个由持有库的进程（collector、api、all）导出，worker 不持有库，所以对应的告警应针对 collector 的抓取目标 |
 | 依赖与状态 | `pg_pool_connections`、`ch_http_seconds`、`build_info`、`schema_version`、`salt_days_loaded` | `account` |

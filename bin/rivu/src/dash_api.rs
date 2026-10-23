@@ -52,22 +52,30 @@
 //!
 //! # 限流（`platform-and-ops.md` §4.4，`rivu-ratelimit::PolicyLimiter`，进程内）
 //!
-//! - 登录：客户端 IP 与账号（规范化邮箱，不论是否存在）各一桶，5 次 / 60 秒，超限 `429` 统一提示；
+//! - 登录阻断两个桶，超限 `429` 统一提示（带 `Retry-After`）：每客户端 IP 20 次 / 60 秒（防同一 IP 对多个账号喷洒）；
+//!   每 `(账号, 客户端 IP)` 5 次 / 60 秒（账号是规范化邮箱，不论是否存在；防同一来源爆破一个账号）。
+//!   **没有单纯按账号的阻断桶**：否则不停用受害者的邮箱登录就能让真用户一直 429（锁号）；
+//! - 登录失败告警（只告警不阻断，只计失败、被限流的请求不算）：同一账号 1 小时内失败达到 50 次、全实例每分钟失败达到 300 次，
+//!   各打一条 `warn!` 并累加 `rivu_auth_login_alerts_total{kind=account|global}`，同一窗口同一对象只告警一次；
+//!   账号表有上限（10 万），满员先清过期窗口，仍满则新账号本窗口不计数；
 //! - 首次初始化：每 IP 5 次 / 60 秒（挡住猜令牌）；
-//! - 共享链接与公开看板：`(客户端 IP, 链接)` / `(客户端 IP, 站点)`，30 次 / 分钟、突发 10；共享链接密码尝试 5 次 / 分钟；
+//! - 共享链接与公开看板：`(客户端 IP, 链接)` / `(客户端 IP, 站点)`，默认 300 次 / 分钟、突发 60
+//!   （`RIVU_PUBLIC_VIEW_RATE_PER_MIN`、`RIVU_PUBLIC_VIEW_BURST`；一个看板页加载并发约 10 个查询再加实时轮询）；
+//!   共享链接密码尝试 5 次 / 分钟；
 //! - IPv6 客户端按 /64 归并（一个终端用户通常拥有整个 /64）。
 //!
 //! 看板会话用户的查询暂不限流（文档 §4.4 写明「会话用户的内部 API 尚未接入」）。
 //!
 //! # 日志与指标
 //!
-//! 日志里没有密码、令牌、cookie、请求体；登录失败只记（存在时的）用户 id 与结果，不记邮箱与 IP。
-//! 指标：`rivu_login_total{result=success|failure|rate_limited}`、`rivu_auth_active_sessions`（每分钟刷新）、
+//! 日志里没有密码、令牌、cookie、请求体；登录失败只记（存在时的）用户 id 与结果，不记邮箱与 IP；告警日志同样。
+//! 指标：`rivu_login_total{result=success|failure|rate_limited}`、`rivu_auth_login_alerts_total{kind=account|global}`、
+//! `rivu_auth_active_sessions`（每分钟刷新）、
 //! `rivu_csrf_rejected_total{reason}`、`rivu_api_requests_total{route="internal.*"}`、
 //! `rivu_query_seconds{route=internal.query|internal.realtime|shared.query|shared.realtime|public.query|public.realtime}`。
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::Router;
@@ -84,7 +92,9 @@ use rivu_auth::scope::{Action, OrgRole, allowed};
 use rivu_auth::session::{
     self, CookieConfig, RENEW_AFTER, SESSION_TTL, SHARE_GRANT_TTL, cookie_value,
 };
-use rivu_common::config::{Cidr, Config};
+use rivu_common::config::{
+    Cidr, Config, DEFAULT_PUBLIC_VIEW_BURST, DEFAULT_PUBLIC_VIEW_RATE_PER_MIN,
+};
 use rivu_geo::GeoDb;
 use rivu_query::spec::Filter;
 use rivu_query::{ExecOptions, QueryError, QueryResult, QuerySpec, TenantScope};
@@ -112,31 +122,150 @@ const REALTIME_CACHE_TTL: Duration = Duration::from_secs(3);
 /// 各类限流的参数。默认值是文档的值，测试里可以放宽。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DashLimits {
-    /// 登录与首次初始化：每个窗口允许的次数（IP 与账号各一桶）。
+    /// 登录的 `(账号, 客户端 IP)` 组合桶与首次初始化的每 IP 桶：每个窗口允许的次数。
     pub login_attempts: u32,
+    /// 登录的每 IP 桶（防同一 IP 对多个账号喷洒）：每个窗口允许的次数，比 `login_attempts` 宽。
+    pub login_ip_attempts: u32,
     pub login_window: Duration,
-    /// 共享链接与公开看板：每分钟次数与突发容量。
+    /// 共享链接与公开看板：每分钟次数与突发容量（来自 `RIVU_PUBLIC_VIEW_*`）。
     pub view_per_min: u32,
     pub view_burst: u32,
     /// 共享链接密码：每分钟尝试次数。
     pub password_per_min: u32,
+    /// 登录失败告警（只告警不阻断）：同一账号 1 小时内失败达到这个次数时告警一次。
+    pub account_fail_alert: u32,
+    /// 登录失败告警：全实例每分钟失败达到这个次数时告警一次。
+    pub global_fail_alert: u32,
 }
 
 impl Default for DashLimits {
     fn default() -> Self {
+        Self::with_view(DEFAULT_PUBLIC_VIEW_RATE_PER_MIN, DEFAULT_PUBLIC_VIEW_BURST)
+    }
+}
+
+impl DashLimits {
+    /// 公开看板的次数与突发取配置（突发容量不超过每分钟次数，与 `RIVU_API_BURST` 的约定一致），其余用默认值。
+    pub fn from_config(config: &Config) -> Self {
+        Self::with_view(config.public_view_rate_per_min, config.public_view_burst)
+    }
+
+    fn with_view(per_min: u32, burst: u32) -> Self {
         DashLimits {
+            view_per_min: per_min,
+            view_burst: burst.min(per_min),
             login_attempts: 5,
+            login_ip_attempts: 20,
             login_window: Duration::from_secs(60),
-            view_per_min: 30,
-            view_burst: 10,
             password_per_min: 5,
+            account_fail_alert: 50,
+            global_fail_alert: 300,
+        }
+    }
+}
+
+/// 账号失败计数窗口（固定窗口，从该账号窗口内第一次失败起算）。
+const ACCOUNT_FAIL_WINDOW: Duration = Duration::from_secs(3600);
+/// 全局失败计数窗口。
+const GLOBAL_FAIL_WINDOW: Duration = Duration::from_secs(60);
+/// 账号失败表的上限：满员时先清掉过期的窗口，仍然满员则新账号本窗口不计数（内存有界，
+/// 宁可漏报也不让告警结构成为被海量不同账号冲击的内存入口）。
+const MAX_TRACKED_ACCOUNTS: usize = 100_000;
+
+/// 一个固定窗口内的失败计数。
+struct FailWindow {
+    start: Instant,
+    count: u32,
+    /// 本窗口已经告警过：同一窗口只告警一次。
+    alerted: bool,
+}
+
+impl FailWindow {
+    /// 记一次失败；本窗口内第一次达到阈值时返回 `true`。
+    fn hit(&mut self, now: Instant, window: Duration, threshold: u32) -> bool {
+        if now.saturating_duration_since(self.start) >= window {
+            *self = FailWindow {
+                start: now,
+                count: 0,
+                alerted: false,
+            };
+        }
+        self.count = self.count.saturating_add(1);
+        if self.count >= threshold && !self.alerted {
+            self.alerted = true;
+            return true;
+        }
+        false
+    }
+}
+
+/// 登录失败的告警判定：只统计失败（被限流拒绝的请求不算），只告警、不阻断。
+/// 账号键是邮箱的哈希（哈希种子进程内随机），内存里不留邮箱原文。
+struct LoginWatch {
+    hasher: std::hash::RandomState,
+    accounts: Mutex<std::collections::HashMap<u64, FailWindow>>,
+    global: Mutex<Option<FailWindow>>,
+}
+
+/// 一次失败触发的告警。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct LoginAlerts {
+    account: bool,
+    global: bool,
+}
+
+impl LoginWatch {
+    fn new() -> Self {
+        LoginWatch {
+            hasher: std::hash::RandomState::new(),
+            accounts: Default::default(),
+            global: Default::default(),
+        }
+    }
+
+    fn record_failure(&self, account: &str, now: Instant, l: &DashLimits) -> LoginAlerts {
+        use std::hash::BuildHasher;
+        let key = self.hasher.hash_one(account);
+        let account_alert = {
+            let mut map = self.accounts.lock().unwrap_or_else(|e| e.into_inner());
+            if !map.contains_key(&key) && map.len() >= MAX_TRACKED_ACCOUNTS {
+                map.retain(|_, w| now.saturating_duration_since(w.start) < ACCOUNT_FAIL_WINDOW);
+            }
+            if !map.contains_key(&key) && map.len() >= MAX_TRACKED_ACCOUNTS {
+                false
+            } else {
+                map.entry(key)
+                    .or_insert_with(|| FailWindow {
+                        start: now,
+                        count: 0,
+                        alerted: false,
+                    })
+                    .hit(now, ACCOUNT_FAIL_WINDOW, l.account_fail_alert)
+            }
+        };
+        let global_alert = self
+            .global
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(|| FailWindow {
+                start: now,
+                count: 0,
+                alerted: false,
+            })
+            .hit(now, GLOBAL_FAIL_WINDOW, l.global_fail_alert);
+        LoginAlerts {
+            account: account_alert,
+            global: global_alert,
         }
     }
 }
 
 struct Limiters {
+    /// 登录：每 IP 一桶（防喷洒）。
     login_ip: PolicyLimiter,
-    login_account: PolicyLimiter,
+    /// 登录：每 `(账号, IP)` 一桶（防同一来源爆破一个账号）。**不再有单纯按账号的桶**：
+    /// 否则任何人不停用受害者的邮箱登录就能让真用户一直 429（锁号）。
+    login_pair: PolicyLimiter,
     setup_ip: PolicyLimiter,
     share_view: PolicyLimiter,
     share_password: PolicyLimiter,
@@ -150,8 +279,12 @@ impl Limiters {
         let view =
             || PolicyLimiter::per_window(l.view_burst, l.view_per_min, Duration::from_secs(60));
         Limiters {
-            login_ip: login(),
-            login_account: login(),
+            login_ip: PolicyLimiter::per_window(
+                l.login_ip_attempts,
+                l.login_ip_attempts,
+                l.login_window,
+            ),
+            login_pair: login(),
             setup_ip: login(),
             share_view: view(),
             share_password: PolicyLimiter::per_window(
@@ -181,6 +314,8 @@ pub struct DashApi {
     dashboard_timeout_secs: u64,
     public_timeout_secs: u64,
     limiters: Limiters,
+    limits: DashLimits,
+    login_watch: LoginWatch,
     realtime_cache: moka::sync::Cache<String, Arc<String>>,
     clock: Clock,
 }
@@ -193,6 +328,7 @@ impl DashApi {
         geo: Option<Arc<GeoDb>>,
     ) -> anyhow::Result<Self> {
         let csrf = Csrf::new(&config.base_url).map_err(anyhow::Error::msg)?;
+        let limits = DashLimits::from_config(config);
         Ok(DashApi {
             pg,
             reader,
@@ -209,7 +345,9 @@ impl DashApi {
             trusted_proxies: config.trusted_proxies.clone(),
             dashboard_timeout_secs: config.query_timeouts.dashboard_secs,
             public_timeout_secs: config.query_timeouts.public_secs,
-            limiters: Limiters::new(&DashLimits::default()),
+            limiters: Limiters::new(&limits),
+            limits,
+            login_watch: LoginWatch::new(),
             realtime_cache: moka::sync::Cache::builder()
                 .max_capacity(10_000)
                 .time_to_live(REALTIME_CACHE_TTL)
@@ -221,6 +359,7 @@ impl DashApi {
     /// 换限流参数（测试用）。
     pub fn with_limits(mut self, limits: DashLimits) -> Self {
         self.limiters = Limiters::new(&limits);
+        self.limits = limits;
         self
     }
 
@@ -228,6 +367,34 @@ impl DashApi {
     pub fn with_clock(mut self, clock: impl Fn() -> Timestamp + Send + Sync + 'static) -> Self {
         self.clock = Arc::new(clock);
         self
+    }
+
+    /// 记一次登录失败并按需告警（只告警不阻断）。日志只带存在时的用户 id（不存在的账号为空），不记邮箱与 IP。
+    fn note_login_failure(&self, account: &str, user_id: Option<i64>) {
+        let alerts = self
+            .login_watch
+            .record_failure(account, Instant::now(), &self.limits);
+        if alerts.account {
+            metrics::counter!("rivu_auth_login_alerts_total", "kind" => "account").increment(1);
+            match user_id {
+                Some(id) => tracing::warn!(
+                    user_id = id,
+                    threshold = self.limits.account_fail_alert,
+                    "同一账号 1 小时内登录失败次数达到告警阈值（疑似爆破，未阻断）"
+                ),
+                None => tracing::warn!(
+                    threshold = self.limits.account_fail_alert,
+                    "不存在的账号 1 小时内登录失败次数达到告警阈值（疑似探测，未阻断）"
+                ),
+            }
+        }
+        if alerts.global {
+            metrics::counter!("rivu_auth_login_alerts_total", "kind" => "global").increment(1);
+            tracing::warn!(
+                threshold = self.limits.global_fail_alert,
+                "全实例每分钟登录失败次数达到告警阈值（疑似撞库，未阻断）"
+            );
+        }
     }
 
     fn client_ip(&self, peer: SocketAddr, headers: &HeaderMap) -> IpAddr {
@@ -611,12 +778,13 @@ async fn login(
     // 账号键：规范化的邮箱（不论账号是否存在，所以限流本身不泄露存在性）
     let account = body.email.trim().to_lowercase();
 
-    // IP 桶在前：被 IP 拒绝的请求不消耗账号的令牌（挡在外面的 IP 不能把受害账号的配额耗光）
+    // IP 桶在前：被 IP 拒绝的请求不消耗 (账号, IP) 的令牌。没有单纯按账号的桶：
+    // 别人换着 IP 用受害者的邮箱登录，只会耗光他自己那个 (账号, IP) 桶，不影响真用户
     let limited = api
         .limiters
         .login_ip
         .check(&ip)
-        .and_then(|()| api.limiters.login_account.check(&account));
+        .and_then(|()| api.limiters.login_pair.check(&(&account, ip)));
     if let Err(wait) = limited {
         metrics::counter!("rivu_login_total", "result" => "rate_limited").increment(1);
         return Err(rate_limited("login", wait));
@@ -642,7 +810,9 @@ async fn login(
         other => {
             metrics::counter!("rivu_login_total", "result" => "failure").increment(1);
             // 失败日志只记（存在时的）用户 id 与结果：不记邮箱，不记 IP
-            tracing::debug!(user_id = other.as_ref().map(|u| u.id), "登录失败");
+            let user_id = other.as_ref().map(|u| u.id);
+            tracing::debug!(user_id, "登录失败");
+            api.note_login_failure(&account, user_id);
             return Err(DashError::InvalidCredentials);
         }
     };
@@ -1382,6 +1552,10 @@ pub fn describe_metrics() {
         "rivu_login_total",
         "登录尝试数，按结果（success / failure / rate_limited）"
     );
+    metrics::describe_counter!(
+        "rivu_auth_login_alerts_total",
+        "登录失败告警次数，按类型（account：同一账号 1 小时内失败达阈值；global：全实例每分钟失败达阈值），只告警不阻断"
+    );
     metrics::describe_gauge!(
         "rivu_auth_active_sessions",
         "有效的登录会话数（每分钟刷新）"
@@ -1541,10 +1715,86 @@ mod tests {
             (l.login_attempts, l.login_window),
             (5, Duration::from_secs(60))
         );
+        assert_eq!(l.login_ip_attempts, 20);
         assert_eq!(
             (l.view_per_min, l.view_burst, l.password_per_min),
-            (30, 10, 5)
+            (300, 60, 5)
         );
+        assert_eq!((l.account_fail_alert, l.global_fail_alert), (50, 300));
+    }
+
+    #[test]
+    fn view_limits_take_the_configured_values_with_burst_capped_by_the_rate() {
+        let l = DashLimits::with_view(300, 60);
+        assert_eq!((l.view_per_min, l.view_burst), (300, 60));
+        assert_eq!(l, DashLimits::default());
+        let l = DashLimits::with_view(100, 500);
+        assert_eq!(
+            (l.view_per_min, l.view_burst),
+            (100, 100),
+            "突发不超过每分钟次数"
+        );
+        assert_eq!(l.login_attempts, 5, "其余沿用默认");
+    }
+
+    fn watch_limits(account: u32, global: u32) -> DashLimits {
+        DashLimits {
+            account_fail_alert: account,
+            global_fail_alert: global,
+            ..DashLimits::default()
+        }
+    }
+
+    #[test]
+    fn account_failure_alert_fires_once_per_window_and_is_per_account() {
+        let w = LoginWatch::new();
+        let l = watch_limits(3, 1_000_000);
+        let t0 = Instant::now();
+        assert_eq!(w.record_failure("a@x", t0, &l), LoginAlerts::default());
+        assert_eq!(w.record_failure("a@x", t0, &l), LoginAlerts::default());
+        // 第 3 次达到阈值：只告警，之后同一窗口不再重复
+        assert!(w.record_failure("a@x", t0, &l).account);
+        assert!(!w.record_failure("a@x", t0, &l).account);
+        assert!(!w.record_failure("a@x", t0, &l).account);
+        // 别的账号单独计数
+        assert!(!w.record_failure("b@x", t0, &l).account);
+        // 窗口过后重新计数、可以再次告警
+        let t1 = t0 + ACCOUNT_FAIL_WINDOW;
+        assert!(!w.record_failure("a@x", t1, &l).account);
+        assert!(!w.record_failure("a@x", t1, &l).account);
+        assert!(w.record_failure("a@x", t1, &l).account);
+    }
+
+    #[test]
+    fn global_failure_alert_fires_once_per_minute_window() {
+        let w = LoginWatch::new();
+        let l = watch_limits(1_000_000, 4);
+        let t0 = Instant::now();
+        // 不同账号的失败合并计数
+        for i in 0..3 {
+            assert!(!w.record_failure(&format!("u{i}"), t0, &l).global);
+        }
+        assert!(w.record_failure("u3", t0, &l).global);
+        assert!(!w.record_failure("u4", t0, &l).global);
+        let t1 = t0 + GLOBAL_FAIL_WINDOW;
+        for i in 0..3 {
+            assert!(!w.record_failure(&format!("v{i}"), t1, &l).global);
+        }
+        assert!(w.record_failure("v3", t1, &l).global);
+    }
+
+    #[test]
+    fn account_table_is_bounded() {
+        let w = LoginWatch::new();
+        let l = watch_limits(10, 1_000_000);
+        let t0 = Instant::now();
+        for i in 0..MAX_TRACKED_ACCOUNTS + 50 {
+            w.record_failure(&format!("n{i}"), t0, &l);
+        }
+        assert_eq!(w.accounts.lock().unwrap().len(), MAX_TRACKED_ACCOUNTS);
+        // 窗口过期后可以清出空间
+        w.record_failure("fresh", t0 + ACCOUNT_FAIL_WINDOW, &l);
+        assert_eq!(w.accounts.lock().unwrap().len(), 1);
     }
 
     #[test]
