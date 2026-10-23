@@ -715,6 +715,19 @@ TTL minute + INTERVAL 90 DAY DELETE;
 | `GET /api/v1/query/schema.json` | 无 | 由 `schemars` 从 Rust 类型生成，文档和校验同源 |
 | `GET /api/internal/sites/{site_id}/realtime` | 同看板 | 当前在线访客，等价于 `date_range: "realtime"` 的查询 |
 
+**公开 API 约定（`POST /api/v1/query`）**
+
+- `site` 必填，缺失返回 400，错误路径为 `site`。
+- 请求体上限 1 MiB，超过返回 413，带 `Connection: close`；读体超过 10 s 返回 408，同样带 `Connection: close`。
+- 不看 `Content-Type`，请求体一律按 JSON 解析，不是 JSON 即 400。
+- 错误体为 `{"error","message"}`；400 另带 `errors: [{path, message}]`。
+- 鉴权与校验顺序：401 → 429 → 403 → 413 / 408 → 400 → 404。
+- 404 对站点不存在、已删除、属于别的组织、key 无权访问四种情况，响应完全相同。
+- 503 `query_timeout` 与 429 `resource_limit` 带 `Retry-After`（10 秒）。
+- `POST /api/v1/query` 的所有响应带 `Cache-Control: no-store`。
+- 不开 CORS：Bearer key 不应放进浏览器。
+- `GET /api/v1/query/schema.json` 不鉴权、不限流，`Cache-Control: public, max-age=3600`，强 ETag，支持 `If-None-Match` 返回 304。
+
 v1 的 `overview`、`timeseries`、`breakdown`、`goals` 改为看板中的查询预设，不再是服务端端点。DSL 只允许白名单内的结构，并不是任意 SQL，所以 v1「不让前端生成任意 SQL」的初衷仍然成立。Plausible 自己也把内部 API 收敛到了一个 `query` 端点（R03 §1.1）。
 
 ### 6.2 `QuerySpec`
@@ -723,7 +736,7 @@ v1 的 `overview`、`timeseries`、`breakdown`、`goals` 改为看板中的查�
 
 | 字段 | 取值 |
 |---|---|
-| `site` | `site_key`，可省略。请求体里的 `site` 只用来核对，从不决定查询哪个站点：路由层对不一致或无权访问的站点返回 404，`resolve` 再核对一次，不一致按校验错误拒绝 |
+| `site` | `site_key`。公开 API（`POST /api/v1/query`）没有路径参数，`site` 必填，缺失返回 400；站点由它经 `authorize_site` 授权后确定，不存在或无权访问一律 404。看板内部端点由路径给出站点，`site` 可以省略，给出时只用来核对：与路径不一致返回 404，`resolve` 再核对一次，不一致按校验错误拒绝 |
 | `metrics` | 至少 1 个、至多 12 个，不得重复：`visitors` `visits` `pageviews` `events` `views_per_visit` `bounce_rate` `visit_duration` `engaged_duration` `percentage` `exit_rate` `time_on_page` `scroll_depth`；`conversion_rate` `group_conversion_rate` 与收入指标 `total_revenue` `average_revenue` 能解析，但返回 `not supported yet` |
 | `date_range` | `day` `24h` `month` `year` `all` `realtime`、`Nd`（1–5000，含 `7d` `28d` `30d`）、`Nmo`（1–100，含 `6mo` `12mo`），或 `[from, to]`：两端同为日期（`YYYY-MM-DD`，含两端的站点本地日）或同为带 UTC 偏移的 RFC 3339 时间戳（含起点、不含终点）。`realtime` 是最近 5 分钟，QuerySpec 本身接受，是否只对看板开放由路由层决定。换算规则见 §6.7 |
 | `dimensions` | 至多 4 个，不得重复，至多一个时间维度。`event:name` `event:page` `event:hostname` `event:goal` `event:props:<k>`、`visit:entry_page` `visit:exit_page` `visit:source` `visit:channel` `visit:referrer` `visit:utm_*` `visit:country` `visit:region` `visit:city` `visit:device` `visit:browser(_version)` `visit:os(_version)`、`time`（自动粒度）`time:minute` `time:hour` `time:day` `time:week` `time:month` |
@@ -901,7 +914,7 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 | Hyperscan 的 `$` | 在 ClickHouse 25.8 的 `multiMatchAny` 上实测：非多行模式，`^` 只匹配串首；`$` 匹配串尾，**也匹配结尾换行之前**（`c$` 能匹配 `abc\n`），不匹配串中间的换行；`.` 匹配换行；`\z` 严格是串尾，所以通配符用 `\A…\z`，带结尾换行的取值不会被整串匹配放过。Rust `regex` 的 `$` 只匹配串尾，两者对「结尾带换行」的取值有差异。pathname、hostname、来源等维度值里没有原始换行（pathname 的控制字符保持转义形态，`tracker-and-protocol.md` §7），所以实际无影响；参考实现（`rivu-reference`）与差分测试也不含这类取值 |
 | 慢查询 | `max_execution_time` 按调用方分三档：看板 10 s、API 20 s、公开或共享链接 5 s，对应三个配置变量（`platform-and-ops.md` §7，§10 Q14），每档都不得大于 `rivu_reader` 配额里的上限；设置 `max_memory_usage`；每个组织的并发信号量（`RIVU_API_MAX_CONCURRENCY`，默认 4），排队超过 `RIVU_API_QUEUE_TIMEOUT_MS`（默认 2000）后返回 `429`（`platform-and-ops.md` §4.4） |
 | 被滥用 | 公开 API 按组织限流（小时配额、突发令牌桶、并发信号量三道闸，`platform-and-ops.md` §4.4）；共享链接和公开看板按 IP 加链接限流。Plausible 的内部 API 完全没有限流（R03 §12.2 #15） |
-| 排障 | 每条查询都带 `log_comment`（JSON：路由、站点、用户、trace_id），可以在 `system.query_log` 中直接追溯（R03 §8.3） |
+| 排障 | 每条查询都带 `log_comment`（JSON：`route`、`site`（站点 id）、`org`（组织 id）、`api_key_id`、`part`（main / compare / total 等查询部分）、`tier`（raw）；只含 id，不含 key 明文；`user` 与 `trace_id` 待会话鉴权与 trace 接入后再补），可以在 `system.query_log` 中直接追溯（R03 §8.3） |
 
 ### 6.9 结果缓存
 
