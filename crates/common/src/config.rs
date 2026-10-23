@@ -231,6 +231,48 @@ impl Default for QueryTimeouts {
     }
 }
 
+/// 公开 API 按组织限流的参数（`platform-and-ops.md` §4.4、§7；`system-design.md` §6.8）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApiRateConfig {
+    /// `RIVU_API_RATE_PER_HOUR`：组织的默认小时配额（`organizations.api_hourly_limit` 可覆盖）。
+    pub hourly_default: u32,
+    /// `RIVU_API_BURST`：突发令牌桶容量，补充速率 = 配额 / 3600。
+    pub burst: u32,
+    /// `RIVU_API_MAX_CONCURRENCY`：每个组织同时在途的请求数（`system-design.md` §6.8 写默认 4，文档没有给变量名）。
+    pub max_concurrency: u32,
+    /// `RIVU_API_QUEUE_TIMEOUT_MS`：并发排队的最长等待，超时返回 429（文档没有给变量名和默认值）。
+    pub queue_timeout: Duration,
+}
+
+impl ApiRateConfig {
+    pub const DEFAULT_HOURLY: u32 = 10_000;
+    pub const DEFAULT_BURST: u32 = 60;
+    pub const DEFAULT_MAX_CONCURRENCY: u32 = 4;
+    pub const DEFAULT_QUEUE_TIMEOUT_MS: u64 = 2000;
+}
+
+impl Default for ApiRateConfig {
+    fn default() -> Self {
+        ApiRateConfig {
+            hourly_default: Self::DEFAULT_HOURLY,
+            burst: Self::DEFAULT_BURST,
+            max_concurrency: Self::DEFAULT_MAX_CONCURRENCY,
+            queue_timeout: Duration::from_millis(Self::DEFAULT_QUEUE_TIMEOUT_MS),
+        }
+    }
+}
+
+/// `RIVU_SHIELD_MAX_RULES_PER_SITE` 的默认值（`platform-and-ops.md` §7）。
+pub const DEFAULT_SHIELD_MAX_RULES_PER_SITE: usize = 500;
+
+/// `RIVU_INGEST_RATE_LIMIT_PER_MIN` 的默认值：每个站点每分钟 300 000 个事件（5000 个/秒）。
+///
+/// `site_settings.ingest_rate_limit_per_min` 为空时用它。site_key 是公开的，没有默认限额就等于没有限流，
+/// 所以要有上限；但上限不能误伤目标规模内的真实流量：单站日均 1000 万事件、20 倍峰值约 2300 个/秒
+/// （v1 第一节），系统压测峰值目标是 5000 个/秒（`system-design.md` §7），默认值取后者。
+/// 小站想更严格就设站点自己的限额；设为 `0` 表示不限流。
+pub const DEFAULT_INGEST_RATE_LIMIT_PER_MIN: u32 = 300_000;
+
 /// 站点缓存的全量重载周期默认值（`RIVU_SITE_CACHE_REFRESH_SECS`）。
 pub const DEFAULT_SITE_CACHE_REFRESH_SECS: u64 = 10;
 
@@ -435,6 +477,12 @@ pub struct Config {
     pub trusted_proxies: Vec<Cidr>,
     pub buffer: BufferConfig,
     pub query_timeouts: QueryTimeouts,
+    /// 公开 API 按组织限流（`RIVU_API_RATE_PER_HOUR`、`RIVU_API_BURST` 等）。
+    pub api_rate: ApiRateConfig,
+    /// `RIVU_SHIELD_MAX_RULES_PER_SITE`：每站屏蔽规则上限。
+    pub shield_max_rules_per_site: usize,
+    /// `RIVU_INGEST_RATE_LIMIT_PER_MIN`：站点没有自己的限额时的默认每分钟事件数；`None` 表示不限流（变量设为 0）。
+    pub ingest_rate_limit_per_min: Option<u32>,
     /// `RIVU_SITE_CACHE_REFRESH_SECS`：站点快照全量重载周期（P1 没有增量刷新和 LISTEN/NOTIFY）。
     pub site_cache_refresh: Duration,
     /// `RIVU_PUBLIC_BASE_URL`（去掉结尾的 `/`）：站点脚本前缀里 `endpoint` 的来源（`tracker-and-protocol.md` §2.3，
@@ -606,6 +654,41 @@ impl Config {
                 1..=300,
             ),
         };
+        let api_rate = ApiRateConfig {
+            hourly_default: l.parse_in_range(
+                "RIVU_API_RATE_PER_HOUR",
+                ApiRateConfig::DEFAULT_HOURLY,
+                1..=100_000_000,
+            ),
+            burst: l.parse_in_range(
+                "RIVU_API_BURST",
+                ApiRateConfig::DEFAULT_BURST,
+                1..=1_000_000,
+            ),
+            max_concurrency: l.parse_in_range(
+                "RIVU_API_MAX_CONCURRENCY",
+                ApiRateConfig::DEFAULT_MAX_CONCURRENCY,
+                1..=1024,
+            ),
+            queue_timeout: Duration::from_millis(l.parse_in_range(
+                "RIVU_API_QUEUE_TIMEOUT_MS",
+                ApiRateConfig::DEFAULT_QUEUE_TIMEOUT_MS,
+                1..=60_000,
+            )),
+        };
+        let shield_max_rules_per_site = l.parse_in_range(
+            "RIVU_SHIELD_MAX_RULES_PER_SITE",
+            DEFAULT_SHIELD_MAX_RULES_PER_SITE,
+            1..=100_000,
+        );
+        let ingest_rate_limit_per_min = match l.parse_in_range(
+            "RIVU_INGEST_RATE_LIMIT_PER_MIN",
+            DEFAULT_INGEST_RATE_LIMIT_PER_MIN,
+            0..=100_000_000,
+        ) {
+            0 => None,
+            n => Some(n),
+        };
         let site_cache_refresh_secs = l.parse_in_range(
             "RIVU_SITE_CACHE_REFRESH_SECS",
             DEFAULT_SITE_CACHE_REFRESH_SECS,
@@ -661,6 +744,9 @@ impl Config {
                 channel_capacity,
             },
             query_timeouts,
+            api_rate,
+            shield_max_rules_per_site,
+            ingest_rate_limit_per_min,
             site_cache_refresh: Duration::from_secs(site_cache_refresh_secs),
             public_base_url,
             public_base_url_explicit,
@@ -1115,6 +1201,55 @@ mod tests {
                 assert_eq!(err.problems.len(), 1, "{name}={bad}: {err}");
                 assert!(err.problems[0].contains(name), "{name}={bad}: {err}");
             }
+        }
+    }
+
+    #[test]
+    fn rate_limit_and_shield_variables_have_defaults_are_read_and_validated() {
+        let cfg = with_env(&[]).unwrap();
+        assert_eq!(cfg.api_rate, ApiRateConfig::default());
+        assert_eq!(cfg.api_rate.hourly_default, 10_000);
+        assert_eq!(cfg.api_rate.burst, 60);
+        assert_eq!(cfg.api_rate.max_concurrency, 4);
+        assert_eq!(cfg.shield_max_rules_per_site, 500);
+        assert_eq!(cfg.ingest_rate_limit_per_min, Some(300_000));
+
+        let cfg = with_env(&[
+            ("RIVU_API_RATE_PER_HOUR", "500"),
+            ("RIVU_API_BURST", "5"),
+            ("RIVU_API_MAX_CONCURRENCY", "2"),
+            ("RIVU_API_QUEUE_TIMEOUT_MS", "250"),
+            ("RIVU_SHIELD_MAX_RULES_PER_SITE", "10"),
+            ("RIVU_INGEST_RATE_LIMIT_PER_MIN", "120"),
+        ])
+        .unwrap();
+        assert_eq!(
+            cfg.api_rate,
+            ApiRateConfig {
+                hourly_default: 500,
+                burst: 5,
+                max_concurrency: 2,
+                queue_timeout: Duration::from_millis(250)
+            }
+        );
+        assert_eq!(cfg.shield_max_rules_per_site, 10);
+        assert_eq!(cfg.ingest_rate_limit_per_min, Some(120));
+        // 0 表示不限流
+        let cfg = with_env(&[("RIVU_INGEST_RATE_LIMIT_PER_MIN", "0")]).unwrap();
+        assert_eq!(cfg.ingest_rate_limit_per_min, None);
+
+        for (name, bad) in [
+            ("RIVU_API_RATE_PER_HOUR", "0"),
+            ("RIVU_API_BURST", "0"),
+            ("RIVU_API_MAX_CONCURRENCY", "0"),
+            ("RIVU_API_QUEUE_TIMEOUT_MS", "0"),
+            ("RIVU_SHIELD_MAX_RULES_PER_SITE", "0"),
+            ("RIVU_INGEST_RATE_LIMIT_PER_MIN", "-1"),
+            ("RIVU_INGEST_RATE_LIMIT_PER_MIN", "many"),
+        ] {
+            let err = with_env(&[(name, bad)]).unwrap_err();
+            assert_eq!(err.problems.len(), 1, "{name}={bad}: {err}");
+            assert!(err.problems[0].contains(name), "{name}={bad}: {err}");
         }
     }
 

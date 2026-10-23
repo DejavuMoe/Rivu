@@ -8,6 +8,8 @@ use jiff::tz::TimeZone;
 use rand::Rng;
 use sqlx::{PgPool, Row, postgres::PgRow};
 
+use crate::shield::ShieldRuleRow;
+
 /// `site_key` 的字母表：base32 小写（`^[a-z2-7]{12}$`，system-design §10 Q11）。
 const SITE_KEY_ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 const SITE_KEY_LEN: usize = 12;
@@ -30,6 +32,10 @@ pub struct SiteRow {
     pub geo_level: String,
     /// `site_settings.tracker->'hash'` 是否为 JSON `true`（hash 路由模式，站点脚本配置前缀用）。
     pub tracker_hash: bool,
+    /// `site_settings.ingest_rate_limit_per_min`：每分钟事件数上限，`None` 用全局默认。
+    pub ingest_rate_limit_per_min: Option<u32>,
+    /// 未删除的屏蔽规则。只有 [`load_sites`]（站点快照用）会填，[`find_site_by_key`] 不加载（留空）。
+    pub shield_rules: Vec<ShieldRuleRow>,
 }
 
 fn site_from_row(r: &PgRow) -> Result<SiteRow> {
@@ -42,6 +48,10 @@ fn site_from_row(r: &PgRow) -> Result<SiteRow> {
         hostnames: r.try_get("hostnames")?,
         geo_level: r.try_get("geo_level")?,
         tracker_hash: r.try_get("tracker_hash")?,
+        ingest_rate_limit_per_min: r
+            .try_get::<Option<i32>, _>("ingest_rate_limit_per_min")?
+            .and_then(|n| u32::try_from(n).ok()),
+        shield_rules: Vec::new(),
     })
 }
 
@@ -52,18 +62,29 @@ pub async fn load_sites(pool: &PgPool) -> Result<Vec<SiteRow>> {
                 COALESCE(ss.collect_enabled, true) AS collect_enabled,
                 COALESCE(ss.geo_level, 'city') AS geo_level,
                 COALESCE(ss.tracker -> 'hash' = 'true'::jsonb, false) AS tracker_hash,
+                ss.ingest_rate_limit_per_min,
                 COALESCE(array_agg(h.pattern ORDER BY h.pattern) FILTER (WHERE h.id IS NOT NULL), '{}') AS hostnames
          FROM sites s
          LEFT JOIN site_settings ss ON ss.site_id = s.id
          LEFT JOIN site_hostnames h ON h.site_id = s.id AND h.deleted_at IS NULL
          WHERE s.deleted_at IS NULL
-         GROUP BY s.id, ss.collect_enabled, ss.geo_level, ss.tracker
+         GROUP BY s.id, ss.collect_enabled, ss.geo_level, ss.tracker, ss.ingest_rate_limit_per_min
          ORDER BY s.id",
     )
     .fetch_all(pool)
     .await
     .context("加载站点失败")?;
-    rows.iter().map(site_from_row).collect()
+    let mut sites = rows.iter().map(site_from_row).collect::<Result<Vec<_>>>()?;
+    // 规则按站点分组挂到站点上（两次查询之间站点被删除的规则会被丢弃）
+    let mut by_site: std::collections::HashMap<u64, Vec<ShieldRuleRow>> =
+        std::collections::HashMap::new();
+    for rule in crate::shield::load_all_rules(pool).await? {
+        by_site.entry(rule.site_id).or_default().push(rule);
+    }
+    for site in &mut sites {
+        site.shield_rules = by_site.remove(&site.id).unwrap_or_default();
+    }
+    Ok(sites)
 }
 
 /// 按 `site_key` 查一个未删除的站点。
@@ -73,18 +94,50 @@ pub async fn find_site_by_key(pool: &PgPool, site_key: &str) -> Result<Option<Si
                 COALESCE(ss.collect_enabled, true) AS collect_enabled,
                 COALESCE(ss.geo_level, 'city') AS geo_level,
                 COALESCE(ss.tracker -> 'hash' = 'true'::jsonb, false) AS tracker_hash,
+                ss.ingest_rate_limit_per_min,
                 COALESCE(array_agg(h.pattern ORDER BY h.pattern) FILTER (WHERE h.id IS NOT NULL), '{}') AS hostnames
          FROM sites s
          LEFT JOIN site_settings ss ON ss.site_id = s.id
          LEFT JOIN site_hostnames h ON h.site_id = s.id AND h.deleted_at IS NULL
          WHERE s.deleted_at IS NULL AND s.site_key = $1
-         GROUP BY s.id, ss.collect_enabled, ss.geo_level, ss.tracker",
+         GROUP BY s.id, ss.collect_enabled, ss.geo_level, ss.tracker, ss.ingest_rate_limit_per_min",
     )
     .bind(site_key)
     .fetch_optional(pool)
     .await
     .context("查询站点失败")?;
     row.as_ref().map(site_from_row).transpose()
+}
+
+/// 站点访问判定需要的字段（`platform-and-ops.md` §4.2）：所属组织和是否公开。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SiteOwner {
+    pub id: u64,
+    pub site_key: String,
+    pub organization_id: i64,
+    pub is_public: bool,
+}
+
+/// 按 `site_key` 查未删除站点的归属（公开 API 的站点访问判定用）；不存在或已软删除返回 `None`。
+pub async fn find_site_owner(pool: &PgPool, site_key: &str) -> Result<Option<SiteOwner>> {
+    let row = sqlx::query(
+        "SELECT id, site_key, organization_id, is_public FROM sites
+         WHERE site_key = $1 AND deleted_at IS NULL",
+    )
+    .bind(site_key)
+    .fetch_optional(pool)
+    .await
+    .context("查询站点归属失败")?;
+    row.map(|r| {
+        let id: i64 = r.try_get("id")?;
+        Ok(SiteOwner {
+            id: u64::try_from(id).context("sites.id 为负数")?,
+            site_key: r.try_get("site_key")?,
+            organization_id: r.try_get("organization_id")?,
+            is_public: r.try_get("is_public")?,
+        })
+    })
+    .transpose()
 }
 
 /// 新站点的参数。

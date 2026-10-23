@@ -10,9 +10,8 @@ use jiff::civil::Date;
 use jiff::tz::TimeZone;
 use rivu_common::config::Config;
 use rivu_geo::{GeoCapability, GeoDb};
-use rivu_ingest::hostname::{HostnamePatterns, normalize_hostname};
 use rivu_query::Dimension;
-use rivu_storage_pg::sites::{NewSite, validate_hostname_pattern};
+use rivu_storage_pg::sites::NewSite;
 use serde_json::json;
 
 use crate::cli::{SiteAddArgs, StatsArgs};
@@ -20,20 +19,9 @@ use crate::cli::{SiteAddArgs, StatsArgs};
 /// `stats` 里每个维度榜的行数。
 const BREAKDOWN_LIMIT: u32 = 10;
 
-/// 规范化一条 hostname 白名单模式：小写、去空白；精确匹配按 hostname 规则（去端口、结尾的 `.`、前导 `www.`），
-/// 通配 `*.example.com` 保留通配头，通配之后的部分不去 `www.`（见 `HostnamePatterns::new`）。
+/// 规范化一条 hostname 白名单模式（实现与屏蔽规则的 hostname 类型共用，见 `rivu_ingest::hostname::validated_pattern`）。
 pub fn normalize_pattern(raw: &str) -> Result<String> {
-    let lowered = raw.trim().to_lowercase();
-    let pattern = match lowered.strip_prefix("*.") {
-        Some(rest) => format!("*.{}", rest.trim_end_matches('.')),
-        None => normalize_hostname(&lowered),
-    };
-    validate_hostname_pattern(&pattern).with_context(|| format!("hostname `{raw}` 无效"))?;
-    // 再过一遍运行时的白名单编译：它认为无效的模式会被悄悄忽略，建站时就要拒绝。
-    if HostnamePatterns::new([pattern.as_str()]).is_empty() {
-        bail!("hostname `{raw}` 无效：规范化后为 `{pattern}`，不是有效的白名单模式");
-    }
-    Ok(pattern)
+    rivu_ingest::hostname::validated_pattern(raw)
 }
 
 /// `rivu site add`：建站，打印 `site_key` 和 `site_id`。
