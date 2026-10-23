@@ -7,7 +7,9 @@
 //! - worker / all：后台任务 `salts_rotate`（启动时补跑一次，之后每小时一次）、`geoip_refresh`
 //!   （无本地副本时立即下载，之后按 `RIVU_GEOIP_REFRESH_INTERVAL` 条件 GET）；
 //! - collector / all：持有 GeoIP 库并每小时检查文件修改时间、热加载；管线第 6 步用它查询位置；
-//! - api：P1 没有 HTTP 接口，`/api/*` 返回 501，指标用命令行 `rivu stats` 查询。
+//! - api / all：公开查询 API（`POST /api/v1/query`、`GET /api/v1/query/schema.json`，见 [`crate::query_api`]）：
+//!   `rivu_reader` 账号的 ClickHouse 客户端、API key 鉴权与按组织限流（[`crate::api_auth::build_guard`]）；
+//!   api 角色也持有 GeoIP 库（只用来在 `meta` 里回显署名与精度），其余 `/api/*` 返回 501，也可用命令行 `rivu stats` 查询。
 //!
 //! 关停顺序：停止接收（HTTP 服务优雅关停）→ 停止后台刷新任务 → 排空 BatchWriter 并 flush →
 //! 刷出全部接入计数（包括还没结束的 10 秒桶）。
@@ -31,8 +33,10 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
+use crate::api_auth;
 use crate::internal::{self, CollectorReadiness, GeoReadiness, InternalState, Probe};
 use crate::public;
+use crate::query_api::{self, QueryApi};
 use crate::script::{ScriptService, TrackerAssets};
 
 /// collector 比较 GeoIP 库文件修改时间的周期（`platform-and-ops.md` §6：每小时）。
@@ -211,12 +215,19 @@ pub async fn run(config: Config) -> Result<ExitCode> {
             ],
         )
         .context("设置阶段耗时直方图的桶失败")?
+        // 查询耗时：毫秒到 API 档上限（20 s）
+        .set_buckets_for_metric(
+            Matcher::Full("rivu_query_seconds".to_owned()),
+            &query_api::QUERY_SECONDS_BUCKETS,
+        )
+        .context("设置查询耗时直方图的桶失败")?
         .install_recorder()
         .context("安装 Prometheus recorder 失败")?;
     internal::describe_metrics();
     rivu_writer::describe_metrics();
     rivu_ingest::pipeline::describe_metrics();
     rivu_geo::describe_metrics();
+    query_api::describe_metrics();
 
     // 先绑定端口：端口被占用时不应该留下已经启动的后台任务。
     let internal_listener = TcpListener::bind(config.internal_addr)
@@ -251,8 +262,8 @@ pub async fn run(config: Config) -> Result<ExitCode> {
     for w in config.geo.warnings() {
         tracing::warn!("{w}");
     }
-    let geo_db = role
-        .serves_collector()
+    // collector 用它查位置；api 只用它回显署名与精度（`meta.geo_attribution` / `geo_capability`）。
+    let geo_db = (role.serves_collector() || role.serves_api())
         .then(|| Arc::new(GeoDb::from_config(&config.geo)));
     if let Some(db) = &geo_db {
         background.push(db.spawn_reloader(
@@ -276,6 +287,29 @@ pub async fn run(config: Config) -> Result<ExitCode> {
     let collector = if role.serves_collector() {
         let geo = geo_db.clone().context("collector 角色没有 GeoIP 库对象")?;
         Some(start_collector(&config, &pg, geo, &bg_stop_rx, &mut background).await?)
+    } else {
+        None
+    };
+
+    // 公开查询 API：只在 api / all 角色。reader 账号是 readonly=1，客户端不设任何 setting（见 `rivu_storage_ch::client`）。
+    let query_routes = if role.serves_api() {
+        let reader_account = config
+            .ch_reader
+            .as_ref()
+            .context("api 需要 RIVU_CH_READER_USER / RIVU_CH_READER_PASSWORD")?;
+        let reader = rivu_storage_ch::client(
+            &config.clickhouse_url,
+            reader_account,
+            Some(&config.ch_database),
+        );
+        let guard = api_auth::build_guard(&config, pg.clone());
+        Some(query_api::router(Arc::new(QueryApi::new(
+            guard,
+            pg.clone(),
+            reader,
+            geo_db.clone(),
+            config.query_timeouts.api_secs,
+        ))))
     } else {
         None
     };
@@ -324,7 +358,7 @@ pub async fn run(config: Config) -> Result<ExitCode> {
                 serve(
                     "公共端口",
                     l,
-                    public::router_with_scripts(role, pipeline, scripts),
+                    public::router_full(role, pipeline, scripts, query_routes),
                     stop_rx.clone(),
                 )
                 .await

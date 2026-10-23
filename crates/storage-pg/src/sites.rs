@@ -140,6 +140,36 @@ pub async fn find_site_owner(pool: &PgPool, site_key: &str) -> Result<Option<Sit
     .transpose()
 }
 
+/// 查询引擎需要的站点设置（`SiteContext` 的来源）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuerySettings {
+    /// IANA 时区名。
+    pub timezone: String,
+    /// 周起始日，0 = 周日，1 = 周一（默认）……6 = 周六（`site_settings.week_starts_on`）。
+    pub week_starts_on: i16,
+}
+
+/// 按站点 id 读查询设置；站点不存在或已软删除返回 `None`。没有 `site_settings` 行时周起始日取列默认值 1（周一）。
+pub async fn find_query_settings(pool: &PgPool, site_id: u64) -> Result<Option<QuerySettings>> {
+    let id = i64::try_from(site_id).context("site_id 超出范围")?;
+    let row = sqlx::query(
+        "SELECT s.timezone, COALESCE(ss.week_starts_on, 1)::smallint AS week_starts_on
+         FROM sites s LEFT JOIN site_settings ss ON ss.site_id = s.id
+         WHERE s.id = $1 AND s.deleted_at IS NULL",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .context("查询站点的查询设置失败")?;
+    row.map(|r| {
+        Ok(QuerySettings {
+            timezone: r.try_get("timezone")?,
+            week_starts_on: r.try_get("week_starts_on")?,
+        })
+    })
+    .transpose()
+}
+
 /// 新站点的参数。
 #[derive(Debug, Clone)]
 pub struct NewSite<'a> {

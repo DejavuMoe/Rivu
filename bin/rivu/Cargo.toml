@@ -23,6 +23,7 @@ anyhow.workspace = true
 axum.workspace = true
 clap.workspace = true
 clickhouse.workspace = true
+http-body-util.workspace = true
 jiff.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true

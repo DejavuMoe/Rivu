@@ -7,6 +7,7 @@ pub mod cli;
 pub mod internal;
 pub mod migrate;
 pub mod public;
+pub mod query_api;
 pub mod run;
 pub mod script;
 pub mod shield_cmd;

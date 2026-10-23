@@ -15,7 +15,8 @@
 //!
 //! 所有响应都带 `Access-Control-Allow-Origin: *`、`Access-Control-Expose-Headers`、`Cache-Control: no-store`、
 //! `Cross-Origin-Resource-Policy: cross-origin`；不带 `Allow-Credentials`，也不设 cookie（请求里的 `Cookie` 被忽略）。
-//! 其余 `/api/*`（api 角色）P1 仍返回 `501`。
+//! api / all 角色另有公开查询 API（`POST /api/v1/query`、`GET /api/v1/query/schema.json`，实现在 [`crate::query_api`]，
+//! 不带 CORS）；其余 `/api/*`（内部看板端点需要登录会话）仍返回 `501`。
 //!
 //! collector / all 角色另有 `GET /js/<site_key>.js`（站点专属脚本，实现在 [`crate::script`]）。
 
@@ -34,6 +35,7 @@ use rivu_ingest::pipeline::{Outcome, Pipeline, RequestCtx};
 use rivu_ingest::protocol::MAX_BODY_BYTES;
 use serde_json::{Value, json};
 
+use crate::query_api;
 use crate::script::{self, ScriptService};
 
 /// 读请求体的超时（§6.1：读体超时 5 s）。
@@ -53,6 +55,17 @@ pub fn router_with_scripts(
     pipeline: Option<Arc<Pipeline>>,
     scripts: Option<Arc<ScriptService>>,
 ) -> Router {
+    router_full(role, pipeline, scripts, None)
+}
+
+/// 公共端口的完整路由。`query_api` 是公开查询 API 的路由（[`crate::query_api::router`]），只在 api / all 角色有值；
+/// 没有时 `/api/v1/query*` 与其他 `/api/*` 一样返回 501。
+pub fn router_full(
+    role: Role,
+    pipeline: Option<Arc<Pipeline>>,
+    scripts: Option<Arc<ScriptService>>,
+    query_api: Option<Router>,
+) -> Router {
     let mut router = Router::new();
     if role.serves_collector()
         && let Some(scripts) = scripts
@@ -69,7 +82,15 @@ pub fn router_with_scripts(
         router = router.merge(collector);
     }
     if role.serves_api() {
-        router = router.route("/api/{*rest}", any(api_not_implemented));
+        if let Some(query_api) = query_api {
+            // 具体路径优先于下面的 `/api/{*rest}` 通配
+            router = router.merge(query_api);
+        }
+        let rest = Router::new().route("/api/{*rest}", any(api_not_implemented));
+        router = router.merge(query_api::count_requests(
+            rest,
+            query_api::ROUTE_NOT_IMPLEMENTED,
+        ));
     }
     router
 }
@@ -248,7 +269,8 @@ mod tests {
     use super::*;
     use crate::testutil::{Resp, request, send};
 
-    const KEY: &str = "k7qm2xv9atbr";
+    /// 合法的 `site_key`（Q11：`^[a-z2-7]{12}$`）。
+    const KEY: &str = "k7qm2xwatbrd";
     /// 没有 `User-Agent` 头的请求是机器人（空 UA），所以测试请求要带一个真实浏览器的 UA。
     const BROWSER_UA: &str = "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
@@ -526,6 +548,52 @@ mod tests {
         // api 角色没有 /api/event 的专用路由，会落到 /api/* 的通配上
         assert_eq!(r.status, 501);
         let r = request(router(Role::Api, None), "GET", "/other").await;
+        assert_eq!(r.status, 404);
+    }
+
+    /// 一个占位的查询 API 路由：只验证它与 501 通配的优先关系，真实实现的测试在 `query_api.rs`。
+    fn stub_query_api() -> Router {
+        Router::new()
+            .route("/api/v1/query", axum::routing::post(|| async { "query" }))
+            .route(
+                "/api/v1/query/schema.json",
+                axum::routing::get(|| async { "schema" }),
+            )
+    }
+
+    #[tokio::test]
+    async fn query_api_routes_take_precedence_over_the_501_wildcard() {
+        for role in [Role::Api, Role::All] {
+            let (p, _w, _rx) = collector(1);
+            let pipeline = (role == Role::All).then_some(p);
+            let app = || router_full(role, pipeline.clone(), None, Some(stub_query_api()));
+            let r = request(app(), "POST", "/api/v1/query").await;
+            assert_eq!((r.status, r.body.as_str()), (200, "query"), "{role:?}");
+            let r = request(app(), "GET", "/api/v1/query/schema.json").await;
+            assert_eq!((r.status, r.body.as_str()), (200, "schema"), "{role:?}");
+            // 其余 /api/* 仍是 501，包括内部看板端点与 v1 下的其他路径
+            for path in [
+                "/api/v1/other",
+                "/api/v1/query/",
+                "/api/internal/sites/1/query",
+                "/api/stats",
+            ] {
+                let r = request(app(), "POST", path).await;
+                assert_eq!(r.status, 501, "{role:?} {path}");
+            }
+            assert_eq!(request(app(), "GET", "/other").await.status, 404);
+        }
+        // 没有挂载查询 API（装配缺失）：`/api/v1/query` 也是 501，不会 404 或 500
+        let r = request(router(Role::Api, None), "POST", "/api/v1/query").await;
+        assert_eq!(r.status, 501);
+        // collector 角色不提供查询 API，即使传了也不挂载
+        let (p, _w, _rx) = collector(1);
+        let r = request(
+            router_full(Role::Collector, Some(p), None, Some(stub_query_api())),
+            "POST",
+            "/api/v1/query",
+        )
+        .await;
         assert_eq!(r.status, 404);
     }
 
