@@ -190,6 +190,9 @@ rivu/
 │   ├── writer/         # ClickHouse 批量写入、重试、去重 token
 │   ├── bus/            # JetStream 发布与消费、分区租约（Reliable）
 │   ├── query/          # QuerySpec → ResolvedQuery → Plan → SQL → Result
+│   ├── reference/      # rivu-reference：QuerySpec 的独立参照执行器（内存里算），只用于差分测试（`brief-p1.md`）
+│   ├── auth/           # rivu-auth：API key 格式与鉴权、scope、角色矩阵、站点访问判定（axum 中间件）
+│   ├── ratelimit/      # rivu-ratelimit：令牌桶、采集按站点限流、API 按组织限流
 │   ├── storage-pg/     # sqlx
 │   ├── storage-ch/     # clickhouse crate 封装、CH 迁移
 │   ├── jobs/           # PG 任务队列、cron leader、汇总层构建
@@ -244,10 +247,10 @@ api × M ─► ClickHouse（只读账号）/ PostgreSQL          jobs：运行�
 | 0 | 传输层 | Axum/tower：只接受 POST；请求体 ≤8 KB；读体超时 5 s；CORS `*`，不带凭证 | 返回 413 / 405 / 408 | 无 |
 | 1 | 解析 | 必须是 JSON 对象；必填 `s`、`n`、`u`；检查长度；规范化 URL、hostname、pathname；只保留白名单内的 query 参数；生成服务端毫秒时间戳 | 返回 400 | 无 |
 | 2 | 客户端上下文 | TCP 对端属于 `RIVU_TRUSTED_PROXIES` 时才读 `X-Forwarded-For`，从右往左取第一个不可信的地址；IP 规范化（IPv4-mapped 转为 IPv4，IPv6 转为小写压缩形式） | 无 | 配置 |
-| 3 | 准入 | 用 `site_key` 在内存快照中查 `SiteConfig`；检查站点是否停用、hostname 是否在白名单（白名单为空时全部丢弃，fail-closed，§10 Q12）、令牌桶限流、垃圾引荐 | `unknown_site` `site_disabled` `hostname_not_allowed` `rate_limited` `spam_referrer` | SiteSnapshot、垃圾引荐表 |
-| 4 | 规则 | IP/CIDR 规则、页面通配规则 | `ip_blocked` `page_blocked` | SiteConfig |
+| 3 | 准入 | 按次序：用 `site_key` 在内存快照中查 `SiteConfig`；站点是否停用；hostname 是否在白名单（白名单为空时全部丢弃，fail-closed，§10 Q12）；hostname 屏蔽规则（`deny` 命中且无 `allow` 例外，记 `hostname_not_allowed`）；每站令牌桶限流（站点 `ingest_rate_limit_per_min` 优先，否则 `RIVU_INGEST_RATE_LIMIT_PER_MIN`）；垃圾引荐（referrer 的 host 后缀命中名单；**engagement 跳过**，它的 referrer 不会被使用）。限流放在 hostname 之后，别的 hostname 冒用 `site_key` 灌进来的流量不会耗掉站点额度 | `unknown_site` `site_disabled` `hostname_not_allowed` `rate_limited` `spam_referrer` | SiteSnapshot、垃圾引荐表 |
+| 4 | 规则 | IP/CIDR 规则（先）、页面通配规则（后）。**engagement 同样适用**：内存里的哈希与比较，没有富化成本；页面规则若放过 engagement，被屏蔽页面的 pageview 虽被丢弃，同一访客在其它页面已开的会话仍会让该页的 engagement 被接受并盖上会话属性，污染 `engaged_duration` 和页面榜；规则在会话中途新增时，已开会话里的 IP 也立即被挡住 | `ip_blocked` `page_blocked` | SiteConfig |
 | 5 | 机器人 | `rivu-ua` 判定：uap-core 的 `Spider`、Headless、自动化框架与脚本客户端、爬虫名与自报家门规则；**空 UA 也算机器人**（§10 Q21）；可选数据中心 CIDR 表 | `bot` `datacenter_ip` | uap-core 规则、自维护名字表、CIDR 表 |
-| 6 | 地理 | 非公网地址（私有、回环、链路本地、CGNAT、文档、保留、组播等；IPv4-mapped 先转 IPv4）不查库，位置为空。否则查 GeoIP 库得 country、region、city，按站点 `geo_level` 截断，再过国家规则。国家码不是两个 ASCII 字母，或为占位码（`ZZ` `XX` `A1` `A2` `T1`），视为未知；没有国家时区域与城市也为空；`region_code` 为 `<国家>-<第一级子区划代码>`（§10 Q26）。默认来源下 region、city 恒为空（§10 Q24） | `country_blocked` | GeoIP 库 |
+| 6 | 地理 | 非公网地址（私有、回环、链路本地、CGNAT、文档、保留、组播等；IPv4-mapped 先转 IPv4）不查库，位置为空。否则查 GeoIP 库得 country、region、city，按站点 `geo_level` 截断，再过国家规则（没有国家的事件按 `ZZ` 判定；engagement 不做，它没有地理查询）。国家码不是两个 ASCII 字母，或为占位码（`ZZ` `XX` `A1` `A2` `T1`），视为未知；没有国家时区域与城市也为空；`region_code` 为 `<国家>-<第一级子区划代码>`（§10 Q26）。默认来源下 region、city 恒为空（§10 Q24） | `country_blocked` | GeoIP 库 |
 | 7 | UA 富化 | 与第 5 步共用一次 `UaParser::parse`（UA 先截断到 512 字节，结果按截断后的 UA 缓存，空 UA 不进缓存）。浏览器和系统取 major.minor，浏览器名按归一化表映射；冻结或精简的 `os_version` 报空串；设备类别只有 desktop / mobile / tablet（§10 Q22） | 无 | uap-core 规则 |
 | 8 | 来源 | `rivu-source` 的 `classify`：referrer → source（host 命中站点白名单的视为内部引荐，调用方传 `None`）；UTM（空串视为缺失）；click id 只记参数名；渠道分类（只有一份 Rust 实现，规则带版本号） | 无 | Matomo 来源库（CC0）、自维护补充表、渠道规则 |
 | 9 | 属性 | 规范化 props；可选的站点 props 白名单；收入（P4） | 无 | SiteConfig |
@@ -255,8 +258,10 @@ api × M ─► ClickHouse（只读账号）/ PostgreSQL          jobs：运行�
 | 11 | 交接 | Lite：交给 SessionAssigner，再交给 BatchWriter；Reliable：发布到 JetStream | `no_session`（engagement）、`overloaded` | 无 |
 
 - **顺序原则**与 Plausible 相同（R01 §5.2）：先做便宜的判断，昂贵的 UA 解析和地理查询放在规则之后。
-- **每个阶段**都记录耗时直方图 `rivu_ingest_stage_seconds{stage}`；每个丢弃原因都计入 `ingest_counters`（§5.4）。
+- **每个阶段**都记录耗时直方图 `rivu_ingest_stage_seconds{stage}`；每个丢弃原因都计入 `ingest_counters`（§5.4）。`stage` 标签共 10 个：`parse`（第 1 步）、`admit`（第 2–3 步，含客户端 IP 与限流）、`shield`（第 4 步）、`bot`（第 5 步；一次 `UaParser::parse` 的耗时记在这里）、`geo`（第 6 步，含国家规则）、`ua`（第 7 步，只是把解析结果写进会话属性）、`source`（第 8 步）、`identity`（第 10 步）、`session`（第 11 步的 SessionAssigner）、`write`（组装行并交给 BatchWriter）。engagement 不经过 `bot` `geo` `ua` `source`，这几个直方图的样本数只对应 pageview 与自定义事件。被限流拒绝的请求另计 `rivu_ratelimit_rejected_total{scope="ingest"}`。
 - **丢弃原因的标识符**（§10 Q13）以 Rust 枚举 `DropReason`（`rivu-domain`）为唯一来源，共 13 个：`unknown_site` `site_disabled` `hostname_not_allowed` `rate_limited` `spam_referrer` `ip_blocked` `page_blocked` `bot` `datacenter_ip` `country_blocked` `no_session` `salt_missing` `overloaded`。`ingest_counters.metric` 取 `accepted` 或 `dropped_<原因>`；未知站点记 `site_id = 0`；已删除的站点从快照摘除后，同样按 `unknown_site` 计。机器人一律记 `dropped_bot`；`rivu-ua` 的 `BotKind`（`spider` `headless` `automation` `empty`）只用于统计与排错，不进 `ingest_counters.metric`（§10 Q21）。`salt_missing` 表示事件的站点本地日期没有盐：collector 不现场生成盐（`platform-and-ops.md` §3.3）。
+- **采集限流**（`rivu-ratelimit::KeyedLimiter`）：每站一个令牌桶，容量 N、补充速率 N/60 每秒（N = 每分钟额度，所以可以一次突发一分钟的量）。额度取站点 `ingest_rate_limit_per_min`，为空取 `RIVU_INGEST_RATE_LIMIT_PER_MIN`，设为 `0` 表示不限流。默认 300000 个/分钟，即 5000 个/秒的系统峰值目标（§7）：`site_key` 是公开的，没有默认上限就等于没有限流；而单站日均 1000 万事件、20 倍峰值约 2300 个/秒，默认值不会误伤目标规模内的真实流量，小站想更严就设站点自己的额度。状态在进程内，多副本 collector 各自本地计数（总额度约为副本数倍），重启清零；站点额度变化时就地调整桶，不重置已有令牌。engagement 同样计数：限流是洪水防护，不分事件类型。
+- **屏蔽规则的语义**（`platform-and-ops.md` §3.3）：规则随站点快照编译成不可变的 `ShieldRules`，`deny` 命中就丢弃，`allow` 是同一类型内的例外。只有 `allow` 没有 `deny` 时不起作用，不是白名单模式。页面通配用分段比较而不是正则（无回溯，pathname ≤1024 字节、模式 ≤250 字节），所以匹配代价有界。
 - **可选优化（仅 Lite）**：续期会话的事件最终会被盖上会话属性，所以第 5–8 步的结果会被覆盖。可以在第 10 步之后先查会话，命中时跳过这几步。
 - **UA 与机器人**（`rivu-ua`，详见 `docs/research/enrich-ua.md`）：第 5、7 步共用一次解析。机器人在第 5 步丢弃，其余字段第 7 步取用。`browser` 的取值不受 uap-core 控制（兜底规则会把任意 token 当家族名），所以查询层展示该维度必须 top-N 加「其它」（§6.10）。
 - **来源与渠道的实现**（`rivu-source`，`classify(&SourceInput) -> SourceInfo`，只有这一份；详见 `docs/research/enrich-source.md`）：
@@ -268,7 +273,7 @@ api × M ─► ClickHouse（只读账号）/ PostgreSQL          jobs：运行�
 
 ### 4.3 站点快照与缓存
 
-- `SiteSnapshot` 是 `ArcSwap<HashMap<SiteKey, Arc<SiteConfig>>>`。`SiteConfig` 包含：`site_id`、`org_id`、状态、时区、已编译的 hostname 模式、规则（IP 集合、CIDR 前缀树、国家集合、页面 glob）、限流参数、脚本开关、保留期、地理精度。
+- `SiteSnapshot` 是 `ArcSwap<HashMap<SiteKey, Arc<SiteConfig>>>`。`SiteConfig` 包含：`site_id`、`org_id`、状态、时区、已编译的 hostname 模式、规则（`deny`、`allow` 各一套：IP 集合、IPv4/IPv6 CIDR 前缀树、国家集合、页面通配、hostname 模式）、限流参数、脚本开关、保留期、地理精度。
 - 刷新有三条路径：
   - 每 5 分钟全量重建；
   - 每 10 秒按 `updated_at > 水位` 做增量刷新，删除通过 `deleted_at` 墓碑感知（Plausible 的删除要等全量刷新才生效，R01 §6.2）；
@@ -286,7 +291,7 @@ api × M ─► ClickHouse（只读账号）/ PostgreSQL          jobs：运行�
 | GeoIP | 默认 DB-IP Lite；可选 MaxMind GeoLite2；可选自定义 mmdb 直链（§10 Q5，详见下） | DB-IP Lite 为 CC BY 4.0，必须署名；GeoLite2 需要 Account ID 加 license key 并遵守其 EULA，也要求署名；自定义库的许可由运维者负责 |
 | 地名 | GeoNames（查询时经 CH 字典转换，与 Plausible 的 `location_data_dict` 做法相同） | CC BY 4.0。默认来源 DB-IP Lite 没有城市的 GeoNames id、也没有子区划代码（§10 Q24），字典只在 MaxMind 或同结构的自定义库下有数据可转换 |
 | 来源 | Matomo `searchengine-and-social-list`（`SearchEngines.yml`、`Socials.yml`、`AIAssistants.yml`，固定 commit，`crates/source/data/matomo/`）加自维护补充表（`supplement.yml`，每条写明依据）。构建时核对数据文件的 SHA-256，编译成排序静态表，运行期无解析、无初始化 | Matomo 数据为 CC0-1.0，无署名义务。Snowplow `referers.yml` 的 README 写明数据按 **GPL-3.0** 提供，**不用**。Google GA4 来源清单无许可声明，只作对照不入库（`docs/research/enrich-source.md` §4.1） |
-| 垃圾引荐 | 开源 referrer spam 列表 | 许可证需核对 |
+| 垃圾引荐 | Matomo `referrer-spam-list`（固定 commit `eaaa5ea`，2352 条，`crates/source/data/spam/`，随仓库嵌入，运行期不联网）。referrer 的 host 做**后缀匹配**：host 等于条目或以 `.<条目>` 结尾才命中（Matomo 自己是子串匹配，这里更严格，`semalt.com` 命中 `a.semalt.com`，不命中 `notsemalt.com`）。构建时核对 `spammers.txt` 的 SHA-256。名单与来源库已复核，只有 2 处重叠：`search.fbdownloader.com`、`search.iminent.com`（浏览器劫持类「搜索引擎」，名单列了它们的根域）；垃圾引荐判定先于来源分类，所以这两个来源的流量被丢弃，新增重叠会让测试失败，须人工复核 | 公有领域 / CC0 1.0（上游 `README.md` 与 `composer.json` 各有一处声明，一致），无署名义务，来源与许可证据见 `crates/source/data/spam/PROVENANCE.md`。名单按现状提供，可能不完整、含过期条目。Plausible 的 `referrer-blocklist` 在 AGPL-3.0 仓库里，不拷贝 |
 
 #### GeoIP 数据源、更新与署名（Q5）
 
@@ -506,7 +511,7 @@ CREATE TABLE rivu.events
     ingest_partition UInt8,                         -- routing % 32（Reliable 的分区号；Lite 的分片号）
     hostname         LowCardinality(String),
     pathname         String CODEC(ZSTD(3)),
-    entry_pathname   String CODEC(ZSTD(3)),         -- 盖章：会话入口页
+    entry_pathname   String CODEC(ZSTD(3)),         -- 盖章：会话入口页；首个 pageview 之前为空，查询不读（§5.2）
     -- 会话属性（盖章，在会话内恒定）
     referrer         String CODEC(ZSTD(3)),
     referrer_source  LowCardinality(String),
@@ -545,7 +550,7 @@ SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1, non_replicated_dedup
 - 排序键沿用 Plausible 的 `(site_id, 日期, name, user_id, ts)`（R02 §8.3）：所有查询都先限定站点和日期；`name` 用于按目标过滤和排除 engagement 事件；`visitor_id` 让 `SAMPLE` 和 `uniq` 更友好。主键去掉末尾的 `ts`，稀疏索引更小。
 - 暂不使用 `SAMPLE` 采样（§10 Q6），大站的长时间范围由日汇总层回答（§6.4）。`SAMPLE BY visitor_id` 仍保留在 DDL 里，将来要采样时不用改表。`sessions` 同理（它的采样键是 `session_id`）。
 - 不再把 v1 的 `site_day` 放进排序键（D4）。
-- 会话属性和 `entry_pathname` 已经盖章到事件上，所以大部分 `visit:*` 过滤可以直接在 `events` 上做，不需要 JOIN。只有 exit page 和会话聚合值（例如停留时长）需要关联 `sessions`。Plausible 的入口页过滤也要 JOIN（R03 §3.4）。
+- 会话属性已经盖章到事件上，且在会话内恒定，所以 `visit:source`、`visit:channel`、`visit:referrer`、`visit:utm_*`、`visit:country`、`visit:region`、`visit:city`、`visit:device`、`visit:browser(_version)`、`visit:os(_version)` 的过滤和分组可以直接用 `events` 的盖章列，不需要 JOIN。**入口页除外**：`entry_pathname` 在会话的第一个 pageview 之前是空的（会话可以由自定义事件开启，此前盖章的行永远保持空），所以入口页的维度与过滤一律从 `sessions`（`entry_page` 聚合状态）取，不用 `events.entry_pathname`。退出页和会话聚合值（例如停留时长）同样要关联 `sessions`。Plausible 的入口页过滤也要 JOIN（R03 §3.4）。查询引擎不读 `events.entry_pathname`。
 - `props` 用 `Map(LowCardinality(String), String)`。每个事件最多 30 个键，`props['k']` 的线性查找代价可以接受；只读键或只读值时，可以用 `props.keys`、`props.values` 子列。常用属性可以提升为独立列。`JSON` 类型从 25.3 起可用于生产，但属性集合有上限时，Map 更简单（#15）。
 
 ### 5.3 `sessions` 与物化视图
@@ -714,35 +719,62 @@ v1 的 `overview`、`timeseries`、`breakdown`、`goals` 改为看板中的查�
 
 ### 6.2 `QuerySpec`
 
+`serde(deny_unknown_fields)`，维度、指标、操作符都是封闭集合；解析只做语法检查，错误带字段路径（`filters[0][2][1]`）。
+
 | 字段 | 取值 |
 |---|---|
-| `site` | `site_key`。必须与鉴权上下文一致，否则返回 404 |
-| `metrics` | `visitors` `visits` `pageviews` `events` `views_per_visit` `bounce_rate` `visit_duration` `engaged_duration` `conversion_rate` `group_conversion_rate` `percentage` `exit_rate` `time_on_page` `scroll_depth`；收入指标（P4） |
-| `date_range` | `day` `24h` `7d` `28d` `30d` `month` `6mo` `12mo` `year` `all`、`Nd`、`Nmo`，或 `[from, to]`（日期或带时区的时间）；看板另有 `realtime` |
-| `dimensions` | `event:name` `event:page` `event:hostname` `event:goal` `event:props:<k>`、`visit:entry_page` `visit:exit_page` `visit:source` `visit:channel` `visit:referrer` `visit:utm_*` `visit:country` `visit:region` `visit:city` `visit:device` `visit:browser(_version)` `visit:os(_version)`、`time` `time:hour` `time:day` `time:week` `time:month` |
-| `filters` | 叶子节点为 `[op, dim, [values], {case_sensitive}]`，`op` 取 `is` `is_not` `contains` `contains_not` `matches` `matches_not` `matches_wildcard` `matches_wildcard_not`；组合节点为 `and` `or` `not` `has_done` `has_not_done`；另有 `["is","segment",[id]]` |
-| `order_by` | 只能是已查询的指标或维度 |
-| `pagination` | `limit` ≤ 10000，`offset` |
-| `include` | `time_labels` `total_rows` `compare`（`previous_period`、`year_over_year`、`[from,to]`）`imports` |
+| `site` | `site_key`，可省略。请求体里的 `site` 只用来核对，从不决定查询哪个站点：路由层对不一致或无权访问的站点返回 404，`resolve` 再核对一次，不一致按校验错误拒绝 |
+| `metrics` | 至少 1 个、至多 12 个，不得重复：`visitors` `visits` `pageviews` `events` `views_per_visit` `bounce_rate` `visit_duration` `engaged_duration` `percentage` `exit_rate` `time_on_page` `scroll_depth`；`conversion_rate` `group_conversion_rate` 与收入指标 `total_revenue` `average_revenue` 能解析，但返回 `not supported yet` |
+| `date_range` | `day` `24h` `month` `year` `all` `realtime`、`Nd`（1–5000，含 `7d` `28d` `30d`）、`Nmo`（1–100，含 `6mo` `12mo`），或 `[from, to]`：两端同为日期（`YYYY-MM-DD`，含两端的站点本地日）或同为带 UTC 偏移的 RFC 3339 时间戳（含起点、不含终点）。`realtime` 是最近 5 分钟，QuerySpec 本身接受，是否只对看板开放由路由层决定。换算规则见 §6.7 |
+| `dimensions` | 至多 4 个，不得重复，至多一个时间维度。`event:name` `event:page` `event:hostname` `event:goal` `event:props:<k>`、`visit:entry_page` `visit:exit_page` `visit:source` `visit:channel` `visit:referrer` `visit:utm_*` `visit:country` `visit:region` `visit:city` `visit:device` `visit:browser(_version)` `visit:os(_version)`、`time`（自动粒度）`time:minute` `time:hour` `time:day` `time:week` `time:month` |
+| `filters` | 顶层数组是隐式 AND。叶子节点为 `[op, dim, [values], {case_sensitive}]`：`op` 取 `is` `is_not` `contains` `contains_not` `matches` `matches_not` `matches_wildcard` `matches_wildcard_not`；`values` 是非空的字符串或整数数组；`case_sensitive` 缺省 `true`。组合节点为 `and` `or` `not` `has_done` `has_not_done`；另有 `["is","segment",[id]]`。嵌套至多 8 层，叶子至多 100 个；时间维度不能用于过滤 |
+| `order_by` | `[key, "asc"\|"desc"]`，`key` 只能是已查询的指标或维度，按请求里的写法（自动粒度的时间维度写 `time`），不得重复。缺省：有时间维度先按时间升序，再按第一个指标降序；其余按第一个指标降序；没有写进 `order_by` 的维度按原始值升序补在最后，保证分页确定 |
+| `pagination` | `limit` 1–10000（缺省 10000），`offset` |
+| `include` | `time_labels`（必须带时间维度）`total_rows` `compare`（`previous_period`、`year_over_year`、`[from,to]`）。没有 `imports`：未实现，`deny_unknown_fields` 会拒绝 |
 
-响应结构与 Plausible v2 同构：`results[{dimensions, metrics}]`、`meta`（`time_labels`、`warnings`、`tiers`、`metric_semantics`）、`query`（规范化后的请求回显）（R03 §3.5）。
+响应结构与 Plausible v2 同构：`results[{dimensions, metrics}]`、`meta`、`query`（规范化后的请求回显）（R03 §3.5）。
+
+| 部分 | 内容 |
+|---|---|
+| `results[].dimensions` | 展示用的字符串：空值换成文案（来源与 referrer `Direct / None`，渠道 `Direct`，事件名、页面、入口页、退出页 `(none)`，其余 `(not set)`）；小时桶是带偏移的站点本地时间（`2026-10-23T14:00:00+08:00`），其余时间桶是桶起始日（`YYYY-MM-DD`，周桶是该周起始日，首桶可能早于范围起点） |
+| `results[].metrics` | 与请求里的 `metrics` 同序。计数类是整数；比率、时长、平均值是浮点数 |
+| `meta` | `time_labels`（`include.time_labels`：完整的桶序列，含空桶；`results` 里只有有数据的桶）、`comparison_time_labels`、`warnings`、`tiers`（现在恒为 `["raw"]`）、`metric_semantics`（每个被请求的指标在本次查询形态下的口径，随过滤与维度而变）、`geo_attribution`（结果含位置维度时必带）、`geo_capability`、`total_rows`（`include.total_rows`，不计 limit 与 offset） |
+| `query` | 规范化后的请求回显：`resolved_date_range`（站点时区的起点与终点，终点已封顶到 `now`）、`comparison_date_range`、`time_zone`、自动粒度换成具体粒度（如 `time:day`）、默认排序与分页已展开 |
+| 对比（`include.compare`） | 无时间维度：每行带 `comparison: {dimensions, metrics, change}`。有时间维度：`comparison_results` 是对比期的行（只含主结果里出现过的非时间维度取值），不带 `change`，对比期的桶序列在 `meta.comparison_time_labels`（同时给了 `include.time_labels` 才返回）。规则见 §6.7 |
+
+#### 当前支持范围（P1，原始层）
+
+不支持的项都能通过语法检查（schema 与 Plausible 的取值集合一致），在 `resolve` 阶段返回校验错误 `… is not supported yet`（带字段路径）。
+
+| 类别 | 已支持 | 返回 `not supported yet` |
+|---|---|---|
+| 指标 | `visitors` `visits` `pageviews` `events` `views_per_visit` `bounce_rate` `visit_duration` `engaged_duration` `percentage` `exit_rate` `time_on_page` `scroll_depth` | 转化率（`conversion_rate` `group_conversion_rate`）、收入（`total_revenue` `average_revenue`） |
+| 维度 | `event:name` `event:page` `event:hostname` `visit:entry_page` `visit:exit_page` `visit:source` `visit:channel` `visit:referrer` `visit:utm_*` `visit:country` `visit:region` `visit:city` `visit:device` `visit:browser(_version)` `visit:os(_version)`、`time` `time:hour` `time:day` `time:week` `time:month` | 目标（`event:goal`）、属性（`event:props:<k>`）、`time:minute` |
+| 过滤 | 上述维度（不含时间维度）上的 8 个叶子操作符，以及 `and` `or` `not`；`visit:city` 只支持 `is` `is_not`，取值是 GeoNames id | `has_done` `has_not_done`、`["is","segment",[id]]`、对目标、属性、`time:minute` 的过滤 |
+| `date_range` | `day` `24h` `month` `year` `all` `realtime` `Nd` `Nmo` `[from, to]` | — |
+| `include` | `time_labels` `total_rows` `compare` | `imports`（未实现，直接是未知字段） |
+| 数据层 | 原始层（`events` 与 `sessions`）。`meta.tiers` 恒为 `["raw"]` | 日汇总层与 §6.4「选层」规则、`range_beyond_raw_retention` 警告 |
 
 ### 6.3 执行流程
 
 ```
 HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
     ─► parse   ─► QuerySpec           // serde(deny_unknown_fields)，只做语法检查，不访问数据库
+    ─► [date_range = all] first_event // build 之前先查一次站点最早事件（读排序键前缀，一条查询），没有数据时只含今天
     ─► build   ─► ResolvedQuery       // 注入 site_id 和时区，UTC 边界，展开分群，加载目标，业务校验
-    ─► optimize                       // 自动时间粒度、默认排序、hostname 过滤扩展、相对范围裁剪
+    ─► optimize                       // 自动时间粒度、默认排序、终点封顶到 now（都在 build 内完成；Plausible 的 hostname 过滤扩展未做）
     ─► plan    ─► Plan{tiers, tables} // 声明式「指标/维度 → 表」映射，并选择数据层
     ─► sql     ─► (String, Params)    // 只拼服务端常量片段，取值一律用 {name:Type} 参数
-    ─► exec    ─► rows                // 带 log_comment、超时和内存配额；受租户并发信号量控制
+    ─► exec    ─► rows                // 带 log_comment、超时和内存配额（租户并发信号量在 API 层，§6.8）
     ─► assemble─► QueryResult
 ```
 
 - `ResolvedQuery` 的构造函数只在 crate 内部可见，handler 无法绕过构建阶段（R03 §12.3）。
 - 分群是查询前的宏展开，执行器不知道分群的存在（R03 §6.5）。
-- 对比查询沿用 Plausible 的做法：先执行主查询，再用主查询结果中的维度值约束对比期，保证两边的行集一致（R03 §7.5）。
+- 对比查询沿用 Plausible 的做法：先执行主查询，再用主查询结果中的维度值约束对比期，保证两边的行集一致（R03 §7.5）。时间维度不参与约束。
+- 一次请求可能发多条查询（`all` 的最早事件、`percentage` 的分母、主查询、对比期），共用同一个截止时间（调用方档位的 `max_execution_time`，§6.8）。
+- **地理元数据**：`meta.geo_capability`（`country` 或 `city`）只在维度或过滤涉及位置（`visit:country` `visit:region` `visit:city`）时给出；`meta.geo_attribution` 只在**维度**含位置时给出（§4.4 署名要求）。站点的地理库能力是 `country`，而维度或过滤用到 `visit:region` 或 `visit:city` 时，`meta.warnings` 带 `geo_capability_country_only`（地理库只提供国家级数据，地区与城市为空，§6.10）。
+- 分群（`segment`）与目标（`event:goal`）的展开、加载目前未实现：build 阶段直接返回 `not supported yet`（§6.2）。
 
 ### 6.4 规划器：选表与选层
 
@@ -751,22 +783,27 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 | 对象 | 归属 |
 |---|---|
 | `pageviews` `events` `time_on_page` `scroll_depth` 收入 | events |
-| `visits` `bounce_rate` `visit_duration` `engaged_duration` `views_per_visit` `exit_rate` | sessions |
+| `bounce_rate` `visit_duration` `engaged_duration` `views_per_visit` `exit_rate`；`visits`（没有 `event:*` 维度时） | sessions |
+| `visits`（有 `event:*` 维度时） | events：含该维度值的（非 engagement）事件所属的不同会话数，`uniq(session_id)`（§6.5） |
 | `visitors` | 只从 events 计算：`sessions` 没有 `visitor_id`（§10 Q9） |
 | 各种比率 | 按分子、分母各自的归属 |
 | `event:*` 维度和过滤 | events |
-| `visit:exit_page` | 只在 sessions |
-| 其他 `visit:*`（含 `entry_page`） | events 和 sessions 都可以（因为已盖章） |
+| `visit:entry_page`、`visit:exit_page` | 只在 sessions：`events.entry_pathname` 在会话首个 pageview 之前为空（§5.2） |
+| 其他 `visit:*` | events 和 sessions 都可以（会话属性已盖章，在会话内恒定） |
 
 | 组合 | 做法 |
 |---|---|
 | 只有事件级的指标、维度和过滤 | 只查 `events` |
 | 只有会话级的内容 | 只查 `sessions`（两级聚合） |
-| 会话指标加事件过滤，例如「浏览过 /pricing 的会话的跳出率」 | `sessions WHERE session_id IN (SELECT session_id FROM events WHERE site_id=… AND 日期… AND pathname…)` |
-| 事件指标加 exit page 过滤 | `events JOIN (sessions 子查询) USING session_id` |
-| 两类指标都要 | 各查各的，再按全部维度 `LEFT JOIN`；时间维度为 hour 或 minute 时用 `FULL JOIN`，与 Plausible 相同 |
+| 会话指标加事件过滤，例如「浏览过 /pricing 的会话的跳出率」 | `sessions WHERE session_id IN (SELECT session_id FROM events WHERE site_id=… AND 日期… AND name != 'engagement' AND pathname…)`：事件级叶子在会话上是「存在」语义（§6.6） |
+| 事件指标加入口页或退出页过滤 | `events WHERE session_id IN (SELECT session_id FROM (sessions 子查询) WHERE …)` |
+| 事件指标按入口页或退出页分组 | `events ANY LEFT JOIN (sessions 子查询) USING session_id` |
+| 带 `event:page` / `event:hostname` 过滤的 `bounce_rate` | 单独的会话组件：只统计入口页匹配、且范围内有匹配事件的会话（§6.6） |
+| 多类指标同时要 | 每类指标各出一个组件（事件、会话、跳出、退出、engagement），输出同一组列（维度 `d0..dk`，度量 `c_*`，每个度量只在一个组件里非零），`UNION ALL` 后按维度整体聚合；比率在外层用分子分母重新计算，排序与分页也在 SQL 里完成。不用 JOIN，所以某个维度值只出现在一侧也不会丢行 |
 
 **选层**
+
+实现状态：P1 只有原始层，`Tier` 留成枚举，`meta.tiers` 恒为 `["raw"]`；下面的规则是日汇总层上线后的目标。
 
 按天把查询范围分配给不同的数据层：
 
@@ -793,48 +830,77 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 | 指标 | 定义 |
 |---|---|
 | `visitors` | `uniqIf(visitor_id, name != 'engagement')`，只读 `events`。排除 engagement，与 `realtime` 同口径：engagement 只是已有页面浏览的附属信号，不代表一次到访（§10 Q17）。事件保留当天的 ID，所以任意范围的值等于各本地日访客数之和（§10 Q9） |
-| `visits` | 区间内活跃的会话数：内层聚合后 `last_event_at ≥ from AND started_at ≤ to`，并且 `start_date ≥ from_date − 7`（依赖 7 天的会话上限，§4.6）。代价是多读 7 天的会话行，排序键含 `start_date`，按范围裁剪 |
+| `visits` | 没有 `event:*` 维度时：区间内活跃的会话数，内层按 `(site_id, start_date, session_id)` 聚合后 `last_event_at ≥ 起点 AND started_at < 终点`（区间是 `[起点, 终点)`，整日区间的终点是末日的次日 00:00，不含），并且 `start_date ≥ 起点的 UTC 日期 − 7`（依赖 7 天的会话上限，§4.6）。代价是多读 7 天的会话行，排序键含 `start_date`，按范围裁剪。**有 `event:*` 维度时**：含该维度值的（非 engagement）事件所属的不同会话数 `uniq(session_id)`，一个会话有多个维度值时每个值各算一次。口径只取决于维度，不取决于同时查了哪些别的指标 |
 | `pageviews` / `events` | `countIf(name='pageview')` / `countIf(name != 'engagement')` |
-| `bounce_rate` | `countIf(pageviews ≤ 1 AND interactive_events = 0) / visits`；带 `event:page` 过滤时，只统计入口页匹配的会话（§6.6） |
+| `bounce_rate` | `countIf(pageviews ≤ 1 AND interactive_events = 0) / 区间内活跃的会话数`，会话不按区间边界截断；带 `event:page` 或 `event:hostname` 过滤时，只统计入口页匹配、且范围内有匹配事件的会话（§6.6） |
 | `visit_duration` | `avg(last_event_at − started_at)`，单位秒。不含 engagement 时间（§10 Q2） |
 | `engaged_duration` | `sum(engagement_ms) / 1000 / count()`，只统计 `engagement_ms > 0` 的会话，单位秒。与 `time_on_page` 同口径，避免没有开启 engagement 的 `core` 脚本把均值拉向 0。超出 `raw_retention` 时只有无维度查询能由 `rollup_site_day` 回答（§6.4 兼容规则） |
 | `views_per_visit` | `avg(pageviews)` |
-| `time_on_page` | 按页面计算：`sum(engagement_ms) / uniqIf(session_id, name='engagement')` |
-| `scroll_depth` | 按页面计算：先对每个会话取 `max(scroll_depth ≤ 100)`，再取平均 |
-| `exit_rate` | 该页的退出次数 / 该页的 pageviews |
+| `time_on_page` | 按行计算，只看 engagement 事件：先对每个（维度值，会话）累加 `engagement_ms`，再 `sum(engagement_ms) / 1000 / 有 engagement 的会话数` |
+| `scroll_depth` | 按行计算：先对每个（维度值，会话）取 `max(scroll_depth ≤ 100)`，再对有有效 `scroll_depth` 的会话取平均，范围 0–100 |
+| `exit_rate` | 该页的退出次数 / 该页的 pageviews。退出次数是区间内活跃、最后一个 pageview 是该页的会话数，所以退出发生在区间之后时比值可以超过 1 |
 | `conversion_rate` | 完成目标的访客数 / 同范围、去掉目标和 props 过滤后的访客数 |
-| `percentage` | 本行访客数 / 去掉维度后的访客总数 |
+| `percentage` | 本行访客数 / 去掉维度后的访客总数（同一区间、同样的过滤，另一次查询）。要求至少一个维度，且不能带时间维度 |
 | `realtime` | `uniq(visitor_id)`，取最近 5 分钟、`name != 'engagement'` 的事件 |
 
 **`uniq` 与容差**（§10 Q10）：原始层和日汇总层用同一个 `uniq`（ClickHouse 的自适应采样近似算法），日汇总层存的就是按同样方法算出的每日值，不另做精确去重；两层的差异只来自 `uniq` 本身。容差写进指标口径文档（`meta.metric_semantics`）。在 ClickHouse 25.8 上实测（`uniq` 对不同值个数的结果）：1000、10000 个不同值时与精确值相等；65536 个时为 65535；65537 个时为 65852（+0.5%）；10 万个时为 100022（+0.02%）；100 万个时为 1002001（+0.2%）。所以单日访客数在 6.5 万以内与精确值至多差 1，超过后误差在 1% 以内。
 
-所有比率都用 `ifNotFinite(…, 0)` 包一层，防止除零产生无穷值。Rivu 没有 `-1` 行，不需要 Plausible 那种 `greatest(…, 0)` 兜底。
+所有比率都用 `ifNotFinite(…, 0)` 包一层，分母为 0 时取 0，不产生 `null` 或无穷值。取值范围：`bounce_rate`、`percentage` 是 0–1，`scroll_depth` 是 0–100，`exit_rate` 如上可超过 1；时长是秒。Rivu 没有 `-1` 行，不需要 Plausible 那种 `greatest(…, 0)` 兜底。
 
-**分组（P1 `rivu_query::breakdown`）**：会话属性维度（来源、渠道、国家、设备）的 `visitors`、`pageviews` 按事件上盖的属性从 `events` 算，`visits` 从 `sessions` 两级聚合后按会话属性计数，两侧 `UNION ALL` 后按值合并（某个值可能只出现在一侧，所以不用 JOIN）。`event:page` 的 `visits` 定义为「区间内浏览过该页的会话数」（一个会话没有单一的页面）。空值的展示文案：来源 `Direct / None`、渠道 `Direct`、设备与国家 `(not set)`；前三项与 Plausible 相同，国家是 Rivu 的约定。
+**分组（`rivu_query::breakdown` 预设，现在内部走 `execute`，口径由统一内核决定）**：会话属性维度（来源、渠道、国家、设备）的 `visitors`、`pageviews` 按事件上盖的属性从 `events` 算，`visits` 从 `sessions` 两级聚合后按会话属性计数，两侧 `UNION ALL` 后按值合并（某个值可能只出现在一侧，所以不用 JOIN）。`event:page` 的 `visits` 定义为「区间内浏览过该页的会话数」（一个会话没有单一的页面）。空值的展示文案：来源 `Direct / None`、渠道 `Direct`、设备与国家 `(not set)`；前三项与 Plausible 相同，国家是 Rivu 的约定。
 
 ### 6.6 过滤语义（写进 API 文档和 `meta.metric_semantics`）
 
 - 带 `event:page` 过滤时：`visitors` 和 `pageviews` 只统计**浏览过**该页的访客和浏览次数；`bounce_rate` 只统计**以该页为入口**的会话；其余会话指标统计**浏览过**该页的会话。这与 Plausible 相同（R03 §6.3）。保留这一语义是为了与 Plausible 导入的数据口径一致，同时必须明示。
-- `has_done` / `has_not_done` 通过 `session_id IN (…)` 实现。
+- **会话行上的事件级叶子是「存在」语义**：`event:name`、`event:page`、`event:hostname` 的叶子在会话指标上翻译成 `session_id IN (SELECT session_id FROM events WHERE name != 'engagement' AND <叶子条件>)`，意思是「会话在范围内有一个满足条件的事件」。所以在会话指标（`visits`、`views_per_visit`、`bounce_rate`、`visit_duration`、`engaged_duration`）上，`["is_not","event:page",["/a"]]`（有一个页面不是 `/a` 的事件）与 `["not",["is","event:page",["/a"]]]`（没有任何事件的页面是 `/a`）**不同**；在事件指标上两者相同，因为是逐事件判定。
+- **事件级的一切都不含 engagement**：`visitors`、`pageviews`、`events`、事件形式的 `visits`、上面的存在子查询都带 `name != 'engagement'`。反过来，`time_on_page` 与 `scroll_depth` 只看 engagement 事件，所以不能与 `event:name` 维度或过滤同用（它们算的是 engagement 事件，`event:name` 恒为 `engagement`）。`event:page` 等过滤对 engagement 事件的 `pathname` 照常生效。
+- **组合限制**（不兼容的组合直接报错，不静默放行）：`percentage` 要求至少一个维度且不能带时间维度；`exit_rate` 要求维度恰好是 `[event:page]`，且不能带事件级过滤（`event:page` `event:hostname` `event:name`）；`event:name` 维度不能与会话指标（`bounce_rate` `visit_duration` `engaged_duration` `views_per_visit`）同用；时间维度至多一个、维度至多 4 个；`include.time_labels` 要求时间维度。
+- **时间维度上的会话**：会话级指标按会话在范围内**首次活跃**的桶计入，即 `max(started_at, 范围起点)` 所在的桶，所以各桶的 `visits` 之和等于整个范围的 `visits`。事件形式的 `visits`（有 `event:*` 维度）按事件时间分桶，同一会话的事件落在多个桶时各算一次，各桶之和可以大于总数。
+- **取值规则**：`is` 的取值若等于该维度的展示文案（`Direct / None`、`(not set)`、`(none)`），按空值匹配；`contains` 不匹配空串；`case_sensitive: false` 只做 ASCII 大小写折叠；`visit:city` 只支持 `is` `is_not`，取值是 GeoNames id。数量上限与正则限制见 §6.8。
+- `has_done` / `has_not_done` 通过 `session_id IN (…)` 实现（目前返回 `not supported yet`，§6.2）。
 - 目标（goal）有三种：事件名、页面通配、滚动深度阈值，每个目标最多带 3 个 props 条件（R03 §6.4）。
 - 未知的过滤组合直接报错，不静默放行。Plausible 的做法是返回 false 再记一条日志，只是不会泄露数据。
 
 ### 6.7 时间与时区
 
-- 存储一律用 UTC。查询边界在 Rust 里按站点时区换算成 UTC，并处理 DST 的缺口与重叠时段（R03 §7.1）。
-- 分桶用 `toStartOfInterval(toTimeZone(ts, tz), …)`。`time:hour` 或 `time:minute` 下的「活跃访客」按 15 分钟时间槽展开，以兼容 +5:45 这类非整点时区（R03 §7.3）。
-- 周起始日做成站点设置，默认周一。Plausible 写死为周一（R03 §12.2 #12）。
-- `7d` 指截至昨天的 7 个完整日，不含今天，与 Plausible 相同（R03 §7.4）。
+- 存储一律用 UTC。查询边界在 Rust 里按站点时区换算成 UTC 毫秒区间 `[起点, 终点)`，并处理 DST 的缺口与重叠时段（R03 §7.1）：本地日 `d` 的起点是 `d 00:00`，落在缺口里就取缺口之后的第一个时刻，所以 23 小时与 25 小时的日子都恰好是一个本地日。支持的日期范围是 1970-01-03 到 2100-12-31。
+- **范围换算**（`today` 指站点本地今天）：
 
+  | `date_range` | 区间 |
+  |---|---|
+  | `day` | 今天 |
+  | `24h` | `[now − 24h, now]`（时刻区间） |
+  | `realtime` | `[now − 5 min, now]`（时刻区间） |
+  | `Nd`（含 `7d` `28d` `30d`） | 截至昨天的 N 个完整本地日，不含今天，与 Plausible 相同（R03 §7.4） |
+  | `month` | 本月 1 日到今天 |
+  | `Nmo`（含 `6mo` `12mo`） | 截至上个月月底的 N 个完整自然月 |
+  | `year` | 当年 1 月 1 日到今天 |
+  | `all` | 站点最早事件所在的本地日到今天；没有数据时只含今天（§6.3） |
+  | `[日期, 日期]` | 两端的本地日都含 |
+  | `[时间戳, 时间戳]` | 含起点、不含终点；起点不得晚于终点 |
+
+- **终点封顶到 `now`**：所有区间的终点取 `min(终点, now + 1 ms)`。未来没有数据，这样 `month`、`year`、`day` 的时间标签不会出现未来的空桶，数据与标签用同一个终点。主区间与对比期都封顶。
+- **自动粒度**（`time` 维度）：按区间覆盖的本地日数：≤ 2 日用小时，≤ 40 日用日，≤ 364 日（52 周）用周，否则用月。与 Plausible 的 48 小时 / 40 天 / 52 周相近，但按本地日数而不是时长，23 与 25 小时的日子不会让「两天」变成「日」。时间桶（标签与结果行）至多 10000 个，超出报校验错误。
+- **分桶**：`toStartOfInterval(toTimeZone(ts, tz), …)`。小时桶对齐站点本地时间的整点（+5:45 这类非整点时区也对齐本地整点），标签带偏移（`2026-10-23T14:00:00+08:00`，DST 回拨的两个 02:00 可以区分）；日、周、月桶的标签是桶起始日 `YYYY-MM-DD`。时间维度的结果只含有数据的桶，完整的桶序列在 `meta.time_labels`。P1 没有 Plausible 的「活跃访客按 15 分钟时间槽展开」：小时桶里的 `visitors` 只数该小时内有事件的访客；`time:minute` 尚不支持。
+- 周起始日做成站点设置，默认周一。Plausible 写死为周一（R03 §12.2 #12）。周桶的标签是该周起始日，首桶可能早于范围起点。
+- **对比期**（`include.compare`），终点同样封顶到 `now`：
+
+  | 主区间 | `previous_period` | `year_over_year` |
+  |---|---|---|
+  | 整日区间 | 向前平移 N 个本地日，N 是主区间的本地日数（终点晚于今天、起点不晚于今天时，终点先裁到今天再数） | 起点减一年（2 月 29 日取 28 日），长度 N 日不变 |
+  | 时刻区间（`24h`、`realtime`、时间戳对） | 向前平移区间的时长 | 起点按站点时区减一年，长度不变 |
+
+  显式的 `[from, to]` 与 `date_range` 的写法和校验相同。`change`（只在无时间维度的对比里给出，与 `metrics` 同序）：`bounce_rate`、`percentage`、`exit_rate` 取绝对差（新 − 旧）；其余指标取相对变化 `(新 − 旧) / 旧`，旧值为 0 时新值也为 0 记 0，否则记 1。对比期里没有的行，旧值按 0 算。
 ### 6.8 安全与隔离
 
 | 风险 | 措施 |
 |---|---|
 | 跨租户读取 | SQL 构建器的每个 `FROM` 都必须传入 `TenantScope`，类型系统强制，所有子查询都会重复注入 `site_id` |
 | 注入 | 字段和函数来自枚举；取值一律通过 ClickHouse 服务端参数 `{name:Type}` 传入（Rust crate 的 `.param()`），不使用客户端转义的 `.bind()`（#10、#13） |
-| 正则 | `matches` 每个过滤最多 10 个模式，每个 ≤256 字符。`max_hyperscan_regexp_length` 和 `max_hyperscan_regexp_total_length` 默认是 0（不限制），必须在 `rivu_reader` 的 profile 中显式设置（#11）。通配符在服务端转成转义后的正则 |
-| 慢查询 | `max_execution_time` 按调用方分三档：看板 10 s、API 20 s、公开或共享链接 5 s，对应三个配置变量（`platform-and-ops.md` §7，§10 Q14），每档都不得大于 `rivu_reader` 配额里的上限；设置 `max_memory_usage`；每个组织的并发信号量（默认 4），排队超时后返回 `429` |
-| 被滥用 | 公开 API 按组织限流（小时配额加突发令牌桶）；共享链接和公开看板按 IP 加链接限流。Plausible 的内部 API 完全没有限流（R03 §12.2 #15） |
+| 正则 | `matches*` 与 `matches_wildcard*` 每个过滤最多 10 个模式，每个 ≤256 字符，**转换后**的正则还要 ≤256 字节（通配符转义与 `(?i)` 前缀都算在内，所以 256 个字符的通配符可能超限）。`max_hyperscan_regexp_length` 和 `max_hyperscan_regexp_total_length` 默认是 0（不限制），必须在 `rivu_reader` 的 profile 中显式设置（#11；开发配置为 256 与 2560，`deploy/clickhouse/users.d/rivu-dev.xml`）。其余数量上限：`is` 系列 ≤1000 个值，`contains` 系列 ≤100 个，单个值 ≤1024 字符（模式按上面的 256），一个查询的过滤叶子 ≤100 个，值不得含 NUL。构建阶段先用 Rust 的 `regex`（线性时间，与 Hyperscan 一样没有反向引用与环视）预检语法与大小（`size_limit` 1 MiB），数据库再拒绝一次（错误码 427 或 36 里带 regexp / hyperscan）也映射为校验错误。通配符只有 `*` 一种（连续的 `*` 合并），匹配任意串（含空串与 `/`），其余字符按字面转义，转成 `\A…\z` 锚定的整串匹配；多个候选请用多个取值。`matches` 的模式不加锚点（串内任意位置匹配），写法由调用方负责 |
+| Hyperscan 的 `$` | 在 ClickHouse 25.8 的 `multiMatchAny` 上实测：非多行模式，`^` 只匹配串首；`$` 匹配串尾，**也匹配结尾换行之前**（`c$` 能匹配 `abc\n`），不匹配串中间的换行；`.` 匹配换行；`\z` 严格是串尾，所以通配符用 `\A…\z`，带结尾换行的取值不会被整串匹配放过。Rust `regex` 的 `$` 只匹配串尾，两者对「结尾带换行」的取值有差异。pathname、hostname、来源等维度值里没有原始换行（pathname 的控制字符保持转义形态，`tracker-and-protocol.md` §7），所以实际无影响；参考实现（`rivu-reference`）与差分测试也不含这类取值 |
+| 慢查询 | `max_execution_time` 按调用方分三档：看板 10 s、API 20 s、公开或共享链接 5 s，对应三个配置变量（`platform-and-ops.md` §7，§10 Q14），每档都不得大于 `rivu_reader` 配额里的上限；设置 `max_memory_usage`；每个组织的并发信号量（`RIVU_API_MAX_CONCURRENCY`，默认 4），排队超过 `RIVU_API_QUEUE_TIMEOUT_MS`（默认 2000）后返回 `429`（`platform-and-ops.md` §4.4） |
+| 被滥用 | 公开 API 按组织限流（小时配额、突发令牌桶、并发信号量三道闸，`platform-and-ops.md` §4.4）；共享链接和公开看板按 IP 加链接限流。Plausible 的内部 API 完全没有限流（R03 §12.2 #15） |
 | 排障 | 每条查询都带 `log_comment`（JSON：路由、站点、用户、trace_id），可以在 `system.query_log` 中直接追溯（R03 §8.3） |
 
 ### 6.9 结果缓存
