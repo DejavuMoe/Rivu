@@ -6,3 +6,6 @@ pub mod internal;
 pub mod migrate;
 pub mod public;
 pub mod run;
+pub mod script;
+#[cfg(test)]
+mod testutil;

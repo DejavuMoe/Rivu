@@ -16,6 +16,8 @@
 //! 所有响应都带 `Access-Control-Allow-Origin: *`、`Access-Control-Expose-Headers`、`Cache-Control: no-store`、
 //! `Cross-Origin-Resource-Policy: cross-origin`；不带 `Allow-Credentials`，也不设 cookie（请求里的 `Cookie` 被忽略）。
 //! 其余 `/api/*`（api 角色）P1 仍返回 `501`。
+//!
+//! collector / all 角色另有 `GET /js/<site_key>.js`（站点专属脚本，实现在 [`crate::script`]）。
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -32,14 +34,31 @@ use rivu_ingest::pipeline::{Outcome, Pipeline, RequestCtx};
 use rivu_ingest::protocol::MAX_BODY_BYTES;
 use serde_json::{Value, json};
 
+use crate::script::{self, ScriptService};
+
 /// 读请求体的超时（§6.1：读体超时 5 s）。
 const BODY_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 const X_RIVU_DROPPED: HeaderName = HeaderName::from_static("x-rivu-dropped");
 
-/// 公共端口的路由。`pipeline` 只在 collector / all 角色有值。
+/// 公共端口的路由（不含站点脚本）。`pipeline` 只在 collector / all 角色有值。
 pub fn router(role: Role, pipeline: Option<Arc<Pipeline>>) -> Router {
+    router_with_scripts(role, pipeline, None)
+}
+
+/// 公共端口的路由。`pipeline` 与 `scripts` 只在 collector / all 角色有值；
+/// `scripts` 提供 `GET /js/<site_key>.js`（`tracker-and-protocol.md` §2.3、§2.4）。
+pub fn router_with_scripts(
+    role: Role,
+    pipeline: Option<Arc<Pipeline>>,
+    scripts: Option<Arc<ScriptService>>,
+) -> Router {
     let mut router = Router::new();
+    if role.serves_collector()
+        && let Some(scripts) = scripts
+    {
+        router = router.merge(script::router(scripts));
+    }
     if role.serves_collector() {
         let collector = Router::new()
             .route(
@@ -221,80 +240,17 @@ mod tests {
     use std::collections::HashMap;
 
     use rivu_common::config::Cidr;
+    use rivu_geo::{GeoDb, GeoLevel};
     use rivu_ingest::pipeline::{SaltCache, SiteConfig, SiteSnapshot, utc_today};
+    use rivu_ua::UaParser;
     use rivu_writer::WriterHandle;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
 
     use super::*;
+    use crate::testutil::{Resp, request, send};
 
     const KEY: &str = "k7qm2xv9atbr";
-
-    struct Resp {
-        status: u16,
-        headers: Vec<(String, String)>,
-        body: String,
-    }
-
-    impl Resp {
-        fn header(&self, name: &str) -> Option<&str> {
-            self.headers
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case(name))
-                .map(|(_, v)| v.as_str())
-        }
-    }
-
-    /// 起一个真实监听端口，发一个最小的 HTTP/1.1 请求，返回解析后的响应。
-    async fn send(router: Router, method: &str, path: &str, headers: &[&str], body: &[u8]) -> Resp {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(
-                listener,
-                router.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .await
-            .unwrap()
-        });
-
-        let mut stream = TcpStream::connect(addr).await.unwrap();
-        let mut req =
-            format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n");
-        for h in headers {
-            req.push_str(h);
-            req.push_str("\r\n");
-        }
-        req.push_str("\r\n");
-        stream.write_all(req.as_bytes()).await.unwrap();
-        stream.write_all(body).await.unwrap();
-        let mut raw = Vec::new();
-        stream.read_to_end(&mut raw).await.unwrap();
-        let raw = String::from_utf8_lossy(&raw).into_owned();
-        let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((&raw, ""));
-        let mut lines = head.lines();
-        let status = lines
-            .next()
-            .unwrap()
-            .split_whitespace()
-            .nth(1)
-            .unwrap()
-            .parse()
-            .unwrap();
-        let headers = lines
-            .filter_map(|l| l.split_once(':'))
-            .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned()))
-            .collect();
-        Resp {
-            status,
-            headers,
-            body: body.to_owned(),
-        }
-    }
-
-    async fn request(router: Router, method: &str, path: &str) -> Resp {
-        send(router, method, path, &["Content-Length: 0"], b"").await
-    }
+    /// 没有 `User-Agent` 头的请求是机器人（空 UA），所以测试请求要带一个真实浏览器的 UA。
+    const BROWSER_UA: &str = "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
     /// 一条管线：一个 UTC 站点，白名单 example.test，盐覆盖今天前后。
     fn collector(
@@ -312,6 +268,8 @@ mod tests {
                 timezone: jiff::tz::TimeZone::UTC,
                 collect_enabled: true,
                 hostnames: rivu_ingest::hostname::HostnamePatterns::new(["example.test"]),
+                geo_level: GeoLevel::City,
+                tracker_hash: false,
             }),
         )]));
         let salts = Arc::new(SaltCache::new());
@@ -329,7 +287,14 @@ mod tests {
         let (writer, rx) = WriterHandle::detached(capacity);
         let trusted: Vec<Cidr> = vec!["10.0.0.0/8".parse().unwrap()];
         (
-            Arc::new(Pipeline::new(sites, salts, writer.clone(), trusted)),
+            Arc::new(Pipeline::new(
+                sites,
+                salts,
+                writer.clone(),
+                trusted,
+                Arc::new(UaParser::embedded().expect("uap-core")),
+                Arc::new(GeoDb::new()),
+            )),
             writer,
             rx,
         )
@@ -347,7 +312,7 @@ mod tests {
             router(Role::Collector, Some(Arc::clone(p))),
             "POST",
             "/api/event",
-            &["Content-Type: text/plain;charset=UTF-8", &len],
+            &["Content-Type: text/plain;charset=UTF-8", BROWSER_UA, &len],
             body,
         )
         .await
@@ -379,6 +344,7 @@ mod tests {
             "/api/event",
             &[
                 "Content-Type: text/plain;charset=UTF-8",
+                BROWSER_UA,
                 "Cookie: session=abc",
                 &len,
             ],

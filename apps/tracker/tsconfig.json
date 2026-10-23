@@ -16,5 +16,5 @@
     "skipLibCheck": true,
     "isolatedModules": true
   },
-  "include": ["src", "test", "playwright.config.ts"]
+  "include": ["src", "test", "playwright.config.ts", "playwright.rivu.config.ts"]
 }

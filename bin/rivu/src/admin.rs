@@ -9,14 +9,16 @@ use anyhow::{Context, Result, bail};
 use jiff::civil::Date;
 use jiff::tz::TimeZone;
 use rivu_common::config::Config;
+use rivu_geo::{GeoCapability, GeoDb};
 use rivu_ingest::hostname::{HostnamePatterns, normalize_hostname};
+use rivu_query::Dimension;
 use rivu_storage_pg::sites::{NewSite, validate_hostname_pattern};
 use serde_json::json;
 
 use crate::cli::{SiteAddArgs, StatsArgs};
 
-/// `stats` 里页面榜的行数。
-const TOP_PAGES_LIMIT: u32 = 10;
+/// `stats` 里每个维度榜的行数。
+const BREAKDOWN_LIMIT: u32 = 10;
 
 /// 规范化一条 hostname 白名单模式：小写、去空白；精确匹配按 hostname 规则（去端口、结尾的 `.`、前导 `www.`），
 /// 通配 `*.example.com` 保留通配头，通配之后的部分不去 `www.`（见 `HostnamePatterns::new`）。
@@ -64,7 +66,8 @@ pub async fn site_add(config: &Config, args: SiteAddArgs) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `rivu stats`：查询一个站点在本地日期范围内的核心指标，打印 JSON。
+/// `rivu stats`：查询一个站点在本地日期范围内的核心指标与各维度分组（页面、来源、渠道、国家、设备，每个最多 10 行），
+/// 打印 JSON。`meta` 带 `geo_attribution` 与 `geo_capability`（结果含国家时必填）。
 pub async fn stats(config: &Config, args: StatsArgs) -> Result<ExitCode> {
     let pool = rivu_storage_pg::connect(config.database_url.expose(), 2).await?;
     let Some(site) = rivu_storage_pg::sites::find_site_by_key(&pool, &args.site).await? else {
@@ -83,8 +86,41 @@ pub async fn stats(config: &Config, args: StatsArgs) -> Result<ExitCode> {
     // `rivu stats` 等同看板查询，用看板档的超时（§10 Q14）。
     let timeout = config.query_timeouts.dashboard_secs;
     let overview = rivu_query::overview(&reader, site.id, &tz, from, to, timeout).await?;
-    let pages =
-        rivu_query::top_pages(&reader, site.id, &tz, from, to, TOP_PAGES_LIMIT, timeout).await?;
+    let mut breakdowns = serde_json::Map::new();
+    for dim in Dimension::ALL {
+        let rows = rivu_query::breakdown(
+            &reader,
+            site.id,
+            &tz,
+            from,
+            to,
+            dim,
+            BREAKDOWN_LIMIT,
+            timeout,
+        )
+        .await?;
+        breakdowns.insert(
+            dim.as_str().to_owned(),
+            rows.iter()
+                .map(|r| {
+                    json!({"value": r.value, "visitors": r.visitors, "visits": r.visits,
+                           "pageviews": r.pageviews})
+                })
+                .collect::<Vec<_>>()
+                .into(),
+        );
+    }
+
+    // 含国家的结果必须带署名与库的能力（system-design §4.4、§6.10）。署名与能力跟随实际加载的库：
+    // 这里读同一个库文件（collector / all 进程热加载的就是它）；文件不存在则两者都是 null。
+    let geo = GeoDb::from_config(&config.geo);
+    if let Err(e) = geo.reload_if_changed(&config.geo.db_path) {
+        tracing::warn!(error = %format!("{e:#}"), "读取 GeoIP 库失败，geo_attribution 与 geo_capability 为 null");
+    }
+    let geo_meta = json!({
+        "geo_attribution": geo.attribution(),
+        "geo_capability": geo.capability().map(GeoCapability::as_str),
+    });
 
     let out = json!({
         "site_key": site.site_key,
@@ -98,10 +134,8 @@ pub async fn stats(config: &Config, args: StatsArgs) -> Result<ExitCode> {
         "bounce_rate": overview.bounce_rate,
         "visit_duration": overview.visit_duration,
         "engaged_duration": overview.engaged_duration,
-        "top_pages": pages
-            .iter()
-            .map(|p| json!({"pathname": p.pathname, "visitors": p.visitors, "pageviews": p.pageviews}))
-            .collect::<Vec<_>>(),
+        "breakdown": breakdowns,
+        "meta": geo_meta,
     });
     println!("{}", serde_json::to_string_pretty(&out)?);
     Ok(ExitCode::SUCCESS)

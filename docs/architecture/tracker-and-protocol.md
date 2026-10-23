@@ -80,8 +80,9 @@ window.rivu=window.rivu||function(){(rivu.q=rivu.q||[]).push(arguments)};rivu.c=
 |---|---|
 | 选 `full` 的条件 | 站点启用了任一 full 专属能力：`engagement`、`outbound`、`downloads`、`forms`、`tagged`、`manual`、手动 API/属性/收入；否则选 `core` |
 | 响应头（站点脚本） | `Content-Type: application/javascript; charset=utf-8`、`ETag`、`Cache-Control: public, max-age=300`、`X-Content-Type-Options: nosniff`、`Cross-Origin-Resource-Policy: cross-origin`、`Access-Control-Allow-Origin: *`（头集合参照 `[01 §3.5]`） |
-| ETag 与生效延迟 | ETag = `sha256(构建号 ‖ 前缀)` 截取 16 字节，`If-None-Match` 命中返回 `304`；开关变更最多 5 分钟生效（Plausible 为 60 秒 `[01 §3.5]`，Rivu 以 ETag 换更长缓存） |
-| 未知 `site_key` | `404`，`Cache-Control: no-store`，空体 |
+| ETag 与生效延迟 | ETag = `sha256(构建号 ‖ 前缀 ‖ 脚本字节)` 截取 16 字节（混入脚本字节，同一构建号重新构建后不会命中旧 ETag），`If-None-Match` 命中返回 `304`；开关变更最多 5 分钟生效（Plausible 为 60 秒 `[01 §3.5]`，Rivu 以 ETag 换更长缓存） |
+| 未知、已删除或已停用（`collect_enabled = false`）的 `site_key` | `404`，`Cache-Control: no-store`，空体 |
+| 脚本产物缺失 | 服务端从 `RIVU_TRACKER_DIR` 读取 CI 构建的 `dist/`；目录缺失时已知站点返回 `503`，`/readyz` 的 `tracker` 项报告但不判失败 |
 | `t.js` | `Cache-Control: public, max-age=86400`，另提供不可变的 `/js/t.<sv>.js` 供固定版本（旧式静态脚本 1 天缓存见 `[01 §3.5]`） |
 
 ### 2.5 队列桩与 `init` 的行为
@@ -314,9 +315,9 @@ rivu('event', 'Video Play', { interactive: false })   // 发 i:false，不影响
 | 3 | 站点配置（进程内缓存，不查 PG）：未知 `s`（已删除的站点从快照摘除后同样如此） | `202`+dropped | `dropped_unknown_site`（`site_id = 0`） |
 | 4 | 站点状态、配额、限流 | `202`+dropped | `dropped_site_disabled` / `dropped_rate_limited` |
 | 5 | hostname 白名单（第 7 节） | `202`+dropped | `dropped_hostname_not_allowed` |
-| 6 | 屏蔽规则、垃圾引荐、机器人、国家 | `202`+dropped | `dropped_ip_blocked` / `dropped_page_blocked` / `dropped_spam_referrer` / `dropped_bot` / `dropped_datacenter_ip` / `dropped_country_blocked` |
+| 6 | 屏蔽规则、垃圾引荐、机器人、国家（engagement 跳过本步与 UA/来源富化：它不能开会话，富化结果不会被使用；机器人的 pageview 已被丢弃，它的 engagement 自然记为 `dropped_no_session`） | `202`+dropped | `dropped_ip_blocked` / `dropped_page_blocked` / `dropped_spam_referrer` / `dropped_bot` / `dropped_datacenter_ip` / `dropped_country_blocked` |
 | 7 | 身份：事件的站点本地日期没有盐（collector 不现场生成盐） | `202`+dropped | `dropped_salt_missing` |
-| 8 | engagement 先查会话（在昂贵的 UA/地理富化之前） | `202`+dropped | `dropped_no_session` |
+| 8 | 会话分配：engagement 没有会话 | `202`+dropped | `dropped_no_session` |
 | 9 | 富化、写缓冲/JetStream | `503` | `dropped_overloaded` |
 
 `ingest_counters` 的维度为 `{分钟, 指标, site_id, script_version}`（进程内按 10 秒桶累加，桶用接收请求时的墙钟）；`sv` 超出 UInt16 的钳到 65535。未知站点统一记 `site_id = 0`，避免用户可控标签撑爆基数 `[01 §10.1]`。丢弃原因以 Rust 枚举 `DropReason` 为唯一来源（`system-design.md` §4.2、§10 Q13），指标名为 `dropped_<原因>`，仅内部可见。

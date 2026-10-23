@@ -13,6 +13,7 @@ use arc_swap::ArcSwap;
 use jiff::Timestamp;
 use jiff::civil::Date;
 use jiff::tz::TimeZone;
+use rivu_geo::GeoLevel;
 use rivu_storage_pg::salts::Salt;
 use rivu_storage_pg::sites::SiteRow;
 use sqlx::PgPool;
@@ -28,18 +29,29 @@ pub struct SiteConfig {
     pub timezone: TimeZone,
     pub collect_enabled: bool,
     pub hostnames: HostnamePatterns,
+    /// 地理精度（`site_settings.geo_level`）：第 6 步按它截断，更细的字段不存。
+    pub geo_level: GeoLevel,
+    /// 站点脚本是否用 hash 路由模式（`site_settings.tracker.hash`，只影响 `/js/<site_key>.js` 的配置前缀）。
+    pub tracker_hash: bool,
 }
 
 impl SiteConfig {
-    /// 从 PG 行构造；时区名无效时返回错误。
+    /// 从 PG 行构造；时区名无效时返回错误。`geo_level` 解析失败按 `country`（最粗的精度，
+    /// 不会多存数据）处理并记 `warn`：PG 的 CHECK 保证取值，这里只是防御。
     pub fn from_row(row: &SiteRow) -> Result<Self> {
         let timezone = TimeZone::get(&row.timezone)
             .map_err(|e| anyhow::anyhow!("站点 {} 的时区 `{}` 无效: {e}", row.id, row.timezone))?;
+        let geo_level = row.geo_level.parse::<GeoLevel>().unwrap_or_else(|e| {
+            tracing::warn!(site_id = row.id, error = %e, "站点的 geo_level 无效，按 country 处理");
+            GeoLevel::Country
+        });
         Ok(SiteConfig {
             site_id: row.id,
             timezone,
             collect_enabled: row.collect_enabled,
             hostnames: HostnamePatterns::new(row.hostnames.iter().map(String::as_str)),
+            geo_level,
+            tracker_hash: row.tracker_hash,
         })
     }
 }
@@ -266,7 +278,33 @@ mod tests {
             timezone: tz.into(),
             collect_enabled: true,
             hostnames: hosts.iter().map(|s| (*s).to_owned()).collect(),
+            geo_level: "city".into(),
+            tracker_hash: false,
         }
+    }
+
+    #[test]
+    fn geo_level_is_parsed_and_an_invalid_value_falls_back_to_country() {
+        for (raw, want) in [
+            ("country", GeoLevel::Country),
+            ("region", GeoLevel::Region),
+            ("city", GeoLevel::City),
+            ("planet", GeoLevel::Country),
+            ("", GeoLevel::Country),
+            ("City", GeoLevel::Country),
+        ] {
+            let mut r = row(1, "aaaaaaaaaaaa", "UTC", &["a.test"]);
+            r.geo_level = raw.into();
+            assert_eq!(SiteConfig::from_row(&r).unwrap().geo_level, want, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn tracker_hash_flag_is_carried_into_the_config() {
+        let mut r = row(1, "aaaaaaaaaaaa", "UTC", &["a.test"]);
+        assert!(!SiteConfig::from_row(&r).unwrap().tracker_hash);
+        r.tracker_hash = true;
+        assert!(SiteConfig::from_row(&r).unwrap().tracker_hash);
     }
 
     #[test]

@@ -234,6 +234,9 @@ impl Default for QueryTimeouts {
 /// 站点缓存的全量重载周期默认值（`RIVU_SITE_CACHE_REFRESH_SECS`）。
 pub const DEFAULT_SITE_CACHE_REFRESH_SECS: u64 = 10;
 
+/// `RIVU_TRACKER_DIR` 的默认值：仓库里 `apps/tracker` 的构建输出（相对进程工作目录）。
+pub const DEFAULT_TRACKER_DIR: &str = "apps/tracker/dist";
+
 /// `RIVU_DBIP_EDITION`：DB-IP Lite 的版本。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DbIpEdition {
@@ -434,6 +437,14 @@ pub struct Config {
     pub query_timeouts: QueryTimeouts,
     /// `RIVU_SITE_CACHE_REFRESH_SECS`：站点快照全量重载周期（P1 没有增量刷新和 LISTEN/NOTIFY）。
     pub site_cache_refresh: Duration,
+    /// `RIVU_PUBLIC_BASE_URL`（去掉结尾的 `/`）：站点脚本前缀里 `endpoint` 的来源（`tracker-and-protocol.md` §2.3，
+    /// 不取请求的 `Host`）。未设置时取 `http://<RIVU_LISTEN_ADDR>`，只适合开发。
+    pub public_base_url: String,
+    /// `RIVU_PUBLIC_BASE_URL` 是否显式设置；否则启动时提醒（生产必须设置）。
+    pub public_base_url_explicit: bool,
+    /// `RIVU_TRACKER_DIR`：tracker 构建产物目录（`core.js`、`meta.json`），启动时读入并缓存。
+    /// 默认 `apps/tracker/dist`（相对进程工作目录）；生产镜像把 CI 构建的 `dist/` 放进该目录。
+    pub tracker_dir: PathBuf,
     /// GeoIP 数据源、刷新与署名（`migrate` 不校验，取默认值）。
     pub geo: GeoConfig,
 }
@@ -601,6 +612,19 @@ impl Config {
             1..=3600,
         );
 
+        let public_base_url = l.optional("RIVU_PUBLIC_BASE_URL");
+        if let Some(u) = &public_base_url {
+            l.check_http_url("RIVU_PUBLIC_BASE_URL", u);
+        }
+        let public_base_url_explicit = public_base_url.is_some();
+        let public_base_url = public_base_url
+            .map(|u| u.trim_end_matches('/').to_owned())
+            .unwrap_or_else(|| format!("http://{listen_addr}"));
+        let tracker_dir = PathBuf::from(
+            l.optional("RIVU_TRACKER_DIR")
+                .unwrap_or_else(|| DEFAULT_TRACKER_DIR.into()),
+        );
+
         // GeoIP 变量对 migrate 没有意义：解析但丢弃问题，避免无关变量挡住迁移。
         let problems_before_geo = l.problems.len();
         let geo = l.geo();
@@ -638,6 +662,9 @@ impl Config {
             },
             query_timeouts,
             site_cache_refresh: Duration::from_secs(site_cache_refresh_secs),
+            public_base_url,
+            public_base_url_explicit,
+            tracker_dir,
             geo,
         })
     }
@@ -997,6 +1024,31 @@ mod tests {
             env.vars.insert((*k).into(), (*v).into());
         }
         Config::from_env(Role::All, &env)
+    }
+
+    #[test]
+    fn tracker_dir_and_public_base_url_have_dev_defaults_and_are_validated() {
+        let cfg = with_env(&[]).unwrap();
+        assert_eq!(cfg.tracker_dir, PathBuf::from("apps/tracker/dist"));
+        assert_eq!(cfg.public_base_url, "http://127.0.0.1:8080");
+        assert!(!cfg.public_base_url_explicit);
+
+        let cfg = with_env(&[
+            ("RIVU_TRACKER_DIR", "/opt/rivu/tracker"),
+            ("RIVU_PUBLIC_BASE_URL", "https://stats.example.com/"),
+        ])
+        .unwrap();
+        assert_eq!(cfg.tracker_dir, PathBuf::from("/opt/rivu/tracker"));
+        assert_eq!(cfg.public_base_url, "https://stats.example.com");
+        assert!(cfg.public_base_url_explicit);
+
+        let err = with_env(&[("RIVU_PUBLIC_BASE_URL", "stats.example.com")]).unwrap_err();
+        assert!(
+            err.problems
+                .iter()
+                .any(|p| p.contains("RIVU_PUBLIC_BASE_URL")),
+            "{err}"
+        );
     }
 
     #[test]

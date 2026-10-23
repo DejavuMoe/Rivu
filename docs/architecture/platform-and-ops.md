@@ -358,6 +358,8 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 | `RIVU_PARTITIONS` | `32`（仅 reliable） | JetStream 分区数 P，只在首次创建流时读取，之后以流元数据里记录的值为准，不一致则拒绝启动；安装后不可改（`system-design.md` §4.8） |
 | `RIVU_RETENTION_DAYS` | `731` | 原始数据保留上限（连续两个自然年，含一个闰年），站点可在其内调小。ClickHouse 表 TTL 同为 731 天，调高需要迁移；日均千万级事件的部署建议调低（`system-design.md` §7） |
 | `RIVU_SITE_DELETE_GRACE_DAYS` | `7` | 站点删除撤销窗口 |
+| `RIVU_PUBLIC_BASE_URL` | `http://<RIVU_LISTEN_ADDR>`（仅开发；未设置时启动打 warn，生产必须设置） | 站点脚本前缀里 `endpoint` 的来源（`tracker-and-protocol.md` §2.3 的 `public_base_url`），不取请求的 `Host` |
+| `RIVU_TRACKER_DIR` | `apps/tracker/dist` | CI 构建的 tracker 产物目录（`core.js`、`meta.json`），启动时读入内存；生产镜像应把 `dist/` 放进该目录 |
 | `RIVU_SITE_CACHE_REFRESH_SECS` | `10` | 站点缓存刷新周期。P1 每个周期全量重载；按 `updated_at` 水位的增量刷新与 `pg_notify` 主动失效尚未实现（`system-design.md` §4.3） |
 | `RIVU_GEOIP_DB_PATH` | `${RIVU_DATA_DIR}/geoip/geoip.mmdb` | 当前生效的 mmdb。所有来源都落在这个文件，旁边有 `.meta.json` 记录来源、ETag、SHA-256（解压后内容）、署名。没有 meta 的文件视为手工放置：默认来源时直接使用、不自动刷新；配置了 URL 或 key 时立即下载（`system-design.md` §10 Q28） |
 | `RIVU_GEOIP_DB_URL` | 空 | 自定义 mmdb 直链（http/https，`.mmdb` 或 `.mmdb.gz`），优先级最高；支持 `_FILE`。许可由运维者负责 |

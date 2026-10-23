@@ -24,7 +24,7 @@ use serde::Deserialize;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use crate::attribution::{Attribution, SOURCE_CUSTOM};
+use crate::attribution::{Attribution, SOURCE_CUSTOM, SOURCE_DBIP};
 use crate::meta;
 
 /// 一次查询的地理信息；查不到时全为空值。
@@ -74,6 +74,35 @@ impl std::str::FromStr for GeoLevel {
                 "`{other}` 不是有效的 geo_level，可选 country | region | city"
             )),
         }
+    }
+}
+
+/// 当前库能提供的地理精度（`system-design.md` §6.10 的 `meta.geo_capability`）。
+/// 看板据此判断站点的 `geo_level`（region / city）是否超出库的能力，并提示运维者。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum GeoCapability {
+    /// 只有国家：DB-IP Lite（city 版也没有 ISO 子区划码与 geoname id），或任何 Country 版库。
+    Country,
+    /// 含区域与城市：MaxMind City、自定义 City 库。（自定义库若缺子区划代码，地区报表仍为空，
+    /// 提示不会触发，这是已知盲区。）
+    City,
+}
+
+impl GeoCapability {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GeoCapability::Country => "country",
+            GeoCapability::City => "city",
+        }
+    }
+}
+
+/// 判定规则：来源为 `dbip-lite`，或库类型（`database_type`，不区分大小写）含 `Country` → `Country`；其余 `City`。
+pub fn capability_of(source: &str, database_type: &str) -> GeoCapability {
+    if source == SOURCE_DBIP || database_type.to_ascii_lowercase().contains("country") {
+        GeoCapability::Country
+    } else {
+        GeoCapability::City
     }
 }
 
@@ -349,6 +378,16 @@ impl GeoDb {
             .and_then(|o| o.attribution.clone())
     }
 
+    /// 当前加载的库的地理精度（`meta.geo_capability`）；未加载时为 `None`。
+    /// 取自**实际加载的库**（来源与 `database_type`），不是配置。
+    pub fn capability(&self) -> Option<GeoCapability> {
+        self.origin
+            .load()
+            .as_ref()
+            .filter(|_| self.is_loaded())
+            .map(|o| capability_of(o.source, &o.database_type))
+    }
+
     pub fn is_loaded(&self) -> bool {
         self.db.load().is_some()
     }
@@ -572,6 +611,57 @@ mod tests {
             "2001:218::1",
         ] {
             assert!(is_public(s.parse().unwrap()), "{s} 应当是公网地址");
+        }
+    }
+
+    #[test]
+    fn capability_follows_source_and_database_type() {
+        use crate::attribution::SOURCE_MAXMIND;
+        // DB-IP Lite：city 版也只有国家
+        assert_eq!(
+            capability_of(SOURCE_DBIP, "DBIP-City-Lite"),
+            GeoCapability::Country
+        );
+        assert_eq!(
+            capability_of(SOURCE_DBIP, "DBIP-Country-Lite"),
+            GeoCapability::Country
+        );
+        // MaxMind：City 版 -> city，Country 版 -> country
+        assert_eq!(
+            capability_of(SOURCE_MAXMIND, "GeoLite2-City"),
+            GeoCapability::City
+        );
+        assert_eq!(
+            capability_of(SOURCE_MAXMIND, "GeoLite2-Country"),
+            GeoCapability::Country
+        );
+        // 自定义库看库类型（不区分大小写）
+        assert_eq!(
+            capability_of(SOURCE_CUSTOM, "GeoIP2-City"),
+            GeoCapability::City
+        );
+        assert_eq!(
+            capability_of(SOURCE_CUSTOM, "MyCOUNTRY-db"),
+            GeoCapability::Country
+        );
+        assert_eq!(GeoCapability::Country.as_str(), "country");
+        assert_eq!(GeoCapability::City.as_str(), "city");
+        assert!(GeoCapability::Country < GeoCapability::City);
+    }
+
+    #[test]
+    fn capability_comes_from_the_loaded_database() {
+        // 未加载：没有能力可报
+        assert_eq!(GeoDb::new().capability(), None);
+        // 手工放置的 City 测试库（没有 meta -> 来源 custom）-> city；Country 测试库 -> country
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/test-data");
+        for (file, want) in [
+            ("GeoIP2-City-Test.mmdb", GeoCapability::City),
+            ("GeoIP2-Country-Test.mmdb", GeoCapability::Country),
+        ] {
+            let db = GeoDb::new();
+            assert!(db.reload_if_changed(&dir.join(file)).unwrap());
+            assert_eq!(db.capability(), Some(want), "{file}");
         }
     }
 

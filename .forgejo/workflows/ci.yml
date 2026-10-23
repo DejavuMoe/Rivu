@@ -128,3 +128,59 @@ jobs:
         with:
           name: tracker-playwright-report
           path: apps/tracker/playwright-report
+
+  # 真实浏览器 -> 真实运行的 rivu -> ClickHouse -> rivu stats（apps/tracker/scripts/e2e-rivu.sh）。
+  # 依赖 Rust 构建与 tracker 构建（脚本自己重新构建两者，所以这里只声明 needs，保证前两个 job 先通过）。
+  # 尚未在真实的 Forgejo runner 上运行过：Playwright 的 --with-deps 要 root/apt；CI 里 ClickHouse 只有一个全权限账号
+  # （见上面的 migrate-and-integration），所以四个角色账号变量都指向它。
+  e2e-rivu:
+    runs-on: docker
+    needs: [migrate-and-integration, tracker]
+    services:
+      postgres:
+        image: postgres:18.6-alpine
+        env:
+          POSTGRES_USER: rivu_migrator
+          POSTGRES_PASSWORD: rivu_ci
+          POSTGRES_DB: rivu
+        options: >-
+          --health-cmd "pg_isready -U rivu_migrator -d rivu"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+      clickhouse:
+        image: clickhouse/clickhouse-server:25.8.33.6
+        env:
+          CLICKHOUSE_USER: rivu_ci
+          CLICKHOUSE_PASSWORD: rivu_ci
+          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+        options: >-
+          --ulimit nofile=262144:262144
+          --health-cmd "wget -qO- http://127.0.0.1:8123/ping"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    env:
+      RIVU_SV: ${{ github.run_number }}
+      RIVU_DATABASE_URL: postgres://rivu_migrator:rivu_ci@postgres:5432/rivu
+      RIVU_CLICKHOUSE_URL: http://clickhouse:8123
+      RIVU_CH_MIGRATOR_USER: rivu_ci
+      RIVU_CH_MIGRATOR_PASSWORD: rivu_ci
+      RIVU_CH_WRITER_USER: rivu_ci
+      RIVU_CH_WRITER_PASSWORD: rivu_ci
+      RIVU_CH_READER_USER: rivu_ci
+      RIVU_CH_READER_PASSWORD: rivu_ci
+      RIVU_CH_MAINTAINER_USER: rivu_ci
+      RIVU_CH_MAINTAINER_PASSWORD: rivu_ci
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust 工具链
+        run: rustup show
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: 安装 pnpm
+        run: npm install -g pnpm@12.5.1
+      - name: 浏览器与系统依赖（需要 root / apt）
+        run: |
+          cd apps/tracker
+          pnpm install --frozen-lockfile
+          pnpm exec playwright install --with-deps chromium firefox webkit
+      - name: 真实浏览器端到端
+        run: RIVU_E2E_SKIP_INSTALL=1 bash apps/tracker/scripts/e2e-rivu.sh

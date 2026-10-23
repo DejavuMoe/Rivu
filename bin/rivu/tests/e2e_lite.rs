@@ -20,13 +20,16 @@ use clickhouse::Client;
 use jiff::civil::{Date, date};
 use jiff::tz::TimeZone;
 use rivu::migrate;
+use rivu::script::{ScriptService, TrackerAssets};
 use rivu_common::config::{BufferConfig, ChAccount, Cidr, Config, Env, Role, Secret};
 use rivu_domain::{DropReason, EventKind};
+use rivu_geo::GeoDb;
 use rivu_ingest::pipeline::{Outcome, Pipeline, RequestCtx, SaltCache, SiteSnapshot};
-use rivu_query::Overview;
-use rivu_reference::{Metrics, RawEvent, metrics, sessionize};
+use rivu_query::{Dimension, Overview};
+use rivu_reference::{EventAttrs, Metrics, RawEvent, RefDim, metrics, sessionize};
 use rivu_storage_ch::rows::{EventRow, IngestCounterRow};
 use rivu_storage_pg::sites::NewSite;
+use rivu_ua::UaParser;
 use rivu_writer::{BatchSink, BatchWriter, ChSink, WriterOptions};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -225,6 +228,7 @@ impl Sim {
             pathname: path.into(),
             interactive,
             engagement_ms: e,
+            attrs: EventAttrs::default(),
         });
     }
 
@@ -437,6 +441,8 @@ async fn pipeline_to_clickhouse_matches_the_reference() {
         Arc::clone(&salts),
         writer.handle(),
         trusted,
+        ua_parser(),
+        Arc::new(GeoDb::new()),
     ));
 
     let mut sim = Sim {
@@ -639,9 +645,18 @@ async fn pipeline_to_clickhouse_matches_the_reference() {
     assert!(overviews[5].visits == 15 && overviews[5].pageviews == 22);
 
     // 页面榜：3/28 浏览最多的页面
-    let top = rivu_query::top_pages(&reader, site_id, &tz, d28, d28, 3, QUERY_TIMEOUT_SECS)
-        .await
-        .expect("top_pages");
+    let top = rivu_query::breakdown(
+        &reader,
+        site_id,
+        &tz,
+        d28,
+        d28,
+        Dimension::Page,
+        3,
+        QUERY_TIMEOUT_SECS,
+    )
+    .await
+    .expect("breakdown(page)");
     assert_eq!(top.len(), 3);
     assert!(top.windows(2).all(|w| w[0].visitors >= w[1].visitors));
 
@@ -785,14 +800,26 @@ async fn http_endpoint_end_to_end() {
         }),
     );
     let pipeline = Arc::new(Pipeline::new(
-        sites,
+        Arc::clone(&sites),
         salts,
         writer.handle(),
         vec!["127.0.0.1/32".parse().unwrap()],
+        ua_parser(),
+        Arc::new(GeoDb::new()),
     ));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let app = rivu::public::router(Role::Collector, Some(pipeline));
+    let assets = Arc::new(TrackerAssets::from_parts(
+        std::path::Path::new("/test"),
+        b"/*core*/".to_vec(),
+        3,
+    ));
+    let scripts = Arc::new(ScriptService::new(
+        sites,
+        assets,
+        "https://stats.example.test",
+    ));
+    let app = rivu::public::router_with_scripts(Role::Collector, Some(pipeline), Some(scripts));
     tokio::spawn(async move {
         axum::serve(
             listener,
@@ -820,12 +847,37 @@ async fn http_endpoint_end_to_end() {
     let r = http_post(addr, "{}").await;
     assert_eq!(r.status, 400);
     assert!(r.body.contains("\"errors\""), "{}", r.body);
+    // 没有 User-Agent 头 = 空 UA = 机器人：202 + x-rivu-dropped，计 dropped_bot
+    let r = http_post_with_ua(addr, &pageview(&created.site_key, "/bot"), None).await;
+    assert_eq!((r.status, r.header("x-rivu-dropped")), (202, Some("1")));
+    // 站点脚本：前缀 + core.js，同一个 HTTP 服务
+    let r = http_get(addr, &format!("/js/{}.js", created.site_key)).await;
+    assert_eq!(r.status, 200);
+    assert!(
+        r.body.starts_with("window.rivu=window.rivu||function(){"),
+        "{}",
+        r.body
+    );
+    assert!(
+        r.body.contains(&format!(
+            "rivu.c={{\"site\":\"{}\",\"endpoint\":\"https://stats.example.test/api/event\",\"hash\":false}};",
+            created.site_key
+        )),
+        "{}",
+        r.body
+    );
+    assert!(r.body.ends_with("/*core*/"));
+    assert_eq!(r.header("cache-control"), Some("public, max-age=300"));
+    assert_eq!(http_get(addr, "/js/zzzzzzzzzzzz.js").await.status, 404);
 
     writer.shutdown().await.expect("关停");
     let reader = reader_client(&env.ch_url);
     assert_eq!(count(&reader, "events", created.id).await, 1);
     let counters = counter_sums(&reader, created.id).await;
-    assert_eq!(counters, BTreeMap::from([("accepted".to_owned(), 1)]));
+    assert_eq!(
+        counters,
+        BTreeMap::from([("accepted".to_owned(), 1), ("dropped_bot".to_owned(), 1)])
+    );
     cleanup(&admin_client(&env.ch_url), created.id).await;
 }
 
@@ -844,13 +896,32 @@ impl HttpResp {
     }
 }
 
+/// 一个真实浏览器的 UA（取自 uap-core 测试集里的同类字符串）。
+const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.5993.771 YaBrowser/23.11.2.771 Yowser/2.5 Safari/537.36";
+
 async fn http_post(addr: SocketAddr, body: &str) -> HttpResp {
-    let mut stream = TcpStream::connect(addr).await.unwrap();
+    http_post_with_ua(addr, body, Some(BROWSER_UA)).await
+}
+
+async fn http_get(addr: SocketAddr, path: &str) -> HttpResp {
+    let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    http_raw(addr, req).await
+}
+
+async fn http_post_with_ua(addr: SocketAddr, body: &str, ua: Option<&str>) -> HttpResp {
+    let ua = ua
+        .map(|u| format!("User-Agent: {u}\r\n"))
+        .unwrap_or_default();
     let req = format!(
         "POST /api/event HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
-         Content-Type: text/plain;charset=UTF-8\r\nUser-Agent: e2e-http\r\nContent-Length: {}\r\n\r\n{body}",
+         Content-Type: text/plain;charset=UTF-8\r\n{ua}Content-Length: {}\r\n\r\n{body}",
         body.len()
     );
+    http_raw(addr, req).await
+}
+
+async fn http_raw(addr: SocketAddr, req: String) -> HttpResp {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
     stream.write_all(req.as_bytes()).await.unwrap();
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw).await.unwrap();
@@ -874,4 +945,491 @@ async fn http_post(addr: SocketAddr, body: &str) -> HttpResp {
         headers,
         body: body.to_owned(),
     }
+}
+
+// ======================================================================================
+// 富化：机器人、地理、UA、来源 -> 分组查询，与参考实现逐行比较
+// ======================================================================================
+
+/// UA 解析器构建一次要编译全部 uap-core 规则，测试间共享。
+fn ua_parser() -> Arc<UaParser> {
+    static PARSER: std::sync::OnceLock<Arc<UaParser>> = std::sync::OnceLock::new();
+    Arc::clone(PARSER.get_or_init(|| Arc::new(UaParser::embedded().expect("uap-core 规则"))))
+}
+
+/// 以下 UA 逐字取自 uap-core 的测试集（`crates/ua/tests/data/uap-test_ua.yaml`），
+/// 测试 `real_browser_uas_come_from_the_uap_core_test_set` 校验它们确实在那份文件里。
+const UA_WIN_YANDEX: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.5993.771 YaBrowser/23.11.2.771 Yowser/2.5 Safari/537.36";
+const UA_MAC_SAFARI: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15 Ddg/17.2";
+const UA_IPHONE: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1 Ddg/17.2";
+const UA_IPAD: &str = "Mozilla/5.0 (iPad; CPU OS 12_5_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/12.0 EdgiOS/46.3.26 Mobile/15E148 Safari/605.1.15";
+const UA_ANDROID: &str = "Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/99.0.4844.84 Mobile Safari/537.36 Brave/1.40.128";
+const UA_GOOGLEBOT: &str =
+    "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
+
+#[test]
+fn real_browser_uas_come_from_the_uap_core_test_set() {
+    let yaml = include_str!("../../../crates/ua/tests/data/uap-test_ua.yaml");
+    for ua in [
+        UA_WIN_YANDEX,
+        UA_MAC_SAFARI,
+        UA_IPHONE,
+        UA_IPAD,
+        UA_ANDROID,
+        UA_GOOGLEBOT,
+    ] {
+        assert!(
+            yaml.contains(&format!("user_agent_string: '{ua}'")),
+            "不在 uap-core 测试集里：{ua}"
+        );
+    }
+}
+
+/// MaxMind 官方测试库（`GeoIP2-City-Test.mmdb`）里有记录的地址，期望值来自它的源数据 JSON
+/// （`crates/geo/tests/data/source-data/GeoIP2-City-Test.json`，见 `docs/research/enrich-geo.md` §4）。
+const IP_SE: &str = "89.160.20.128"; // SE，SE-E，city 2694762
+const IP_GB: &str = "81.2.69.142"; // GB
+const IP_CN: &str = "175.16.199.1"; // CN
+const IP_JP: &str = "2001:218::1"; // JP（IPv6）
+const IP_NO_GEO: &str = "203.0.113.50"; // 文档地址，不是公网：没有位置
+
+fn person_at(id: u64, ip: &str, ua: &str) -> Person {
+    Person {
+        id,
+        ip: ip.into(),
+        ua: ua.into(),
+    }
+}
+
+/// 一个事件按**自己的请求**会得到的属性（手写的真值，规则来自 `docs/research/enrich-source.md` 与 `enrich-ua.md`）。
+fn attrs(source: &str, channel: &str, country: &str, device: &str) -> EventAttrs {
+    EventAttrs {
+        referrer_source: source.into(),
+        channel: channel.into(),
+        country: country.into(),
+        device: device.into(),
+    }
+}
+
+impl Sim {
+    /// 带额外字段（`r`、带 UTM 的 `u` 等）的 pageview；`attrs` 是该事件自己的属性真值。
+    fn pv_ext(&mut self, p: &Person, ts: i64, path: &str, extra: Value, own: EventAttrs) {
+        let mut body =
+            json!({"v": 1, "sv": 1, "s": self.site_key, "n": "pageview", "u": Self::url(path)});
+        for (k, v) in extra.as_object().expect("extra 是对象") {
+            body[k] = v.clone();
+        }
+        self.push_raw(p, ts, EventKind::Pageview, path, true, 0);
+        self.raw.last_mut().expect("刚推入").attrs = own;
+        self.site_calls += 1;
+        assert_eq!(
+            self.call(p, ts, &body),
+            Outcome::Accepted,
+            "pageview {path}"
+        );
+    }
+
+    /// 会被丢弃的事件（机器人）：只经过管线，不进参考实现的输入。
+    fn expect_dropped(&mut self, p: &Person, ts: i64, body: Value, reason: DropReason) {
+        self.site_calls += 1;
+        assert_eq!(self.call(p, ts, &body), Outcome::Dropped(reason));
+    }
+}
+
+fn ref_dim(d: Dimension) -> RefDim {
+    match d {
+        Dimension::Page => RefDim::Page,
+        Dimension::Source => RefDim::Source,
+        Dimension::Channel => RefDim::Channel,
+        Dimension::Country => RefDim::Country,
+        Dimension::Device => RefDim::Device,
+    }
+}
+
+type Row4 = (String, u64, u64, u64);
+
+#[allow(clippy::too_many_arguments)]
+async fn assert_breakdowns_match(
+    label: &str,
+    reader: &Client,
+    site_id: u64,
+    tz: &TimeZone,
+    raw: &[RawEvent],
+    sessions: &[rivu_reference::RefSession],
+    from: Date,
+    to: Date,
+) -> BTreeMap<&'static str, Vec<Row4>> {
+    let mut shown = BTreeMap::new();
+    for dim in Dimension::ALL {
+        for limit in [100u32, 2] {
+            let q: Vec<Row4> = rivu_query::breakdown(
+                reader,
+                site_id,
+                tz,
+                from,
+                to,
+                dim,
+                limit,
+                QUERY_TIMEOUT_SECS,
+            )
+            .await
+            .expect("breakdown")
+            .into_iter()
+            .map(|r| (r.value, r.visitors, r.visits, r.pageviews))
+            .collect();
+            let t: Vec<Row4> = rivu_reference::breakdown(
+                raw,
+                sessions,
+                site_id,
+                tz,
+                from,
+                to,
+                ref_dim(dim),
+                limit as usize,
+            )
+            .into_iter()
+            .map(|r| (r.value, r.visitors, r.visits, r.pageviews))
+            .collect();
+            assert_eq!(q, t, "{label} / {} / limit {limit}", dim.as_str());
+            if limit == 100 {
+                shown.insert(dim.as_str(), q);
+            }
+        }
+    }
+    shown
+}
+
+#[tokio::test]
+async fn enriched_pipeline_breakdowns_match_the_reference() {
+    let Some(env) = test_env("enriched_pipeline_breakdowns_match_the_reference") else {
+        return;
+    };
+    migrate_once(&env).await;
+
+    // ---- 站点、盐、富化器 ------------------------------------------------------------------
+    let pg = rivu_storage_pg::connect(&env.pg_url, 4)
+        .await
+        .expect("连接 PG");
+    let hostnames = vec![HOST.to_owned()];
+    let created = rivu_storage_pg::sites::create_site(
+        &pg,
+        &NewSite {
+            name: "e2e-enriched",
+            timezone: "Europe/Berlin",
+            hostnames: &hostnames,
+        },
+    )
+    .await
+    .expect("建站");
+    let (site_id, site_key) = (created.id, created.site_key.clone());
+    let (d27, d28, d29, d30) = (
+        date(2026, 3, 27),
+        date(2026, 3, 28),
+        date(2026, 3, 29),
+        date(2026, 3, 30),
+    );
+    rivu_storage_pg::salts::ensure_salts(&pg, &days(date(2026, 3, 26), date(2026, 4, 1)))
+        .await
+        .expect("ensure_salts");
+    let sites = Arc::new(SiteSnapshot::new());
+    sites.reload(&pg).await.expect("加载站点快照");
+    let salts = Arc::new(SaltCache::new());
+    salts
+        .reload(&pg, date(2026, 3, 20), date(2026, 4, 10))
+        .await
+        .expect("加载盐");
+
+    // 真实的 GeoDb：MaxMind 官方测试库，手工放置（没有 meta），署名来自配置
+    let geo = Arc::new(GeoDb::with_manual_attribution(
+        Some("MaxMind test database"),
+        Some("https://github.com/maxmind/MaxMind-DB"),
+    ));
+    let mmdb = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../crates/geo/tests/data/test-data/GeoIP2-City-Test.mmdb");
+    assert!(geo.reload_if_changed(&mmdb).expect("加载测试库"));
+
+    let sink = Arc::new(RecordingSink {
+        inner: ChSink::new(rivu_storage_ch::writer_client(
+            &env.ch_url,
+            &account("writer"),
+            &ch_database(),
+        )),
+        batches: Mutex::new(Vec::new()),
+        counter_batches: Mutex::new(Vec::new()),
+    });
+    let mut opts = WriterOptions::new(BufferConfig {
+        flush_interval: Duration::from_millis(100),
+        max_rows: 10,
+        max_bytes: 8 << 20,
+        channel_capacity: 10_000,
+    });
+    opts.counter_flush_interval = Duration::from_secs(10);
+    let writer = BatchWriter::spawn(Arc::clone(&sink), opts);
+    let pipeline = Arc::new(Pipeline::new(
+        Arc::clone(&sites),
+        Arc::clone(&salts),
+        writer.handle(),
+        vec!["127.0.0.1/32".parse().unwrap()],
+        ua_parser(),
+        Arc::clone(&geo),
+    ));
+    let mut sim = Sim {
+        pipeline,
+        site_key: site_key.clone(),
+        site_id,
+        raw: Vec::new(),
+        tally: Tally::default(),
+        site_calls: 0,
+    };
+
+    // ---- 场景（柏林本地时间）：每个事件同时写下它自己的属性真值 ------------------------------------
+    let p1 = person_at(1, IP_SE, UA_WIN_YANDEX);
+    let p2 = person_at(2, IP_GB, UA_IPHONE);
+    let p3 = person_at(3, IP_CN, UA_MAC_SAFARI);
+    let p4 = person_at(4, IP_JP, UA_IPAD);
+    let p5 = person_at(5, IP_NO_GEO, UA_ANDROID);
+    let p6 = person_at(6, IP_SE, UA_MAC_SAFARI);
+    let bot = person_at(7, IP_SE, UA_GOOGLEBOT);
+
+    // P1（SE，桌面）：3/28 来自 Google 搜索，会话里第二页的 referrer 是 Twitter（SPA 不会带，这里故意带上，
+    // 它必须被忽略：会话属性由首事件决定）；晚上带 utm 再来一次（新会话，来源取 utm_source，渠道 Email）
+    let google = attrs("Google", "Organic Search", "SE", "desktop");
+    sim.pv_ext(
+        &p1,
+        at(d28, 12, 0),
+        "/",
+        json!({"r": "https://www.google.com/search?q=rivu"}),
+        google.clone(),
+    );
+    sim.pv_ext(
+        &p1,
+        at(d28, 12, 3),
+        "/pricing",
+        json!({"r": "https://twitter.com/rivu/status/1"}),
+        attrs("X (Twitter)", "Organic Social", "SE", "desktop"),
+    );
+    sim.eng(&p1, at(d28, 12, 4), "/pricing", 6000, 70, true);
+    sim.pv_ext(
+        &p1,
+        at(d28, 20, 0),
+        "/pricing",
+        json!({"u": "https://example.test/pricing?utm_source=newsletter&utm_medium=email&utm_campaign=spring"}),
+        attrs("newsletter", "Email", "SE", "desktop"),
+    );
+
+    // P2（GB，手机）：3/29 来自 t.co（X）
+    sim.pv_ext(
+        &p2,
+        at(d29, 9, 0),
+        "/",
+        json!({"r": "https://t.co/abc123"}),
+        attrs("X (Twitter)", "Organic Social", "GB", "mobile"),
+    );
+    sim.pv_ext(
+        &p2,
+        at(d29, 9, 2),
+        "/docs",
+        json!({}),
+        attrs("", "Direct", "GB", "mobile"),
+    );
+
+    // P3（CN，Mac）：3/28 23:50 直接访问，跨午夜到 3/29 00:10（同一会话，第二页的 referrer 是 Google，被忽略）；
+    // 3/30 又来一次，只有 gclid（referrer 被隐私设置抹掉）-> 推断 Google / Paid Search
+    let direct_cn = attrs("", "Direct", "CN", "desktop");
+    sim.pv_ext(&p3, at(d28, 23, 50), "/blog", json!({}), direct_cn.clone());
+    sim.pv_ext(
+        &p3,
+        at(d29, 0, 10),
+        "/docs",
+        json!({"r": "https://www.google.com/"}),
+        attrs("Google", "Organic Search", "CN", "desktop"),
+    );
+    sim.pv_ext(
+        &p3,
+        at(d30, 10, 0),
+        "/blog",
+        json!({"u": "https://example.test/blog?gclid=abc"}),
+        attrs("Google", "Paid Search", "CN", "desktop"),
+    );
+
+    // P4（JP，IPv6，平板）：3/29 来自本站自己的页面（内部引荐，算 Direct）；3/30 带 bing 的付费标签，referrer 是 Google
+    // （utm_source 覆盖 referrer）；3/30 稍后（新会话）来自 Bing 自然搜索
+    sim.pv_ext(
+        &p4,
+        at(d29, 15, 0),
+        "/",
+        json!({"r": "https://www.example.test/other"}),
+        attrs("", "Direct", "JP", "tablet"),
+    );
+    sim.pv_ext(
+        &p4,
+        at(d30, 9, 0),
+        "/pricing",
+        json!({"u": "https://example.test/pricing?utm_source=bing&utm_medium=cpc",
+               "r": "https://www.google.com/"}),
+        attrs("Bing", "Paid Search", "JP", "tablet"),
+    );
+    sim.pv_ext(
+        &p4,
+        at(d30, 11, 0),
+        "/",
+        json!({"r": "https://www.bing.com/search?q=rivu"}),
+        attrs("Bing", "Organic Search", "JP", "tablet"),
+    );
+
+    // P5（没有位置，Android）：认不出的 referrer 域名 -> 来源是 host，渠道 Referral
+    sim.pv_ext(
+        &p5,
+        at(d29, 12, 0),
+        "/",
+        json!({"r": "https://blog.example.org/post/1"}),
+        attrs("blog.example.org", "Referral", "", "mobile"),
+    );
+
+    // P6（SE，Mac）：同一天两次访问，间隔超过 30 分钟（两个会话），都是直接访问 —— 访客数只算一次
+    sim.pv_ext(
+        &p6,
+        at(d29, 8, 0),
+        "/",
+        json!({}),
+        attrs("", "Direct", "SE", "desktop"),
+    );
+    sim.pv_ext(
+        &p6,
+        at(d29, 9, 0),
+        "/blog",
+        json!({}),
+        attrs("", "Direct", "SE", "desktop"),
+    );
+
+    // 机器人：pageview 被丢弃（dropped_bot），它的 engagement 没有会话（dropped_no_session）
+    sim.expect_dropped(
+        &bot,
+        at(d29, 13, 0),
+        json!({"v": 1, "sv": 1, "s": site_key, "n": "pageview", "u": Sim::url("/")}),
+        DropReason::Bot,
+    );
+    sim.expect_dropped(
+        &bot,
+        at(d29, 13, 0) + 1000,
+        json!({"v": 1, "sv": 1, "s": site_key, "n": "engagement", "u": Sim::url("/"), "sd": 10, "e": 3000}),
+        DropReason::NoSession,
+    );
+
+    // ---- flush ----------------------------------------------------------------------------
+    let Sim {
+        raw,
+        tally,
+        site_calls,
+        pipeline,
+        ..
+    } = sim;
+    drop(pipeline);
+    writer.shutdown().await.expect("关停写入器");
+    println!("管线结果：{tally:?}，本站点被处理的请求 {site_calls}");
+    assert_eq!(tally.dropped_count(DropReason::Bot), 1);
+    assert_eq!(tally.dropped_count(DropReason::NoSession), 1);
+    assert_eq!(tally.overloaded, 0);
+
+    let ref_sessions = sessionize(&raw);
+    let absorbed: usize = ref_sessions.iter().map(|s| s.event_indices.len()).sum();
+    assert_eq!(
+        absorbed as u64, tally.accepted,
+        "参考实现并入的事件数 = 接受数"
+    );
+    assert_eq!(
+        raw.len() as u64,
+        tally.accepted,
+        "没有被丢弃的合法事件混进参考输入"
+    );
+    assert_eq!(ref_sessions.len(), 11, "场景里一共 11 个会话");
+
+    // ---- 对账 ----------------------------------------------------------------------------------
+    let reader = reader_client(&env.ch_url);
+    assert_eq!(count(&reader, "events", site_id).await, tally.accepted);
+    assert_eq!(
+        merged_sessions(&reader, site_id).await,
+        ref_sessions.len() as u64
+    );
+    let counters = counter_sums(&reader, site_id).await;
+    println!("ingest_counters：{counters:?}");
+    assert_eq!(
+        counters,
+        BTreeMap::from([
+            ("accepted".to_owned(), tally.accepted),
+            ("dropped_bot".to_owned(), 1),
+            ("dropped_no_session".to_owned(), 1),
+        ])
+    );
+    assert_eq!(
+        counters.values().sum::<u64>(),
+        site_calls,
+        "ingest_counters 总和 = 本站点被处理的请求数"
+    );
+
+    // 位置字段按站点的 geo_level（默认 city）存：SE 的事件带区域与城市（源数据：SE-E、2694762）
+    #[derive(clickhouse::Row, serde::Deserialize)]
+    struct GeoRow {
+        region_code: String,
+        city_geoname_id: u32,
+    }
+    let se: Vec<GeoRow> = reader
+        .query(
+            "SELECT DISTINCT region_code, city_geoname_id FROM events \
+             WHERE site_id = {site:UInt64} AND country_code = 'SE'",
+        )
+        .param("site", site_id)
+        .fetch_all()
+        .await
+        .expect("SE 行");
+    assert_eq!(se.len(), 1);
+    assert_eq!(
+        (se[0].region_code.as_str(), se[0].city_geoname_id),
+        ("SE-E", 2_694_762)
+    );
+
+    // ---- 每个维度与参考实现逐行相等 ---------------------------------------------------------------
+    let tz = berlin();
+    for (label, from, to) in [
+        ("3/28-3/30", d28, d30),
+        ("3/29（夏令时切换日）", d29, d29),
+        ("3/28", d28, d28),
+        ("3/30", d30, d30),
+        ("3/27（无数据）", d27, d27),
+    ] {
+        let shown =
+            assert_breakdowns_match(label, &reader, site_id, &tz, &raw, &ref_sessions, from, to)
+                .await;
+        if label == "3/28-3/30" {
+            for (dim, rows) in &shown {
+                println!("[{label}] {dim}：value | visitors/visits/pageviews（查询值 = 参考值）");
+                for (v, a, b, c) in rows {
+                    println!("    {v:<22} {a}/{b}/{c}");
+                }
+            }
+            // 防止「空对空」的假通过：具体行数与几个手算值
+            assert_eq!(shown["country"].len(), 5, "SE GB CN JP (not set)");
+            assert_eq!(shown["device"].len(), 3, "desktop mobile tablet");
+            let by = |dim: &str, v: &str| shown[dim].iter().find(|r| r.0 == v).cloned();
+            assert_eq!(by("country", "SE"), Some(("SE".into(), 2, 4, 5)));
+            assert_eq!(
+                by("source", "Direct / None"),
+                Some(("Direct / None".into(), 4, 4, 5))
+            );
+            assert_eq!(
+                by("channel", "Paid Search"),
+                Some(("Paid Search".into(), 2, 2, 2))
+            );
+        } else if label.contains("无数据") {
+            assert!(shown.values().all(Vec::is_empty), "{label}: {shown:?}");
+        }
+    }
+
+    // ---- 署名与能力：含国家的结果要附带 -------------------------------------------------------------
+    assert!(Dimension::Country.needs_geo_attribution());
+    let attribution = geo.attribution().expect("手工署名");
+    assert_eq!(attribution.text, "MaxMind test database");
+    assert_eq!(geo.capability(), Some(rivu_geo::GeoCapability::City));
+
+    cleanup(&admin_client(&env.ch_url), site_id).await;
 }
