@@ -1,0 +1,1 @@
+{"metrics":["visitors","visits","bounce_rate"],"date_range":"6mo","dimensions":["time:week","visit:device"],"include":{"time_labels":true}}

@@ -1,0 +1,1 @@
+{"metrics":["visitors"],"date_range":"7d","filters":[["is","event:page",["'; DROP TABLE events; --","{x:String}","/* c */ OR 1=1 --"]]]}

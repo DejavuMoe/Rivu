@@ -1,0 +1,1 @@
+{"metrics":["visitors","percentage"],"date_range":"7d","dimensions":["visit:source"],"filters":[["is_not","visit:channel",["Direct"]]]}

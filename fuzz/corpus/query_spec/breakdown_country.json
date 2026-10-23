@@ -1,0 +1,1 @@
+{"metrics":["visitors","visits","pageviews"],"date_range":"7d","dimensions":["visit:country"],"order_by":[["visitors","desc"],["visits","desc"]],"pagination":{"limit":10}}
