@@ -1,0 +1,48 @@
+---
+source: crates/query/src/sql_tests.rs
+expression: "render(&sql, &params)"
+---
+SELECT sum(c_visitors) AS m0
+FROM (
+  SELECT uniq(visitor_id) AS c_visitors
+  FROM (
+    SELECT *
+    FROM events
+    WHERE site_id = {site:UInt64} AND toDate(ts) >= {from_date:Date} AND toDate(ts) <= {to_date:Date} AND ts >= fromUnixTimestamp64Milli({from_ms:Int64}, 'UTC') AND ts < fromUnixTimestamp64Milli({to_ms:Int64}, 'UTC') AND name != 'engagement' AND (toString(country_code) IN {p0:Array(String)} AND (multiSearchAnyCaseInsensitive(pathname, {p1:Array(String)}) OR NOT (multiMatchAny(browser, {p2:Array(String)})) OR (multiMatchAny(hostname, {p3:Array(String)}) AND NOT (city_geoname_id IN {p4:Array(UInt32)}))) AND session_id IN (
+        SELECT session_id
+        FROM (
+          SELECT session_id, tupleElement(argMinIfMerge(entry_page), 2) AS s_entry_path
+          FROM sessions
+          WHERE site_id = {site:UInt64} AND start_date >= {s_from:Date} AND start_date <= {to_date:Date}
+          GROUP BY site_id, start_date, session_id)
+        WHERE NOT (multiMatchAny(s_entry_path, {p5:Array(String)}))) AND NOT (multiSearchAny(utm_campaign, {p6:Array(String)})) AND NOT (multiMatchAny(referrer, {p7:Array(String)})) AND session_id IN (
+        SELECT session_id
+        FROM (
+          SELECT session_id, tupleElement(argMaxIfMerge(exit_page), 2) AS s_exit_path
+          FROM sessions
+          WHERE site_id = {site:UInt64} AND start_date >= {s_from:Date} AND start_date <= {to_date:Date}
+          GROUP BY site_id, start_date, session_id)
+        WHERE NOT (s_exit_path IN {p8:Array(String)})))) AS e)
+ORDER BY m0 DESC
+LIMIT {p9:UInt64} OFFSET {p10:UInt64}
+
+-- params
+site: UInt64 = 4242
+from_ms: Int64 = 1790287200000
+to_ms: Int64 = 1792706400000
+from_date: Date = "2026-09-24"
+to_date: Date = "2026-10-22"
+s_from: Date = "2026-09-17"
+tz: String = "Europe/Berlin"
+wk: UInt8 = 7
+p0: Array(String) = ["DE", ""]
+p1: Array(String) = ["blog", "docs"]
+p2: Array(String) = ["^Chrome|Safari$"]
+p3: Array(String) = ["\\A.*\\.example\\.com\\z"]
+p4: Array(UInt32) = [2694762]
+p5: Array(String) = ["\\A/docs/.*\\z"]
+p6: Array(String) = ["spring"]
+p7: Array(String) = ["(?i)^x\\.com"]
+p8: Array(String) = ["/"]
+p9: UInt64 = 10000
+p10: UInt64 = 0

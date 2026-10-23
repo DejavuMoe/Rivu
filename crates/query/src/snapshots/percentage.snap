@@ -1,0 +1,29 @@
+---
+source: crates/query/src/sql_tests.rs
+expression: "render(&sql, &params)"
+---
+SELECT d0, sum(c_visitors) AS m0, ifNotFinite(sum(c_visitors) / {total:Float64}, 0) AS m1
+FROM (
+  SELECT toString(referrer_source) AS d0, uniq(visitor_id) AS c_visitors
+  FROM (
+    SELECT *
+    FROM events
+    WHERE site_id = {site:UInt64} AND toDate(ts) >= {from_date:Date} AND toDate(ts) <= {to_date:Date} AND ts >= fromUnixTimestamp64Milli({from_ms:Int64}, 'UTC') AND ts < fromUnixTimestamp64Milli({to_ms:Int64}, 'UTC') AND name != 'engagement' AND NOT (channel IN {p0:Array(String)})) AS e
+  GROUP BY d0)
+GROUP BY d0
+ORDER BY m0 DESC, d0 ASC
+LIMIT {p1:UInt64} OFFSET {p2:UInt64}
+
+-- params
+site: UInt64 = 4242
+from_ms: Int64 = 1792101600000
+to_ms: Int64 = 1792706400000
+from_date: Date = "2026-10-15"
+to_date: Date = "2026-10-22"
+s_from: Date = "2026-10-08"
+tz: String = "Europe/Berlin"
+wk: UInt8 = 7
+total: Float64 = 0
+p0: Array(String) = [""]
+p1: UInt64 = 10000
+p2: UInt64 = 0

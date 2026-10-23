@@ -11,6 +11,8 @@
 //!
 //! 为了保证它简单到不会错，这里宁可 O(n log n) 排序、整体遍历，也不做任何增量或索引优化。
 
+pub mod query;
+
 use std::collections::{BTreeSet, HashSet};
 
 use jiff::Timestamp;

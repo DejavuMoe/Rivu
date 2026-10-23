@@ -1,0 +1,25 @@
+---
+source: crates/query/src/sql_tests.rs
+expression: "render(&sql, &params)"
+---
+SELECT sum(c_visitors) AS m0
+FROM (
+  SELECT uniq(visitor_id) AS c_visitors
+  FROM (
+    SELECT *
+    FROM events
+    WHERE site_id = {site:UInt64} AND toDate(ts) >= {from_date:Date} AND toDate(ts) <= {to_date:Date} AND ts >= fromUnixTimestamp64Milli({from_ms:Int64}, 'UTC') AND ts < fromUnixTimestamp64Milli({to_ms:Int64}, 'UTC') AND name != 'engagement') AS e)
+ORDER BY m0 DESC
+LIMIT {p0:UInt64} OFFSET {p1:UInt64}
+
+-- params
+site: UInt64 = 4242
+from_ms: Int64 = 1792749300000
+to_ms: Int64 = 1792749600001
+from_date: Date = "2026-10-23"
+to_date: Date = "2026-10-23"
+s_from: Date = "2026-10-16"
+tz: String = "Europe/Berlin"
+wk: UInt8 = 7
+p0: UInt64 = 10000
+p1: UInt64 = 0
