@@ -313,12 +313,15 @@ rivu('event', 'Video Play', { interactive: false })   // 发 i:false，不影响
 | 1 | 方法/路径、体积（413）、读体超时（408） | `413` / `408` | `rejected_body_size`（413，只进 Prometheus） |
 | 2 | 解析 JSON 与字段校验、`u` 解析（400） | `400` | `rejected_<field>`，只进 Prometheus，维度含 `sv`，**不含**站点，不进 `ingest_counters` |
 | 3 | 站点配置（进程内缓存，不查 PG）：未知 `s`（已删除的站点从快照摘除后同样如此） | `202`+dropped | `dropped_unknown_site`（`site_id = 0`） |
-| 4 | 站点状态、配额、限流 | `202`+dropped | `dropped_site_disabled` / `dropped_rate_limited` |
-| 5 | hostname 白名单（第 7 节） | `202`+dropped | `dropped_hostname_not_allowed` |
-| 6 | 屏蔽规则、垃圾引荐、机器人、国家（engagement 跳过本步与 UA/来源富化：它不能开会话，富化结果不会被使用；机器人的 pageview 已被丢弃，它的 engagement 自然记为 `dropped_no_session`） | `202`+dropped | `dropped_ip_blocked` / `dropped_page_blocked` / `dropped_spam_referrer` / `dropped_bot` / `dropped_datacenter_ip` / `dropped_country_blocked` |
-| 7 | 身份：事件的站点本地日期没有盐（collector 不现场生成盐） | `202`+dropped | `dropped_salt_missing` |
-| 8 | 会话分配：engagement 没有会话 | `202`+dropped | `dropped_no_session` |
-| 9 | 富化、写缓冲/JetStream | `503` | `dropped_overloaded` |
+| 4 | 站点状态（停用） | `202`+dropped | `dropped_site_disabled` |
+| 5 | hostname 白名单（第 7 节，空白名单全部丢弃），再过 hostname 屏蔽规则（`deny` 命中且无 `allow` 例外） | `202`+dropped | `dropped_hostname_not_allowed`（两者同一个计数） |
+| 6 | 采集限流：每站令牌桶，站点 `ingest_rate_limit_per_min` 优先，否则 `RIVU_INGEST_RATE_LIMIT_PER_MIN`（默认 300000，`0` 不限流）；engagement 同样适用 | `202`+dropped | `dropped_rate_limited` |
+| 7 | 垃圾引荐（referrer 的 host 后缀命中 Matomo 名单）；engagement 跳过（它的 `r` 不会被使用） | `202`+dropped | `dropped_spam_referrer` |
+| 8 | 屏蔽规则：IP/CIDR（先），页面通配（后）；**engagement 同样适用**：纯内存判断，且必须挡住被屏蔽页面的 engagement，否则它会借同一访客在其它页面已开的会话被接受 | `202`+dropped | `dropped_ip_blocked` / `dropped_page_blocked` |
+| 9 | 机器人、地理、国家规则（含 UA/来源富化）；engagement 整段跳过：它不能开会话，富化结果不会被使用；机器人的 pageview 已被丢弃，它的 engagement 自然记为 `dropped_no_session` | `202`+dropped | `dropped_bot` / `dropped_datacenter_ip` / `dropped_country_blocked` |
+| 10 | 身份：事件的站点本地日期没有盐（collector 不现场生成盐） | `202`+dropped | `dropped_salt_missing` |
+| 11 | 会话分配：engagement 没有会话 | `202`+dropped | `dropped_no_session` |
+| 12 | 写缓冲/JetStream | `503` | `dropped_overloaded` |
 
 `ingest_counters` 的维度为 `{分钟, 指标, site_id, script_version}`（进程内按 10 秒桶累加，桶用接收请求时的墙钟）；`sv` 超出 UInt16 的钳到 65535。未知站点统一记 `site_id = 0`，避免用户可控标签撑爆基数 `[01 §10.1]`。丢弃原因以 Rust 枚举 `DropReason` 为唯一来源（`system-design.md` §4.2、§10 Q13），指标名为 `dropped_<原因>`，仅内部可见。
 
