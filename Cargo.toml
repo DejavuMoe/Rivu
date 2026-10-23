@@ -56,6 +56,8 @@ base64 = { version = "0.22", default-features = false, features = ["std"] }
 subtle = "2"
 # 测试用：`ServiceExt::oneshot` 直接驱动 axum Router，不起监听端口。
 tower = { version = "0.5", default-features = false, features = ["util"] }
+# 公开查询 API 读请求体：区分「超过上限」与其他读取错误（`LengthLimitError`）；axum 本来就依赖它。
+http-body-util = "0.1"
 jiff = "0.2"
 # GeoIP（rivu-geo）：mmdb 读取、下载（reqwest 关闭默认 TLS 后端，由我们注入 ring + webpki-roots，
 # 与 clickhouse 的选择一致，避免引入 aws-lc）、gzip / tar.gz 解压。
