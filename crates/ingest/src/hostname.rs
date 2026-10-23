@@ -61,6 +61,25 @@ fn normalize_pattern(pattern: &str, strip_www: bool) -> String {
     }
 }
 
+/// 规范化并校验一条 hostname 模式（站点白名单与屏蔽规则的 `hostname` 类型共用）：小写、去空白；
+/// 精确匹配按 hostname 规则（去端口、结尾的 `.`、前导 `www.`），通配 `*.example.com` 保留通配头，
+/// 通配之后的部分不去 `www.`（见 [`HostnamePatterns::new`]）。结果符合 PG 的 CHECK 约束，
+/// 且能被 [`HostnamePatterns::new`] 接受（它会悄悄忽略无效模式，所以写库前就要拒绝）。
+pub fn validated_pattern(raw: &str) -> anyhow::Result<String> {
+    use anyhow::Context as _;
+    let lowered = raw.trim().to_lowercase();
+    let pattern = match lowered.strip_prefix("*.") {
+        Some(rest) => format!("*.{}", rest.trim_end_matches('.')),
+        None => normalize_hostname(&lowered),
+    };
+    rivu_storage_pg::sites::validate_hostname_pattern(&pattern)
+        .with_context(|| format!("hostname `{raw}` 无效"))?;
+    if HostnamePatterns::new([pattern.as_str()]).is_empty() {
+        anyhow::bail!("hostname `{raw}` 无效：规范化后为 `{pattern}`，不是有效的白名单模式");
+    }
+    Ok(pattern)
+}
+
 /// 站点 `hostnames` 白名单。精确匹配，或 `*.example.com` 通配。
 #[derive(Clone, Debug, Default)]
 pub struct HostnamePatterns {

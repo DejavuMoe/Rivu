@@ -317,6 +317,8 @@ mod tests {
             hostnames: HostnamePatterns::new(["example.test"]),
             geo_level: GeoLevel::Country,
             tracker_hash,
+            shield: Default::default(),
+            ingest_rate_limit_per_min: None,
         })
     }
 

@@ -18,6 +18,7 @@ rand.workspace = true
 rivu-common.workspace = true
 rivu-domain.workspace = true
 rivu-geo.workspace = true
+rivu-ratelimit.workspace = true
 rivu-session.workspace = true
 rivu-source.workspace = true
 rivu-storage-ch.workspace = true

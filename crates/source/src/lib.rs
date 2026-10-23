@@ -18,6 +18,7 @@
 
 mod channel;
 mod rules;
+pub mod spam;
 mod table;
 
 use rivu_domain::Utm;

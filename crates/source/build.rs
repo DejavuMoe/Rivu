@@ -39,6 +39,9 @@ const PINNED: [(&str, &str); 4] = [
     ),
 ];
 
+/// 垃圾引荐名单 `data/spam/spammers.txt`（Matomo referrer-spam-list，固定到 commit eaaa5ea）的 SHA-256。
+const SPAM_PINNED_SHA256: &str = "640a63e8324b441c5f22240308e3925cea57464ffaafe6174cfd46c3925c6751";
+
 #[derive(Deserialize)]
 struct Supplement {
     #[serde(default)]
@@ -214,6 +217,16 @@ fn main() {
         );
         fingerprint.update(rel.as_bytes());
         fingerprint.update(text.as_bytes());
+    }
+    // 垃圾引荐名单（Matomo referrer-spam-list）不进来源数据的指纹（它不影响 `RULES_VERSION` 的回填语义），
+    // 但哈希同样在构建时核对，被悄悄改动就构建失败。
+    {
+        let rel = "data/spam/spammers.txt";
+        let got = sha256_hex(read_normalized(&manifest.join(rel)).as_bytes());
+        assert_eq!(
+            got, SPAM_PINNED_SHA256,
+            "{rel} 的 SHA-256 与固定值不符：只能通过 data/spam/PROVENANCE.md 的升级流程更新"
+        );
     }
     let supplement_text = read_normalized(&manifest.join("data/supplement.yml"));
     fingerprint.update(b"data/supplement.yml");

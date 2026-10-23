@@ -25,3 +25,5 @@ proptest.workspace = true
 # 数据驱动测试直接读取 data/ 里的 YAML 作为期望值。
 serde.workspace = true
 serde-saphyr.workspace = true
+# 垃圾引荐名单测试用独立实现重算 SHA-256。
+sha2.workspace = true

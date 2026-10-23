@@ -1,7 +1,8 @@
 //! 角色的公共启动流程：构建依赖 -> 绑定端口 -> 装配 -> 服务 -> 优雅关停。
 //!
 //! 装配（按角色）：
-//! - collector / all：BatchWriter（`rivu_writer` 账号）、站点快照、盐缓存、UA 解析器、接入管线（含机器人、地理、UA、来源富化）、
+//! - collector / all：BatchWriter（`rivu_writer` 账号）、站点快照（含屏蔽规则与站点限额）、盐缓存、UA 解析器、
+//!   接入管线（hostname、限流、垃圾引荐、屏蔽规则、机器人、地理、UA、来源）、
 //!   会话清扫、站点脚本分发（`GET /js/<site_key>.js`，`core.js` 启动时从 `RIVU_TRACKER_DIR` 读入）；
 //! - worker / all：后台任务 `salts_rotate`（启动时补跑一次，之后每小时一次）、`geoip_refresh`
 //!   （无本地副本时立即下载，之后按 `RIVU_GEOIP_REFRESH_INTERVAL` 条件 GET）；
@@ -148,14 +149,17 @@ async fn start_collector(
             .context("构建 UA 解析器的任务异常")?
             .context("构建 UA 解析器失败")?,
     );
-    let pipeline = Arc::new(Pipeline::new(
-        Arc::clone(&sites),
-        Arc::clone(&salts),
-        writer.handle(),
-        config.trusted_proxies.clone(),
-        ua,
-        geo_db,
-    ));
+    let pipeline = Arc::new(
+        Pipeline::new(
+            Arc::clone(&sites),
+            Arc::clone(&salts),
+            writer.handle(),
+            config.trusted_proxies.clone(),
+            ua,
+            geo_db,
+        )
+        .with_default_ingest_rate(config.ingest_rate_limit_per_min),
+    );
     background.push(pipeline.spawn_sweeper(SESSION_SWEEP_INTERVAL, stop.clone()));
 
     // 站点脚本：core.js 启动时读入并缓存；缺失不阻止启动，路由返回 503，/readyz 报告。

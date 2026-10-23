@@ -6,16 +6,25 @@
 //! |---|---|---|
 //! | 1 | 解析（400，不进 `ingest_counters`） | — |
 //! | 2 | 客户端 IP | — |
-//! | 3 | 站点查找、`collect_enabled`、hostname 白名单（空白名单 fail-closed） | `unknown_site` `site_disabled` `hostname_not_allowed` |
-//! | 4 | 规则（IP / 页面屏蔽、限流、垃圾引荐：尚未实现） | — |
+//! | 3 | 站点查找、`collect_enabled`、hostname 白名单（空白名单 fail-closed）、hostname 屏蔽规则、按站点令牌桶限流、垃圾引荐（referrer 的 host 后缀匹配） | `unknown_site` `site_disabled` `hostname_not_allowed` `rate_limited` `spam_referrer` |
+//! | 4 | 规则：IP / CIDR（先），页面通配（后） | `ip_blocked` `page_blocked` |
 //! | 5 | 机器人：`UaParser::parse`，`bot` 非空即丢弃（空 UA 也是机器人） | `bot` |
-//! | 6 | 地理：`GeoDb::lookup(ip, site.geo_level)`，按站点精度截断 | — |
+//! | 6 | 地理：`GeoDb::lookup(ip, site.geo_level)`，按站点精度截断；之后过国家规则 | `country_blocked` |
 //! | 7 | UA 富化：浏览器、系统、设备类别 | — |
 //! | 8 | 来源：内部引荐传 `None`，`rivu_source::classify` 给出 `referrer_source` 与 `channel` | — |
 //! | 10 | 身份（盐缺失 `salt_missing`；前一天的盐缺失只是不算 `prev_visitor_id`） | `salt_missing` |
 //! | 11 | SessionAssigner → 组装 `EventRow` → BatchWriter（缓冲满 `dropped_overloaded`） | `no_session` `overloaded` |
 //!
-//! **engagement 跳过第 5–8 步**，直接进身份和 SessionAssigner（没有会话就是 `no_session`）：
+//! **规则与限流对 engagement 的处理**（`tracker-and-protocol.md` §6.4 第 6 行写的是 engagement 整段跳过屏蔽规则，
+//! 这里有意偏离其中一部分，见下）：
+//! - 限流（令牌桶）、hostname 屏蔽、IP / CIDR 规则、页面规则**照常对 engagement 生效**：它们是内存里的哈希查找和
+//!   几次比较，没有富化成本；而页面规则若放过 engagement，被屏蔽页面的 pageview 虽然丢了，同一访客在别的页面
+//!   已开的会话仍会让这个页面的 engagement 被接受并盖上会话属性，污染 `engaged_duration` 和页面榜；
+//!   规则在会话中途新增时，已开会话里的 IP 也应立即被挡住；限流是洪水防护，不分事件类型；
+//! - 垃圾引荐只看 pageview 与自定义事件的 referrer（engagement 的 `r` 不会被使用），engagement 跳过；
+//! - 国家规则依赖地理查询（富化），engagement 不做：被屏蔽国家的 pageview 已被丢弃，不会有会话。
+//!
+//! **engagement 跳过第 5–8 步**（机器人、地理、UA、来源），直接进身份和 SessionAssigner（没有会话就是 `no_session`）：
 //! - engagement 不能开会话（§4.6），而富化的结果只在「开新会话」时才被 SessionAssigner 取用
 //!   （会话属性由会话的第一个事件决定，此后盖到会话内的每个事件上，包括 engagement），
 //!   所以对 engagement 做 UA / 地理 / 来源富化是白费的；
@@ -42,6 +51,7 @@ use rivu_domain::{
     DropReason, EventKind, METRIC_ACCEPTED, NormalizedEvent, SessionAttrs, UNKNOWN_SITE_ID,
 };
 use rivu_geo::GeoDb;
+use rivu_ratelimit::KeyedLimiter;
 use rivu_session::assigner::{Assignment, Incoming, SessionAssigner, SessionConfig, Stamp};
 use rivu_session::identity::{Salt, local_date, routing_hash, visitor_hash};
 use rivu_source::{SourceInput, classify};
@@ -114,6 +124,7 @@ impl EnrichWork {
 struct StageHistograms {
     parse: metrics::Histogram,
     admit: metrics::Histogram,
+    shield: metrics::Histogram,
     bot: metrics::Histogram,
     geo: metrics::Histogram,
     ua: metrics::Histogram,
@@ -132,6 +143,7 @@ impl StageHistograms {
         StageHistograms {
             parse: h("parse"),
             admit: h("admit"),
+            shield: h("shield"),
             bot: h("bot"),
             geo: h("geo"),
             ua: h("ua"),
@@ -161,6 +173,11 @@ pub struct Pipeline {
     geo: Arc<GeoDb>,
     work: EnrichWork,
     stages: StageHistograms,
+    /// 按站点的采集限流（令牌桶，进程内；多副本 collector 各自本地计数，总额度约为副本数倍）。
+    limiter: KeyedLimiter,
+    /// 站点没有自己的 `ingest_rate_limit_per_min` 时用的全局默认（`RIVU_INGEST_RATE_LIMIT_PER_MIN`）；
+    /// `None` 表示不限流。[`Pipeline::new`] 默认不限流，由装配代码用 [`Pipeline::with_default_ingest_rate`] 设置。
+    default_ingest_rate: Option<u32>,
 }
 
 impl Pipeline {
@@ -185,7 +202,15 @@ impl Pipeline {
             geo,
             work: EnrichWork::default(),
             stages: StageHistograms::new(),
+            limiter: KeyedLimiter::new(),
+            default_ingest_rate: None,
         }
+    }
+
+    /// 设置全局默认的采集限额（每站每分钟事件数）；`None` 不限流。站点自己的限额优先。
+    pub fn with_default_ingest_rate(mut self, per_min: Option<u32>) -> Self {
+        self.default_ingest_rate = per_min;
+        self
     }
 
     /// 各富化步骤已执行的次数。
@@ -249,9 +274,45 @@ impl Pipeline {
             observe(&self.stages.admit, t);
             return self.dropped(site_id, &ev, DropReason::HostnameNotAllowed);
         }
+        // hostname 屏蔽规则：在白名单之内再挖掉一部分（`deny`，`allow` 是例外）
+        if site.shield.hostname_blocked(&ev.hostname) {
+            observe(&self.stages.admit, t);
+            return self.dropped(site_id, &ev, DropReason::HostnameNotAllowed);
+        }
+        // 令牌桶限流（§4.2 第 3 步）：站点自己的限额，没有就用全局默认；放在 hostname 之后，
+        // 这样别的 hostname 冒用 site_key 灌进来的流量不会耗掉站点的额度。
+        if let Some(limit) = site.ingest_rate_limit_per_min.or(self.default_ingest_rate)
+            && !self.limiter.allow_per_min(site_id, limit)
+        {
+            observe(&self.stages.admit, t);
+            metrics::counter!("rivu_ratelimit_rejected_total", "scope" => "ingest").increment(1);
+            return self.dropped(site_id, &ev, DropReason::RateLimited);
+        }
+        // 垃圾引荐：referrer 的 host 后缀命中 Matomo 名单。engagement 的 referrer 不会被使用，跳过。
+        if ev.kind != EventKind::Engagement
+            && ev
+                .referrer
+                .as_ref()
+                .is_some_and(|r| rivu_source::spam::is_spam_referrer(&r.host))
+        {
+            observe(&self.stages.admit, t);
+            return self.dropped(site_id, &ev, DropReason::SpamReferrer);
+        }
         observe(&self.stages.admit, t);
 
-        // 4. 规则（IP / 页面屏蔽、垃圾引荐）：尚未实现。
+        // 4. 规则：IP / CIDR 先，页面后（§4.2）。engagement 同样适用（见模块文档）。
+        let t = Instant::now();
+        let blocked = if site.shield.ip_blocked(ip) {
+            Some(DropReason::IpBlocked)
+        } else if site.shield.page_blocked(&ev.pathname) {
+            Some(DropReason::PageBlocked)
+        } else {
+            None
+        };
+        observe(&self.stages.shield, t);
+        if let Some(reason) = blocked {
+            return self.dropped(site_id, &ev, reason);
+        }
 
         // 5.–8. 机器人、地理、UA、来源。engagement 整段跳过（见模块文档）：它不能开会话，
         // 属性也不会被取用，没有会话时直接按 `no_session` 丢弃。
@@ -345,6 +406,10 @@ impl Pipeline {
         self.work.geo_lookups.fetch_add(1, Ordering::Relaxed);
         let geo = self.geo.lookup(ip, site.geo_level);
         observe(&self.stages.geo, t);
+        // 国家规则必须在地理之后（§4.2 第 6 步）；没有国家的事件按 `ZZ` 判定。
+        if site.shield.country_blocked(geo.country_code) {
+            return Err(DropReason::CountryBlocked);
+        }
 
         // 7. UA 富化
         let t = Instant::now();
@@ -442,7 +507,11 @@ pub fn describe_metrics() {
     metrics::describe_histogram!(
         STAGE_SECONDS_METRIC,
         metrics::Unit::Seconds,
-        "接入管线各阶段的耗时，按阶段（parse、admit、bot、geo、ua、source、identity、session、write）"
+        "接入管线各阶段的耗时，按阶段（parse、admit、shield、bot、geo、ua、source、identity、session、write）"
+    );
+    metrics::describe_counter!(
+        "rivu_ratelimit_rejected_total",
+        "被限流拒绝的请求数，按范围（scope：ingest、api_burst、api_hourly_quota、api_concurrency）"
     );
 }
 
@@ -529,11 +598,15 @@ mod tests {
     const EMPTY_KEY: &str = "eeeeeeeeeeee";
     const COUNTRY_KEY: &str = "gggggggggggg";
     const REGION_KEY: &str = "hhhhhhhhhhhh";
+    const RULES_KEY: &str = "rrrrrrrrrrrr";
+    const LIMIT_KEY: &str = "llllllllllll";
     const SITE: u64 = 42;
     const OFF_SITE: u64 = 43;
     const EMPTY_SITE: u64 = 44;
     const COUNTRY_SITE: u64 = 45;
     const REGION_SITE: u64 = 46;
+    const RULES_SITE: u64 = 50;
+    const LIMIT_SITE: u64 = 51;
     const MIN: i64 = 60_000;
 
     /// 真实浏览器 UA（取自 uap-core 测试集的同类字符串）。
@@ -582,6 +655,43 @@ mod tests {
         days.map(|d| date(2026, 3, d)).collect()
     }
 
+    fn rule(kind: &str, action: &str, value: &str) -> rivu_storage_pg::shield::ShieldRuleRow {
+        rivu_storage_pg::shield::ShieldRuleRow {
+            id: format!("{kind}/{action}/{value}"),
+            site_id: RULES_SITE,
+            kind: kind.into(),
+            action: action.into(),
+            value: value.into(),
+            description: None,
+        }
+    }
+
+    /// 带规则的站点：IP、CIDR（含一个 allow 例外）、页面（含 allow 例外）、国家、hostname。
+    fn rules_site() -> Arc<SiteConfig> {
+        let rows = [
+            rule("ip", "deny", "203.0.113.50"),
+            rule("cidr", "deny", "198.51.100.0/24"),
+            rule("ip", "allow", "198.51.100.7"),
+            rule("page", "deny", "/admin*"),
+            rule("page", "allow", "/admin/public*"),
+            rule("page", "deny", "/secret.html"),
+            rule("country", "deny", "SE"),
+            rule("hostname", "deny", "internal.example.test"),
+        ];
+        let (shield, errors) = crate::shield::ShieldRules::compile(&rows);
+        assert!(errors.is_empty(), "{errors:?}");
+        Arc::new(SiteConfig {
+            site_id: RULES_SITE,
+            timezone: berlin(),
+            collect_enabled: true,
+            hostnames: crate::hostname::HostnamePatterns::new(["example.test", "*.example.test"]),
+            geo_level: GeoLevel::Country,
+            tracker_hash: false,
+            shield,
+            ingest_rate_limit_per_min: None,
+        })
+    }
+
     struct Rig {
         pipeline: Pipeline,
         rx: mpsc::Receiver<EventRow>,
@@ -602,6 +712,8 @@ mod tests {
                 hostnames: crate::hostname::HostnamePatterns::new(hosts.iter().copied()),
                 geo_level,
                 tracker_hash: false,
+                shield: Default::default(),
+                ingest_rate_limit_per_min: None,
             })
         };
         let city = GeoLevel::City;
@@ -620,6 +732,14 @@ mod tests {
             (
                 REGION_KEY.to_owned(),
                 site(REGION_SITE, true, &["example.test"], GeoLevel::Region),
+            ),
+            (RULES_KEY.to_owned(), rules_site()),
+            (
+                LIMIT_KEY.to_owned(),
+                Arc::new(SiteConfig {
+                    ingest_rate_limit_per_min: Some(3),
+                    ..(*site(LIMIT_SITE, true, &["example.test"], city)).clone()
+                }),
             ),
         ]));
         let salt_cache = Arc::new(SaltCache::new());
@@ -1255,5 +1375,434 @@ mod tests {
             accepted_rows += 1;
         }
         assert_eq!(accepted_rows, 3, "缓冲容量 3，其余 pageview 为 overloaded");
+    }
+
+    // ------------------------------------------------------------ 屏蔽规则、限流、垃圾引荐
+
+    fn rules_pv(path: &str) -> Vec<u8> {
+        body(
+            RULES_KEY,
+            "pageview",
+            &format!("https://example.test{path}"),
+        )
+    }
+
+    fn rules_engagement(path: &str) -> Vec<u8> {
+        json!({"v":1,"s":RULES_KEY,"n":"engagement","u":format!("https://example.test{path}"),"e":3000,"sd":10})
+            .to_string()
+            .into_bytes()
+    }
+
+    #[test]
+    fn ip_and_cidr_rules_drop_with_ip_blocked_and_allow_is_an_exception() {
+        let r = rig(20);
+        let t = at(date(2026, 3, 28), 12, 0);
+        let go = |ip: &str, i: i64| {
+            r.pipeline
+                .process(&rules_pv("/"), ctx(ip, CHROME_WIN, t + i))
+        };
+        // 精确 IP 规则
+        assert_eq!(
+            go("203.0.113.50", 0),
+            Outcome::Dropped(DropReason::IpBlocked)
+        );
+        assert_eq!(go("203.0.113.51", 1), Outcome::Accepted);
+        // IPv4-mapped 先转成 IPv4 再比较
+        assert_eq!(
+            go("::ffff:203.0.113.50", 2),
+            Outcome::Dropped(DropReason::IpBlocked)
+        );
+        // CIDR：网段内被挡，边界之外放行，allow 例外放行
+        assert_eq!(
+            go("198.51.100.0", 3),
+            Outcome::Dropped(DropReason::IpBlocked)
+        );
+        assert_eq!(
+            go("198.51.100.255", 4),
+            Outcome::Dropped(DropReason::IpBlocked)
+        );
+        assert_eq!(go("198.51.100.7", 5), Outcome::Accepted);
+        assert_eq!(go("198.51.101.0", 6), Outcome::Accepted);
+        assert_eq!(go("198.51.99.255", 7), Outcome::Accepted);
+        assert_eq!(
+            counts(&r.writer),
+            BTreeMap::from([
+                (key(RULES_SITE, "dropped_ip_blocked"), 4),
+                (key(RULES_SITE, "accepted"), 4),
+            ])
+        );
+    }
+
+    #[test]
+    fn page_rules_match_the_normalized_pathname_and_allow_is_an_exception() {
+        let r = rig(20);
+        let t = at(date(2026, 3, 28), 12, 0);
+        let mut i = 0;
+        let mut go = |path: &str| {
+            i += 1;
+            r.pipeline
+                .process(&rules_pv(path), ctx("203.0.113.9", CHROME_WIN, t + i))
+        };
+        for blocked in [
+            "/admin",
+            "/admin/",
+            "/admin/users/1",
+            "/adminx",
+            "/secret.html",
+        ] {
+            assert_eq!(
+                go(blocked),
+                Outcome::Dropped(DropReason::PageBlocked),
+                "{blocked}"
+            );
+        }
+        for ok in [
+            "/",
+            "/Admin",
+            "/admin/public",
+            "/admin/public/page",
+            "/secret.htm",
+            "/a/admin",
+            "/blog",
+        ] {
+            assert_eq!(go(ok), Outcome::Accepted, "{ok}");
+        }
+        // 规则对规范化后的 pathname 生效：query 与 fragment 已被去掉，不影响匹配
+        assert_eq!(
+            go("/admin?x=1#top"),
+            Outcome::Dropped(DropReason::PageBlocked)
+        );
+        assert_eq!(
+            go("/secret.html?x=1"),
+            Outcome::Dropped(DropReason::PageBlocked)
+        );
+        assert_eq!(
+            counts(&r.writer),
+            BTreeMap::from([
+                (key(RULES_SITE, "dropped_page_blocked"), 7),
+                (key(RULES_SITE, "accepted"), 7),
+            ])
+        );
+    }
+
+    #[test]
+    fn country_rules_apply_after_geo_and_unknown_country_is_not_blocked_without_a_zz_rule() {
+        let mut r = rig_with_geo(20, test_geo());
+        let t = at(date(2026, 3, 28), 12, 0);
+        // SE 被屏蔽（SE_IP 在测试库里是瑞典）；GB 的地址放行；没有地理信息的私有地址放行
+        assert_eq!(
+            r.pipeline
+                .process(&rules_pv("/"), ctx(SE_IP, CHROME_WIN, t)),
+            Outcome::Dropped(DropReason::CountryBlocked)
+        );
+        assert_eq!(
+            r.pipeline
+                .process(&rules_pv("/"), ctx("81.2.69.142", CHROME_WIN, t + 1)),
+            Outcome::Accepted
+        );
+        assert_eq!(
+            r.pipeline
+                .process(&rules_pv("/"), ctx("10.1.2.3", CHROME_WIN, t + 2)),
+            Outcome::Accepted
+        );
+        // 没有规则的站点不受影响
+        assert_eq!(
+            r.pipeline
+                .process(&pageview("/"), ctx(SE_IP, CHROME_WIN, t + 3)),
+            Outcome::Accepted
+        );
+        assert_eq!(
+            counts(&r.writer),
+            BTreeMap::from([
+                (key(RULES_SITE, "dropped_country_blocked"), 1),
+                (key(RULES_SITE, "accepted"), 2),
+                (key(SITE, "accepted"), 1),
+            ])
+        );
+        assert_eq!(r.rx.try_recv().unwrap().country_code, *b"GB");
+    }
+
+    #[test]
+    fn hostname_rules_remove_hosts_from_the_whitelist() {
+        let mut r = rig(20);
+        let t = at(date(2026, 3, 28), 12, 0);
+        let pv = |host: &str| body(RULES_KEY, "pageview", &format!("https://{host}/"));
+        assert_eq!(
+            r.pipeline
+                .process(&pv("internal.example.test"), ctx("1.1.1.1", CHROME_WIN, t)),
+            Outcome::Dropped(DropReason::HostnameNotAllowed)
+        );
+        assert_eq!(
+            r.pipeline
+                .process(&pv("app.example.test"), ctx("1.1.1.1", CHROME_WIN, t + 1)),
+            Outcome::Accepted
+        );
+        assert_eq!(r.rx.try_recv().unwrap().hostname, "app.example.test");
+    }
+
+    #[test]
+    fn rules_and_rate_limit_apply_to_engagement_but_spam_and_country_do_not() {
+        let mut r = rig_with_geo(20, test_geo());
+        let t = at(date(2026, 3, 28), 12, 0);
+        let ua = CHROME_WIN;
+        // 访客在 GB 地址上开了会话（/ 页面）
+        let gb = "81.2.69.142";
+        assert_eq!(
+            r.pipeline.process(&rules_pv("/"), ctx(gb, ua, t)),
+            Outcome::Accepted
+        );
+        // 被屏蔽页面的 engagement：即使该访客有会话，也不能被接受（否则污染页面榜）
+        assert_eq!(
+            r.pipeline
+                .process(&rules_engagement("/admin"), ctx(gb, ua, t + 1000)),
+            Outcome::Dropped(DropReason::PageBlocked)
+        );
+        // 正常页面的 engagement 被接受
+        assert_eq!(
+            r.pipeline
+                .process(&rules_engagement("/"), ctx(gb, ua, t + 2000)),
+            Outcome::Accepted
+        );
+        // 被屏蔽 IP 的 engagement：原因是 ip_blocked，而不是没有会话（规则先于会话判定）
+        assert_eq!(
+            r.pipeline
+                .process(&rules_engagement("/"), ctx("203.0.113.50", ua, t + 3000)),
+            Outcome::Dropped(DropReason::IpBlocked)
+        );
+        // 垃圾引荐不看 engagement（它的 referrer 不会被使用）：有会话的 engagement 带垃圾 r 仍然接受
+        let spam_eng = json!({"v":1,"s":RULES_KEY,"n":"engagement","u":"https://example.test/",
+                              "e":3000,"sd":10,"r":"https://semalt.com/"})
+        .to_string()
+        .into_bytes();
+        assert_eq!(
+            r.pipeline.process(&spam_eng, ctx(gb, ua, t + 4000)),
+            Outcome::Accepted
+        );
+        // 国家规则不对 engagement 做地理查询：SE 地址的 engagement 没有会话，原因是 no_session
+        let before = r.pipeline.enrich_work().geo_lookups();
+        assert_eq!(
+            r.pipeline
+                .process(&rules_engagement("/"), ctx(SE_IP, ua, t + 5000)),
+            Outcome::Dropped(DropReason::NoSession)
+        );
+        assert_eq!(r.pipeline.enrich_work().geo_lookups(), before);
+        assert_eq!(
+            counts(&r.writer),
+            BTreeMap::from([
+                (key(RULES_SITE, "accepted"), 3),
+                (key(RULES_SITE, "dropped_page_blocked"), 1),
+                (key(RULES_SITE, "dropped_ip_blocked"), 1),
+                (key(RULES_SITE, "dropped_no_session"), 1),
+            ])
+        );
+        let rows: Vec<_> = std::iter::from_fn(|| r.rx.try_recv().ok()).collect();
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn spam_referrers_are_dropped_by_host_suffix() {
+        let mut r = rig(20);
+        let t = at(date(2026, 3, 28), 12, 0);
+        let with_ref = |name: &str, referrer: &str| {
+            json!({"v":1,"s":KEY,"n":name,"u":"https://example.test/","r":referrer})
+                .to_string()
+                .into_bytes()
+        };
+        let go = |r: &Rig, name: &str, referrer: &str, i: i64| {
+            r.pipeline.process(
+                &with_ref(name, referrer),
+                ctx("203.0.113.9", CHROME_WIN, t + i),
+            )
+        };
+        for (i, spam) in [
+            "https://semalt.com/",
+            "https://www.semalt.com/x?y=1",
+            "https://a.b.semalt.com/",
+            "http://SEMALT.COM",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                go(&r, "pageview", spam, i as i64),
+                Outcome::Dropped(DropReason::SpamReferrer),
+                "{spam}"
+            );
+        }
+        // 自定义事件的 referrer 同样检查
+        assert_eq!(
+            go(&r, "Signup", "https://semalt.com/", 10),
+            Outcome::Dropped(DropReason::SpamReferrer)
+        );
+        // 合法来源与「只是名字相近」的域名不受影响
+        for (i, ok) in [
+            "https://www.google.com/",
+            "https://t.co/x",
+            "https://notsemalt.com/",
+            "https://semalt.com.example.org/",
+            "https://www.bing.com/",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                go(&r, "pageview", ok, 20 + i as i64),
+                Outcome::Accepted,
+                "{ok}"
+            );
+        }
+        assert_eq!(
+            counts(&r.writer),
+            BTreeMap::from([
+                (key(SITE, "dropped_spam_referrer"), 5),
+                (key(SITE, "accepted"), 5),
+            ])
+        );
+        assert!(r.rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn site_rate_limit_is_a_token_bucket_per_site_and_only_counts_admitted_hostnames() {
+        let mut r = rig(50);
+        let t = at(date(2026, 3, 28), 12, 0);
+        let lpv = |host: &str| body(LIMIT_KEY, "pageview", &format!("https://{host}/"));
+        // hostname 不在白名单的事件先被丢弃，不消耗令牌
+        for i in 0..5 {
+            assert_eq!(
+                r.pipeline
+                    .process(&lpv("evil.test"), ctx("1.1.1.1", CHROME_WIN, t + i)),
+                Outcome::Dropped(DropReason::HostnameNotAllowed)
+            );
+        }
+        // 限额 3/分钟：前 3 个放行，之后 rate_limited
+        let outcomes: Vec<_> = (0..6)
+            .map(|i| {
+                r.pipeline
+                    .process(&lpv("example.test"), ctx("1.1.1.1", CHROME_WIN, t + 10 + i))
+            })
+            .collect();
+        assert_eq!(
+            outcomes,
+            [
+                Outcome::Accepted,
+                Outcome::Accepted,
+                Outcome::Accepted,
+                Outcome::Dropped(DropReason::RateLimited),
+                Outcome::Dropped(DropReason::RateLimited),
+                Outcome::Dropped(DropReason::RateLimited),
+            ]
+        );
+        // 别的站点不受影响
+        assert_eq!(
+            r.pipeline
+                .process(&pageview("/"), ctx("1.1.1.1", CHROME_WIN, t + 20)),
+            Outcome::Accepted
+        );
+        // 限流先于 bot 判定：被限流的机器人记 rate_limited，不做 UA 解析
+        let parses = r.pipeline.enrich_work().ua_parses();
+        assert_eq!(
+            r.pipeline
+                .process(&lpv("example.test"), ctx("1.1.1.1", GOOGLEBOT, t + 21)),
+            Outcome::Dropped(DropReason::RateLimited)
+        );
+        assert_eq!(r.pipeline.enrich_work().ua_parses(), parses);
+        assert_eq!(
+            counts(&r.writer),
+            BTreeMap::from([
+                (key(LIMIT_SITE, "dropped_hostname_not_allowed"), 5),
+                (key(LIMIT_SITE, "accepted"), 3),
+                (key(LIMIT_SITE, "dropped_rate_limited"), 4),
+                (key(SITE, "accepted"), 1),
+            ])
+        );
+        let accepted_rows = std::iter::from_fn(|| r.rx.try_recv().ok()).count();
+        assert_eq!(accepted_rows, 4);
+    }
+
+    #[test]
+    fn global_default_rate_applies_when_the_site_has_no_limit_and_the_site_limit_wins() {
+        let mut r = rig(50);
+        r.pipeline = r.pipeline.with_default_ingest_rate(Some(2));
+        let t = at(date(2026, 3, 28), 12, 0);
+        let default_site: Vec<_> = (0..4)
+            .map(|i| {
+                r.pipeline
+                    .process(&pageview("/"), ctx("1.1.1.1", CHROME_WIN, t + i))
+            })
+            .collect();
+        assert_eq!(
+            default_site,
+            [
+                Outcome::Accepted,
+                Outcome::Accepted,
+                Outcome::Dropped(DropReason::RateLimited),
+                Outcome::Dropped(DropReason::RateLimited),
+            ]
+        );
+        // 站点自己的限额（3）覆盖全局默认（2）
+        let own: Vec<_> = (0..4)
+            .map(|i| {
+                r.pipeline.process(
+                    &body(LIMIT_KEY, "pageview", "https://example.test/"),
+                    ctx("1.1.1.1", CHROME_WIN, t + 10 + i),
+                )
+            })
+            .map(|o| o == Outcome::Accepted)
+            .collect();
+        assert_eq!(own, [true, true, true, false]);
+        // 不设默认（None）= 不限流
+        let r2 = rig(200);
+        for i in 0..100 {
+            assert_eq!(
+                r2.pipeline
+                    .process(&pageview("/"), ctx("1.1.1.1", CHROME_WIN, t + i)),
+                Outcome::Accepted
+            );
+        }
+    }
+
+    #[test]
+    fn drop_order_follows_the_pipeline_table() {
+        let r = rig_with_geo(50, test_geo());
+        let t = at(date(2026, 3, 28), 12, 0);
+        let spam_pv = |path: &str| {
+            json!({"v":1,"s":RULES_KEY,"n":"pageview","u":format!("https://example.test{path}"),
+                   "r":"https://semalt.com/"})
+            .to_string()
+            .into_bytes()
+        };
+        // 垃圾引荐（第 3 步）先于 IP 规则（第 4 步）
+        assert_eq!(
+            r.pipeline
+                .process(&spam_pv("/"), ctx("203.0.113.50", CHROME_WIN, t)),
+            Outcome::Dropped(DropReason::SpamReferrer)
+        );
+        // IP 规则先于页面规则
+        assert_eq!(
+            r.pipeline
+                .process(&rules_pv("/admin"), ctx("203.0.113.50", CHROME_WIN, t + 1)),
+            Outcome::Dropped(DropReason::IpBlocked)
+        );
+        // 页面规则先于机器人判定与国家规则
+        assert_eq!(
+            r.pipeline
+                .process(&rules_pv("/admin"), ctx(SE_IP, GOOGLEBOT, t + 2)),
+            Outcome::Dropped(DropReason::PageBlocked)
+        );
+        // 机器人判定（第 5 步）先于国家规则（第 6 步）
+        assert_eq!(
+            r.pipeline
+                .process(&rules_pv("/"), ctx(SE_IP, GOOGLEBOT, t + 3)),
+            Outcome::Dropped(DropReason::Bot)
+        );
+        assert_eq!(
+            counts(&r.writer),
+            BTreeMap::from([
+                (key(RULES_SITE, "dropped_spam_referrer"), 1),
+                (key(RULES_SITE, "dropped_ip_blocked"), 1),
+                (key(RULES_SITE, "dropped_page_blocked"), 1),
+                (key(RULES_SITE, "dropped_bot"), 1),
+            ])
+        );
     }
 }
