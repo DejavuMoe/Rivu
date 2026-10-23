@@ -262,6 +262,12 @@ impl Default for ApiRateConfig {
     }
 }
 
+/// `RIVU_PUBLIC_VIEW_RATE_PER_MIN` 的默认值：一个看板页加载并发约 10 个查询再加实时轮询，300 次/分钟（`platform-and-ops.md` §4.4）。
+pub const DEFAULT_PUBLIC_VIEW_RATE_PER_MIN: u32 = 300;
+
+/// `RIVU_PUBLIC_VIEW_BURST` 的默认值：首屏并发查询的突发容量。
+pub const DEFAULT_PUBLIC_VIEW_BURST: u32 = 60;
+
 /// `RIVU_SHIELD_MAX_RULES_PER_SITE` 的默认值（`platform-and-ops.md` §7）。
 pub const DEFAULT_SHIELD_MAX_RULES_PER_SITE: usize = 500;
 
@@ -479,6 +485,10 @@ pub struct Config {
     pub query_timeouts: QueryTimeouts,
     /// 公开 API 按组织限流（`RIVU_API_RATE_PER_HOUR`、`RIVU_API_BURST` 等）。
     pub api_rate: ApiRateConfig,
+    /// `RIVU_PUBLIC_VIEW_RATE_PER_MIN`：公开看板与共享链接每个 `(客户端 IP, 站点或链接)` 每分钟的请求数。
+    pub public_view_rate_per_min: u32,
+    /// `RIVU_PUBLIC_VIEW_BURST`：同上的突发令牌桶容量（实际容量取 `min(突发, 每分钟次数)`，与 `RIVU_API_BURST` 一致）。
+    pub public_view_burst: u32,
     /// `RIVU_SHIELD_MAX_RULES_PER_SITE`：每站屏蔽规则上限。
     pub shield_max_rules_per_site: usize,
     /// `RIVU_INGEST_RATE_LIMIT_PER_MIN`：站点没有自己的限额时的默认每分钟事件数；`None` 表示不限流（变量设为 0）。
@@ -687,6 +697,16 @@ impl Config {
                 1..=60_000,
             )),
         };
+        let public_view_rate_per_min = l.parse_in_range(
+            "RIVU_PUBLIC_VIEW_RATE_PER_MIN",
+            DEFAULT_PUBLIC_VIEW_RATE_PER_MIN,
+            1..=1_000_000,
+        );
+        let public_view_burst = l.parse_in_range(
+            "RIVU_PUBLIC_VIEW_BURST",
+            DEFAULT_PUBLIC_VIEW_BURST,
+            1..=1_000_000,
+        );
         let shield_max_rules_per_site = l.parse_in_range(
             "RIVU_SHIELD_MAX_RULES_PER_SITE",
             DEFAULT_SHIELD_MAX_RULES_PER_SITE,
@@ -784,6 +804,8 @@ impl Config {
             },
             query_timeouts,
             api_rate,
+            public_view_rate_per_min,
+            public_view_burst,
             shield_max_rules_per_site,
             ingest_rate_limit_per_min,
             site_cache_refresh: Duration::from_secs(site_cache_refresh_secs),
@@ -1299,6 +1321,16 @@ mod tests {
         assert_eq!(cfg.api_rate.max_concurrency, 4);
         assert_eq!(cfg.shield_max_rules_per_site, 500);
         assert_eq!(cfg.ingest_rate_limit_per_min, Some(300_000));
+        assert_eq!(cfg.public_view_rate_per_min, 300);
+        assert_eq!(cfg.public_view_burst, 60);
+
+        let cfg = with_env(&[
+            ("RIVU_PUBLIC_VIEW_RATE_PER_MIN", "600"),
+            ("RIVU_PUBLIC_VIEW_BURST", "100"),
+        ])
+        .unwrap();
+        assert_eq!(cfg.public_view_rate_per_min, 600);
+        assert_eq!(cfg.public_view_burst, 100);
 
         let cfg = with_env(&[
             ("RIVU_API_RATE_PER_HOUR", "500"),
@@ -1329,6 +1361,10 @@ mod tests {
             ("RIVU_API_BURST", "0"),
             ("RIVU_API_MAX_CONCURRENCY", "0"),
             ("RIVU_API_QUEUE_TIMEOUT_MS", "0"),
+            ("RIVU_PUBLIC_VIEW_RATE_PER_MIN", "0"),
+            ("RIVU_PUBLIC_VIEW_RATE_PER_MIN", "abc"),
+            ("RIVU_PUBLIC_VIEW_BURST", "0"),
+            ("RIVU_PUBLIC_VIEW_BURST", "-5"),
             ("RIVU_SHIELD_MAX_RULES_PER_SITE", "0"),
             ("RIVU_INGEST_RATE_LIMIT_PER_MIN", "-1"),
             ("RIVU_INGEST_RATE_LIMIT_PER_MIN", "many"),
