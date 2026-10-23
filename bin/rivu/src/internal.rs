@@ -18,6 +18,8 @@ use rivu_ingest::pipeline::{SaltCache, SiteSnapshot, utc_today};
 use rivu_jobs::GeoRefreshState;
 use serde_json::{Value, json};
 
+use crate::script::TrackerAssets;
+
 /// 单项检查的超时：依赖卡住时 `/readyz` 也要及时返回 503，而不是挂起。
 const CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -70,6 +72,9 @@ pub struct InternalState {
     pub probe: Probe,
     /// 只有 collector / all 有。
     pub collector: Option<CollectorReadiness>,
+    /// tracker 构建产物（`/js/<site_key>.js` 的来源），只有 collector / all 有。**只报告，不判就绪失败**：
+    /// 缺失时脚本路由返回 503，但事件采集不依赖它。
+    pub tracker: Option<Arc<TrackerAssets>>,
     pub geo: GeoReadiness,
     pub metrics: PrometheusHandle,
     pub started: Instant,
@@ -189,6 +194,9 @@ async fn readyz(State(state): State<Arc<InternalState>>) -> impl IntoResponse {
         checks["salts"] = salts;
     }
     checks["geoip"] = geoip_check(&state.geo);
+    if let Some(t) = &state.tracker {
+        checks["tracker"] = t.status();
+    }
 
     let body = json!({
         "status": if ready { "ready" } else { "not_ready" },

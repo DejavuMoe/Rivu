@@ -1,10 +1,11 @@
 //! 角色的公共启动流程：构建依赖 -> 绑定端口 -> 装配 -> 服务 -> 优雅关停。
 //!
 //! 装配（按角色）：
-//! - collector / all：BatchWriter（`rivu_writer` 账号）、站点快照、盐缓存、接入管线、会话清扫；
+//! - collector / all：BatchWriter（`rivu_writer` 账号）、站点快照、盐缓存、UA 解析器、接入管线（含机器人、地理、UA、来源富化）、
+//!   会话清扫、站点脚本分发（`GET /js/<site_key>.js`，`core.js` 启动时从 `RIVU_TRACKER_DIR` 读入）；
 //! - worker / all：后台任务 `salts_rotate`（启动时补跑一次，之后每小时一次）、`geoip_refresh`
 //!   （无本地副本时立即下载，之后按 `RIVU_GEOIP_REFRESH_INTERVAL` 条件 GET）；
-//! - collector / all：持有 GeoIP 库并每小时检查文件修改时间、热加载（管线尚未接入，见 `rivu-geo`）；
+//! - collector / all：持有 GeoIP 库并每小时检查文件修改时间、热加载；管线第 6 步用它查询位置；
 //! - api：P1 没有 HTTP 接口，`/api/*` 返回 501，指标用命令行 `rivu stats` 查询。
 //!
 //! 关停顺序：停止接收（HTTP 服务优雅关停）→ 停止后台刷新任务 → 排空 BatchWriter 并 flush →
@@ -16,12 +17,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use metrics_exporter_prometheus::PrometheusBuilder;
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 use rivu_common::build_info;
 use rivu_common::config::{Config, Role};
 use rivu_geo::GeoDb;
 use rivu_ingest::pipeline::{Pipeline, SaltCache, SiteSnapshot, salt_window, utc_today};
 use rivu_jobs::GeoRefreshState;
+use rivu_ua::UaParser;
 use rivu_writer::{BatchWriter, ChSink, WriterOptions};
 use sqlx::PgPool;
 use tokio::net::TcpListener;
@@ -30,6 +32,7 @@ use tokio::task::JoinHandle;
 
 use crate::internal::{self, CollectorReadiness, GeoReadiness, InternalState, Probe};
 use crate::public;
+use crate::script::{ScriptService, TrackerAssets};
 
 /// collector 比较 GeoIP 库文件修改时间的周期（`platform-and-ops.md` §6：每小时）。
 const GEO_RELOAD_CHECK_INTERVAL: Duration = Duration::from_secs(3600);
@@ -104,6 +107,8 @@ struct Collector {
     pipeline: Arc<Pipeline>,
     readiness: CollectorReadiness,
     writer: BatchWriter,
+    tracker: Arc<TrackerAssets>,
+    scripts: Arc<ScriptService>,
 }
 
 /// 装配 collector：写入器、站点快照、盐缓存与管线，并启动它们的后台任务。
@@ -111,6 +116,7 @@ struct Collector {
 async fn start_collector(
     config: &Config,
     pg: &PgPool,
+    geo_db: Arc<GeoDb>,
     stop: &watch::Receiver<bool>,
     background: &mut Vec<JoinHandle<()>>,
 ) -> Result<Collector> {
@@ -135,18 +141,43 @@ async fn start_collector(
     background.push(sites.spawn_refresh(pg.clone(), config.site_cache_refresh, stop.clone()));
     background.push(salts.spawn_refresh(pg.clone(), SALT_CACHE_REFRESH, stop.clone()));
 
+    // uap-core 规则的编译约 130 ms（release），放到阻塞线程里，不占用异步工作线程。
+    let ua = Arc::new(
+        tokio::task::spawn_blocking(UaParser::embedded)
+            .await
+            .context("构建 UA 解析器的任务异常")?
+            .context("构建 UA 解析器失败")?,
+    );
     let pipeline = Arc::new(Pipeline::new(
         Arc::clone(&sites),
         Arc::clone(&salts),
         writer.handle(),
         config.trusted_proxies.clone(),
+        ua,
+        geo_db,
     ));
     background.push(pipeline.spawn_sweeper(SESSION_SWEEP_INTERVAL, stop.clone()));
+
+    // 站点脚本：core.js 启动时读入并缓存；缺失不阻止启动，路由返回 503，/readyz 报告。
+    if !config.public_base_url_explicit {
+        tracing::warn!(
+            base_url = %config.public_base_url,
+            "未设置 RIVU_PUBLIC_BASE_URL：站点脚本里的采集端点取 http://<RIVU_LISTEN_ADDR>，只适合开发；生产必须设置为对外的 https 地址"
+        );
+    }
+    let tracker = Arc::new(TrackerAssets::load(&config.tracker_dir));
+    let scripts = Arc::new(ScriptService::new(
+        Arc::clone(&sites),
+        Arc::clone(&tracker),
+        &config.public_base_url,
+    ));
 
     Ok(Collector {
         pipeline,
         readiness: CollectorReadiness { sites, salts },
         writer,
+        tracker,
+        scripts,
     })
 }
 
@@ -165,7 +196,17 @@ pub async fn run(config: Config) -> Result<ExitCode> {
         config.ch_database.clone(),
     )?;
 
+    // 阶段耗时在微秒量级（UA 缓存命中约 150 ns，未命中约 20 µs，地理查询几 µs）：
+    // 用固定桶而不是默认的 summary，这样多个副本的结果可以相加。
     let metrics = PrometheusBuilder::new()
+        .set_buckets_for_metric(
+            Matcher::Full(rivu_ingest::pipeline::STAGE_SECONDS_METRIC.to_owned()),
+            &[
+                1e-7, 5e-7, 1e-6, 2.5e-6, 5e-6, 1e-5, 2.5e-5, 5e-5, 1e-4, 2.5e-4, 5e-4, 1e-3, 5e-3,
+                1e-2, 0.1,
+            ],
+        )
+        .context("设置阶段耗时直方图的桶失败")?
         .install_recorder()
         .context("安装 Prometheus recorder 失败")?;
     internal::describe_metrics();
@@ -229,7 +270,8 @@ pub async fn run(config: Config) -> Result<ExitCode> {
     }
 
     let collector = if role.serves_collector() {
-        Some(start_collector(&config, &pg, &bg_stop_rx, &mut background).await?)
+        let geo = geo_db.clone().context("collector 角色没有 GeoIP 库对象")?;
+        Some(start_collector(&config, &pg, geo, &bg_stop_rx, &mut background).await?)
     } else {
         None
     };
@@ -238,6 +280,7 @@ pub async fn run(config: Config) -> Result<ExitCode> {
         role,
         probe,
         collector: collector.as_ref().map(|c| c.readiness.clone()),
+        tracker: collector.as_ref().map(|c| Arc::clone(&c.tracker)),
         geo: GeoReadiness {
             db: geo_db,
             refresh: geo_refresh,
@@ -270,13 +313,14 @@ pub async fn run(config: Config) -> Result<ExitCode> {
         stop_rx.clone(),
     );
     let pipeline = collector.as_ref().map(|c| Arc::clone(&c.pipeline));
+    let scripts = collector.as_ref().map(|c| Arc::clone(&c.scripts));
     let public_task = async {
         match public_listener {
             Some(l) => {
                 serve(
                     "公共端口",
                     l,
-                    public::router(role, pipeline),
+                    public::router_with_scripts(role, pipeline, scripts),
                     stop_rx.clone(),
                 )
                 .await

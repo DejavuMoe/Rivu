@@ -12,7 +12,7 @@ mod meta;
 mod refresh;
 
 pub use attribution::{Attribution, SOURCE_CUSTOM, SOURCE_DBIP, SOURCE_MAXMIND, StoredAttribution};
-pub use db::{GeoDb, GeoInfo, GeoLevel, GeoStatus, describe_metrics};
+pub use db::{GeoCapability, GeoDb, GeoInfo, GeoLevel, GeoStatus, capability_of, describe_metrics};
 pub use meta::{META_SUFFIX, Meta, meta_path, read as read_meta, write as write_meta};
 pub use refresh::{
     DBIP_BASE_URL, HttpClient, HttpOptions, LocalCopy, MAX_DOWNLOAD_BYTES, MAX_REDIRECTS,

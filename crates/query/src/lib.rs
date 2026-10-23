@@ -1,4 +1,5 @@
-//! 查询：核心指标（`overview`）与页面榜（`top_pages`），直接读 ClickHouse 的原始层（`events` + `sessions`）。
+//! 查询：核心指标（`overview`）与按维度分组（`breakdown`：页面、来源、渠道、国家、设备），
+//! 直接读 ClickHouse 的原始层（`events` + `sessions`）。
 //! 口径见 `docs/architecture/system-design.md` §5.3（派生指标）、§6.5（指标定义）、§6.7（时间与时区）。
 //!
 //! P1 只有这两个函数，没有 QuerySpec / 规划器 / 缓存（P2）。约定：
@@ -29,15 +30,6 @@ pub struct Overview {
     pub visit_duration: f64,
     /// 秒，只统计 `engagement_ms > 0` 的会话。
     pub engaged_duration: f64,
-}
-
-/// 页面榜的一行。
-#[derive(Clone, Debug, PartialEq)]
-pub struct PageStat {
-    pub pathname: String,
-    /// 浏览过该页的访客数。
-    pub visitors: u64,
-    pub pageviews: u64,
 }
 
 /// 站点本地日期范围换算出的参数。
@@ -192,55 +184,226 @@ pub async fn overview(
     })
 }
 
+/// 分组维度（P1：页面、来源、渠道、国家、设备类别）。维度名来自这个枚举，SQL 片段是写死的常量，
+/// 不拼接任何用户输入（§6.8）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Dimension {
+    /// `event:page`：`events.pathname`，只看 pageview。
+    Page,
+    /// `visit:source`：`referrer_source`。
+    Source,
+    /// `visit:channel`。
+    Channel,
+    /// `visit:country`：ISO 3166-1 alpha-2。
+    Country,
+    /// `visit:device`：desktop / mobile / tablet。
+    Device,
+}
+
+/// 空值（来源、渠道、国家、设备）的展示文案，沿用 Plausible 的习惯
+/// （`docs/research/plausible/03-stats-query-engine.md` §5.1）：来源 `Direct / None`、渠道 `Direct`、
+/// 设备 `(not set)`；国家 Plausible 没有兜底文案（直接丢掉未知行），Rivu 保留这一行并按设备同样写 `(not set)`。
+pub const NO_SOURCE: &str = "Direct / None";
+pub const NO_CHANNEL: &str = "Direct";
+pub const NOT_SET: &str = "(not set)";
+
+impl Dimension {
+    pub const ALL: [Dimension; 5] = [
+        Dimension::Page,
+        Dimension::Source,
+        Dimension::Channel,
+        Dimension::Country,
+        Dimension::Device,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Dimension::Page => "page",
+            Dimension::Source => "source",
+            Dimension::Channel => "channel",
+            Dimension::Country => "country",
+            Dimension::Device => "device",
+        }
+    }
+
+    /// 空值（库里存的是空串）的展示文案。
+    pub fn empty_label(self) -> &'static str {
+        match self {
+            Dimension::Page => "(none)",
+            Dimension::Source => NO_SOURCE,
+            Dimension::Channel => NO_CHANNEL,
+            Dimension::Country | Dimension::Device => NOT_SET,
+        }
+    }
+
+    /// 结果是否含位置数据：含则调用方必须带上 `GeoDb::attribution()`（§4.4「署名要求」，`meta.geo_attribution` 必填）。
+    pub fn needs_geo_attribution(self) -> bool {
+        self == Dimension::Country
+    }
+
+    /// `events` 与 `sessions` 上同名的列表达式（取字符串）。`country_code` 是 `FixedString(2)`，
+    /// `toString` 会去掉尾部的 NUL，所以未知（`\0\0`）得到空串。
+    fn column_expr(self) -> &'static str {
+        match self {
+            Dimension::Page => "pathname",
+            Dimension::Source => "toString(referrer_source)",
+            Dimension::Channel => "toString(channel)",
+            Dimension::Country => "toString(country_code)",
+            Dimension::Device => "toString(device)",
+        }
+    }
+}
+
+impl std::str::FromStr for Dimension {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Dimension::ALL
+            .into_iter()
+            .find(|d| d.as_str() == s)
+            .ok_or_else(|| {
+                format!("`{s}` 不是有效的维度，可选 page | source | channel | country | device")
+            })
+    }
+}
+
+/// 分组结果的一行。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BreakdownRow {
+    /// 维度值；空值已换成展示文案（[`Dimension::empty_label`]）。
+    pub value: String,
+    /// `uniqIf(visitor_id, name != 'engagement')`，只读 `events`（Q9、Q17）；`page` 维度只看 pageview。
+    pub visitors: u64,
+    /// 会话维度：区间内活跃、且（会话首事件的）该属性等于本行的会话数；
+    /// `page` 维度：区间内浏览过该页的会话数（一个会话没有单一的页面，所以只能从 events 数）。
+    pub visits: u64,
+    pub pageviews: u64,
+}
+
 #[derive(Row, Deserialize)]
-struct PageAgg {
-    pathname: String,
+struct BreakdownAgg {
+    v: String,
     visitors: u64,
+    visits: u64,
     pageviews: u64,
 }
 
-const TOP_PAGES_SQL: &str = "
-SELECT pathname,
-       uniq(visitor_id) AS visitors,
-       count() AS pageviews
-FROM events
-WHERE site_id = {site:UInt64}
-  AND name = 'pageview'
-  AND toDate(ts) >= {from_date:Date} AND toDate(ts) <= {to_date:Date}
-  AND ts >= fromUnixTimestamp64Milli({from_ms:Int64}, 'UTC')
-  AND ts <  fromUnixTimestamp64Milli({to_ms:Int64}, 'UTC')
-GROUP BY pathname
-ORDER BY visitors DESC, pageviews DESC, pathname ASC
+/// 排序与截断：访客数、会话数、浏览次数降序，同数按（原始）维度值升序。
+const BREAKDOWN_TAIL: &str = "
+ORDER BY visitors DESC, visits DESC, pageviews DESC, v ASC
 LIMIT {limit:UInt32}";
 
-/// 页面榜：浏览过该页的访客数与浏览次数，按访客数降序（同数按浏览次数、路径）。
-/// `timeout_secs` 同 [`overview`]。
-pub async fn top_pages(
+/// `events` 的时间裁剪：排序键含 `toDate(ts)`，先按 UTC 日期裁剪，再按毫秒精确过滤。
+const EVENTS_RANGE: &str = "site_id = {site:UInt64}
+      AND toDate(ts) >= {from_date:Date} AND toDate(ts) <= {to_date:Date}
+      AND ts >= fromUnixTimestamp64Milli({from_ms:Int64}, 'UTC')
+      AND ts <  fromUnixTimestamp64Milli({to_ms:Int64}, 'UTC')";
+
+/// 生成某个维度的分组 SQL。
+///
+/// **会话属性维度**（来源、渠道、国家、设备）两张表各出一部分，`UNION ALL` 后按维度值合并：
+/// - `events` 侧：`visitors`、`pageviews`，按事件上盖的属性分组（事件上的会话属性是会话首事件的值，在会话内恒定）；
+/// - `sessions` 侧：`visits`，两级聚合（内层按排序键 `(site_id, start_date, session_id)` 合并未合并的部分行，
+///   属性用 `any(...)`——会话内恒定，所以取任意一个就是首事件的值；保留「区间内活跃」的会话，口径同 [`overview`]），
+///   外层按属性计数。
+///
+/// 合并而不用 JOIN：某个值可能只出现在一侧（会话开始于区间之前、区间内只有 engagement；或相反），
+/// 另一侧按 0 计；三个数都是 0 的行（只有 engagement 事件的值）丢掉。排序和 `LIMIT` 在合并之后做，
+/// 所以截断不会让某个值只剩一半的数字。
+///
+/// **页面维度**只读 `events`（pageview）：一个会话没有单一的页面，`visits` 是浏览过该页的会话数。
+///
+/// 内层别名与列名刻意不同（`c_*`、`s_*`）：外层 `sum(c_x) AS x` 若与内层列同名，会被当成聚合函数嵌套。
+fn breakdown_sql(dim: Dimension) -> String {
+    let expr = dim.column_expr();
+    if dim == Dimension::Page {
+        return format!(
+            "SELECT {expr} AS v,
+       uniq(visitor_id) AS visitors,
+       uniq(session_id) AS visits,
+       count() AS pageviews
+FROM events
+WHERE {EVENTS_RANGE}
+  AND name = 'pageview'
+GROUP BY v{BREAKDOWN_TAIL}"
+        );
+    }
+    format!(
+        "SELECT v,
+       sum(c_visitors) AS visitors,
+       sum(c_visits) AS visits,
+       sum(c_pageviews) AS pageviews
+FROM (
+    SELECT {expr} AS v,
+           uniqIf(visitor_id, name != 'engagement') AS c_visitors,
+           toUInt64(0) AS c_visits,
+           countIf(name = 'pageview') AS c_pageviews
+    FROM events
+    WHERE {EVENTS_RANGE}
+    GROUP BY v
+    UNION ALL
+    SELECT s_v AS v,
+           toUInt64(0) AS c_visitors,
+           count() AS c_visits,
+           toUInt64(0) AS c_pageviews
+    FROM (
+        SELECT site_id, start_date, session_id,
+               any({expr}) AS s_v,
+               min(started_at) AS s_start,
+               max(last_event_at) AS s_last
+        FROM sessions
+        WHERE site_id = {{site:UInt64}}
+          AND start_date >= {{from_date:Date}} - 7 AND start_date <= {{to_date:Date}}
+        GROUP BY site_id, start_date, session_id
+        HAVING s_last >= fromUnixTimestamp64Milli({{from_ms:Int64}}, 'UTC')
+           AND s_start <  fromUnixTimestamp64Milli({{to_ms:Int64}}, 'UTC')
+    )
+    GROUP BY v
+)
+GROUP BY v
+HAVING visitors > 0 OR visits > 0 OR pageviews > 0{BREAKDOWN_TAIL}"
+    )
+}
+
+/// 站点本地日期范围 `[from, to]`（含）内按维度分组：每个维度值的访客数、会话数、浏览次数，
+/// 按访客数降序，最多 `limit` 行。`timeout_secs` 同 [`overview`]。
+///
+/// 空值（库里是空串）换成展示文案（[`Dimension::empty_label`]）。基数不受控的维度（页面）要靠 `limit` 截断。
+/// 维度含国家时（[`Dimension::needs_geo_attribution`]），调用方必须同时给出 `GeoDb::attribution()`。
+#[allow(clippy::too_many_arguments)] // 签名由任务书规定：与 `overview` 的参数顺序一致，再加维度与行数
+pub async fn breakdown(
     reader: &Client,
     site_id: u64,
     tz: &TimeZone,
     from: Date,
     to: Date,
+    dim: Dimension,
     limit: u32,
     timeout_secs: u64,
-) -> Result<Vec<PageStat>> {
+) -> Result<Vec<BreakdownRow>> {
     let b = bounds(tz, from, to)?;
+    let sql = breakdown_sql(dim);
     let rows = bind(
-        reader.query(TOP_PAGES_SQL),
+        reader.query(&sql),
         site_id,
         &b,
         timeout_secs,
-        "top_pages",
+        &format!("breakdown.{}", dim.as_str()),
     )
     .param("limit", limit)
-    .fetch_all::<PageAgg>()
+    .fetch_all::<BreakdownAgg>()
     .await
-    .context("查询 top_pages 失败")?;
+    .with_context(|| format!("查询 breakdown({}) 失败", dim.as_str()))?;
     Ok(rows
         .into_iter()
-        .map(|r| PageStat {
-            pathname: r.pathname,
+        .map(|r| BreakdownRow {
+            value: if r.v.is_empty() {
+                dim.empty_label().to_owned()
+            } else {
+                r.v
+            },
             visitors: r.visitors,
+            visits: r.visits,
             pageviews: r.pageviews,
         })
         .collect())
@@ -315,10 +478,75 @@ mod tests {
 
     #[test]
     fn sql_uses_server_side_parameters_only() {
-        for sql in [EVENTS_SQL, SESSIONS_SQL, TOP_PAGES_SQL] {
+        let breakdowns: Vec<String> = Dimension::ALL.into_iter().map(breakdown_sql).collect();
+        let fixed = [EVENTS_SQL, SESSIONS_SQL];
+        for sql in fixed
+            .iter()
+            .copied()
+            .chain(breakdowns.iter().map(String::as_str))
+        {
             assert!(sql.contains("{site:UInt64}"));
             // `?` 是客户端 .bind() 的占位符，这里不允许出现
             assert!(!sql.contains('?'), "{sql}");
         }
+        for (dim, sql) in Dimension::ALL.into_iter().zip(&breakdowns) {
+            // 所有取值（站点、日期、毫秒区间、行数）都走参数
+            for p in [
+                "{site:UInt64}",
+                "{from_date:Date}",
+                "{to_date:Date}",
+                "{from_ms:Int64}",
+                "{to_ms:Int64}",
+                "{limit:UInt32}",
+            ] {
+                assert!(sql.contains(p), "{dim:?} 缺少 {p}:\n{sql}");
+            }
+            // 没有残留的格式化占位符：片段都是写死的常量
+            assert!(!sql.contains("{{") && !sql.contains("}}"), "{sql}");
+        }
+    }
+
+    #[test]
+    fn session_dimensions_merge_events_and_sessions_and_page_reads_events_only() {
+        for dim in Dimension::ALL {
+            let sql = breakdown_sql(dim);
+            if dim == Dimension::Page {
+                assert!(!sql.contains("FROM sessions"), "{sql}");
+                assert!(sql.contains("name = 'pageview'"), "{sql}");
+                continue;
+            }
+            // 两张表各一部分，visitors 排除 engagement（Q9、Q17），visits 来自两级聚合，截断在合并之后
+            assert!(
+                sql.contains("FROM events") && sql.contains("FROM sessions"),
+                "{sql}"
+            );
+            assert!(
+                sql.contains("uniqIf(visitor_id, name != 'engagement')"),
+                "{sql}"
+            );
+            assert!(
+                sql.contains("GROUP BY site_id, start_date, session_id"),
+                "{sql}"
+            );
+            assert!(sql.contains("UNION ALL"), "{sql}");
+            assert!(
+                sql.find("LIMIT").unwrap() > sql.rfind("UNION ALL").unwrap(),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn dimensions_parse_and_label_empty_values() {
+        for d in Dimension::ALL {
+            assert_eq!(d.as_str().parse::<Dimension>(), Ok(d));
+        }
+        assert!("browser".parse::<Dimension>().is_err());
+        assert_eq!(Dimension::Source.empty_label(), "Direct / None");
+        assert_eq!(Dimension::Channel.empty_label(), "Direct");
+        assert_eq!(Dimension::Device.empty_label(), "(not set)");
+        assert_eq!(Dimension::Country.empty_label(), "(not set)");
+        assert!(Dimension::Country.needs_geo_attribution());
+        assert!(!Dimension::Device.needs_geo_attribution());
     }
 }

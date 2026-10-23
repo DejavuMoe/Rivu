@@ -10,12 +10,14 @@ Rivu 是开源、自托管的网站分析系统（Plausible 的替代品）：�
 
 | 已有 | 还没有（后续阶段） |
 |---|---|
-| Cargo workspace 和单个二进制 `rivu`（`collector \| worker \| api \| migrate \| all`，另有 `site add`、`stats`） | tracker 脚本（P1 后续）、管理后台（等待 `designs/` 原型审批） |
+| Cargo workspace 和单个二进制 `rivu`（`collector \| worker \| api \| migrate \| all`，另有 `site add`、`stats`） | tracker `full` 变体（`core` 已实现）、管理后台（等待 `designs/` 原型审批） |
 | 配置加载与集中校验（`RIVU_*`，支持 `*_FILE`），含写缓冲与站点缓存参数 | `/api/*` 查询接口、查询引擎的 QuerySpec 与规划器、日汇总层（P2） |
-| `rivu migrate`：PG 与 ClickHouse 迁移按版本号交织执行 | 机器人、UA、地理、来源与渠道富化（字段先留空值） |
+| `rivu migrate`：PG 与 ClickHouse 迁移按版本号交织执行 | 数据中心 IP 表、IP / 页面屏蔽规则、垃圾引荐（管线第 4 步） |
 | 内部端口 `/healthz` `/readyz` `/metrics`；`/readyz` 含站点快照与盐是否已加载 | JetStream、worker 的会话分配与批量写入、Reliable 模式（P3） |
 | `POST /api/event`：协议解析、站点快照与 hostname 白名单、每日盐的访客 ID、SessionAssigner、BatchWriter（带去重 token 的重试）、`ingest_counters` | 会话状态的快照与预热、限流、屏蔽规则 |
-| 核心指标查询（visitors / visits / pageviews / bounce_rate / visit_duration / engaged_duration）与页面榜；参考实现与差分测试 | 站点增量刷新与 `LISTEN/NOTIFY` |
+| 接入富化：机器人（含空 UA）、GeoIP（按站点 `geo_level` 截断）、UA、来源与渠道（`rivu-ua` / `rivu-geo` / `rivu-source`），各阶段耗时直方图 `rivu_ingest_stage_seconds{stage}` | 站点增量刷新与 `LISTEN/NOTIFY` |
+| 核心指标查询（visitors / visits / pageviews / bounce_rate / visit_duration / engaged_duration）与按页面、来源、渠道、国家、设备分组（`breakdown`）；参考实现与差分测试 | |
+| `GET /js/<site_key>.js`：配置前缀 + tracker `core.js`（`RIVU_TRACKER_DIR`，默认 `apps/tracker/dist`；缺失时 503，`/readyz` 报告但不判失败；生产镜像应放入 CI 构建的 `dist/`），`RIVU_PUBLIC_BASE_URL` 决定脚本里的采集端点 | |
 | 后台任务 `salts_rotate`（`all`、`worker`） | |
 | 初始 schema：PG 业务表，ClickHouse `events` / `sessions` / `mv_sessions` / `ingest_counters` | |
 | `deploy/compose.dev.yml`、CI 工作流 | |
@@ -113,9 +115,9 @@ curl.exe -i -X POST http://127.0.0.1:8080/api/event -d '{}'    # 400（缺必填
 发一个 pageview 并查询（先 `cargo run -p rivu -- site add --name demo --hostname example.test`，记下打印的 `site_key`）：
 
 ```powershell
-curl.exe -i -X POST http://127.0.0.1:8080/api/event -H "Content-Type: text/plain" -A "demo-ua" `
+curl.exe -i -X POST http://127.0.0.1:8080/api/event -H "Content-Type: text/plain" -A "Mozilla/5.0 (X11; Linux x86_64; rv:126.0) Gecko/20100101 Firefox/126.0" `
   -d '{"v":1,"s":"<site_key>","n":"pageview","u":"https://example.test/"}'     # 202
-# 等 2 秒，写缓冲每秒 flush 一次
+# 等 2 秒，写缓冲每秒 flush 一次。没有 User-Agent 头（空 UA）和机器人 UA 的事件会被丢弃（dropped_bot）
 cargo run -p rivu -- stats --site <site_key> --from 2026-10-22 --to 2026-10-22  # 日期是站点本地日期
 ```
 
@@ -141,7 +143,15 @@ cargo test                      # 集成测试在缺少 RIVU_TEST_* 变量时跳
 加载 `.env.example` 后（里面带了 `RIVU_TEST_*`），`cargo test` 会连真实的 PostgreSQL 和 ClickHouse 跑两个集成测试：
 
 - `bin/rivu/tests/clickhouse_sessions.rs`：迁移后写入一个会话的 3 个事件，校验 `mv_sessions` 的聚合，并用同一个 `insert_deduplication_token` 重放，确认 `events` 和 `sessions` 都不重复计数。
-- `bin/rivu/tests/e2e_lite.rs`：事件经管线、会话分配、批量写入进入 ClickHouse（事件放在 2026-03-28..30，覆盖夏令时切换日与跨午夜会话），用 `rivu_query::overview` 查询多个日期范围，与 `rivu-reference` 在同一批事件上算出的真值逐项比较，并对账 `ingest_counters`、验证去重重放；另有一个经真实 HTTP 的用例。
+- `bin/rivu/tests/e2e_lite.rs`：事件经管线、会话分配、批量写入进入 ClickHouse（事件放在 2026-03-28..30，覆盖夏令时切换日与跨午夜会话），用 `rivu_query::overview` 查询多个日期范围，与 `rivu-reference` 在同一批事件上算出的真值逐项比较，并对账 `ingest_counters`、验证去重重放；另有一个经真实 HTTP 的用例（含 `/js/<site_key>.js`），以及一个富化用例：真实浏览器 UA（取自 uap-core 测试集）、机器人 UA、MaxMind 官方测试库里的 IP（经受信代理的 XFF）、不同 referrer / utm / click id，每个维度（页面、来源、渠道、国家、设备）的 `breakdown` 与参考实现逐行相等。
+
+### 真实浏览器端到端（Linux）
+
+`apps/tracker/scripts/e2e-rivu.sh` 在构建镜像里构建 tracker 与 rivu、迁移、为三个内核各建一个站点、后台启动 `rivu all`，再用 Playwright（chromium / firefox / webkit）做一组已知动作（首屏、SPA 跳转、整页跳转、返回），用 `rivu stats` 断言 pageviews / visits / visitors 与页面榜完全一致：
+
+```powershell
+& D:\WSL\Scripts\linux-task.ps1 -Mode build -Project 'D:\Forgejo\Rivu' -Command 'set -a; . ./.env.example; set +a; bash apps/tracker/scripts/e2e-rivu.sh'
+```
 
 运行中的 `rivu all` 每小时会清理 `today-2` 之前的盐，可能删掉测试写入的 2026 年 3 月的盐；测试每次运行开头都会重新补齐，一般不受影响。
 
