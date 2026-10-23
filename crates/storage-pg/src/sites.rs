@@ -25,6 +25,11 @@ pub struct SiteRow {
     pub collect_enabled: bool,
     /// hostname 白名单的原始模式（`site_hostnames.pattern`，未删除的）。
     pub hostnames: Vec<String>,
+    /// `site_settings.geo_level`：`country` | `region` | `city`（PG 的 CHECK 保证取值；没有 settings 行时按 `city`，与列默认值一致）。
+    /// 这里保持字符串，解析在 `rivu-ingest`（storage 层不依赖 `rivu-geo`）。
+    pub geo_level: String,
+    /// `site_settings.tracker->'hash'` 是否为 JSON `true`（hash 路由模式，站点脚本配置前缀用）。
+    pub tracker_hash: bool,
 }
 
 fn site_from_row(r: &PgRow) -> Result<SiteRow> {
@@ -35,20 +40,24 @@ fn site_from_row(r: &PgRow) -> Result<SiteRow> {
         timezone: r.try_get("timezone")?,
         collect_enabled: r.try_get("collect_enabled")?,
         hostnames: r.try_get("hostnames")?,
+        geo_level: r.try_get("geo_level")?,
+        tracker_hash: r.try_get("tracker_hash")?,
     })
 }
 
-/// 加载全部未删除的站点：`sites` + `site_hostnames` + `site_settings.collect_enabled`。
+/// 加载全部未删除的站点：`sites` + `site_hostnames` + `site_settings`（`collect_enabled`、`geo_level`、`tracker.hash`）。
 pub async fn load_sites(pool: &PgPool) -> Result<Vec<SiteRow>> {
     let rows = sqlx::query(
         "SELECT s.id, s.site_key, s.timezone,
                 COALESCE(ss.collect_enabled, true) AS collect_enabled,
+                COALESCE(ss.geo_level, 'city') AS geo_level,
+                COALESCE(ss.tracker -> 'hash' = 'true'::jsonb, false) AS tracker_hash,
                 COALESCE(array_agg(h.pattern ORDER BY h.pattern) FILTER (WHERE h.id IS NOT NULL), '{}') AS hostnames
          FROM sites s
          LEFT JOIN site_settings ss ON ss.site_id = s.id
          LEFT JOIN site_hostnames h ON h.site_id = s.id AND h.deleted_at IS NULL
          WHERE s.deleted_at IS NULL
-         GROUP BY s.id, ss.collect_enabled
+         GROUP BY s.id, ss.collect_enabled, ss.geo_level, ss.tracker
          ORDER BY s.id",
     )
     .fetch_all(pool)
@@ -62,12 +71,14 @@ pub async fn find_site_by_key(pool: &PgPool, site_key: &str) -> Result<Option<Si
     let row = sqlx::query(
         "SELECT s.id, s.site_key, s.timezone,
                 COALESCE(ss.collect_enabled, true) AS collect_enabled,
+                COALESCE(ss.geo_level, 'city') AS geo_level,
+                COALESCE(ss.tracker -> 'hash' = 'true'::jsonb, false) AS tracker_hash,
                 COALESCE(array_agg(h.pattern ORDER BY h.pattern) FILTER (WHERE h.id IS NOT NULL), '{}') AS hostnames
          FROM sites s
          LEFT JOIN site_settings ss ON ss.site_id = s.id
          LEFT JOIN site_hostnames h ON h.site_id = s.id AND h.deleted_at IS NULL
          WHERE s.deleted_at IS NULL AND s.site_key = $1
-         GROUP BY s.id, ss.collect_enabled",
+         GROUP BY s.id, ss.collect_enabled, ss.geo_level, ss.tracker",
     )
     .bind(site_key)
     .fetch_optional(pool)

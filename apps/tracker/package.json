@@ -16,6 +16,7 @@
     "test:unit": "node --test \"test/unit/*.test.ts\"",
     "test:e2e": "node scripts/build.mjs && playwright test",
     "test": "pnpm run test:unit && pnpm run test:e2e",
+    "test:e2e-rivu": "playwright test -c playwright.rivu.config.ts",
     "browsers": "playwright install chromium firefox webkit"
   },
   "devDependencies": {

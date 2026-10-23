@@ -1,13 +1,31 @@
 //! 接入管线（Lite）：`POST /api/event` 的请求体到「已盖章的事件行」，只含内存里的查找和哈希，没有 IO。
 //!
-//! 顺序（`system-design.md` §4.2，先做便宜的判断）：
-//! 解析（400）→ 客户端 IP → 站点查找（`unknown_site`）→ `collect_enabled`（`site_disabled`）→
-//! hostname 白名单，空白名单 fail-closed（`hostname_not_allowed`）→ 身份（盐缺失 `salt_missing`；
-//! 前一天的盐缺失只是不算 `prev_visitor_id`）→ 会话属性 → SessionAssigner（`no_session`）→
-//! 组装 `EventRow` → 交给 BatchWriter（缓冲满则 `Overloaded`，同时计 `dropped_overloaded`）。
+//! 顺序（`system-design.md` §4.2，先做便宜的判断，昂贵的 UA 解析和地理查询放在规则之后）：
+//!
+//! | # | 阶段 | 丢弃原因 |
+//! |---|---|---|
+//! | 1 | 解析（400，不进 `ingest_counters`） | — |
+//! | 2 | 客户端 IP | — |
+//! | 3 | 站点查找、`collect_enabled`、hostname 白名单（空白名单 fail-closed） | `unknown_site` `site_disabled` `hostname_not_allowed` |
+//! | 4 | 规则（IP / 页面屏蔽、限流、垃圾引荐：尚未实现） | — |
+//! | 5 | 机器人：`UaParser::parse`，`bot` 非空即丢弃（空 UA 也是机器人） | `bot` |
+//! | 6 | 地理：`GeoDb::lookup(ip, site.geo_level)`，按站点精度截断 | — |
+//! | 7 | UA 富化：浏览器、系统、设备类别 | — |
+//! | 8 | 来源：内部引荐传 `None`，`rivu_source::classify` 给出 `referrer_source` 与 `channel` | — |
+//! | 10 | 身份（盐缺失 `salt_missing`；前一天的盐缺失只是不算 `prev_visitor_id`） | `salt_missing` |
+//! | 11 | SessionAssigner → 组装 `EventRow` → BatchWriter（缓冲满 `dropped_overloaded`） | `no_session` `overloaded` |
+//!
+//! **engagement 跳过第 5–8 步**，直接进身份和 SessionAssigner（没有会话就是 `no_session`）：
+//! - engagement 不能开会话（§4.6），而富化的结果只在「开新会话」时才被 SessionAssigner 取用
+//!   （会话属性由会话的第一个事件决定，此后盖到会话内的每个事件上，包括 engagement），
+//!   所以对 engagement 做 UA / 地理 / 来源富化是白费的；
+//! - 机器人的 pageview 在第 5 步已被丢弃，不会产生会话，它之后发来的 engagement 自然没有会话，
+//!   在 SessionAssigner 处按 `no_session` 丢弃，不需要再做一遍机器人判定
+//!   （代价：这类 engagement 记为 `dropped_no_session` 而不是 `dropped_bot`）。
 //!
 //! 每个结果都计入 `ingest_counters`：`accepted` 或 `dropped_<原因>`；未知站点记在 `site_id = 0`。
 //! 400 不进 `ingest_counters`，只进 Prometheus `rivu_ingest_rejected_total{field}`（§10 Q13）。
+//! 每个阶段的耗时记入直方图 `rivu_ingest_stage_seconds{stage}`（§4.2）。
 //!
 //! 时间由调用方传入（`RequestCtx::now_ms`），所以测试可以把事件放到任意时刻。
 
@@ -16,13 +34,19 @@ mod snapshot;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use rivu_common::config::Cidr;
-use rivu_domain::{DropReason, METRIC_ACCEPTED, NormalizedEvent, SessionAttrs, UNKNOWN_SITE_ID};
+use rivu_domain::{
+    DropReason, EventKind, METRIC_ACCEPTED, NormalizedEvent, SessionAttrs, UNKNOWN_SITE_ID,
+};
+use rivu_geo::GeoDb;
 use rivu_session::assigner::{Assignment, Incoming, SessionAssigner, SessionConfig, Stamp};
 use rivu_session::identity::{Salt, local_date, routing_hash, visitor_hash};
+use rivu_source::{SourceInput, classify};
 use rivu_storage_ch::rows::EventRow;
+use rivu_ua::UaParser;
 use rivu_writer::{TrySendError, WriterHandle};
 use time::OffsetDateTime;
 use tokio::sync::watch;
@@ -59,6 +83,70 @@ pub enum Outcome {
     Overloaded,
 }
 
+/// 各富化步骤实际执行的次数（只增不减）。测试用它证明「engagement 不触发富化」，
+/// 也方便排错；Prometheus 里对应阶段直方图的样本数。
+#[derive(Debug, Default)]
+pub struct EnrichWork {
+    ua_parses: AtomicU64,
+    geo_lookups: AtomicU64,
+    source_classifications: AtomicU64,
+}
+
+impl EnrichWork {
+    /// `UaParser::parse` 的调用次数（第 5 步）。
+    pub fn ua_parses(&self) -> u64 {
+        self.ua_parses.load(Ordering::Relaxed)
+    }
+
+    /// `GeoDb::lookup` 的调用次数（第 6 步）。
+    pub fn geo_lookups(&self) -> u64 {
+        self.geo_lookups.load(Ordering::Relaxed)
+    }
+
+    /// `rivu_source::classify` 的调用次数（第 8 步）。
+    pub fn source_classifications(&self) -> u64 {
+        self.source_classifications.load(Ordering::Relaxed)
+    }
+}
+
+/// `rivu_ingest_stage_seconds{stage}` 的直方图句柄：构造时取一次，热路径不再做标签查找。
+/// 句柄绑定到构造时已安装的 recorder；没有 recorder（单元测试）时是空操作。
+struct StageHistograms {
+    parse: metrics::Histogram,
+    admit: metrics::Histogram,
+    bot: metrics::Histogram,
+    geo: metrics::Histogram,
+    ua: metrics::Histogram,
+    source: metrics::Histogram,
+    identity: metrics::Histogram,
+    session: metrics::Histogram,
+    write: metrics::Histogram,
+}
+
+/// 阶段耗时直方图的指标名。
+pub const STAGE_SECONDS_METRIC: &str = "rivu_ingest_stage_seconds";
+
+impl StageHistograms {
+    fn new() -> Self {
+        let h = |stage: &'static str| metrics::histogram!(STAGE_SECONDS_METRIC, "stage" => stage);
+        StageHistograms {
+            parse: h("parse"),
+            admit: h("admit"),
+            bot: h("bot"),
+            geo: h("geo"),
+            ua: h("ua"),
+            source: h("source"),
+            identity: h("identity"),
+            session: h("session"),
+            write: h("write"),
+        }
+    }
+}
+
+fn observe(h: &metrics::Histogram, start: Instant) {
+    h.record(start.elapsed().as_secs_f64());
+}
+
 /// 接入管线。线程安全，`process` 可被多个请求并发调用。
 pub struct Pipeline {
     sites: Arc<SiteSnapshot>,
@@ -69,14 +157,22 @@ pub struct Pipeline {
     /// 分片号用的长期密钥。Lite 不持久化它：重启后随机重新生成，内存里的会话也随之清空
     /// （从 ClickHouse 预热留到以后，§4.6「预热」、§10 Q15）。
     routing_secret: Salt,
+    ua: Arc<UaParser>,
+    geo: Arc<GeoDb>,
+    work: EnrichWork,
+    stages: StageHistograms,
 }
 
 impl Pipeline {
+    /// `ua` 与 `geo` 是进程共享的富化器：`UaParser::embedded()` 构建一次约 130 ms，`GeoDb` 由后台任务热加载。
+    /// `geo` 里还没有加载库时，位置字段为空（不阻塞接收，§4.4）。
     pub fn new(
         sites: Arc<SiteSnapshot>,
         salts: Arc<SaltCache>,
         writer: WriterHandle,
         trusted_proxies: Vec<Cidr>,
+        ua: Arc<UaParser>,
+        geo: Arc<GeoDb>,
     ) -> Self {
         Pipeline {
             sites,
@@ -85,7 +181,16 @@ impl Pipeline {
             writer,
             trusted_proxies,
             routing_secret: rand::random::<Salt>(),
+            ua,
+            geo,
+            work: EnrichWork::default(),
+            stages: StageHistograms::new(),
         }
+    }
+
+    /// 各富化步骤已执行的次数。
+    pub fn enrich_work(&self) -> &EnrichWork {
+        &self.work
     }
 
     /// 换成指定的 routing 密钥和会话参数（测试用，让分片和 `session_id` 可复现）。
@@ -110,7 +215,10 @@ impl Pipeline {
     /// 处理一个请求体。不 panic，不做 IO。
     pub fn process(&self, body: &[u8], ctx: RequestCtx) -> Outcome {
         // 1. 解析：400 不进 ingest_counters，也不暴露站点
-        let ev = match parse_event(body) {
+        let t = Instant::now();
+        let parsed = parse_event(body);
+        observe(&self.stages.parse, t);
+        let ev = match parsed {
             Ok(ev) => ev,
             Err(errors) => {
                 for field in errors.fields() {
@@ -121,29 +229,46 @@ impl Pipeline {
             }
         };
 
-        // 2. 客户端 IP
+        // 2.–3. 客户端 IP、准入（站点查找、停用、hostname 白名单）
+        let t = Instant::now();
         let xff: Vec<&str> = ctx.xff.iter().map(String::as_str).collect();
         let ip = client_ip(ctx.peer, &xff, &self.trusted_proxies);
 
-        // 3. 站点查找：未知站点没有 site_id，记在 0 上
+        // 未知站点没有 site_id，记在 0 上
         let Some(site) = self.sites.get(&ev.site_key) else {
+            observe(&self.stages.admit, t);
             return self.dropped(UNKNOWN_SITE_ID, &ev, DropReason::UnknownSite);
         };
         let site_id = site.site_id;
-
-        // 4. 站点停用
         if !site.collect_enabled {
+            observe(&self.stages.admit, t);
             return self.dropped(site_id, &ev, DropReason::SiteDisabled);
         }
-
-        // 5. hostname 白名单；空白名单 fail-closed（§10 Q12）
+        // 空白名单 fail-closed（§10 Q12）
         if site.hostnames.is_empty() || !site.hostnames.matches(&ev.hostname) {
+            observe(&self.stages.admit, t);
             return self.dropped(site_id, &ev, DropReason::HostnameNotAllowed);
         }
+        observe(&self.stages.admit, t);
 
-        // 6. 身份：按事件的站点本地日期选盐（§4.5）
+        // 4. 规则（IP / 页面屏蔽、垃圾引荐）：尚未实现。
+
+        // 5.–8. 机器人、地理、UA、来源。engagement 整段跳过（见模块文档）：它不能开会话，
+        // 属性也不会被取用，没有会话时直接按 `no_session` 丢弃。
+        let attrs = if ev.kind == EventKind::Engagement {
+            SessionAttrs::default()
+        } else {
+            match self.enrich(&ev, &site, ip, &ctx.user_agent) {
+                Ok(attrs) => attrs,
+                Err(reason) => return self.dropped(site_id, &ev, reason),
+            }
+        };
+
+        // 10. 身份：按事件的站点本地日期选盐（§4.5）
+        let t = Instant::now();
         let date = local_date(ctx.now_ms, &site.timezone);
         let Some(salt) = self.salts.get(date) else {
+            observe(&self.stages.identity, t);
             return self.dropped(site_id, &ev, DropReason::SaltMissing);
         };
         let visitor_id = visitor_hash(&salt, site_id, ip, &ctx.user_agent);
@@ -154,12 +279,11 @@ impl Pipeline {
             .and_then(|d| self.salts.get(d))
             .map(|prev_salt| visitor_hash(&prev_salt, site_id, ip, &ctx.user_agent));
         let routing = routing_hash(&self.routing_secret, site_id, ip, &ctx.user_agent);
+        observe(&self.stages.identity, t);
 
-        // 7. 会话属性（富化尚未实现的字段留空）
-        let attrs = session_attrs(&ev, &site);
-
-        // 8. 会话分配与盖章
-        let stamp = match self.assigner.assign(&Incoming {
+        // 11. 会话分配与盖章
+        let t = Instant::now();
+        let assigned = self.assigner.assign(&Incoming {
             site_id,
             visitor_id,
             prev_visitor_id,
@@ -168,14 +292,19 @@ impl Pipeline {
             kind: ev.kind,
             pathname: &ev.pathname,
             attrs: &attrs,
-        }) {
+        });
+        observe(&self.stages.session, t);
+        let stamp = match assigned {
             Assignment::Stamped(stamp) => stamp,
             Assignment::NoSession => return self.dropped(site_id, &ev, DropReason::NoSession),
         };
 
-        // 9. 组装行并交给 BatchWriter
+        // 组装行并交给 BatchWriter
+        let t = Instant::now();
         let row = build_row(site_id, ev.clone(), &stamp, ctx.now_ms);
-        match self.writer.try_send(row) {
+        let sent = self.writer.try_send(row);
+        observe(&self.stages.write, t);
+        match sent {
             Ok(()) => {
                 self.writer
                     .count(site_id, METRIC_ACCEPTED, ev.script_version);
@@ -187,6 +316,83 @@ impl Pipeline {
                 Outcome::Overloaded
             }
         }
+    }
+
+    /// 第 5–8 步：机器人 → 地理 → UA 富化 → 来源，得到会话属性；机器人返回 `Err(DropReason::Bot)`。
+    ///
+    /// 一次 `UaParser::parse` 同时给出机器人判定和 UA 富化的结果（带缓存），它的耗时记在 `bot` 阶段
+    /// （第一次需要 UA 的地方）；`ua` 阶段只是把结果写进会话属性。
+    fn enrich(
+        &self,
+        ev: &NormalizedEvent,
+        site: &SiteConfig,
+        ip: IpAddr,
+        user_agent: &str,
+    ) -> Result<SessionAttrs, DropReason> {
+        // 5. 机器人：空 UA 也算（`BotKind::Empty`，偏离 Plausible，见 docs/research/enrich-ua.md §4.2）。
+        // `BotKind` 只用于排错，不进 ingest_counters。
+        let t = Instant::now();
+        self.work.ua_parses.fetch_add(1, Ordering::Relaxed);
+        let ua = self.ua.parse(user_agent);
+        observe(&self.stages.bot, t);
+        if let Some(kind) = ua.bot {
+            tracing::trace!(bot = ?kind, "丢弃机器人事件");
+            return Err(DropReason::Bot);
+        }
+
+        // 6. 地理：按站点的 geo_level 截断；私有地址、库未加载、查不到都是空值
+        let t = Instant::now();
+        self.work.geo_lookups.fetch_add(1, Ordering::Relaxed);
+        let geo = self.geo.lookup(ip, site.geo_level);
+        observe(&self.stages.geo, t);
+
+        // 7. UA 富化
+        let t = Instant::now();
+        let (device, browser, browser_version, os, os_version) = (
+            ua.device.as_str().to_owned(),
+            ua.browser.clone(),
+            ua.browser_version.clone(),
+            ua.os.clone(),
+            ua.os_version.clone(),
+        );
+        observe(&self.stages.ua, t);
+
+        // 8. 来源：referrer 的 host 命中站点白名单是内部引荐，传 None（库不区分它和「没有 referrer」）；
+        // 落库的 referrer 也只在外部引荐时保留。
+        let t = Instant::now();
+        self.work
+            .source_classifications
+            .fetch_add(1, Ordering::Relaxed);
+        let external = ev
+            .referrer
+            .as_ref()
+            .filter(|r| !site.hostnames.matches(&r.host));
+        let source = classify(&SourceInput {
+            referrer_host: external.map(|r| r.host.as_str()),
+            utm: &ev.utm,
+            click_id_param: ev.click_id_param,
+        });
+        observe(&self.stages.source, t);
+
+        Ok(SessionAttrs {
+            referrer: external.map(|r| r.stored.clone()).unwrap_or_default(),
+            referrer_source: source.referrer_source,
+            channel: source.channel.as_str().to_owned(),
+            utm_source: ev.utm.source.clone().unwrap_or_default(),
+            utm_medium: ev.utm.medium.clone().unwrap_or_default(),
+            utm_campaign: ev.utm.campaign.clone().unwrap_or_default(),
+            utm_content: ev.utm.content.clone().unwrap_or_default(),
+            utm_term: ev.utm.term.clone().unwrap_or_default(),
+            click_id_param: ev.click_id_param.unwrap_or_default().to_owned(),
+            country_code: geo.country_code,
+            region_code: geo.region_code,
+            city_geoname_id: geo.city_geoname_id,
+            device,
+            browser,
+            browser_version,
+            os,
+            os_version,
+        })
     }
 
     /// 记一次丢弃：`ingest_counters` + Prometheus。
@@ -233,37 +439,11 @@ pub fn describe_metrics() {
         "管线处理结果：accepted 或丢弃原因（unknown_site 等）"
     );
     metrics::describe_gauge!("rivu_session_active", "SessionAssigner 里保留的会话数");
-}
-
-/// 会话属性：会话的第一个事件决定。
-///
-/// - referrer：host 命中站点白名单视为内部（不记来源）；否则 `referrer = stored`、
-///   `referrer_source = referrer.host`（暂行，等来源库再分类）；
-/// - channel 为空串；utm、click id 照抄；地理、UA 为空值（`country_code = [0, 0]`）。
-fn session_attrs(ev: &NormalizedEvent, site: &SiteConfig) -> SessionAttrs {
-    let (referrer, referrer_source) = match &ev.referrer {
-        Some(r) if !site.hostnames.matches(&r.host) => (r.stored.clone(), r.host.clone()),
-        _ => (String::new(), String::new()),
-    };
-    SessionAttrs {
-        referrer,
-        referrer_source,
-        channel: String::new(),
-        utm_source: ev.utm.source.clone().unwrap_or_default(),
-        utm_medium: ev.utm.medium.clone().unwrap_or_default(),
-        utm_campaign: ev.utm.campaign.clone().unwrap_or_default(),
-        utm_content: ev.utm.content.clone().unwrap_or_default(),
-        utm_term: ev.utm.term.clone().unwrap_or_default(),
-        click_id_param: ev.click_id_param.unwrap_or_default().to_owned(),
-        country_code: [0, 0],
-        region_code: String::new(),
-        city_geoname_id: 0,
-        device: String::new(),
-        browser: String::new(),
-        browser_version: String::new(),
-        os: String::new(),
-        os_version: String::new(),
-    }
+    metrics::describe_histogram!(
+        STAGE_SECONDS_METRIC,
+        metrics::Unit::Seconds,
+        "接入管线各阶段的耗时，按阶段（parse、admit、bot、geo、ua、source、identity、session、write）"
+    );
 }
 
 /// 毫秒时间戳转 `OffsetDateTime`；超出范围时取 Unix 纪元（不 panic）。
@@ -334,8 +514,11 @@ fn build_row(site_id: u64, ev: NormalizedEvent, stamp: &Stamp, ts_ms: i64) -> Ev
 mod tests {
     use std::collections::BTreeMap;
 
+    use std::sync::OnceLock;
+
     use jiff::civil::{Date, date};
     use jiff::tz::TimeZone;
+    use rivu_geo::GeoLevel;
     use serde_json::json;
     use tokio::sync::mpsc;
 
@@ -344,10 +527,36 @@ mod tests {
     const KEY: &str = "aaaaaaaaaaaa";
     const OFF_KEY: &str = "dddddddddddd";
     const EMPTY_KEY: &str = "eeeeeeeeeeee";
+    const COUNTRY_KEY: &str = "gggggggggggg";
+    const REGION_KEY: &str = "hhhhhhhhhhhh";
     const SITE: u64 = 42;
     const OFF_SITE: u64 = 43;
     const EMPTY_SITE: u64 = 44;
+    const COUNTRY_SITE: u64 = 45;
+    const REGION_SITE: u64 = 46;
     const MIN: i64 = 60_000;
+
+    /// 真实浏览器 UA（取自 uap-core 测试集的同类字符串）。
+    const CHROME_WIN: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+    const GOOGLEBOT: &str =
+        "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
+    /// MaxMind 官方测试库（`GeoIP2-City-Test`）里有记录的地址：`89.160.20.128` -> SE / SE-E / 2694762。
+    const SE_IP: &str = "89.160.20.128";
+
+    /// 解析器构建一次要编译全部 uap-core 规则，测试间共享。
+    fn ua_parser() -> Arc<UaParser> {
+        static PARSER: OnceLock<Arc<UaParser>> = OnceLock::new();
+        Arc::clone(PARSER.get_or_init(|| Arc::new(UaParser::embedded().expect("uap-core 规则"))))
+    }
+
+    /// 装载了 MaxMind 官方测试库的 `GeoDb`。
+    fn test_geo() -> Arc<GeoDb> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../geo/tests/data/test-data/GeoIP2-City-Test.mmdb");
+        let db = GeoDb::new();
+        assert!(db.reload_if_changed(&path).expect("加载测试库"));
+        Arc::new(db)
+    }
 
     fn berlin() -> TimeZone {
         TimeZone::get("Europe/Berlin").unwrap()
@@ -381,29 +590,54 @@ mod tests {
     }
 
     fn rig(capacity: usize) -> Rig {
-        let site = |id: u64, collect: bool, hosts: &[&str]| {
+        rig_with_geo(capacity, Arc::new(GeoDb::new()))
+    }
+
+    fn rig_with_geo(capacity: usize, geo: Arc<GeoDb>) -> Rig {
+        let site = |id: u64, collect: bool, hosts: &[&str], geo_level: GeoLevel| {
             Arc::new(SiteConfig {
                 site_id: id,
                 timezone: berlin(),
                 collect_enabled: collect,
                 hostnames: crate::hostname::HostnamePatterns::new(hosts.iter().copied()),
+                geo_level,
+                tracker_hash: false,
             })
         };
+        let city = GeoLevel::City;
         let sites = Arc::new(SiteSnapshot::new());
         sites.replace(HashMap::from([
-            (KEY.to_owned(), site(SITE, true, &["example.test"])),
-            (OFF_KEY.to_owned(), site(OFF_SITE, false, &["example.test"])),
-            (EMPTY_KEY.to_owned(), site(EMPTY_SITE, true, &[])),
+            (KEY.to_owned(), site(SITE, true, &["example.test"], city)),
+            (
+                OFF_KEY.to_owned(),
+                site(OFF_SITE, false, &["example.test"], city),
+            ),
+            (EMPTY_KEY.to_owned(), site(EMPTY_SITE, true, &[], city)),
+            (
+                COUNTRY_KEY.to_owned(),
+                site(COUNTRY_SITE, true, &["example.test"], GeoLevel::Country),
+            ),
+            (
+                REGION_KEY.to_owned(),
+                site(REGION_SITE, true, &["example.test"], GeoLevel::Region),
+            ),
         ]));
         let salt_cache = Arc::new(SaltCache::new());
         salt_cache.replace(salts(&march(27..=31)));
         let (writer, rx) = WriterHandle::detached(capacity);
         let trusted = vec!["127.0.0.1/32".parse().unwrap()];
-        let pipeline = Pipeline::new(sites, Arc::clone(&salt_cache), writer.clone(), trusted)
-            .with_assigner(
-                SessionAssigner::with_seed(SessionConfig::default(), 1),
-                [9; 16],
-            );
+        let pipeline = Pipeline::new(
+            sites,
+            Arc::clone(&salt_cache),
+            writer.clone(),
+            trusted,
+            ua_parser(),
+            geo,
+        )
+        .with_assigner(
+            SessionAssigner::with_seed(SessionConfig::default(), 1),
+            [9; 16],
+        );
         Rig {
             pipeline,
             rx,
@@ -455,7 +689,7 @@ mod tests {
                    "p": {"plan": "pro"}})
                 .to_string()
                 .as_bytes(),
-            ctx("203.0.113.9", "UA/1", t),
+            ctx("203.0.113.9", CHROME_WIN, t),
         );
         assert_eq!(out, Outcome::Accepted);
         let row = r.rx.try_recv().unwrap();
@@ -469,15 +703,26 @@ mod tests {
         assert_ne!(row.session_id, 0);
         assert!(row.ingest_partition < 32);
         assert_eq!(row.referrer, "news.example.org/post/42");
-        assert_eq!(row.referrer_source, "news.example.org");
-        assert_eq!(row.channel, "");
+        // utm_source 覆盖 referrer 的 host；utm_medium=email 决定渠道
+        assert_eq!(row.referrer_source, "news");
+        assert_eq!(row.channel, "Email");
         assert_eq!(
             (row.utm_source.as_str(), row.utm_medium.as_str()),
             ("news", "email")
         );
         assert_eq!(row.click_id_param, "gclid");
+        // 203.0.113.9 是文档地址：不是公网，没有地理信息
         assert_eq!(row.country_code, [0, 0]);
-        assert_eq!((row.device.as_str(), row.browser.as_str()), ("", ""));
+        assert_eq!(
+            (
+                row.device.as_str(),
+                row.browser.as_str(),
+                row.browser_version.as_str(),
+                row.os.as_str(),
+                row.os_version.as_str()
+            ),
+            ("desktop", "Chrome", "126.0", "Windows", "10")
+        );
         assert!(row.interactive);
         assert_eq!(row.scroll_depth, 255);
         assert_eq!(row.props.get("plan").map(String::as_str), Some("pro"));
@@ -623,15 +868,268 @@ mod tests {
         );
         let internal = r.rx.try_recv().unwrap();
         let external = r.rx.try_recv().unwrap();
+        // 内部引荐：没有来源，渠道是 Direct
         assert_eq!(
             (
                 internal.referrer.as_str(),
-                internal.referrer_source.as_str()
+                internal.referrer_source.as_str(),
+                internal.channel.as_str()
             ),
-            ("", "")
+            ("", "", "Direct")
         );
+        // 外部引荐：认不出的 host 用 host 本身作来源，渠道 Referral
         assert_eq!(external.referrer, "news.example.org/p");
         assert_eq!(external.referrer_source, "news.example.org");
+        assert_eq!(external.channel, "Referral");
+    }
+
+    /// 取出一行并返回 `(referrer_source, channel)`。
+    fn source_of(row: &EventRow) -> (&str, &str) {
+        (row.referrer_source.as_str(), row.channel.as_str())
+    }
+
+    #[test]
+    fn referrers_are_classified_into_source_and_channel() {
+        let mut r = rig(10);
+        let t = at(date(2026, 3, 28), 12, 0);
+        let send = |r: &Rig, i: u8, extra: serde_json::Value| {
+            let mut b = json!({"v":1,"s":KEY,"n":"pageview","u":"https://example.test/"});
+            for (k, v) in extra.as_object().unwrap() {
+                b[k] = v.clone();
+            }
+            r.pipeline.process(
+                b.to_string().as_bytes(),
+                ctx(&format!("1.1.1.{i}"), CHROME_WIN, t),
+            )
+        };
+        // 搜索引擎 referrer（www. 与国家后缀）-> Google / Organic Search
+        send(&r, 1, json!({"r": "https://www.google.co.jp/search?q=x"}));
+        // 社交
+        send(&r, 2, json!({"r": "https://t.co/abc"}));
+        // 没有 referrer、没有标签 -> Direct
+        send(&r, 3, json!({}));
+        // 只有 click id（隐私设置抹掉了 referrer）-> 推断 Google / Paid Search
+        send(&r, 4, json!({"u": "https://example.test/?gclid=abc"}));
+        let rows: Vec<EventRow> = (0..4).map(|_| r.rx.try_recv().unwrap()).collect();
+        assert_eq!(source_of(&rows[0]), ("Google", "Organic Search"));
+        assert_eq!(source_of(&rows[1]), ("X (Twitter)", "Organic Social"));
+        assert_eq!(source_of(&rows[2]), ("", "Direct"));
+        assert_eq!(source_of(&rows[3]), ("Google", "Paid Search"));
+        assert_eq!(rows[3].click_id_param, "gclid");
+    }
+
+    #[test]
+    fn utm_source_overrides_the_referrer_and_medium_decides_the_channel() {
+        let mut r = rig(10);
+        let t = at(date(2026, 3, 28), 12, 0);
+        // referrer 是 google，但链接带了 utm_source=bing&utm_medium=cpc：来源取 utm（别名表规范化成 Bing），
+        // 渠道是 Paid Search；referrer 本身仍原样存下
+        r.pipeline.process(
+            json!({"v":1,"s":KEY,"n":"pageview",
+                   "u":"https://example.test/?utm_source=bing&utm_medium=cpc&utm_campaign=spring",
+                   "r":"https://www.google.com/"})
+            .to_string()
+            .as_bytes(),
+            ctx("1.1.1.1", CHROME_WIN, t),
+        );
+        let row = r.rx.try_recv().unwrap();
+        assert_eq!(source_of(&row), ("Bing", "Paid Search"));
+        assert_eq!(row.referrer, "google.com");
+        assert_eq!(
+            (row.utm_source.as_str(), row.utm_campaign.as_str()),
+            ("bing", "spring")
+        );
+    }
+
+    #[test]
+    fn bots_are_dropped_and_counted() {
+        let mut r = rig(10);
+        let t = at(date(2026, 3, 28), 12, 0);
+        for (i, ua) in [GOOGLEBOT, "", "curl/8.5.0", "HeadlessChrome/126.0.0.0"]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(
+                r.pipeline
+                    .process(&pageview("/"), ctx("1.1.1.1", ua, t + i as i64)),
+                Outcome::Dropped(DropReason::Bot),
+                "{ua:?}"
+            );
+        }
+        // 真实浏览器不受影响
+        assert_eq!(
+            r.pipeline
+                .process(&pageview("/"), ctx("1.1.1.1", CHROME_WIN, t + 10)),
+            Outcome::Accepted
+        );
+        assert_eq!(
+            counts(&r.writer),
+            BTreeMap::from([(key(SITE, "dropped_bot"), 4), (key(SITE, "accepted"), 1)])
+        );
+        assert_eq!(r.rx.try_recv().unwrap().pathname, "/");
+        assert!(r.rx.try_recv().is_err(), "机器人事件不写入");
+        assert_eq!(r.pipeline.assigner().len(), 1, "机器人不开会话");
+    }
+
+    #[test]
+    fn a_bots_engagement_has_no_session_and_is_counted_as_no_session() {
+        let r = rig(10);
+        let t = at(date(2026, 3, 28), 12, 0);
+        let eng =
+            json!({"v":1,"s":KEY,"n":"engagement","u":"https://example.test/","e":4000,"sd":10})
+                .to_string()
+                .into_bytes();
+        assert_eq!(
+            r.pipeline
+                .process(&pageview("/"), ctx("1.1.1.1", GOOGLEBOT, t)),
+            Outcome::Dropped(DropReason::Bot)
+        );
+        assert_eq!(
+            r.pipeline
+                .process(&eng, ctx("1.1.1.1", GOOGLEBOT, t + 1000)),
+            Outcome::Dropped(DropReason::NoSession)
+        );
+    }
+
+    #[test]
+    fn geo_is_truncated_to_the_sites_level() {
+        let mut r = rig_with_geo(10, test_geo());
+        let t = at(date(2026, 3, 28), 12, 0);
+        let pv = |key: &str| body(key, "pageview", "https://example.test/");
+        for (key, i) in [(COUNTRY_KEY, 0), (REGION_KEY, 1), (KEY, 2)] {
+            assert_eq!(
+                r.pipeline.process(&pv(key), ctx(SE_IP, CHROME_WIN, t + i)),
+                Outcome::Accepted
+            );
+        }
+        let (country, region, city) = (
+            r.rx.try_recv().unwrap(),
+            r.rx.try_recv().unwrap(),
+            r.rx.try_recv().unwrap(),
+        );
+        // country：只有国家
+        assert_eq!(country.country_code, *b"SE");
+        assert_eq!(
+            (country.region_code.as_str(), country.city_geoname_id),
+            ("", 0)
+        );
+        // region：加上 ISO 3166-2 子区划，没有城市
+        assert_eq!(region.country_code, *b"SE");
+        assert_eq!(
+            (region.region_code.as_str(), region.city_geoname_id),
+            ("SE-E", 0)
+        );
+        // city：全部
+        assert_eq!(city.country_code, *b"SE");
+        assert_eq!(
+            (city.region_code.as_str(), city.city_geoname_id),
+            ("SE-E", 2_694_762)
+        );
+    }
+
+    #[test]
+    fn private_addresses_and_unloaded_databases_give_empty_geo() {
+        let mut r = rig_with_geo(10, test_geo());
+        let t = at(date(2026, 3, 28), 12, 0);
+        r.pipeline
+            .process(&pageview("/"), ctx("10.1.2.3", CHROME_WIN, t));
+        assert_eq!(r.rx.try_recv().unwrap().country_code, [0, 0]);
+        // 库没加载：位置为空，事件照常接收
+        let mut r = rig(10);
+        assert_eq!(
+            r.pipeline
+                .process(&pageview("/"), ctx(SE_IP, CHROME_WIN, t)),
+            Outcome::Accepted
+        );
+        assert_eq!(r.rx.try_recv().unwrap().country_code, [0, 0]);
+    }
+
+    #[test]
+    fn engagement_does_not_trigger_enrichment_and_takes_the_sessions_attributes() {
+        let mut r = rig_with_geo(10, test_geo());
+        let t = at(date(2026, 3, 28), 12, 0);
+        let work = r.pipeline.enrich_work();
+        // 请求体里带了与会话不同的 referrer：如果 engagement 被富化，来源会变成 Google
+        let eng = json!({"v":1,"s":KEY,"n":"engagement","u":"https://example.test/","e":4000,
+                         "sd":10,"r":"https://www.google.com/"})
+        .to_string()
+        .into_bytes();
+        // 没有会话的 engagement：丢弃，没有任何富化
+        assert_eq!(
+            r.pipeline.process(&eng, ctx(SE_IP, CHROME_WIN, t)),
+            Outcome::Dropped(DropReason::NoSession)
+        );
+        assert_eq!(
+            (
+                work.ua_parses(),
+                work.geo_lookups(),
+                work.source_classifications()
+            ),
+            (0, 0, 0)
+        );
+        // pageview 开会话：三个富化各做一次
+        r.pipeline.process(
+            &body(
+                KEY,
+                "pageview",
+                "https://example.test/?utm_source=bing&utm_medium=cpc",
+            ),
+            ctx(SE_IP, CHROME_WIN, t + 1000),
+        );
+        assert_eq!(
+            (
+                work.ua_parses(),
+                work.geo_lookups(),
+                work.source_classifications()
+            ),
+            (1, 1, 1)
+        );
+        // 有会话的 engagement：被接受，仍然不富化，行上盖的是会话（第一个 pageview）的属性，
+        // 即使 engagement 自己的请求体带了不同的 referrer
+        assert_eq!(
+            r.pipeline.process(&eng, ctx(SE_IP, CHROME_WIN, t + 2000)),
+            Outcome::Accepted
+        );
+        assert_eq!(
+            (
+                work.ua_parses(),
+                work.geo_lookups(),
+                work.source_classifications()
+            ),
+            (1, 1, 1),
+            "engagement 不触发 UA 解析、地理查询和来源分类"
+        );
+        let (_pv, e) = (r.rx.try_recv().unwrap(), r.rx.try_recv().unwrap());
+        assert_eq!(e.name, "engagement");
+        assert_eq!(source_of(&e), ("Bing", "Paid Search"));
+        assert_eq!(e.country_code, *b"SE");
+        assert_eq!(
+            (e.device.as_str(), e.browser.as_str()),
+            ("desktop", "Chrome")
+        );
+    }
+
+    #[test]
+    fn stage_timing_counters_follow_the_event_kind() {
+        // 被丢弃的机器人只做了 UA 解析：没有地理和来源
+        let r = rig_with_geo(10, test_geo());
+        let t = at(date(2026, 3, 28), 12, 0);
+        r.pipeline.process(&pageview("/"), ctx(SE_IP, GOOGLEBOT, t));
+        let w = r.pipeline.enrich_work();
+        assert_eq!(
+            (w.ua_parses(), w.geo_lookups(), w.source_classifications()),
+            (1, 0, 0)
+        );
+        // 站点未知、hostname 不在白名单：连 UA 都不解析（先做便宜的判断）
+        r.pipeline.process(
+            &body("zzzzzzzzzzzz", "pageview", "https://example.test/"),
+            ctx(SE_IP, CHROME_WIN, t),
+        );
+        r.pipeline.process(
+            &body(KEY, "pageview", "https://evil.test/"),
+            ctx(SE_IP, CHROME_WIN, t),
+        );
+        assert_eq!(w.ua_parses(), 1);
     }
 
     #[test]

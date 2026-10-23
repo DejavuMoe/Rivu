@@ -35,7 +35,7 @@ pub enum Command {
     All,
     /// 站点管理
     Site(SiteArgs),
-    /// 查询一个站点在日期范围内的核心指标（打印 JSON）
+    /// 查询一个站点在日期范围内的核心指标与维度分组（打印 JSON）
     Stats(StatsArgs),
 }
 

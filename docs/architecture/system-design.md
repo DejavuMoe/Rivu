@@ -810,6 +810,8 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 
 所有比率都用 `ifNotFinite(…, 0)` 包一层，防止除零产生无穷值。Rivu 没有 `-1` 行，不需要 Plausible 那种 `greatest(…, 0)` 兜底。
 
+**分组（P1 `rivu_query::breakdown`）**：会话属性维度（来源、渠道、国家、设备）的 `visitors`、`pageviews` 按事件上盖的属性从 `events` 算，`visits` 从 `sessions` 两级聚合后按会话属性计数，两侧 `UNION ALL` 后按值合并（某个值可能只出现在一侧，所以不用 JOIN）。`event:page` 的 `visits` 定义为「区间内浏览过该页的会话数」（一个会话没有单一的页面）。空值的展示文案：来源 `Direct / None`、渠道 `Direct`、设备与国家 `(not set)`；前三项与 Plausible 相同，国家是 Rivu 的约定。
+
 ### 6.6 过滤语义（写进 API 文档和 `meta.metric_semantics`）
 
 - 带 `event:page` 过滤时：`visitors` 和 `pageviews` 只统计**浏览过**该页的访客和浏览次数；`bounce_rate` 只统计**以该页为入口**的会话；其余会话指标统计**浏览过**该页的会话。这与 Plausible 相同（R03 §6.3）。保留这一语义是为了与 Plausible 导入的数据口径一致，同时必须明示。

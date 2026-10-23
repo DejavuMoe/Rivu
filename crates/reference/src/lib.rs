@@ -23,6 +23,21 @@ pub const TIMEOUT_MS: i64 = 30 * 60 * 1000;
 /// 会话最长时长：7 天（§4.6、§10 Q7）。
 pub const MAX_DURATION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
+/// 一个事件「按自己的请求」算出的会话属性（测试作者按研究文档手写的真值，不调用任何富化代码）。
+/// 会话的属性由**会话首事件**决定：同一会话里后续事件的这些字段会被忽略（管线把首事件的属性盖到每个事件上）。
+/// 空串表示没有：来源为空是 Direct / None，国家为空是未知，设备为空是未知。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EventAttrs {
+    /// 规范来源名（`Google`、`X (Twitter)`……）。
+    pub referrer_source: String,
+    /// 渠道（`Organic Search`、`Direct`……）。
+    pub channel: String,
+    /// ISO 3166-1 alpha-2。
+    pub country: String,
+    /// desktop / mobile / tablet。
+    pub device: String,
+}
+
 /// 一条原始事件，带上测试里已知的「真实的人」。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RawEvent {
@@ -36,6 +51,8 @@ pub struct RawEvent {
     pub interactive: bool,
     /// 只有 engagement 事件有值。
     pub engagement_ms: u32,
+    /// 该事件自己的会话属性；只有会话首事件的值有意义（见 [`EventAttrs`]）。
+    pub attrs: EventAttrs,
 }
 
 /// 参考实现切出的一个会话，字段与 `sessions` 表（§5.3）的聚合列一一对应。
@@ -286,6 +303,161 @@ pub fn daily_visitors(
     out
 }
 
+/// 分组维度。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefDim {
+    /// 页面：只看 pageview。
+    Page,
+    Source,
+    Channel,
+    Country,
+    Device,
+}
+
+/// 分组的一行（已按展示文案命名空值）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefBreakdownRow {
+    pub value: String,
+    pub visitors: u64,
+    pub visits: u64,
+    pub pageviews: u64,
+}
+
+/// 空值的展示文案。故意与 `rivu-query` 各写一份：参考实现不共享查询层的任何代码。
+fn empty_label(dim: RefDim) -> &'static str {
+    match dim {
+        RefDim::Page => "(none)",
+        RefDim::Source => "Direct / None",
+        RefDim::Channel => "Direct",
+        RefDim::Country | RefDim::Device => "(not set)",
+    }
+}
+
+/// 会话属性维度上，一个会话的取值：会话**首事件**（按时间、同一毫秒按输入顺序的第一个）的属性。
+fn session_value(dim: RefDim, s: &RefSession, events: &[RawEvent]) -> String {
+    let a = &events[s.event_indices[0]].attrs;
+    match dim {
+        RefDim::Source => a.referrer_source.clone(),
+        RefDim::Channel => a.channel.clone(),
+        RefDim::Country => a.country.clone(),
+        RefDim::Device => a.device.clone(),
+        RefDim::Page => unreachable!("页面不是会话属性"),
+    }
+}
+
+/// 按维度分组，范围 = 站点本地日期 `[from, to]`（含），时区 `tz`；口径：
+///
+/// - `visitors`：Σ 每个本地日（该日在该维度值下有**非 engagement** 事件的不同 `person` 数），
+///   与 [`metrics`] 的 `visitors` 同口径；会话属性维度里，事件的维度值是它所在会话的首事件属性；
+/// - `pageviews`：范围内、维度值等于该值的 pageview 数；
+/// - `visits`：会话属性维度 = 区间内活跃的会话（口径同 [`metrics`]）按首事件属性分组的数量；
+///   页面维度 = 范围内浏览过该页的不同会话数；
+/// - 页面维度只看 pageview（`visitors` 也是）；
+/// - 空值换成展示文案；三个数都是 0 的行丢掉；
+/// - 排序：访客数、会话数、浏览次数降序，同数按**原始**维度值（空串最小）升序；取前 `limit` 行。
+#[allow(clippy::too_many_arguments)] // 与 `rivu_query::breakdown` 的参数一一对应
+pub fn breakdown(
+    events: &[RawEvent],
+    sessions: &[RefSession],
+    site_id: u64,
+    tz: &TimeZone,
+    from: Date,
+    to: Date,
+    dim: RefDim,
+    limit: usize,
+) -> Vec<RefBreakdownRow> {
+    if from > to {
+        return Vec::new();
+    }
+    let start_ms = day_start_ms(from, tz);
+    let end_ms = day_start_ms(to.tomorrow().expect("日期在 jiff 的范围内"), tz);
+
+    // 事件所属会话：事件下标 -> 会话下标
+    let mut owner: Vec<Option<usize>> = vec![None; events.len()];
+    for (si, s) in sessions.iter().enumerate() {
+        for &i in &s.event_indices {
+            owner[i] = Some(si);
+        }
+    }
+
+    #[derive(Default)]
+    struct Acc {
+        persons: HashSet<(Date, u64)>,
+        sessions: HashSet<usize>,
+        visits: u64,
+        pageviews: u64,
+    }
+    let mut groups: std::collections::BTreeMap<String, Acc> = std::collections::BTreeMap::new();
+
+    for (i, e) in events.iter().enumerate() {
+        if e.site_id != site_id || e.ts_ms < start_ms || e.ts_ms >= end_ms {
+            continue;
+        }
+        // 没有并入任何会话的事件（被丢弃的 engagement）不在管线的输出里
+        let Some(si) = owner[i] else { continue };
+        let is_pv = e.kind == EventKind::Pageview;
+        let value = match dim {
+            RefDim::Page => {
+                if !is_pv {
+                    continue;
+                }
+                e.pathname.clone()
+            }
+            _ => session_value(dim, &sessions[si], events),
+        };
+        let acc = groups.entry(value).or_default();
+        if e.kind != EventKind::Engagement {
+            acc.persons.insert((date_of(e.ts_ms, tz), e.person));
+        }
+        if is_pv {
+            acc.pageviews += 1;
+            acc.sessions.insert(si);
+        }
+    }
+
+    if dim != RefDim::Page {
+        for s in sessions.iter().filter(|s| {
+            s.site_id == site_id && s.last_event_at_ms >= start_ms && s.started_at_ms < end_ms
+        }) {
+            groups
+                .entry(session_value(dim, s, events))
+                .or_default()
+                .visits += 1;
+        }
+    }
+
+    let mut rows: Vec<(String, RefBreakdownRow)> = groups
+        .into_iter()
+        .map(|(raw, a)| {
+            let visits = if dim == RefDim::Page {
+                a.sessions.len() as u64
+            } else {
+                a.visits
+            };
+            let value = if raw.is_empty() {
+                empty_label(dim).to_owned()
+            } else {
+                raw.clone()
+            };
+            (
+                raw,
+                RefBreakdownRow {
+                    value,
+                    visitors: a.persons.len() as u64,
+                    visits,
+                    pageviews: a.pageviews,
+                },
+            )
+        })
+        .filter(|(_, r)| r.visitors > 0 || r.visits > 0 || r.pageviews > 0)
+        .collect();
+    // BTreeMap 已按原始值升序；稳定排序保持这个次序作为最后的平手规则
+    rows.sort_by(|(_, a), (_, b)| {
+        (b.visitors, b.visits, b.pageviews).cmp(&(a.visitors, a.visits, a.pageviews))
+    });
+    rows.into_iter().map(|(_, r)| r).take(limit).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,6 +476,7 @@ mod tests {
             pathname: path.into(),
             interactive: false,
             engagement_ms: 0,
+            attrs: EventAttrs::default(),
         }
     }
 
@@ -498,6 +671,93 @@ mod tests {
         assert_eq!((m.visitors, m.visits, m.pageviews), (1, 1, 1));
         let d = date(2026, 3, 30);
         assert_eq!(metrics(&evs, &s, 1, &tz, d, d), Metrics::default());
+    }
+
+    fn pv_with(person: u64, ts: i64, path: &str, source: &str, device: &str) -> RawEvent {
+        RawEvent {
+            attrs: EventAttrs {
+                referrer_source: source.into(),
+                channel: if source.is_empty() {
+                    "Direct"
+                } else {
+                    "Referral"
+                }
+                .into(),
+                country: if device == "mobile" { "" } else { "SE" }.into(),
+                device: device.into(),
+            },
+            ..pv(person, ts, path)
+        }
+    }
+
+    fn rows(evs: &[RawEvent], dim: RefDim, limit: usize) -> Vec<(String, u64, u64, u64)> {
+        let s = sessionize(evs);
+        let d = date(1970, 1, 1);
+        breakdown(evs, &s, 1, &TimeZone::UTC, d, d, dim, limit)
+            .into_iter()
+            .map(|r| (r.value, r.visitors, r.visits, r.pageviews))
+            .collect()
+    }
+
+    #[test]
+    fn breakdown_by_hand_uses_the_first_events_attributes() {
+        let evs = [
+            pv_with(1, 0, "/a", "Google", "desktop"),
+            // 同一会话的第二个事件自己的来源是 Bing：被忽略，会话仍是 Google
+            pv_with(1, MIN, "/b", "Bing", "desktop"),
+            eng(1, 2 * MIN, 1000),
+            pv_with(2, 0, "/a", "", "mobile"),
+            // 没有会话的 engagement：丢弃，不出现在任何维度里
+            eng(3, 0, 5),
+        ];
+        let t = |v: &str, a, b, c| (v.to_owned(), a, b, c);
+        assert_eq!(
+            rows(&evs, RefDim::Source, 10),
+            vec![t("Google", 1, 1, 2), t("Direct / None", 1, 1, 1)]
+        );
+        assert_eq!(
+            rows(&evs, RefDim::Channel, 10),
+            vec![t("Referral", 1, 1, 2), t("Direct", 1, 1, 1)]
+        );
+        assert_eq!(
+            rows(&evs, RefDim::Device, 10),
+            vec![t("desktop", 1, 1, 2), t("mobile", 1, 1, 1)]
+        );
+        assert_eq!(
+            rows(&evs, RefDim::Country, 10),
+            vec![t("SE", 1, 1, 2), t("(not set)", 1, 1, 1)]
+        );
+        // 页面：只看 pageview；visits = 浏览过该页的会话数
+        assert_eq!(
+            rows(&evs, RefDim::Page, 10),
+            vec![t("/a", 2, 2, 2), t("/b", 1, 1, 1)]
+        );
+        // limit 在排序之后截断
+        assert_eq!(rows(&evs, RefDim::Page, 1), vec![t("/a", 2, 2, 2)]);
+    }
+
+    #[test]
+    fn breakdown_visits_count_active_sessions_even_without_events_in_range() {
+        // 会话从 1/1 的 23:50 持续到 1/2 的 00:10：1/2 的范围里它有 1 个 visit，
+        // 但开会话的 /a 在 1/1，所以只有 1 个 pageview（/b），属性仍取首事件（Google）
+        let evs = [
+            pv_with(1, 23 * 60 * MIN + 50 * MIN, "/a", "Google", "desktop"),
+            pv_with(1, DAY + 10 * MIN, "/b", "Bing", "desktop"),
+            eng(1, DAY + 12 * MIN, 1000),
+        ];
+        let s = sessionize(&evs);
+        let d2 = date(1970, 1, 2);
+        let r = breakdown(&evs, &s, 1, &TimeZone::UTC, d2, d2, RefDim::Source, 10);
+        assert_eq!(r.len(), 1);
+        assert_eq!(
+            (
+                r[0].value.as_str(),
+                r[0].visitors,
+                r[0].visits,
+                r[0].pageviews
+            ),
+            ("Google", 1, 1, 1)
+        );
     }
 
     #[test]

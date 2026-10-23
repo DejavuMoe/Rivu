@@ -106,6 +106,7 @@ pub fn raw(site_id: u64, person: u64, ts_ms: i64, kind: EventKind, path: &str) -
         pathname: path.into(),
         interactive: false,
         engagement_ms: 0,
+        attrs: Default::default(),
     }
 }
 
