@@ -1,0 +1,31 @@
+[package]
+name = "rivu-auth"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+base64.workspace = true
+metrics.workspace = true
+parking_lot.workspace = true
+rand.workspace = true
+rivu-ratelimit.workspace = true
+rivu-storage-pg.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+subtle.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tower.workspace = true
+# 暂停时钟：last_used_at 节流、并发排队超时的测试不用真等
+tokio = { workspace = true, features = ["test-util"] }

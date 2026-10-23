@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "bin/rivu",
+    "crates/auth",
     "crates/bus",
     "crates/common",
     "crates/domain",
@@ -9,6 +10,7 @@ members = [
     "crates/ingest",
     "crates/jobs",
     "crates/query",
+    "crates/ratelimit",
     "crates/reference",
     "crates/session",
     "crates/source",
@@ -30,12 +32,14 @@ unsafe_code = "forbid"
 
 [workspace.dependencies]
 # 工作区内部 crate
+rivu-auth = { path = "crates/auth" }
 rivu-common = { path = "crates/common" }
 rivu-domain = { path = "crates/domain" }
 rivu-geo = { path = "crates/geo" }
 rivu-ingest = { path = "crates/ingest" }
 rivu-jobs = { path = "crates/jobs" }
 rivu-query = { path = "crates/query" }
+rivu-ratelimit = { path = "crates/ratelimit" }
 rivu-reference = { path = "crates/reference" }
 rivu-session = { path = "crates/session" }
 rivu-source = { path = "crates/source" }
@@ -47,6 +51,11 @@ rivu-storage-ch = { path = "crates/storage-ch" }
 # 第三方依赖：只加 P0 用到的（async-nats 留到 P3）
 anyhow = "1"
 arc-swap = "1"
+# API key（rivu-auth）：32 字节随机数的 base64url 编码、哈希的常数时间比较。
+base64 = { version = "0.22", default-features = false, features = ["std"] }
+subtle = "2"
+# 测试用：`ServiceExt::oneshot` 直接驱动 axum Router，不起监听端口。
+tower = { version = "0.5", default-features = false, features = ["util"] }
 jiff = "0.2"
 # GeoIP（rivu-geo）：mmdb 读取、下载（reqwest 关闭默认 TLS 后端，由我们注入 ring + webpki-roots，
 # 与 clickhouse 的选择一致，避免引入 aws-lc）、gzip / tar.gz 解压。
@@ -62,6 +71,11 @@ serde-saphyr = "2"
 ua-parser = "0.2"
 parking_lot = "0.12"
 percent-encoding = "2"
+# 查询内核（rivu-query）：QuerySpec 的 JSON Schema 与字段路径错误、正则预校验；SQL 与 schema 快照测试。
+schemars = "1"
+serde_path_to_error = "0.1"
+regex = "1"
+insta = { version = "1", features = ["json"] }
 proptest = "1"
 rand = "0.9"
 siphasher = "1"

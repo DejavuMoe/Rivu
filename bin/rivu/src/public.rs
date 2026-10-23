@@ -270,6 +270,8 @@ mod tests {
                 hostnames: rivu_ingest::hostname::HostnamePatterns::new(["example.test"]),
                 geo_level: GeoLevel::City,
                 tracker_hash: false,
+                shield: Default::default(),
+                ingest_rate_limit_per_min: None,
             }),
         )]));
         let salts = Arc::new(SaltCache::new());

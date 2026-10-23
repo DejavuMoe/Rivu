@@ -21,6 +21,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::hostname::HostnamePatterns;
+use crate::shield::ShieldRules;
 
 /// 一个站点在热路径上需要的配置。
 #[derive(Clone, Debug)]
@@ -33,6 +34,12 @@ pub struct SiteConfig {
     pub geo_level: GeoLevel,
     /// 站点脚本是否用 hash 路由模式（`site_settings.tracker.hash`，只影响 `/js/<site_key>.js` 的配置前缀）。
     pub tracker_hash: bool,
+    /// 屏蔽规则（`shield_rules`）：IP 集合、CIDR 前缀树、国家集合、页面通配、hostname 规则，
+    /// 随快照整体替换；管线第 3、4、6 步使用。
+    pub shield: ShieldRules,
+    /// `site_settings.ingest_rate_limit_per_min`：每分钟事件数上限；`None` 用全局默认
+    /// （`RIVU_INGEST_RATE_LIMIT_PER_MIN`，由管线持有）。
+    pub ingest_rate_limit_per_min: Option<u32>,
 }
 
 impl SiteConfig {
@@ -45,6 +52,11 @@ impl SiteConfig {
             tracing::warn!(site_id = row.id, error = %e, "站点的 geo_level 无效，按 country 处理");
             GeoLevel::Country
         });
+        // 规则在写入时已经校验；这里编译失败的行只可能来自手工改库：跳过并记 `warn`，不影响站点其余规则。
+        let (shield, rule_errors) = ShieldRules::compile(&row.shield_rules);
+        for e in &rule_errors {
+            tracing::warn!(site_id = row.id, rule_id = %e.rule_id, reason = %e.reason, "屏蔽规则无效，已跳过");
+        }
         Ok(SiteConfig {
             site_id: row.id,
             timezone,
@@ -52,6 +64,8 @@ impl SiteConfig {
             hostnames: HostnamePatterns::new(row.hostnames.iter().map(String::as_str)),
             geo_level,
             tracker_hash: row.tracker_hash,
+            shield,
+            ingest_rate_limit_per_min: row.ingest_rate_limit_per_min,
         })
     }
 }
@@ -280,6 +294,8 @@ mod tests {
             hostnames: hosts.iter().map(|s| (*s).to_owned()).collect(),
             geo_level: "city".into(),
             tracker_hash: false,
+            ingest_rate_limit_per_min: None,
+            shield_rules: Vec::new(),
         }
     }
 
