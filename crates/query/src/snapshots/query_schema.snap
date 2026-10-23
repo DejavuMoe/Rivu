@@ -1,0 +1,357 @@
+---
+source: crates/query/src/sql_tests.rs
+expression: "crate::schema_json()"
+---
+{
+  "$defs": {
+    "Compare": {
+      "anyOf": [
+        {
+          "enum": [
+            "previous_period",
+            "year_over_year"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "[from, to]: two dates (YYYY-MM-DD, both days included, site time zone) or two RFC 3339 timestamps with a UTC offset (from included, to excluded).",
+          "maxItems": 2,
+          "minItems": 2,
+          "prefixItems": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "type": "array"
+        }
+      ],
+      "description": "The comparison period. The comparison query is restricted to the dimension values of the main result."
+    },
+    "DateRange": {
+      "anyOf": [
+        {
+          "enum": [
+            "day",
+            "24h",
+            "month",
+            "year",
+            "all",
+            "realtime"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "N full local days ending yesterday (1 to 5000), e.g. 7d, 28d, 30d.",
+          "pattern": "^[0-9]{1,9}d$",
+          "type": "string"
+        },
+        {
+          "description": "N full calendar months ending last month (1 to 100), e.g. 6mo, 12mo.",
+          "pattern": "^[0-9]{1,9}mo$",
+          "type": "string"
+        },
+        {
+          "description": "[from, to]: two dates (YYYY-MM-DD, both days included, site time zone) or two RFC 3339 timestamps with a UTC offset (from included, to excluded).",
+          "maxItems": 2,
+          "minItems": 2,
+          "prefixItems": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "type": "array"
+        }
+      ],
+      "description": "The period to query. Relative ranges follow the site's time zone; `7d` ends yesterday and does not include today."
+    },
+    "Dimension": {
+      "anyOf": [
+        {
+          "enum": [
+            "event:name",
+            "event:page",
+            "event:hostname",
+            "event:goal",
+            "visit:entry_page",
+            "visit:exit_page",
+            "visit:source",
+            "visit:channel",
+            "visit:referrer",
+            "visit:utm_source",
+            "visit:utm_medium",
+            "visit:utm_campaign",
+            "visit:utm_content",
+            "visit:utm_term",
+            "visit:country",
+            "visit:region",
+            "visit:city",
+            "visit:device",
+            "visit:browser",
+            "visit:browser_version",
+            "visit:os",
+            "visit:os_version",
+            "time",
+            "time:minute",
+            "time:hour",
+            "time:day",
+            "time:week",
+            "time:month"
+          ],
+          "type": "string"
+        },
+        {
+          "maxLength": 212,
+          "pattern": "^event:props:.+$",
+          "type": "string"
+        }
+      ],
+      "description": "A dimension. `event:goal`, `event:props:<key>` and `time:minute` are accepted by the schema but not supported yet."
+    },
+    "Filter": {
+      "anyOf": [
+        {
+          "maxItems": 4,
+          "minItems": 3,
+          "prefixItems": [
+            {
+              "enum": [
+                "is",
+                "is_not",
+                "contains",
+                "contains_not",
+                "matches",
+                "matches_not",
+                "matches_wildcard",
+                "matches_wildcard_not"
+              ],
+              "type": "string"
+            },
+            {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Dimension"
+                },
+                {
+                  "const": "segment"
+                }
+              ]
+            },
+            {
+              "items": {
+                "type": [
+                  "string",
+                  "integer"
+                ]
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "case_sensitive": {
+                  "type": "boolean"
+                }
+              },
+              "type": "object"
+            }
+          ],
+          "type": "array"
+        },
+        {
+          "maxItems": 2,
+          "minItems": 2,
+          "prefixItems": [
+            {
+              "enum": [
+                "and",
+                "or"
+              ]
+            },
+            {
+              "items": {
+                "$ref": "#/$defs/Filter"
+              },
+              "minItems": 1,
+              "type": "array"
+            }
+          ],
+          "type": "array"
+        },
+        {
+          "maxItems": 2,
+          "minItems": 2,
+          "prefixItems": [
+            {
+              "enum": [
+                "not",
+                "has_done",
+                "has_not_done"
+              ]
+            },
+            {
+              "$ref": "#/$defs/Filter"
+            }
+          ],
+          "type": "array"
+        }
+      ],
+      "description": "A filter tree node. Leaf: [op, dimension, [values], {\"case_sensitive\": bool}?]. Branch: [\"and\" | \"or\", [filters]] or [\"not\", filter]. `has_done`, `has_not_done` and `segment` are accepted by the schema but not supported yet."
+    },
+    "Include": {
+      "additionalProperties": false,
+      "properties": {
+        "compare": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Compare"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "time_labels": {
+          "default": false,
+          "description": "返回 `meta.time_labels`（完整的时间桶序列，含空桶）。必须带时间维度。",
+          "type": "boolean"
+        },
+        "total_rows": {
+          "default": false,
+          "description": "返回 `meta.total_rows`（不计 limit / offset 的总行数）。",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "Metric": {
+      "description": "指标。后四项（目标转化与收入）在本轮不支持：能解析，resolve 阶段报 `not supported yet`。",
+      "enum": [
+        "visitors",
+        "visits",
+        "pageviews",
+        "events",
+        "views_per_visit",
+        "bounce_rate",
+        "visit_duration",
+        "engaged_duration",
+        "percentage",
+        "exit_rate",
+        "time_on_page",
+        "scroll_depth",
+        "conversion_rate",
+        "group_conversion_rate",
+        "total_revenue",
+        "average_revenue"
+      ],
+      "type": "string"
+    },
+    "OrderBy": {
+      "description": "[metric_or_dimension, direction]. The key must be one of the requested metrics or dimensions.",
+      "maxItems": 2,
+      "minItems": 2,
+      "prefixItems": [
+        {
+          "type": "string"
+        },
+        {
+          "enum": [
+            "asc",
+            "desc"
+          ]
+        }
+      ],
+      "type": "array"
+    },
+    "Pagination": {
+      "additionalProperties": false,
+      "properties": {
+        "limit": {
+          "default": 10000,
+          "description": "1 到 10000，缺省 10000。",
+          "format": "uint32",
+          "maximum": 10000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "offset": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "查询请求。`POST /api/v1/query` 与看板的内部查询端点是同一个类型（§6.1）。",
+  "properties": {
+    "date_range": {
+      "$ref": "#/$defs/DateRange"
+    },
+    "dimensions": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/Dimension"
+      },
+      "type": "array"
+    },
+    "filters": {
+      "default": [],
+      "description": "顶层数组是隐式 AND。",
+      "items": {
+        "$ref": "#/$defs/Filter"
+      },
+      "type": "array"
+    },
+    "include": {
+      "$ref": "#/$defs/Include",
+      "default": {
+        "time_labels": false,
+        "total_rows": false
+      }
+    },
+    "metrics": {
+      "description": "至少一个，不得重复。",
+      "items": {
+        "$ref": "#/$defs/Metric"
+      },
+      "type": "array"
+    },
+    "order_by": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/OrderBy"
+      },
+      "type": "array"
+    },
+    "pagination": {
+      "$ref": "#/$defs/Pagination",
+      "default": {
+        "limit": 10000,
+        "offset": 0
+      }
+    },
+    "site": {
+      "description": "`site_key`。给出时必须与鉴权上下文里的站点一致（路由层负责返回 404；这里的 resolve 也会核对）。",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "metrics",
+    "date_range"
+  ],
+  "title": "QuerySpec",
+  "type": "object"
+}

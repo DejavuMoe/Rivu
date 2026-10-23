@@ -13,5 +13,14 @@ workspace = true
 anyhow.workspace = true
 clickhouse.workspace = true
 jiff.workspace = true
+regex.workspace = true
+rivu-geo.workspace = true
+schemars.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+serde_path_to_error.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+insta.workspace = true

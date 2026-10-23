@@ -1,0 +1,46 @@
+---
+source: crates/query/src/sql_tests.rs
+expression: "render(&sql, &params)"
+---
+SELECT d0, d1, sum(c_visitors) AS m0, sum(c_pageviews) AS m1, ifNotFinite(sum(c_tp_ms) / 1000 / sum(c_tp_n), 0) AS m2
+FROM (
+  SELECT s_entry_path AS d0, s_exit_path AS d1, uniq(visitor_id) AS c_visitors, countIf(name = 'pageview') AS c_pageviews, toUInt64(0) AS c_tp_ms, toUInt64(0) AS c_tp_n
+  FROM (
+    SELECT *
+    FROM events
+    WHERE site_id = {site:UInt64} AND toDate(ts) >= {from_date:Date} AND toDate(ts) <= {to_date:Date} AND ts >= fromUnixTimestamp64Milli({from_ms:Int64}, 'UTC') AND ts < fromUnixTimestamp64Milli({to_ms:Int64}, 'UTC') AND name != 'engagement') AS e
+  ANY LEFT JOIN (
+    SELECT session_id, tupleElement(argMinIfMerge(entry_page), 2) AS s_entry_path, tupleElement(argMaxIfMerge(exit_page), 2) AS s_exit_path
+    FROM sessions
+    WHERE site_id = {site:UInt64} AND start_date >= {s_from:Date} AND start_date <= {to_date:Date}
+    GROUP BY site_id, start_date, session_id) AS sx USING (session_id)
+  GROUP BY d0, d1
+  UNION ALL SELECT d0, d1, toUInt64(0) AS c_visitors, toUInt64(0) AS c_pageviews, sum(e_ms) AS c_tp_ms, count() AS c_tp_n
+  FROM (
+    SELECT s_entry_path AS d0, s_exit_path AS d1, session_id, sum(engagement_ms) AS e_ms, maxIf(scroll_depth, scroll_depth <= 100) AS e_sd, countIf(scroll_depth <= 100) AS e_sdc
+    FROM (
+      SELECT *
+      FROM events
+      WHERE site_id = {site:UInt64} AND toDate(ts) >= {from_date:Date} AND toDate(ts) <= {to_date:Date} AND ts >= fromUnixTimestamp64Milli({from_ms:Int64}, 'UTC') AND ts < fromUnixTimestamp64Milli({to_ms:Int64}, 'UTC') AND name = 'engagement') AS e
+    ANY LEFT JOIN (
+      SELECT session_id, tupleElement(argMinIfMerge(entry_page), 2) AS s_entry_path, tupleElement(argMaxIfMerge(exit_page), 2) AS s_exit_path
+      FROM sessions
+      WHERE site_id = {site:UInt64} AND start_date >= {s_from:Date} AND start_date <= {to_date:Date}
+      GROUP BY site_id, start_date, session_id) AS sx USING (session_id)
+    GROUP BY d0, d1, session_id)
+  GROUP BY d0, d1)
+GROUP BY d0, d1
+ORDER BY m0 DESC, d0 ASC, d1 ASC
+LIMIT {p0:UInt64} OFFSET {p1:UInt64}
+
+-- params
+site: UInt64 = 4242
+from_ms: Int64 = 1792101600000
+to_ms: Int64 = 1792706400000
+from_date: Date = "2026-10-15"
+to_date: Date = "2026-10-22"
+s_from: Date = "2026-10-08"
+tz: String = "Europe/Berlin"
+wk: UInt8 = 7
+p0: UInt64 = 10000
+p1: UInt64 = 0
