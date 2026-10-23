@@ -6,7 +6,7 @@
 
 ## 1. 进程与部署拓扑
 ### 1.1 子命令
-同一二进制 `rivu`、同一镜像（Cargo workspace：`domain`、`ingest`、`session`、`storage-pg`、`storage-ch`、`query`、`jobs`、`common`、`bin/rivu`）。取代 Plausible 的 `db <name>` 入口脚本（04§7.1）。
+同一二进制 `rivu`、同一镜像（Cargo workspace：`domain`、`ingest`、`session`、`storage-pg`、`storage-ch`、`query`、`auth`、`ratelimit`、`jobs`、`common`、`bin/rivu`）。取代 Plausible 的 `db <name>` 入口脚本（04§7.1）。
 
 | 子命令 | 职责 | 公共端口 | 内部端口 `:9090` | `RIVU_JOBS` 默认 |
 |---|---|---|---|---|
@@ -232,6 +232,23 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 
 设计说明：
 - **站点删除是多阶段流程**（借鉴 04§9.9 的「提醒、撤销窗口、执行前复核」与 04§3.2 `ClickhouseCleanSites` 的分批清理）：`sites.deleted_at` 置位后缓存立即摘除，此后 collector 按 `unknown_site` 丢弃（`system-design.md` §10 Q13）；宽限期（`RIVU_SITE_DELETE_GRACE_DAYS`，默认 7）内可恢复；到期后 `site_delete_schedule` 插入 `scope='site'` 意图，由 `ch_delete_batch` 按分区执行。日期范围删除立即插入 `scope='date_range'` 意图，完成后触发受影响日期的 rollup 重建（见 `system-design.md`）。
+- **屏蔽规则 `shield_rules`**（采集侧编译与匹配见 `system-design.md` §4.2，实现在 `rivu-ingest::shield`）：
+
+  | 项 | 规则 |
+  |---|---|
+  | `action` | `deny`：命中即丢弃。`allow`：同一类型内的例外，值命中任一 `allow` 就不受该类型 `deny` 影响（`allow` 优先）。只有 `allow`、没有同类型 `deny` 时不起作用：不是白名单模式，没有规则就是放行（与 Plausible 一致）。例：`deny 10.0.0.0/8` 加 `allow 10.1.2.3`，屏蔽整个 10 网段，唯独放过 10.1.2.3 |
+  | 站点 hostname 白名单 | 才是 hostname 的白名单：在规则之前判定，永远 fail-closed（空白名单全部丢弃） |
+  | `ip` | 单个地址（不带 `/`），写入时规范化：IPv4-mapped 转 IPv4，IPv6 小写压缩。匹配前客户端 IP 同样规范化 |
+  | `cidr` | 必须带前缀长度，主机位清零（`10.1.2.3/8` 存为 `10.0.0.0/8`）；IPv4-mapped 且前缀 ≥96 的转成 IPv4。IPv4、IPv6 各一棵二叉前缀树 |
+  | `country` | 两位大写字母。事件没有国家（私有地址、库未加载、查不到、占位码）时按 `ZZ` 判定，所以可以用 `ZZ` 屏蔽或放行「未知国家」 |
+  | `page` | 以 `/` 开头、≤250 字节、不含空白与控制字符（pathname 是百分号编码的，空格写成 `%20`）。**只有 `*` 是通配**（任意长度，含 `/`），连续的 `*` 合并成一个；其余字符（`.` `?` `[` `(` `\` 等）都是字面量。**区分大小写**，匹配**规范化后的 pathname**（`tracker-and-protocol.md` §7），不含 query |
+  | `hostname` | 与站点白名单同语法（`example.com`、`*.example.com`），匹配规范化后的事件 hostname；命中记 `hostname_not_allowed`（与白名单未命中同一个计数）。适合在白名单之内挖掉一部分，例如白名单 `*.example.com`、`deny staging.example.com` |
+  | 唯一性 | `(site_id, type, value)` 在未删除行里唯一，不论 `action`：同一个值不能同时有 `deny` 与 `allow` |
+  | 每站上限 | `RIVU_SHIELD_MAX_RULES_PER_SITE`（默认 500）。添加在事务内先 `SELECT id FROM sites WHERE id = $1 AND deleted_at IS NULL FOR UPDATE` 锁住站点行，先查重（站点已满时重复项报「重复」而不是「已满」），再数未删除的规则，达到上限就拒绝，否则插入；同一站点的并发添加因此被串行化，不会超限 |
+  | 删除 | 软删除（置 `deleted_at`），快照按 `deleted_at` 摘除；部分唯一索引允许同值规则再次添加 |
+  | 坏行 | 写入时已校验；快照编译时遇到非法行（只可能来自手工改库）跳过并记 `warn`，不影响站点其余规则 |
+  | 命令行 | `rivu shield add \| list \| remove` |
+
 - **盐**：事件用**站点本地日期**对应的盐，各进程每 60 秒从 PG 刷新；缺盐则丢弃事件并计入 `dropped_salt_missing`，绝不在 collector 现场生成（避免多副本分歧）。只缺前一天的盐时，不计算 `prev_visitor_id`（这次不续会话），事件照常接收。Reliable 下访客 ID 在入队前计算，JetStream 积压不依赖盐的保留期。任务见第 6 节 `salts_rotate`。
 
 ## 4. 权限模型
@@ -241,7 +258,9 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 | 动作 | owner | admin | editor | viewer | 站点访客 editor | 站点访客 viewer |
 |---|---|---|---|---|---|---|
 | `stats.read` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `sites.read`（读站点信息；API key 的 `sites:read`） | ✓ | ✓ | ✓ | ✓ | — | — |
 | `export.create`、`site.content.write`（goals、funnels、segments） | ✓ | ✓ | ✓ | ✗ | ✓ | ✗ |
+| `exports.read`（读导出；API key 的 `exports:read`，与 `export.create` 同级） | ✓ | ✓ | ✓ | ✗ | — | — |
 | `shared_link.manage` | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ |
 | `site.settings.write`（hostnames、采集、隐私、shield、保留期）、`site.public.toggle` | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ |
 | `site.create`、`site.delete`、`stats.delete`、`import.run`、`site_membership.manage` | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ |
@@ -250,6 +269,8 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 | `org.update`、`org.delete`、`owner.assign` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
 
 ※ admin 只能分配与修改 admin/editor/viewer，不能触碰 owner（对应 04§2.1「能分配哪些角色」「能改哪个成员的角色」）；另有纯函数 `can_assign(actor, target_role)`、`can_modify(actor, member_role)`。站点访客不是 org 成员，不能创建 API key。
+
+`sites.read`、`exports.read` 两行由 `crates/auth` 的 `Action`（`StatsRead` `SitesRead` `SitesWrite` `ExportsRead`）实现：成员都能读站点信息；读导出与 `export.create` 同级（owner、admin、editor）；API key 的 `sites:write` 对应 `site.settings.write`（owner、admin）。站点访客不是 org 成员，不能持有 API key，所以这两行的访客列记 —。
 
 **状态规则**（服务层事务内校验；04§2.1 同样把此类规则留在 service）：org 至少保留一名 owner（降级、移除、自行退出都先 `SELECT ... FOR UPDATE` 锁 org 行再数 owner）；同时有 org 角色与站点访客角色时取较高者；邀请不能授予超出邀请人可分配范围的角色，过期或已接受的邀请不可复用；站点已软删除时除恢复外的写动作返回 404。
 
@@ -271,21 +292,39 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 ### 4.3 API key 作用域
 | 项 | 规则 |
 |---|---|
-| 格式与存储 | `rivu_` + 32 字节随机 base64url；只存 SHA-256 与前 12 字符（04§2.3 同样只存哈希与前缀） |
+| 格式与存储 | `rivu_` + 32 字节 CSPRNG 随机数的 base64url（无填充，43 个字符，共 48 个字符）；库里只存 SHA-256（`key_hash`，32 字节）与明文前 12 个字符（`key_prefix`，即 `rivu_` 加 7 个随机字符，仅用于列表识别）；明文只在创建时显示一次，之后无法找回（04§2.3 同样只存哈希与前缀）。key 本身是 256 位随机数，没有低熵口令要拉伸，鉴权又在每个请求的热路径上，所以用 SHA-256 而不是 argon2 |
+| 鉴权流程 | 解析 `Authorization: Bearer <key>`（方案名不区分大小写）→ 检查格式（`rivu_` 加恰好解码成 32 字节的 43 个 base64url 字符，格式不对不查库）→ SHA-256 → **每个请求**按摘要查库，同一条查询判定吊销、过期、所属组织已删除、所属用户已禁用或已删除、用户不再是 org 成员 → 对摘要再做一次常数时间比较。因为不缓存，吊销与移出成员立即生效 |
+| `last_used_at` | 同一把 key 每分钟最多写一次库（进程内记录上次写入时刻，后台任务写，不阻塞请求） |
+| 检查顺序 | **401 → 429 → 403 → 404**：认证失败（缺失、格式错、未知、吊销、过期、用户被禁用或被移出 org，一律同一个 401，原因只进 debug 日志）→ 按组织限流（§4.4）→ key 完全没有该路由所需 resource:action 的 scope（403）→ 站点不存在、属于别的组织或 scope 目标不含该站点（404，响应完全相同，不泄露站点是否存在）。限流在 scope 与站点校验之前，所以用错误请求反复试探也要消耗配额 |
 | scope 语法 | `resource:action:target`，target 为 `*` 或 `site_key`，如 `stats:read:*`；可用：`stats:read`、`sites:read`、`sites:write`、`exports:read` |
 | 默认 | 仅 `stats:read:*`（Plausible 另有隐式的 `sites:read:*`，04§2.3；Rivu 不做隐式授权） |
 | 不开放给 key | 成员管理、org 设置、API key 管理、删除站点与统计数据，只能由会话用户执行 |
-| 失效与错误码 | 过期、软删除、所属用户被移出 org 或被禁用时立即失效；缺失或无效 401，scope 不足 403，超限 429（04§2.3；无计费故无 402） |
+| 失效与错误码 | 过期、软删除、所属用户被移出 org 或被禁用时立即失效；缺失或无效 401（带 `WWW-Authenticate: Bearer realm="rivu"`），scope 不足 403，站点无权访问 404，超限 429（04§2.3；无计费故无 402）。库里无法解析的 scope 文本被忽略并记 `warn`（fail-closed：少授权，不多授权） |
+| 命令行 | `rivu apikey create \| list \| revoke` |
 
 ### 4.4 限流
 内存实现（分片 map + 令牌桶），单节点准确；多节点时各节点独立计数（有效上限约 N 倍），需精确时再改用 PG 或 Valkey；重启清零。
 
 | 维度 | 键 | 规则 | 超限 |
 |---|---|---|---|
-| API（key 与会话） | `organization_id` | 小时配额 `RIVU_API_RATE_PER_HOUR`（可被 `organizations.api_hourly_limit` 覆盖）+ 突发令牌桶 `RIVU_API_BURST`（默认 60，补充速率=配额/3600） | 429 + `Retry-After`、`X-RateLimit-*` |
+| API（key；会话用户的内部 API 尚未接入） | `organization_id` | 三道闸，见下：小时配额 `RIVU_API_RATE_PER_HOUR`（可被 `organizations.api_hourly_limit` 覆盖）→ 突发令牌桶 `RIVU_API_BURST`（默认 60）→ 每组织并发信号量 `RIVU_API_MAX_CONCURRENCY`（默认 4） | 429 + `Retry-After`、`X-RateLimit-*` |
 | shared link 与公开看板 | `(客户端 IP, link_id 或 site_id)` | 30 次/分钟、突发 10；密码尝试 5 次/分钟 | 429 |
 | 登录 | IP 与账号各一桶 | 5 次/60 秒（沿用 04§2.4） | 429，统一提示 |
-| `/api/event` | 站点与全局 | 见 `system-design.md` | — |
+| `/api/event` | `site_id` | 每站令牌桶：站点 `ingest_rate_limit_per_min`，否则 `RIVU_INGEST_RATE_LIMIT_PER_MIN`（默认 300000，`0` 不限流）；多副本 collector 各自本地限流（`system-design.md` §4.2） | `202` + `x-rivu-dropped`，记 `dropped_rate_limited` |
+
+**API 限流的三道闸**（`rivu-ratelimit::ApiLimiter`，按此顺序检查）：
+
+| 闸 | 规则 | 被拒 |
+|---|---|---|
+| 1. 小时配额 | 固定 3600 秒窗口，**从该组织的第一个请求起算**（不对齐整点），过期后下一个请求开新窗口，窗口内最多 `quota` 次。`quota` 取 `organizations.api_hourly_limit`，为空取 `RIVU_API_RATE_PER_HOUR`；每个请求都按当前值判定，改了下一个请求就生效 | `Retry-After` 为距窗口结束的秒数；`scope="api_hourly_quota"` |
+| 2. 突发令牌桶 | 容量 `min(RIVU_API_BURST, quota)`（至少 1），补充速率 `quota / 3600` 每秒，创建时是满的 | `Retry-After` 为下一个令牌到来的秒数（比 `X-RateLimit-Reset` 短）；`scope="api_burst"` |
+| 3. 并发信号量 | 每组织同时在途的请求不超过 `RIVU_API_MAX_CONCURRENCY`；多出来的排队，等待超过 `RIVU_API_QUEUE_TIMEOUT_MS`（默认 2000）就拒绝 | `Retry-After` 为排队超时的秒数；`scope="api_concurrency"` |
+
+- 前两道闸通过时各扣一次（小时计数加一、取走一个令牌），第三道闸超时不退还：被并发闸拒绝的请求仍占用了配额，反复重试不会让排队变成免费的探测。被前两道闸拒绝的请求不再扣。通过限流之后才失败的请求（403、404）同样已经扣过，因为限流在 scope 与站点校验之前（§4.3）。401 在限流之前，不扣。
+- 并发名额持有到处理函数返回、响应头生成之后；响应体是流式的话，响应头发出时归还。
+- 响应头（放行、429、403 以及处理函数返回的响应都带；401 不带）：`X-RateLimit-Limit` 为每小时配额；`X-RateLimit-Remaining` 为「本窗口剩余次数」与「令牌桶里整数个令牌」的较小值；`X-RateLimit-Reset` 为**距窗口结束的相对秒数**（向上取整，不是时间戳）。429 另带 `Retry-After`（向上取整，至少 1 秒），响应体为 `{"error":"rate_limited","message":…,"retry_after":<秒>}`。
+- 指标 `rivu_ratelimit_rejected_total{scope}`：`ingest`、`api_burst`、`api_hourly_quota`、`api_concurrency`。
+- 进程内状态，限额范围 `RIVU_API_RATE_PER_HOUR` 1–100000000，`RIVU_API_BURST` 1–1000000，`RIVU_API_MAX_CONCURRENCY` 1–1024，`RIVU_API_QUEUE_TIMEOUT_MS` 1–60000。
 
 限额挂在 org 而非 key，同 org 多把 key 共享（04§2.3、04§9.3；Plausible 的 key 级限额列已被迁移删除）。ClickHouse 查询的超时按调用方分三档（`system-design.md` §6.8、§10 Q14）：看板（登录会话）`RIVU_QUERY_TIMEOUT_SECS`（默认 10）；公开 API（API key）`RIVU_API_QUERY_TIMEOUT_SECS`（默认 20，与 Plausible 的 20s 同量级，04§4.2）；公开看板与 shared link `RIVU_PUBLIC_QUERY_TIMEOUT_SECS`（默认 5，最低）。三档都必须不大于 `rivu_reader` 配额里的 `max_execution_time` 上限（第 8 节）。
 
@@ -369,9 +408,11 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 | `RIVU_GEOIP_ATTRIBUTION_TEXT`、`RIVU_GEOIP_ATTRIBUTION_URL` | 空 | 自定义来源（或手工放置的文件）的署名文本和链接，看板显示、查询 API 的 `meta.geo_attribution` 返回；DB-IP 和 MaxMind 使用内置署名，不读这两个变量 |
 | `RIVU_DATA_DIR` | `/var/lib/rivu` | GeoIP 与本地导出 |
 | `RIVU_JOBS`、`RIVU_JOBS_CONCURRENCY` | 见 1.1；`4` | 任务开关与同进程并发数 |
-| `RIVU_API_RATE_PER_HOUR`、`RIVU_API_BURST` | `10000`、`60` | org 默认小时配额与令牌桶容量 |
+| `RIVU_API_RATE_PER_HOUR`、`RIVU_API_BURST` | `10000`、`60`（范围 1–100000000、1–1000000） | org 默认小时配额（`organizations.api_hourly_limit` 可覆盖）与突发令牌桶容量，实际容量为 `min(RIVU_API_BURST, 配额)`（§4.4） |
+| `RIVU_API_MAX_CONCURRENCY`、`RIVU_API_QUEUE_TIMEOUT_MS` | `4`、`2000`（范围 1–1024、1–60000） | 每个 org 同时在途的公开 API 请求数；超出的排队，等待超过该毫秒数返回 429（§4.4） |
+| `RIVU_INGEST_RATE_LIMIT_PER_MIN` | `300000`（范围 0–100000000） | 站点没有自己的 `ingest_rate_limit_per_min` 时的每站每分钟事件数，300000 即 5000/s 的系统峰值目标（`system-design.md` §7）；`0` 表示不限流；站点设置优先；多副本 collector 各自本地限流（`system-design.md` §4.2） |
 | `RIVU_QUERY_TIMEOUT_SECS`、`RIVU_API_QUERY_TIMEOUT_SECS`、`RIVU_PUBLIC_QUERY_TIMEOUT_SECS` | `10`、`20`、`5` | 看板、公开 API、公开看板与共享链接各一档（取值 1–300）；须不大于 reader 配额上限（第 8 节） |
-| `RIVU_SHIELD_MAX_RULES_PER_SITE` | `500` | 每站规则上限 |
+| `RIVU_SHIELD_MAX_RULES_PER_SITE` | `500`（范围 1–100000） | 每站屏蔽规则上限，添加时在事务内锁站点行后计数（§3.3） |
 | `RIVU_REGISTRATION`、`RIVU_SETUP_TOKEN` | `invite_only`；可选 | 注册策略；首次 `/setup` 令牌 |
 | `RIVU_LOG_FORMAT`、`RIVU_LOG_LEVEL` | `json`、`info` | `json` \| `pretty` |
 | `RIVU_METRICS` | `on` | 内部口 `/metrics` 开关（Plausible 默认关，04§0#6） |
