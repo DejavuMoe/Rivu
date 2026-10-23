@@ -10,13 +10,14 @@ Rivu 是开源、自托管的网站分析系统（Plausible 的替代品）：�
 
 | 已有 | 还没有（后续阶段） |
 |---|---|
-| Cargo workspace 和单个二进制 `rivu`（`collector \| worker \| api \| migrate \| all`，另有 `site add`、`shield add\|list\|remove`、`apikey create\|list\|revoke`、`stats`） | tracker `full` 变体（`core` 已实现）、管理后台（等待 `designs/` 原型审批） |
-| 配置加载与集中校验（`RIVU_*`，支持 `*_FILE`），含写缓冲与站点缓存参数 | 内部看板端点 `/api/internal/*`（需要登录会话）、日汇总层与规划器选层（P2） |
+| Cargo workspace 和单个二进制 `rivu`（`collector \| worker \| api \| migrate \| all`，另有 `site add`、`shield add\|list\|remove`、`apikey create\|list\|revoke`、`stats`、`setup`、`user add\|disable\|enable\|list`、`org create`、`org member add`、`share create\|list\|revoke`） | tracker `full` 变体（`core` 已实现）、管理后台（等待 `designs/` 原型审批） |
+| 配置加载与集中校验（`RIVU_*`，支持 `*_FILE`），含写缓冲与站点缓存参数 | 看板页面（等待 `designs/` 原型审批）、其余内部端点（站点与设置管理、成员、邀请等，仍返回 501）、日汇总层与规划器选层（P2） |
 | `rivu migrate`：PG 与 ClickHouse 迁移按版本号交织执行 | 数据中心 IP 表 |
 | 内部端口 `/healthz` `/readyz` `/metrics`；`/readyz` 含站点快照与盐是否已加载 | JetStream、worker 的会话分配与批量写入、Reliable 模式（P3） |
 | `POST /api/event`：协议解析、站点快照与 hostname 白名单、每日盐的访客 ID、SessionAssigner、BatchWriter（带去重 token 的重试）、`ingest_counters` | 会话状态的快照与预热 |
 | 接入准入与规则：按站点令牌桶限流（`site_settings.ingest_rate_limit_per_min`，缺省用 `RIVU_INGEST_RATE_LIMIT_PER_MIN`）、垃圾引荐（Matomo referrer-spam-list，公有领域，按 host 后缀匹配）、屏蔽规则（IP / CIDR / 国家 / 页面通配 / hostname，`rivu shield`，每站上限 `RIVU_SHIELD_MAX_RULES_PER_SITE`） | 规则的看板管理界面 |
-| 公开 API 组件（`rivu-auth`、`rivu-ratelimit`）：API key（`rivu_` + 32 字节随机数，库里只存 SHA-256）、`Authorization: Bearer` 鉴权、scope 与角色、站点访问判定、按组织限流（小时配额 + 突发令牌桶 + 并发信号量，`RIVU_API_RATE_PER_HOUR` / `RIVU_API_BURST` / `RIVU_API_MAX_CONCURRENCY` / `RIVU_API_QUEUE_TIMEOUT_MS`）；`rivu apikey create\|list\|revoke` | 共享链接与公开看板的查询入口 |
+| 公开 API 组件（`rivu-auth`、`rivu-ratelimit`）：API key（`rivu_` + 32 字节随机数，库里只存 SHA-256）、`Authorization: Bearer` 鉴权、scope 与角色、站点访问判定、按组织限流（小时配额 + 突发令牌桶 + 并发信号量，`RIVU_API_RATE_PER_HOUR` / `RIVU_API_BURST` / `RIVU_API_MAX_CONCURRENCY` / `RIVU_API_QUEUE_TIMEOUT_MS`）；`rivu apikey create\|list\|revoke` | TOTP 与邮件流程（P4） |
+| 看板的内部端点（api / all 角色，**只有后端，没有页面**）：首次初始化 `POST /api/internal/setup`（`RIVU_SETUP_TOKEN`；已有用户后 404）与 `rivu setup`；argon2id 密码登录 / 登出 / 登出所有设备 / 会话列表与撤销（`__Host-rivu_session`，库里只存令牌的 SHA-256，14 天滑动续期）；CSRF（JSON + 同源 `Origin`，`RIVU_BASE_URL`）；登录按 IP 与账号限流；`GET /api/internal/me`、`/sites`；`POST /api/internal/sites/{site}/query`、`GET .../realtime`（会话、共享链接或公开站点，同一个 `QuerySpec`）；共享链接（可选密码与过期、绑定 segment 的过滤）与公开看板按 (IP, 链接或站点) 限流；`rivu user` / `org` / `share`。设计与顺序见 `bin/rivu/src/dash_api.rs` 的模块文档 | 页面、站点与设置的管理端点 |
 | 接入富化：机器人（含空 UA）、GeoIP（按站点 `geo_level` 截断）、UA、来源与渠道（`rivu-ua` / `rivu-geo` / `rivu-source`），各阶段耗时直方图 `rivu_ingest_stage_seconds{stage}` | 站点增量刷新与 `LISTEN/NOTIFY` |
 | 统一查询内核 `rivu-query`（`QuerySpec` → 解析 → 校验 → 规划 → SQL → 执行；12 个指标、维度、过滤树、日期范围、时间序列、对比期；`overview` / `breakdown` 是它的预设）；独立参考实现 `rivu-reference` 与差分测试（`bin/rivu/tests/query_differential.rs`） | |
 | 公开查询 API（api / all 角色）：`POST /api/v1/query`（API key `stats:read`，按组织限流，请求体 ≤ 1 MiB，超时 `RIVU_API_QUERY_TIMEOUT_SECS`，不开 CORS，响应 `Cache-Control: no-store`）与 `GET /api/v1/query/schema.json`（公开，`ETag`，`max-age=3600`）；指标 `rivu_api_requests_total{route,status}`、`rivu_query_seconds{route}`；ClickHouse 的 `log_comment` 带 route / site / org / api_key_id | |
@@ -124,7 +125,7 @@ curl.exe -i -X POST http://127.0.0.1:8080/api/event -H "Content-Type: text/plain
 cargo run -p rivu -- stats --site <site_key> --from 2026-10-22 --to 2026-10-22  # 日期是站点本地日期
 ```
 
-用公开查询 API 查询（api key 属于站点所在的组织：先建用户与成员关系，再 `cargo run -p rivu -- apikey create --org <slug> --name demo`，明文只显示一次）：
+用公开查询 API 查询（api key 属于站点所在的组织：先 `rivu setup --email you@example.com --org-name Acme --password-file pw.txt` 创建首个用户与组织（密码只能从文件或标准输入来，没有命令行明文参数；也可以 `POST /api/internal/setup`），再 `cargo run -p rivu -- apikey create --org <slug> --name demo`，明文只显示一次）：
 
 ```powershell
 # 请求体就是 QuerySpec，`site` 必填；PowerShell 里用文件传 JSON 最省引号
@@ -161,6 +162,7 @@ cargo test                      # 集成测试在缺少 RIVU_TEST_* 变量时跳
 
 - `bin/rivu/tests/shield_and_apikey.rs`：建站与屏蔽规则（IP、CIDR、allow 例外、页面通配、国家）、站点令牌桶限流、垃圾引荐、机器人、hostname，经管线处理一组事件后，`ingest_counters` 里 `accepted` 与各 `dropped_*` 逐项等于预期、`events` 行数等于 `accepted`；每站规则上限在并发添加下不超限；API key 全链路（创建、401、403、404、429 的小时配额与并发排队、`last_used_at` 节流、吊销与各种失效）；`shield` / `apikey` 命令的校验与副作用。
 
+- `bin/rivu/tests/internal_api.rs`：看板内部端点的端到端测试（真实 PG / ClickHouse、真实本地端口）：首次初始化（令牌、只能一次、并发只有一个成功；在独立的临时 schema 里跑）、登录与会话的完整生命周期（cookie 属性、列表、撤销、轮换、续期节流、登出所有设备）、禁用 / 删除用户后会话立即失效、CSRF 的各种拒绝、登录限流（IP 与账号）、会话查询与直接 `execute` 逐字节相同、无权与不存在的站点 404 响应相同、公开站点、共享链接（密码、过期、吊销、不能越权、绑定 segment）、公开与共享的限流、https 模式的 cookie、日志不含任何敏感值与指标、登录耗时的统计粗测。
 - `bin/rivu/tests/public_api.rs`：公开查询 API 的端到端测试（真实 PG / ClickHouse、真实本地端口，路由由 `public::router_full` 装配）。两个站点（UTC；Asia/Kathmandu + 周日起始）经管线写入固定的历史事件，17 个 `QuerySpec`（overview、维度、过滤、compare、time_labels、分页、realtime、相对范围、周桶）的 HTTP 响应与直接调用 `rivu_query::execute` 的结果逐字节相等；400（非法 JSON、未知字段、非法过滤的 path）、401、403、404（不存在、别的组织、scope 不含该站点：响应体完全相同）、429（组织小时配额，`Retry-After` 与 `X-RateLimit-*`）、405、其余 `/api/*` 的 501、schema.json（200 / 304）；`rivu_api_requests_total` 与 `rivu_query_seconds` 的计数。
 
 另有两个查询内核的集成测试：`bin/rivu/tests/query_differential.rs` 用确定性随机生成器造两个站点（Europe/Berlin、Asia/Kathmandu）的事件，经真实管线写入后，随机生成数百个 `QuerySpec`（`RIVU_DIFF_SEED` 改种子、`RIVU_DIFF_CASES` 改个数，默认 500），逐个与 `rivu_reference::query` 比较，失败时打印最小化后的请求；`bin/rivu/tests/query_security.rs` 用恶意取值（引号、反斜杠、`{x:String}`、注释、换行）验证没有注入、站点之间互不可见。SQL 与 JSON Schema 的 insta 快照在 `crates/query/src/snapshots/`（`INSTA_UPDATE=always cargo test -p rivu-query` 更新）。

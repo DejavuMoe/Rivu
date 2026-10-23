@@ -1,5 +1,7 @@
 [workspace]
 resolver = "3"
+# cargo-fuzz 的独立 crate（有自己的 lockfile 与 target），不参与工作区构建。
+exclude = ["fuzz"]
 members = [
     "bin/rivu",
     "crates/auth",
@@ -51,6 +53,8 @@ rivu-storage-ch = { path = "crates/storage-ch" }
 # 第三方依赖：只加 P0 用到的（async-nats 留到 P3）
 anyhow = "1"
 arc-swap = "1"
+# 密码哈希（rivu-auth）：argon2id。0.5 系列；不开默认特性（rand_core 0.6 的 OsRng），盐用工作区的 rand 0.9 生成。
+argon2 = { version = "0.5", default-features = false, features = ["alloc", "password-hash"] }
 # API key（rivu-auth）：32 字节随机数的 base64url 编码、哈希的常数时间比较。
 base64 = { version = "0.22", default-features = false, features = ["std"] }
 subtle = "2"
@@ -98,6 +102,12 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "json", "ansi", "std"] }
 uuid = { version = "1", features = ["v7"] }
+
+# argon2id 在 opt-level 0 下慢两个数量级（一次哈希要几秒）：登录与测试都要算哈希，所以依赖包始终优化。
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3
 
 [profile.release]
 lto = "thin"
