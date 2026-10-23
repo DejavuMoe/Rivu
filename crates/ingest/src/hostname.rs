@@ -72,6 +72,13 @@ pub fn validated_pattern(raw: &str) -> anyhow::Result<String> {
         Some(rest) => format!("*.{}", rest.trim_end_matches('.')),
         None => normalize_hostname(&lowered),
     };
+    // 精确模式规范化后仍以 `www.` 开头（输入是 `www.www.x`）：存下去的 `www.x` 重新编译时会再被去掉一个
+    // `www.`，变成 `x`——规则的含义悄悄变了（屏蔽了 `x` 而不是 `www.www.x`）。规范形式必须是不动点，所以拒绝。
+    if !pattern.starts_with("*.") && pattern.starts_with("www.") {
+        anyhow::bail!(
+            "hostname `{raw}` 无效：规范化后为 `{pattern}`，仍以 `www.` 开头，存下后会被再次规范化而改变含义"
+        );
+    }
     rivu_storage_pg::sites::validate_hostname_pattern(&pattern)
         .with_context(|| format!("hostname `{raw}` 无效"))?;
     if HostnamePatterns::new([pattern.as_str()]).is_empty() {
@@ -269,6 +276,34 @@ mod tests {
         assert!(!p.matches("127.0.0.2"));
     }
 
+    /// 模糊测试（fuzz/hostname）发现：`validated_pattern("www.www.071")` 曾返回 `www.071`，而存下的 `www.071`
+    /// 重新编译成 `HostnamePatterns` 时再去掉一个 `www.` 变成 `071`，规则含义悄悄改变。现在拒绝这种模式。
+    #[test]
+    fn validated_pattern_rejects_double_www_instead_of_changing_meaning() {
+        assert!(validated_pattern("www.www.071").is_err());
+        assert!(validated_pattern("WWW.www.example.com.").is_err());
+        // 通配头之后的 `www.` 本来就不去，仍然合法；普通的单个 `www.` 被去掉
+        assert_eq!(
+            validated_pattern("*.www.example.com").unwrap(),
+            "*.www.example.com"
+        );
+        assert_eq!(validated_pattern("www.example.com").unwrap(), "example.com");
+    }
+
+    /// 通过校验的模式是不动点：再校验得到同一个值，。
+    #[test]
+    fn validated_patterns_are_fixed_points() {
+        for raw in [
+            "Example.COM.",
+            "www.example.com:8443",
+            "*.Example.com",
+            "xn--r8jz45g.jp",
+            "127.0.0.1",
+        ] {
+            let v = validated_pattern(raw).unwrap();
+            assert_eq!(validated_pattern(&v).unwrap(), v, "{raw}");
+        }
+    }
     proptest! {
         /// 任意字符串规范化后再规范化，结果不变（`www.www.` 开头的结果除外，见 `normalize_hostname` 文档）。
         #[test]

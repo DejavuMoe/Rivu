@@ -1,0 +1,1 @@
+{"metrics":["pageviews","exit_rate"],"date_range":"7d","dimensions":["event:page"],"filters":[["is","visit:country",["US"]]]}
