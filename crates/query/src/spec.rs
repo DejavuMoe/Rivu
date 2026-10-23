@@ -1071,7 +1071,7 @@ impl Default for Pagination {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct QuerySpec {
-    /// `site_key`。给出时必须与鉴权上下文里的站点一致（路由层负责返回 404；这里的 resolve 也会核对）。
+    /// `site_key`。公开 API（`POST /api/v1/query`）必填，缺失返回 400；看板内部端点由路径给出站点时可以省略。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub site: Option<String>,
     /// 至少一个，不得重复。

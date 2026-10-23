@@ -299,7 +299,7 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 | scope 语法 | `resource:action:target`，target 为 `*` 或 `site_key`，如 `stats:read:*`；可用：`stats:read`、`sites:read`、`sites:write`、`exports:read` |
 | 默认 | 仅 `stats:read:*`（Plausible 另有隐式的 `sites:read:*`，04§2.3；Rivu 不做隐式授权） |
 | 不开放给 key | 成员管理、org 设置、API key 管理、删除站点与统计数据，只能由会话用户执行 |
-| 失效与错误码 | 过期、软删除、所属用户被移出 org 或被禁用时立即失效；缺失或无效 401（带 `WWW-Authenticate: Bearer realm="rivu"`），scope 不足 403，站点无权访问 404，超限 429（04§2.3；无计费故无 402）。库里无法解析的 scope 文本被忽略并记 `warn`（fail-closed：少授权，不多授权） |
+| 失效与错误码 | 过期、软删除、所属用户被移出 org 或被禁用时立即失效；缺失或无效 401（带 `WWW-Authenticate: Bearer realm="rivu"`），scope 不足 403，站点不存在或无权访问 404（响应相同），超限 429。公开查询 API 另有：请求体非法或缺 `site` 400，请求体超过 1 MiB 413，查询超过 API 档时限 503，见 `system-design.md` §6.1（04§2.3；无计费故无 402）。库里无法解析的 scope 文本被忽略并记 `warn`（fail-closed：少授权，不多授权） |
 | 命令行 | `rivu apikey create \| list \| revoke` |
 
 ### 4.4 限流
@@ -434,6 +434,7 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 - ClickHouse 账号经 `users.d/*.xml` 声明，密码用 `from_env` 注入（来自 Docker secrets），profile 与 quota 同处声明。
 - **与 `log_comment` 的冲突**：`readonly=1` 默认不允许修改任何 setting，而所有查询要带 `log_comment`（第 10 节），公开链接还要调低 `max_execution_time`。方案：在 `rivu_reader` profile 中对这两项声明 `CHANGEABLE_IN_READONLY` 约束；若所选版本验证不可行，降级为 `readonly=2` 加 `MAX` 约束锁住超时与内存。P0 已在 25.8 验证：`rivu_reader` 能带 `log_comment` 查询，INSERT 被拒绝（E8）；按查询调低 `max_execution_time` 留到 P1 接入查询时验证。
 - Plausible 的护栏是 `readonly=1`、查询超时 15s、`max_execution_time` 20s（04§4.2），Rivu 沿用同量级并移入账号配额，由服务端强制。
+- API 档超时（`RIVU_API_QUERY_TIMEOUT_SECS`，默认 20 s）依赖每条查询显式设置 `max_execution_time`；`rivu_reader` profile 的默认值是 15 s、约束上限 20 s（`deploy/clickhouse/users.d/rivu-dev.xml`），所以档位不得超过 20 s。
 - `all` 进程持有全部应用凭据（Lite 的取舍）；Reliable 下各进程只拿各自所需。
 
 ## 9. 迁移与版本升级
@@ -464,7 +465,7 @@ PG 与 ClickHouse 迁移放在同一目录、同一版本序列（14 位时间�
 |---|---|
 | 端点 | 内部端口 `:9090`：`/healthz`（存活）、`/readyz`（就绪）、`/metrics`（Prometheus，默认开，`RIVU_METRICS=off` 可关）；均不经 Caddy |
 | `/readyz` | 全部满足才 200，否则 503 并返回逐项 JSON：PG `SELECT 1`、ClickHouse `SELECT 1`、**站点缓存已预热**、**会话缓存已预热**、盐已加载（`today-1`、`today`、`today+1`）、schema 版本达标、Reliable 下 NATS 已连接；另报告 GeoIP 库的状态（`checks.geoip`，`ok` 恒为 `true`，不参与就绪判断；字段：`file_present`、持有库的进程另有 `loaded` `source` `database_type` `build_epoch` `age_seconds`、运行刷新任务的进程另有 `refresh.{schedule,last_attempt_at,last_result,last_error,consecutive_failures}`）：下载上百 MB 超出预热预算，缺库只让位置字段为空。借鉴 04§6 就绪检查（PG、CH、关键缓存），增加盐、schema、NATS。公共监听在预热完成后才绑定，预热预算应小于 `lb_try_duration`（预热细节见 `system-design.md`）。JSON 含 `version`、`commit`、`schema_version`（对应 04§6 的 info 端点） |
-| ClickHouse 查询 | 所有查询带 `log_comment`，JSON：`{"route":"stats.breakdown","site":123,"org":4,"user":56,"trace_id":"…"}`，只含 id，不含邮箱、IP、UA、过滤值，用于 `system.query_log` 归因慢查询 |
+| ClickHouse 查询 | 所有查询带 `log_comment`，JSON：`route`、`site`（站点 id）、`org`（组织 id）、`api_key_id`、`part`（main / compare / total 等查询部分）、`tier`（raw）；只含 id，不含 key 明文、邮箱、IP、UA、过滤值；`user` 与 `trace_id` 待会话鉴权与 trace 接入后再补。用于 `system.query_log` 归因慢查询 |
 | 采集计数 | ClickHouse `ingest_counters`（站点 × 原因 × 脚本版本 × 分钟，accepted/dropped），结构与原因枚举见 `system-design.md`。Prometheus 指标**不带 `site` 标签**（防基数爆炸），站点维度只查该表 |
 | 日志 | 结构化 JSON；请求日志只记 `method`、路由模板、状态、耗时、`trace_id`，**不记查询串**（Plausible 请求日志含路径加查询串，04§6）；`/api/event` 不记 IP、UA、完整 URL |
 | 追踪 | 可选 OTLP，默认关；span 只带 `site_id`、`org_id`、`user_id`，不带邮箱（Plausible 的 span 属性含用户邮箱，04§6 追踪行） |
@@ -479,11 +480,13 @@ PG 与 ClickHouse 迁移放在同一目录、同一版本序列（14 位时间�
 | 管线各阶段耗时 | `ingest_stage_seconds` | `stage`（validate/site_lookup/shield/sanitize/enrich/session/enqueue） |
 | 写缓冲深度与 flush | `write_buffer_depth`、`write_buffer_bytes`；`write_flush_seconds`、`write_flush_rows`；`write_flush_failures_total`；`write_buffer_dropped_total` | `reason` |
 | JetStream 积压 | `jetstream_pending_messages`、`jetstream_ack_pending`、`jetstream_consumer_lag_seconds`、`jetstream_publish_seconds`、`jetstream_redeliveries_total` | `consumer` |
-| 查询耗时按端点 | `query_seconds`、`query_errors_total` | `endpoint`、`kind`、`principal`（session/key/shared_link） |
+| 公开 API 请求 | `rivu_api_requests_total` | `route`（`api.query` 等）、`status`（含 401 / 403 / 429） |
+| 查询耗时 | `rivu_query_seconds`（固定桶直方图） | `route` |
+| 查询失败 | `rivu_query_errors_total` | `route`、`kind`（`validation` / `timeout` / `resource_limit` / `internal`） |
 | 缓存命中率 | `cache_hits_total`、`cache_misses_total`、`cache_entries`、`cache_refresh_seconds` | `cache`（site/session/query/salt） |
 | 限流与认证 | `ratelimit_rejected_total`、`auth_login_failures_total` | `scope` |
 | 后台任务 | `jobs_total`、`job_seconds`、`jobs_queue_age_seconds`、`jobs_leader` | `kind`、`state` |
-| GeoIP | `geoip_refresh_total`；`geoip_db_age_seconds`（按库的 `build_epoch`）、`geoip_loaded`（0/1） | 只有 `geoip_refresh_total` 带标签：`source`（dbip-lite/maxmind-geolite2/custom）、`result`（updated/not_modified/failed）；另两个无标签（来源切换后旧标签的序列会残留）。后两个由持有库的进程（collector、all）导出，worker 不持有库，所以对应的告警应针对 collector 的抓取目标 |
+| GeoIP | `geoip_refresh_total`；`geoip_db_age_seconds`（按库的 `build_epoch`）、`geoip_loaded`（0/1） | 只有 `geoip_refresh_total` 带标签：`source`（dbip-lite/maxmind-geolite2/custom）、`result`（updated/not_modified/failed）；另两个无标签（来源切换后旧标签的序列会残留）。后两个由持有库的进程（collector、api、all）导出，worker 不持有库，所以对应的告警应针对 collector 的抓取目标 |
 | 依赖与状态 | `pg_pool_connections`、`ch_http_seconds`、`build_info`、`schema_version`、`salt_days_loaded` | `account` |
 
 Plausible 自定义指标覆盖缓存命中、ingest buffer 入队与丢弃、清理阶段耗时（04§6）；Rivu 补齐阶段耗时、JetStream 与按端点查询耗时。建议告警起点：写缓冲深度 > 80% 持续 1 分钟、`write_flush_failures_total` 增长、JetStream lag > 60s、非 bot/shield 丢弃率 > 1%、`/readyz` 失败 > 2 分钟、`jobs_leader` 总和 ≠ 1、`geoip_loaded` = 0 持续 1 小时或 `geoip_db_age_seconds` 超过 45 天（DB-IP 按月发布）、最近成功备份距今 > 26 小时。
