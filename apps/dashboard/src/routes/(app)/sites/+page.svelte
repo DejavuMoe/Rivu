@@ -2,10 +2,10 @@
   站点列表：当前组织的站点网格。卡片整体可点进看板；24 小时内没有数据的站点链到安装页。
   每张卡片各查两次：按小时的访客走势，以及 24 小时去重访客总数（分小时的访客数不能相加）。
   卡片进入视口才查询，同时最多 4 张卡片在查（站点多时不一次把查询并发打满）。
-  站点多于 6 个时才出现搜索框。目前没有创建站点的接口，所以没有「添加站点」入口。
+  站点多于 6 个时才出现搜索框。owner / admin 在页头和空状态里有「添加站点」入口。
 -->
 <script lang="ts">
-  import { Inbox, Search, X } from "@lucide/svelte";
+  import { Inbox, Plus, Search, X } from "@lucide/svelte";
   import PageHeader from "#lib/app/PageHeader.svelte";
   import Sparkline from "#lib/charts/Sparkline.svelte";
   import Avatar from "#lib/ui/Avatar.svelte";
@@ -19,7 +19,7 @@
   import { api } from "#lib/api.ts";
   import { compact } from "#lib/format.ts";
   import { t } from "#lib/i18n.ts";
-  import { orgSites } from "#lib/session.svelte.ts";
+  import { canAddSite, orgSites } from "#lib/session.svelte.ts";
   import { app } from "#lib/state.svelte.ts";
   import { inview, limiter } from "#lib/lazy.ts";
   import "./strings";
@@ -76,7 +76,13 @@
 </script>
 
 <div class="page">
-  <PageHeader title={t("sites.title")} />
+  <PageHeader title={t("sites.title")}>
+    {#snippet actions()}
+      {#if canAddSite()}
+        <Button variant="primary" icon={Plus} href="/sites/new">{t("nav.addSite")}</Button>
+      {/if}
+    {/snippet}
+  </PageHeader>
 
   {#if all.length > 6}
     <div class="search">
@@ -90,7 +96,11 @@
 
   {#if all.length === 0}
     <Card>
-      <EmptyState icon={Inbox} title={t("sites.empty.title")} />
+      <EmptyState icon={Inbox} title={t("sites.empty.title")} body={canAddSite() ? undefined : t("sl.empty.viewer")}>
+        {#snippet actions()}
+          {#if canAddSite()}<Button variant="primary" icon={Plus} href="/sites/new">{t("nav.addSite")}</Button>{/if}
+        {/snippet}
+      </EmptyState>
     </Card>
   {:else if shown.length === 0}
     <Card>

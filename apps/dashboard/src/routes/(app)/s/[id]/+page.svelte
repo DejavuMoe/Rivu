@@ -3,6 +3,7 @@
   import { page } from "$app/state";
   import DashboardView from "#lib/dashboard/DashboardView.svelte";
   import NotFound from "#lib/app/NotFound.svelte";
+  import { canShareLinks } from "#lib/admin/sections.ts";
   import { findSite } from "#lib/session.svelte.ts";
 
   const site = $derived(findSite(Number(page.params.id)));
@@ -14,7 +15,7 @@
 
 {#if site}
   {#key site.id}
-    <DashboardView source={{ site: site.id }} name={site.name} siteId={site.id} />
+    <DashboardView source={{ site: site.id }} name={site.name} siteId={site.id} canShare={canShareLinks(site)} />
   {/key}
 {:else}
   <NotFound />

@@ -1,9 +1,10 @@
 <!--
   左侧栏：组织切换与搜索 → 全部站点 → 当前组织的站点 → 用户菜单。
-  当前项用背景色表示，不加色条。服务端还没有的管理页（接入诊断、站点设置、成员、API 密钥）暂不出现。
+  当前站点展开看板 / 站点设置二级项；owner / admin 在「站点」标题行右侧有添加站点的加号。
+  当前项用背景色表示，不加色条。服务端还没有的管理页（接入诊断、成员、API 密钥）暂不出现。
 -->
 <script lang="ts">
-  import { ChevronsUpDown, LayoutGrid, LogOut, Search, ShieldCheck } from "@lucide/svelte";
+  import { ChartSpline, ChevronsUpDown, LayoutGrid, LogOut, Plus, Search, Settings2, ShieldCheck } from "@lucide/svelte";
   import { goto } from "$app/navigation";
   import { page } from "$app/state";
   import Popover from "../ui/Popover.svelte";
@@ -14,8 +15,10 @@
   import Kbd from "../ui/Kbd.svelte";
   import Segmented from "../ui/Segmented.svelte";
   import { t } from "../i18n";
+  import type { Role } from "../api";
   import { app, setLang, setTheme, type ThemePref, type Lang } from "../state.svelte";
-  import { currentOrg, displayName, orgSites, orgs, session, setOrg } from "../session.svelte";
+  import { visibleSections } from "../admin/sections";
+  import { canAddSite, currentOrg, displayName, orgSites, orgs, session, setOrg } from "../session.svelte";
   import { signOut } from "./sign-out";
 
   let { onsearch }: { onsearch?: () => void } = $props();
@@ -24,6 +27,17 @@
   const sites = $derived(orgSites());
   const path = $derived(page.url.pathname);
   const currentSite = $derived(page.params.id ? Number(page.params.id) : null);
+  /** 当前站点所在的子页：看板、设置，其余（安装页）都不高亮二级项 */
+  const tab = $derived.by(() => {
+    if (currentSite === null) return null;
+    const rest = path.slice(`/s/${currentSite}`.length);
+    return rest === "" || rest === "/" ? "dashboard" : rest.startsWith("/settings") ? "settings" : null;
+  });
+  /** 设置入口指向第一个可见分区；一个都看不到时不显示 */
+  function settingsHref(s: { id: number; role: Role | null; access: "member" | "guest" }) {
+    const first = visibleSections(s)[0];
+    return first ? `/s/${s.id}/settings/${first}` : null;
+  }
 </script>
 
 <aside class="sidebar">
@@ -66,15 +80,34 @@
       <span class="grow">{t("nav.allSites")}</span>
     </a>
 
-    {#if sites.length}
-      <div class="group"><span>{t("nav.sites")}</span></div>
+    {#if sites.length || canAddSite()}
+      <div class="group">
+        <span>{t("nav.sites")}</span>
+        {#if canAddSite()}
+          <a class="add" href="/sites/new" aria-label={t("nav.addSite")} title={t("nav.addSite")}><Plus size={16} strokeWidth={1.75} /></a>
+        {/if}
+      </div>
     {/if}
 
     {#each sites as s (s.id)}
-      <a class="item" href="/s/{s.id}" aria-current={s.id === currentSite ? "page" : undefined}>
+      {@const open = s.id === currentSite}
+      {@const settings = open ? settingsHref(s) : null}
+      <a class="item" href="/s/{s.id}" aria-current={open && tab === "dashboard" ? "page" : undefined} class:open>
         <Avatar name={s.name} shape="square" size={16} />
         <span class="grow">{s.name}</span>
       </a>
+      {#if open && settings}
+        <div class="sub">
+          <a class="item" href="/s/{s.id}" aria-current={tab === "dashboard" ? "page" : undefined}>
+            <ChartSpline size={16} strokeWidth={1.75} />
+            <span class="grow">{t("nav.dashboard")}</span>
+          </a>
+          <a class="item" href={settings} aria-current={tab === "settings" ? "page" : undefined}>
+            <Settings2 size={16} strokeWidth={1.75} />
+            <span class="grow">{t("nav.settings")}</span>
+          </a>
+        </div>
+      {/if}
     {/each}
   </nav>
 
@@ -233,14 +266,37 @@
     min-height: 0;
     overflow-y: auto;
   }
+  .item.open {
+    color: var(--text);
+  }
   .group {
     display: flex;
     align-items: center;
+    justify-content: space-between;
     height: var(--control-md);
     margin-top: var(--sp-3);
     padding: 0 var(--sp-1) 0 var(--sp-2);
     color: var(--text-muted);
     font-size: var(--fs-sm);
+  }
+  .add {
+    display: grid;
+    place-items: center;
+    width: 24px;
+    height: 24px;
+    border-radius: var(--r-xs);
+    color: var(--text-muted);
+  }
+  .add:hover {
+    background: var(--bg-element);
+    color: var(--text);
+  }
+  /* 二级导航：图标与上一级的文字左缘对齐（8 + 16 + 8 = 32） */
+  .sub {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding-left: var(--sp-6);
   }
 
   .bottom {

@@ -88,6 +88,12 @@ export function canManage(site: Site | undefined): boolean {
   return site?.role === "owner" || site?.role === "admin";
 }
 
+/** 能否在组织里添加站点：该组织的 owner / admin（只以站点访客身份可见的组织不行）。 */
+export function canAddSite(orgId: number | null = session.orgId): boolean {
+  const role = session.me?.organizations.find((o) => o.id === orgId)?.role;
+  return role === "owner" || role === "admin";
+}
+
 export function displayName(): string {
   const u = session.me?.user;
   return u?.name || u?.email || "";
