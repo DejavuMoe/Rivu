@@ -55,7 +55,8 @@ Lite 的会话分配依赖单写者，只允许一个 `all`（或一个 `collect
 - `lb_try_duration` 让 collector 重启期间的连接失败请求在 Caddy 排队重试，实现近零丢失重启；超过 5s 仍无上游返回 502，该窗口事件丢失，只留在 Caddy 日志，不进 `ingest_counters`。
 - Reliable 多副本用 `dynamic a`（Docker DNS）发现副本，配 `health_uri /readyz` + `health_port 9090` 主动检查；Lite 单上游不启用主动检查，避免预热期被整体摘除。
 - 服务端只信任 `RIVU_TRUSTED_PROXIES` 内对端传来的 `X-Forwarded-For`：从右向左跳过可信 CIDR，取第一个不可信地址为客户端 IP；对端不在可信范围则忽略该头。Caddy 默认用对端地址覆盖该头，前面再有 CDN 时才在全局 `servers { trusted_proxies }` 加 CDN 的 CIDR。
-- Caddy 访问日志必须删除 IP 与请求头（如上），否则隐私承诺在代理层被破坏。HSTS、`Content-Security-Policy: default-src 'self'` 等安全头在静态 handle 中统一设置。
+- Caddy 访问日志必须删除 IP 与请求头（如上），否则隐私承诺在代理层被破坏。HSTS、`X-Content-Type-Options: nosniff`、`Referrer-Policy: same-origin` 等安全头在静态 handle 中统一设置。
+- 页面的 CSP 由 `apps/dashboard` 的构建写进 `index.html` 的 `<meta>`（`default-src 'self'`，入口的内联启动脚本按哈希放行，`style-src` 带 `'unsafe-inline'`），Caddy 不能再给页面加一份限制脚本的 CSP：两份策略取交集，启动脚本会被挡掉。`<meta>` 表达不了的 `frame-ancestors` 由 Caddy 用只含这一项的头给出：`Content-Security-Policy: frame-ancestors 'none'`。
 
 ### 1.4 拓扑示意
 ```
