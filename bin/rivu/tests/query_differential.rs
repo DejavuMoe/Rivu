@@ -424,7 +424,14 @@ const VISIT_DIMS: [&str; 18] = [
     "visit:os",
     "visit:os_version",
 ];
-const TIME_DIMS: [&str; 5] = ["time", "time:hour", "time:day", "time:week", "time:month"];
+const TIME_DIMS: [&str; 6] = [
+    "time",
+    "time:minute",
+    "time:hour",
+    "time:day",
+    "time:week",
+    "time:month",
+];
 const OPS: [&str; 8] = [
     "is",
     "is_not",
@@ -692,8 +699,35 @@ impl Gen<'_> {
     }
 
     /// 日期范围；`small`：时间维度是小时，范围不能太长。
-    fn date_range(&mut self, small: bool, now: i64) -> Value {
+    fn date_range(&mut self, small: bool, minute: bool, now: i64) -> Value {
         let form = self.rng.random_range(0..100);
+        if minute {
+            // 分钟桶上限 25 小时：只用 ≤ 25 小时的范围（含 DST 回拨日与跨午夜的时间戳范围）
+            return match form {
+                0..=24 => json!("day"),
+                25..=44 => json!("24h"),
+                45..=64 => json!("realtime"),
+                65..=74 => json!("1d"),
+                _ => {
+                    let (from, _) = self.random_dates(0, now);
+                    let start = from
+                        .at(
+                            self.rng.random_range(0..24),
+                            self.rng.random_range(0..60),
+                            0,
+                            0,
+                        )
+                        .to_zoned(self.berlin.clone())
+                        .unwrap()
+                        .timestamp()
+                        .as_millisecond();
+                    let len = self.rng.random_range(60_000..20 * 3_600_000);
+                    let a = self.timestamp_bound(start);
+                    let b = self.timestamp_bound(start + len);
+                    json!([a, b])
+                }
+            };
+        }
         if small {
             return match form {
                 0..=19 => json!("day"),
@@ -834,6 +868,7 @@ impl Gen<'_> {
             _ => {}
         }
         let hour_dim = dims.contains(&"time:hour");
+        let minute_dim = dims.contains(&"time:minute");
 
         // 过滤
         let mut filters: Vec<Value> = Vec::new();
@@ -893,7 +928,7 @@ impl Gen<'_> {
 
         let mut spec = json!({
             "metrics": metrics,
-            "date_range": self.date_range(hour_dim, now),
+            "date_range": self.date_range(hour_dim, minute_dim, now),
         });
         if !dims.is_empty() {
             spec["dimensions"] = json!(dims);

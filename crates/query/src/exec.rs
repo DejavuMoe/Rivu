@@ -328,7 +328,7 @@ fn labels(q: &ResolvedQuery, raw: &[String]) -> Vec<String> {
                     v.clone()
                 }
             }
-            RDim::Time(Gran::Hour) => v
+            RDim::Time(Gran::Minute | Gran::Hour) => v
                 .parse::<i64>()
                 .map(|secs| fmt_local(&q.tz, secs.saturating_mul(1000)))
                 .unwrap_or_else(|_| v.clone()),

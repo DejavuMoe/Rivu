@@ -229,6 +229,30 @@ fn sql_time_series_with_week_start() {
             "dimensions": ["time"]
         }),
     );
+    // 分钟桶：事件与会话指标混用，会话按范围内首次活跃的分钟归桶
+    snap(
+        "time_minute",
+        json!({
+            "metrics": ["visitors", "pageviews", "visits"],
+            "date_range": "realtime",
+            "dimensions": ["time:minute"],
+            "include": {"time_labels": true}
+        }),
+    );
+}
+
+#[test]
+fn time_minute_bucket_cap_is_a_validation_error() {
+    let (p, m) = validation(json!({
+        "metrics": ["visitors"], "date_range": "2d", "dimensions": ["time:minute"]
+    }));
+    assert_eq!(p, "dimensions");
+    assert!(m.contains("time:minute"), "{m}");
+    // realtime 与 24h 都在上限内
+    for r in ["realtime", "24h", "day"] {
+        build(json!({"metrics": ["visitors"], "date_range": r, "dimensions": ["time:minute"]}))
+            .unwrap_or_else(|e| panic!("{r}: {e:?}"));
+    }
 }
 
 #[test]
@@ -582,11 +606,6 @@ fn invalid_combinations_and_unsupported_features_fail_with_paths() {
                 json!(["visit:country", "event:props:plan"]),
             ),
             "dimensions[1]",
-            "not supported yet",
-        ),
-        (
-            base(json!(["visitors"]), json!(["time:minute"])),
-            "dimensions[0]",
             "not supported yet",
         ),
         (

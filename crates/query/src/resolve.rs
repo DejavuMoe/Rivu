@@ -85,6 +85,9 @@ pub const MAX_VALUE_CHARS: usize = 1024;
 pub const MAX_FILTER_LEAVES: usize = 100;
 /// 时间维度的桶数上限（标签与结果行数）。
 pub const MAX_TIME_BUCKETS: usize = 10_000;
+/// `time:minute` 的桶数上限：25 小时 = 1500 个桶，足够一个 DST 回拨日（25 小时）或起点不在整分的 `24h`（1441 个桶）。
+/// 分钟桶只服务实时视图，更长的范围用 `time:hour`。
+pub const MAX_MINUTE_BUCKETS: usize = 1500;
 
 /// 支持的最早本地日期：保证本地午夜换算成 UTC 后仍在 1970 年之后（ClickHouse 的 `Date` 从 1970-01-01 起）。
 const MIN_DATE: Date = Date::constant(1970, 1, 3);
@@ -183,6 +186,7 @@ impl Col {
 /// 时间粒度。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Gran {
+    Minute,
     Hour,
     Day,
     Week,
@@ -192,6 +196,7 @@ pub(crate) enum Gran {
 impl Gran {
     pub(crate) fn dimension_name(self) -> &'static str {
         match self {
+            Gran::Minute => "time:minute",
             Gran::Hour => "time:hour",
             Gran::Day => "time:day",
             Gran::Week => "time:week",
@@ -840,6 +845,15 @@ pub(crate) fn fmt_local(tz: &TimeZone, ms: i64) -> String {
     )
 }
 
+/// 分钟桶起点（UTC 毫秒）：把时刻对齐到站点本地时间的整分（UTC 偏移都是整分钟，所以与 UTC 整分一致）。
+pub(crate) fn minute_floor_ms(tz: &TimeZone, ms: i64) -> i64 {
+    let Ok(ts) = Timestamp::from_millisecond(ms) else {
+        return ms;
+    };
+    let z = ts.to_zoned(tz.clone());
+    ms - (i64::from(z.second()) * 1000 + i64::from(z.millisecond()))
+}
+
 /// 小时桶起点（UTC 毫秒）：把时刻对齐到站点本地时间的整点（非整点时区如 +5:45 也对齐本地整点）。
 pub(crate) fn hour_floor_ms(tz: &TimeZone, ms: i64) -> i64 {
     let Ok(ts) = Timestamp::from_millisecond(ms) else {
@@ -871,6 +885,21 @@ pub(crate) fn time_labels(
         )
     };
     match gran {
+        Gran::Minute => {
+            let mut t = minute_floor_ms(tz, iv.start_ms);
+            while t < iv.end_ms {
+                if out.len() >= MAX_MINUTE_BUCKETS {
+                    return Err(range_error(
+                        "dimensions",
+                        format!(
+                            "the date range has more than {MAX_MINUTE_BUCKETS} `time:minute` buckets (about 24 hours); use `time:hour` or a shorter range"
+                        ),
+                    ));
+                }
+                out.push(fmt_local(tz, t));
+                t += 60_000;
+            }
+        }
         Gran::Hour => {
             let mut t = hour_floor_ms(tz, iv.start_ms);
             while t < iv.end_ms {
@@ -1055,6 +1084,7 @@ impl ResolvedQuery {
                 time_seen = true;
                 let g = match d {
                     Dimension::Time => auto_granularity(&main_iv, &tz),
+                    Dimension::TimeMinute => Gran::Minute,
                     Dimension::TimeHour => Gran::Hour,
                     Dimension::TimeDay => Gran::Day,
                     Dimension::TimeWeek => Gran::Week,
@@ -1103,7 +1133,7 @@ impl ResolvedQuery {
         if spec.include.time_labels && time_dim.is_none() {
             return Err(QueryError::validation(
                 "include.time_labels",
-                "requires a time dimension (`time`, `time:hour`, `time:day`, `time:week` or `time:month`)",
+                "requires a time dimension (`time`, `time:minute`, `time:hour`, `time:day`, `time:week` or `time:month`)",
             ));
         }
 
@@ -1654,6 +1684,63 @@ mod tests {
                 .len(),
             144
         );
+    }
+
+    #[test]
+    fn minute_labels_and_bucket_cap() {
+        let berlin = tz("Europe/Berlin");
+        let now = ms(&berlin, 2026, 10, 24, 15, 42) + 17_000; // 15:42:17
+        // realtime：[now - 5min, now]，首桶对齐本地整分
+        let r = iv(DateRange::Realtime, &berlin, now);
+        let labels = time_labels(&r, Gran::Minute, &berlin, Weekday::Monday).unwrap();
+        assert_eq!(labels.len(), 6);
+        assert_eq!(labels[0], "2026-10-24T15:37:00+02:00");
+        assert_eq!(labels[5], "2026-10-24T15:42:00+02:00");
+        // 24h：起点不在整分，多跨一个桶（1441），仍在上限内
+        let h = iv(DateRange::Hours24, &berlin, now);
+        assert_eq!(
+            time_labels(&h, Gran::Minute, &berlin, Weekday::Monday)
+                .unwrap()
+                .len(),
+            1441
+        );
+        // 非整点时区：偏移带 :45，分钟对齐本地整分
+        let kt = tz("Asia/Kathmandu");
+        let r = iv(
+            DateRange::Custom(CustomRange {
+                from: RangeBound::Instant("2026-03-01T00:20:30Z".parse().unwrap()),
+                to: RangeBound::Instant("2026-03-01T00:23:00Z".parse().unwrap()),
+            }),
+            &kt,
+            now,
+        );
+        assert_eq!(
+            time_labels(&r, Gran::Minute, &kt, Weekday::Monday).unwrap(),
+            [
+                "2026-03-01T06:05:00+05:45",
+                "2026-03-01T06:06:00+05:45",
+                "2026-03-01T06:07:00+05:45"
+            ]
+        );
+        // DST 回拨日 25 小时 = 1500 个桶，正好在上限内；回拨的两个 02:00 可以区分
+        let fall = iv(
+            DateRange::Custom(CustomRange {
+                from: RangeBound::Date(date(2026, 10, 25)),
+                to: RangeBound::Date(date(2026, 10, 25)),
+            }),
+            &berlin,
+            ms(&berlin, 2026, 11, 1, 0, 0),
+        );
+        let l = time_labels(&fall, Gran::Minute, &berlin, Weekday::Monday).unwrap();
+        assert_eq!(l.len(), MAX_MINUTE_BUCKETS);
+        assert_eq!(l[179], "2026-10-25T02:59:00+02:00");
+        assert_eq!(l[180], "2026-10-25T02:00:00+01:00");
+        // 超过上限：校验错误
+        let two_days = iv(DateRange::Days(2), &berlin, now);
+        let e = time_labels(&two_days, Gran::Minute, &berlin, Weekday::Monday).unwrap_err();
+        let (path, msg) = e.as_validation().unwrap();
+        assert_eq!(path, "dimensions");
+        assert!(msg.contains("time:minute"), "{msg}");
     }
 
     #[test]

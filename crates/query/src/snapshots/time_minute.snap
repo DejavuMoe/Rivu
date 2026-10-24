@@ -1,0 +1,35 @@
+---
+source: crates/query/src/sql_tests.rs
+expression: "render(&sql, &params)"
+---
+SELECT d0, sum(c_visitors) AS m0, sum(c_pageviews) AS m1, sum(c_visits) AS m2
+FROM (
+  SELECT toString(toUnixTimestamp(toStartOfInterval(toTimeZone(ts, {tz:String}), INTERVAL 1 MINUTE))) AS d0, uniq(visitor_id) AS c_visitors, countIf(name = 'pageview') AS c_pageviews, toUInt64(0) AS c_visits
+  FROM (
+    SELECT *
+    FROM events
+    WHERE site_id = {site:UInt64} AND toDate(ts) >= {from_date:Date} AND toDate(ts) <= {to_date:Date} AND ts >= fromUnixTimestamp64Milli({from_ms:Int64}, 'UTC') AND ts < fromUnixTimestamp64Milli({to_ms:Int64}, 'UTC') AND name != 'engagement') AS e
+  GROUP BY d0
+  UNION ALL SELECT toString(toUnixTimestamp(toStartOfInterval(toTimeZone(greatest(s_start, fromUnixTimestamp64Milli({from_ms:Int64}, 'UTC')), {tz:String}), INTERVAL 1 MINUTE))) AS d0, toUInt64(0) AS c_visitors, toUInt64(0) AS c_pageviews, count() AS c_visits
+  FROM (
+    SELECT session_id, min(started_at) AS s_start, max(last_event_at) AS s_last, sum(pageviews) AS s_pv, sum(interactive_events) AS s_inter, sum(engagement_ms) AS s_eng
+    FROM sessions
+    WHERE site_id = {site:UInt64} AND start_date >= {s_from:Date} AND start_date <= {to_date:Date}
+    GROUP BY site_id, start_date, session_id
+    HAVING s_last >= fromUnixTimestamp64Milli({from_ms:Int64}, 'UTC') AND s_start < fromUnixTimestamp64Milli({to_ms:Int64}, 'UTC'))
+  GROUP BY d0)
+GROUP BY d0
+ORDER BY d0 ASC, m0 DESC
+LIMIT {p0:UInt64} OFFSET {p1:UInt64}
+
+-- params
+site: UInt64 = 4242
+from_ms: Int64 = 1792749300000
+to_ms: Int64 = 1792749600001
+from_date: Date = "2026-10-23"
+to_date: Date = "2026-10-23"
+s_from: Date = "2026-10-16"
+tz: String = "Europe/Berlin"
+wk: UInt8 = 7
+p0: UInt64 = 10000
+p1: UInt64 = 0
