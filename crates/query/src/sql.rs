@@ -496,6 +496,9 @@ impl<'a> Builder<'a> {
     fn time_expr(gran: Gran, base: &str) -> String {
         let local = format!("toTimeZone({base}, {{tz:String}})");
         match gran {
+            Gran::Minute => {
+                format!("toString(toUnixTimestamp(toStartOfInterval({local}, INTERVAL 1 MINUTE)))")
+            }
             Gran::Hour => {
                 format!("toString(toUnixTimestamp(toStartOfInterval({local}, INTERVAL 1 HOUR)))")
             }
