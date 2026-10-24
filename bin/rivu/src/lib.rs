@@ -12,6 +12,7 @@ pub mod query_api;
 pub mod run;
 pub mod script;
 pub mod shield_cmd;
+pub mod site_admin;
 #[cfg(test)]
 mod testutil;
 pub mod user_cmd;

@@ -261,6 +261,7 @@ pub async fn issue_link(
             password_hash: password_hash.as_deref(),
             expires_at_unix: expires_at,
             created_by: None,
+            name: None,
         },
     )
     .await?;
