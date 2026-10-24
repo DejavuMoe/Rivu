@@ -762,8 +762,8 @@ v1 的 `overview`、`timeseries`、`breakdown`、`goals` 改为看板中的查�
 | 类别 | 已支持 | 返回 `not supported yet` |
 |---|---|---|
 | 指标 | `visitors` `visits` `pageviews` `events` `views_per_visit` `bounce_rate` `visit_duration` `engaged_duration` `percentage` `exit_rate` `time_on_page` `scroll_depth` | 转化率（`conversion_rate` `group_conversion_rate`）、收入（`total_revenue` `average_revenue`） |
-| 维度 | `event:name` `event:page` `event:hostname` `visit:entry_page` `visit:exit_page` `visit:source` `visit:channel` `visit:referrer` `visit:utm_*` `visit:country` `visit:region` `visit:city` `visit:device` `visit:browser(_version)` `visit:os(_version)`、`time` `time:hour` `time:day` `time:week` `time:month` | 目标（`event:goal`）、属性（`event:props:<k>`）、`time:minute` |
-| 过滤 | 上述维度（不含时间维度）上的 8 个叶子操作符，以及 `and` `or` `not`；`visit:city` 只支持 `is` `is_not`，取值是 GeoNames id | `has_done` `has_not_done`、`["is","segment",[id]]`、对目标、属性、`time:minute` 的过滤 |
+| 维度 | `event:name` `event:page` `event:hostname` `visit:entry_page` `visit:exit_page` `visit:source` `visit:channel` `visit:referrer` `visit:utm_*` `visit:country` `visit:region` `visit:city` `visit:device` `visit:browser(_version)` `visit:os(_version)`、`time` `time:minute` `time:hour` `time:day` `time:week` `time:month`（`time:minute` 至多 1500 个桶，约 25 小时） | 目标（`event:goal`）、属性（`event:props:<k>`） |
+| 过滤 | 上述维度（不含时间维度）上的 8 个叶子操作符，以及 `and` `or` `not`；`visit:city` 只支持 `is` `is_not`，取值是 GeoNames id | `has_done` `has_not_done`、`["is","segment",[id]]`、对目标、属性的过滤 |
 | `date_range` | `day` `24h` `month` `year` `all` `realtime` `Nd` `Nmo` `[from, to]` | — |
 | `include` | `time_labels` `total_rows` `compare` | `imports`（未实现，直接是未知字段） |
 | 数据层 | 原始层（`events` 与 `sessions`）。`meta.tiers` 恒为 `["raw"]` | 日汇总层与 §6.4「选层」规则、`range_beyond_raw_retention` 警告 |
@@ -894,7 +894,7 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 
 - **终点封顶到 `now`**：所有区间的终点取 `min(终点, now + 1 ms)`。未来没有数据，这样 `month`、`year`、`day` 的时间标签不会出现未来的空桶，数据与标签用同一个终点。主区间与对比期都封顶。
 - **自动粒度**（`time` 维度）：按区间覆盖的本地日数：≤ 2 日用小时，≤ 40 日用日，≤ 364 日（52 周）用周，否则用月。与 Plausible 的 48 小时 / 40 天 / 52 周相近，但按本地日数而不是时长，23 与 25 小时的日子不会让「两天」变成「日」。时间桶（标签与结果行）至多 10000 个，超出报校验错误。
-- **分桶**：`toStartOfInterval(toTimeZone(ts, tz), …)`。小时桶对齐站点本地时间的整点（+5:45 这类非整点时区也对齐本地整点），标签带偏移（`2026-10-23T14:00:00+08:00`，DST 回拨的两个 02:00 可以区分）；日、周、月桶的标签是桶起始日 `YYYY-MM-DD`。时间维度的结果只含有数据的桶，完整的桶序列在 `meta.time_labels`。P1 没有 Plausible 的「活跃访客按 15 分钟时间槽展开」：小时桶里的 `visitors` 只数该小时内有事件的访客；`time:minute` 尚不支持。
+- **分桶**：`toStartOfInterval(toTimeZone(ts, tz), …)`。小时桶对齐站点本地时间的整点（+5:45 这类非整点时区也对齐本地整点），标签带偏移（`2026-10-23T14:00:00+08:00`，DST 回拨的两个 02:00 可以区分）；分钟桶同理对齐本地整分，标签 `2026-10-24T15:12:00+08:00`，范围超过 1500 个桶（25 小时，容得下 DST 回拨日）报校验错误，`realtime`（5 分钟）可用，自动粒度 `time` 不会选分钟；日、周、月桶的标签是桶起始日 `YYYY-MM-DD`。时间维度的结果只含有数据的桶，完整的桶序列在 `meta.time_labels`。P1 没有 Plausible 的「活跃访客按 15 分钟时间槽展开」：小时桶里的 `visitors` 只数该小时内有事件的访客，分钟桶同样只数该分钟内有事件的访客。
 - 周起始日做成站点设置，默认周一。Plausible 写死为周一（R03 §12.2 #12）。周桶的标签是该周起始日，首桶可能早于范围起点。
 - **对比期**（`include.compare`），终点同样封顶到 `now`：
 

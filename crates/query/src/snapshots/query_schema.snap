@@ -111,7 +111,7 @@ expression: "crate::schema_json()"
           "type": "string"
         }
       ],
-      "description": "A dimension. `event:goal`, `event:props:<key>` and `time:minute` are accepted by the schema but not supported yet."
+      "description": "A dimension. `event:goal` and `event:props:<key>` are accepted by the schema but not supported yet."
     },
     "Filter": {
       "anyOf": [

@@ -510,6 +510,10 @@ impl Clock<'_> {
     fn bucket(&self, gran: &str, ms: i64) -> String {
         let z = self.zoned(ms);
         match gran {
+            "minute" => {
+                let into = i64::from(z.second()) * 1000 + i64::from(z.millisecond());
+                ((ms - into).div_euclid(1000)).to_string()
+            }
             "hour" => {
                 let into = (i64::from(z.minute()) * 60 + i64::from(z.second())) * 1000
                     + i64::from(z.millisecond());
@@ -523,8 +527,8 @@ impl Clock<'_> {
 
     /// 桶的展示值。
     fn bucket_label(&self, gran: &str, raw: &str) -> String {
-        if gran == "hour" {
-            self.fmt_hour(raw.parse::<i64>().expect("小时桶是秒数") * 1000)
+        if gran == "hour" || gran == "minute" {
+            self.fmt_hour(raw.parse::<i64>().expect("小时 / 分钟桶是秒数") * 1000)
         } else {
             raw.to_owned()
         }
@@ -535,12 +539,13 @@ impl Clock<'_> {
         if iv.end <= iv.start {
             return out;
         }
-        if gran == "hour" {
-            let first: i64 = self.bucket("hour", iv.start).parse().expect("秒数");
+        if gran == "hour" || gran == "minute" {
+            let step = if gran == "hour" { 3_600_000 } else { 60_000 };
+            let first: i64 = self.bucket(gran, iv.start).parse().expect("秒数");
             let mut t = first * 1000;
             while t < iv.end {
                 out.push(self.fmt_hour(t));
-                t += 3_600_000;
+                t += step;
             }
             return out;
         }
@@ -1139,6 +1144,7 @@ pub fn run(spec_json: &Value, site: &RefSite, events: &[RefEvent]) -> Result<Ref
     let time_idx = spec.dims.iter().position(|d| d.starts_with("time"));
     let gran = match time_idx.map(|i| spec.dims[i].as_str()) {
         Some("time") => clock.auto_gran(&main_iv),
+        Some("time:minute") => "minute",
         Some("time:hour") => "hour",
         Some("time:day") => "day",
         Some("time:week") => "week",

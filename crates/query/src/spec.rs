@@ -162,7 +162,7 @@ impl Metric {
 // 维度
 // ------------------------------------------------------------------------------------------
 
-/// 分组与过滤的维度。`event:goal`、`event:props:<k>`、`time:minute` 本轮不支持（能解析）。
+/// 分组与过滤的维度。`event:goal`、`event:props:<k>` 本轮不支持（能解析）。
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Dimension {
     EventName,
@@ -303,10 +303,7 @@ impl Dimension {
 
     /// 本轮不支持的维度。
     pub fn is_supported(&self) -> bool {
-        !matches!(
-            self,
-            Dimension::EventGoal | Dimension::EventProp(_) | Dimension::TimeMinute
-        )
+        !matches!(self, Dimension::EventGoal | Dimension::EventProp(_))
     }
 }
 
@@ -337,7 +334,7 @@ impl JsonSchema for Dimension {
     fn json_schema(_: &mut SchemaGenerator) -> Schema {
         let names: Vec<&str> = FIXED_DIMENSIONS.iter().map(|(n, _)| *n).collect();
         schema(json!({
-            "description": "A dimension. `event:goal`, `event:props:<key>` and `time:minute` are accepted by the schema but not supported yet.",
+            "description": "A dimension. `event:goal` and `event:props:<key>` are accepted by the schema but not supported yet.",
             "anyOf": [
                 {"type": "string", "enum": names},
                 {"type": "string", "pattern": "^event:props:.+$", "maxLength": 212}
