@@ -116,7 +116,7 @@ Reliable:  浏览器 ─443─► Caddy ─┬ /api/event,/js/* ─► collector
 | `goals` | 转化目标 | `site_id`、`kind` ∈ event/page、`event_name`、`page_path`、`display_name` | `UNIQUE(site,kind,COALESCE(event_name,page_path))` 部分唯一 |
 | `funnels`、`funnel_steps` | 漏斗（第 4 阶段） | `site_id`、`name`；`funnel_id`、`goal_id`、`step_order` | `UNIQUE(funnel_id,step_order)` |
 | `segments` | 保存的筛选段 | `site_id`、`owner_user_id` NULL=站点级、`name`、`filter jsonb`（结构见 `system-design.md`） | `INDEX(site_id)` |
-| `shared_links` | 分享链接 | `site_id`、`slug`（≥24 字符随机）、`password_hash` NULL（argon2id）、`segment_id` NULL、`expires_at` | `UNIQUE(slug)` |
+| `shared_links` | 分享链接 | `site_id`、`name` NULL（1–100 字符，看板里区分链接用）、`slug`（≥24 字符随机）、`password_hash` NULL（argon2id）、`segment_id` NULL、`expires_at` | `UNIQUE(slug)` |
 | `shield_rules` | 屏蔽规则，单表（Plausible 为 4 张，04§1.2） | `site_id`、`type`、`action`、`value` | `UNIQUE(site,type,value)` 部分唯一；每站上限见 3.3 |
 | `api_keys` | API 密钥 | `organization_id`、`user_id`、`name`、`key_prefix`、`key_hash`、`scopes text[]`、`last_used_at`、`expires_at` | `UNIQUE(key_hash)`；`INDEX(user_id)` |
 | `auth_sessions` | 后台登录会话 | `user_id`、`token_hash`、`device_label`、`last_used_at`、`expires_at` | `UNIQUE(token_hash)`；`INDEX(expires_at)` |
@@ -272,6 +272,8 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 ※ admin 只能分配与修改 admin/editor/viewer，不能触碰 owner（对应 04§2.1「能分配哪些角色」「能改哪个成员的角色」）；另有纯函数 `can_assign(actor, target_role)`、`can_modify(actor, member_role)`。站点访客不是 org 成员，不能创建 API key。
 
 `sites.read`、`exports.read` 两行由 `crates/auth` 的 `Action`（`StatsRead` `SitesRead` `SitesWrite` `ExportsRead`）实现：成员都能读站点信息；读导出与 `export.create` 同级（owner、admin、editor）；API key 的 `sites:write` 对应 `site.settings.write`（owner、admin）。站点访客不是 org 成员，不能持有 API key，所以这两行的访客列记 —。
+
+**看板站点管理端点**（`bin/rivu/src/site_admin.rs`，`/api/internal/*`，会话鉴权 + CSRF）按同一矩阵判定，`Action` 另有 `SiteSettingsRead`（读设置、屏蔽规则、共享链接列表：有效角色 ≥ editor，站点访客 editor 也可读）、`SiteSettingsWrite`（设置、hostnames、shield 写）、`SitePublicToggle`、`SiteCreate`、`SiteDelete`（均 owner、admin）、`SharedLinkManage`（owner、admin、editor）。写动作与 `shared_link.manage` 只认**组织角色**，站点访客永远不够。响应码规则：未登录 401；站点对调用者不可见（不存在、已删除、非组织成员且无访客授权）404，与 4.2 一致；**站点可见但角色不够 403 `forbidden`**（已经可见，403 不泄露存在性）；建站（`POST /orgs/{org_id}/sites`）看目标组织里的组织角色，不是该组织成员 404、成员但低于 admin 403。取值非法 400，重复 409 `conflict`，屏蔽规则已满 409 `limit_reached`。站点删除目前只做**软删除**（`sites.deleted_at`，请求体 `confirm` 须等于站点名；之后统计、共享链接、公开看板、设置都 404），不做恢复，也不清理 ClickHouse 数据（多阶段删除流程以后做）。共享链接密码与命令行一致（12–128 字符，argon2id）；hostnames 写入前拒绝 `www.` 开头（含 `*.www.`），因为采集侧规范化会去掉 `www.`，写进去永远匹配不到；允许删光白名单（空白名单 = collector 丢弃全部事件，fail-closed）。
 
 **状态规则**（服务层事务内校验；04§2.1 同样把此类规则留在 service）：org 至少保留一名 owner（降级、移除、自行退出都先 `SELECT ... FOR UPDATE` 锁 org 行再数 owner）；同时有 org 角色与站点访客角色时取较高者；邀请不能授予超出邀请人可分配范围的角色，过期或已接受的邀请不可复用；站点已软删除时除恢复外的写动作返回 404。
 

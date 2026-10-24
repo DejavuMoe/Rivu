@@ -16,6 +16,15 @@
 //! | `GET /api/internal/shared/{slug}` | 无（限流） | 共享链接的入口信息：是否要密码、是否已授权；已授权才带站点 |
 //! | `POST /api/internal/shared/{slug}/auth` | 无（限流） | 共享链接密码，通过后签发 12 小时的访问凭证 cookie |
 //! | `GET /api/internal/public/{site}` | 无（限流） | 公开站点（`is_public`）的入口信息 |
+//! | `POST /api/internal/orgs/{org_id}/sites` | 会话，组织 admin+ | 建站（域名规范化、白名单 = [域名]） |
+//! | `GET /api/internal/sites/{site}/settings` | 会话，有效角色 editor+ | 站点设置、白名单、限额与地理库能力 |
+//! | `PATCH /api/internal/sites/{site}` | 会话，组织 admin+ | 改名称、时区、周起始日、公开、采集、hash 路由、限速、地理精度 |
+//! | `DELETE /api/internal/sites/{site}` | 会话，组织 admin+ | 软删除（请求体 `confirm` 须等于站点名） |
+//! | `POST /api/internal/sites/{site}/hostnames`、`DELETE …/hostnames/{pattern}` | 会话，组织 admin+ | 白名单增删 |
+//! | `GET /api/internal/sites/{site}/shield`（editor+）、`POST`（admin+）、`DELETE …/shield/{id}`（admin+） | 会话 | 屏蔽规则 |
+//! | `GET /api/internal/sites/{site}/shared-links`、`POST`、`DELETE …/shared-links/{id}` | 会话，组织 editor+ | 共享链接的列表、创建、吊销 |
+//!
+//! 站点管理端点的实现在 [`crate::site_admin`]：站点对调用者不可见一律 404，可见但角色不够 403 `forbidden`。
 //!
 //! 其余 `/api/internal/*` 仍是 501（`public.rs` 的通配）。`{site}` 是站点的数字 id（`sites.id`，文档里的 `{site_id}`）
 //! 或 12 位的 `site_key`；匿名的公开看板只知道 `site_key`，所以两种都收。
@@ -113,7 +122,7 @@ use crate::query_api::{self, Fail, no_store};
 pub const SHARE_HEADER: &str = "x-rivu-share";
 
 /// 认证类端点的请求体上限。
-const AUTH_BODY_MAX: usize = 16 * 1024;
+pub(crate) const AUTH_BODY_MAX: usize = 16 * 1024;
 /// 查询请求体的上限（与公开 API 相同）。
 const QUERY_BODY_MAX: usize = query_api::MAX_BODY_BYTES;
 /// 实时查询的结果缓存时间（`system-design.md` §6.9：实时 3 s）。
@@ -301,11 +310,15 @@ type Clock = Arc<dyn Fn() -> Timestamp + Send + Sync>;
 
 /// 内部端点的依赖。进程里建一个并共享：限流状态在它里面。
 pub struct DashApi {
-    pg: PgPool,
+    pub(crate) pg: PgPool,
     /// `rivu_reader` 账号的客户端（已绑定库）。
     reader: clickhouse::Client,
-    geo: Option<Arc<GeoDb>>,
-    passwords: PasswordService,
+    pub(crate) geo: Option<Arc<GeoDb>>,
+    pub(crate) passwords: PasswordService,
+    /// `RIVU_SHIELD_MAX_RULES_PER_SITE`。
+    pub(crate) shield_max_rules: usize,
+    /// `RIVU_INGEST_RATE_LIMIT_PER_MIN`（`None` = 不限流）：站点没有自己的限额时用它，设置页展示。
+    pub(crate) ingest_rate_default: Option<u32>,
     csrf: Csrf,
     cookies: CookieConfig,
     /// `RIVU_SETUP_TOKEN` 的 SHA-256：比较时两边都是定长摘要，常数时间。
@@ -334,6 +347,8 @@ impl DashApi {
             reader,
             geo,
             passwords: PasswordService::new(rivu_auth::password::DEFAULT_CONCURRENCY),
+            shield_max_rules: config.shield_max_rules_per_site,
+            ingest_rate_default: config.ingest_rate_limit_per_min,
             csrf,
             cookies: CookieConfig {
                 secure: config.cookie_secure,
@@ -412,7 +427,7 @@ impl DashApi {
 // ------------------------------------------------------------------------------------------
 
 #[derive(Debug)]
-enum DashError {
+pub(crate) enum DashError {
     /// 401：没有有效的会话。
     Unauthorized,
     /// 401：邮箱或密码不对（统一消息，不区分账号不存在、密码错误、账号被禁用）。
@@ -427,6 +442,10 @@ enum DashError {
     Csrf(CsrfError),
     /// 404：不存在、无权访问、已关闭（全部同一个响应）。
     NotFound,
+    /// 403：站点对调用者可见（所以不泄露存在性），但有效角色不够。
+    Forbidden,
+    /// 409：与现有数据冲突（`conflict` 重复）或已达上限（`limit_reached`）。
+    Conflict(&'static str, String),
     /// 400。
     Invalid(String),
     /// 429，带建议的等待时间。
@@ -444,7 +463,7 @@ impl From<anyhow::Error> for DashError {
     }
 }
 
-fn json_response(status: StatusCode, body: Value) -> Response {
+pub(crate) fn json_response(status: StatusCode, body: Value) -> Response {
     let mut resp = (status, Json(body)).into_response();
     no_store(&mut resp);
     resp
@@ -490,6 +509,10 @@ impl IntoResponse for DashError {
                 )
             }
             DashError::NotFound => error_body(StatusCode::NOT_FOUND, "not_found", "not found"),
+            DashError::Forbidden => {
+                error_body(StatusCode::FORBIDDEN, "forbidden", "insufficient role")
+            }
+            DashError::Conflict(code, message) => error_body(StatusCode::CONFLICT, code, &message),
             DashError::Invalid(message) => {
                 error_body(StatusCode::BAD_REQUEST, "invalid_request", &message)
             }
@@ -525,7 +548,7 @@ fn csrf_reason(r: CsrfError) -> &'static str {
     }
 }
 
-type Res<T> = Result<T, DashError>;
+pub(crate) type Res<T> = Result<T, DashError>;
 
 fn rate_limited(scope: &'static str, wait: Duration) -> DashError {
     metrics::counter!("rivu_ratelimit_rejected_total", "scope" => scope).increment(1);
@@ -562,7 +585,7 @@ fn ip_bucket(ip: IpAddr) -> IpBucket {
 // ------------------------------------------------------------------------------------------
 
 /// 读并解析 JSON 请求体。解析错误一律是不含内容的 400：serde 的错误消息可能回显取值（密码）。
-async fn read_json<T: for<'de> Deserialize<'de>>(req: Request, max: usize) -> Res<T> {
+pub(crate) async fn read_json<T: for<'de> Deserialize<'de>>(req: Request, max: usize) -> Res<T> {
     let bytes = query_api::read_body(req, max)
         .await
         .map_err(|f| DashError::Fail(f, 0))?;
@@ -575,8 +598,8 @@ async fn read_json<T: for<'de> Deserialize<'de>>(req: Request, max: usize) -> Re
 // ------------------------------------------------------------------------------------------
 
 /// 一个请求里识别出的登录会话。
-struct SessionCtx {
-    s: ActiveSession,
+pub(crate) struct SessionCtx {
+    pub(crate) s: ActiveSession,
     /// 这个请求续了期：响应里要刷新 cookie。
     renewed: Option<String>,
 }
@@ -607,12 +630,12 @@ impl DashApi {
         Ok(Some(SessionCtx { s, renewed }))
     }
 
-    async fn require_session(&self, headers: &HeaderMap) -> Res<SessionCtx> {
+    pub(crate) async fn require_session(&self, headers: &HeaderMap) -> Res<SessionCtx> {
         self.session(headers).await?.ok_or(DashError::Unauthorized)
     }
 
     /// 带上续期的 cookie。
-    fn finish(&self, resp: Response, ctx: &SessionCtx) -> Response {
+    pub(crate) fn finish(&self, resp: Response, ctx: &SessionCtx) -> Response {
         match &ctx.renewed {
             Some(c) => with_cookie(resp, c),
             None => resp,
@@ -743,7 +766,7 @@ async fn setup(
     ))
 }
 
-fn clean_name(raw: Option<&str>) -> Res<Option<String>> {
+pub(crate) fn clean_name(raw: Option<&str>) -> Res<Option<String>> {
     let Some(n) = raw.map(str::trim).filter(|n| !n.is_empty()) else {
         return Ok(None);
     };
@@ -838,7 +861,7 @@ fn no_content_clearing(api: &DashApi) -> Response {
     )
 }
 
-fn ns(mut resp: Response) -> Response {
+pub(crate) fn ns(mut resp: Response) -> Response {
     no_store(&mut resp);
     resp
 }
@@ -916,7 +939,7 @@ async fn me(State(api): State<Arc<DashApi>>, req: Request) -> Res<Response> {
 }
 
 /// 有效角色 = max(组织角色, 站点访客角色)（`platform-and-ops.md` §4.2 第 4 步）。无法识别的角色文本不参与（fail-closed）。
-fn effective_role(roles: &UserSiteRoles) -> Option<OrgRole> {
+pub(crate) fn effective_role(roles: &UserSiteRoles) -> Option<OrgRole> {
     [roles.org_role.as_deref(), roles.guest_role.as_deref()]
         .into_iter()
         .flatten()
@@ -934,20 +957,33 @@ async fn list_sites(State(api): State<Arc<DashApi>>, req: Request) -> Res<Respon
     let body: Vec<Value> = sites
         .iter()
         .map(|s| {
-            json!({
-                "id": s.id,
-                "site_key": s.site_key,
-                "name": s.name,
-                "timezone": s.timezone,
-                "is_public": s.is_public,
-                "organization": {"id": s.org_id, "name": s.org_name, "slug": s.org_slug},
-                "role": effective_role(&s.roles).map(OrgRole::as_str),
+            site_list_item(
+                s,
+                effective_role(&s.roles),
                 // 站点访客不是组织成员（没有 sites.read 等组织级动作）
-                "access": if s.roles.org_role.is_some() { "member" } else { "guest" },
-            })
+                s.roles.org_role.is_some(),
+            )
         })
         .collect();
     Ok(api.finish(json_response(StatusCode::OK, json!({"sites": body})), &ctx))
+}
+
+/// `GET /sites` 列表里一个站点的形状（建站端点的响应复用它）。
+pub(crate) fn site_list_item(
+    s: &access::VisibleSite,
+    role: Option<OrgRole>,
+    is_member: bool,
+) -> Value {
+    json!({
+        "id": s.id,
+        "site_key": s.site_key,
+        "name": s.name,
+        "timezone": s.timezone,
+        "is_public": s.is_public,
+        "organization": {"id": s.org_id, "name": s.org_name, "slug": s.org_slug},
+        "role": role.map(OrgRole::as_str),
+        "access": if is_member { "member" } else { "guest" },
+    })
 }
 
 // ------------------------------------------------------------------------------------------
@@ -1401,7 +1437,7 @@ async fn csrf_layer(State(api): State<Arc<DashApi>>, req: Request, next: Next) -
     }
 }
 
-async fn method_not_allowed(allow: &'static str) -> Response {
+pub(crate) async fn method_not_allowed(allow: &'static str) -> Response {
     let mut resp = StatusCode::METHOD_NOT_ALLOWED.into_response();
     resp.headers_mut()
         .insert(header::ALLOW, HeaderValue::from_static(allow));
@@ -1410,7 +1446,7 @@ async fn method_not_allowed(allow: &'static str) -> Response {
 }
 
 /// 一个端点：先过 CSRF 判定，再计入 `rivu_api_requests_total{route}`。
-fn endpoint(
+pub(crate) fn endpoint(
     api: &Arc<DashApi>,
     route: &'static str,
     path: &'static str,
@@ -1508,6 +1544,7 @@ pub fn router(api: Arc<DashApi>) -> Router {
             "/api/internal/public/{site}",
             get_only(get(public_info)),
         ))
+        .merge(crate::site_admin::routes(a))
 }
 // ------------------------------------------------------------------------------------------
 // 后台：活跃会话数与清理

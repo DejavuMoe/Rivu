@@ -64,6 +64,59 @@ pub async fn list_rules(pool: &PgPool, site_id: u64) -> Result<Vec<ShieldRuleRow
     rows.iter().map(rule_from_row).collect()
 }
 
+/// 设置页的一行规则（带创建时间）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleAdminRow {
+    pub rule: ShieldRuleRow,
+    /// UTC、毫秒精度的 RFC 3339 文本。
+    pub created_at: String,
+}
+
+/// 一个站点的未删除规则，按创建时间降序（最新的在前），供设置页列表。
+pub async fn list_rules_admin(pool: &PgPool, site_id: u64) -> Result<Vec<RuleAdminRow>> {
+    let rows = sqlx::query(concat!(
+        "SELECT id::text AS id, site_id, type, action, value, description, ",
+        ts_utc!("created_at"),
+        " AS created_at
+         FROM shield_rules WHERE site_id = $1 AND deleted_at IS NULL ORDER BY shield_rules.created_at DESC, id DESC"
+    ))
+    .bind(i64::try_from(site_id).context("site_id 超出范围")?)
+    .fetch_all(pool)
+    .await
+    .context("查询屏蔽规则失败")?;
+    rows.iter()
+        .map(|r| {
+            Ok(RuleAdminRow {
+                rule: rule_from_row(r)?,
+                created_at: r.try_get("created_at")?,
+            })
+        })
+        .collect()
+}
+
+/// 按 id 取一条未删除的规则（`id` 必须是 UUID 文本，否则报错）。
+pub async fn get_rule_admin(pool: &PgPool, site_id: u64, id: &str) -> Result<Option<RuleAdminRow>> {
+    anyhow::ensure!(is_uuid_text(id), "`{id}` 不是有效的规则 id（UUID）");
+    let row = sqlx::query(concat!(
+        "SELECT id::text AS id, site_id, type, action, value, description, ",
+        ts_utc!("created_at"),
+        " AS created_at
+         FROM shield_rules WHERE site_id = $1 AND id = ($2::text)::uuid AND deleted_at IS NULL"
+    ))
+    .bind(i64::try_from(site_id).context("site_id 超出范围")?)
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .context("查询屏蔽规则失败")?;
+    row.map(|r| {
+        Ok(RuleAdminRow {
+            rule: rule_from_row(&r)?,
+            created_at: r.try_get("created_at")?,
+        })
+    })
+    .transpose()
+}
+
 /// 新规则。`value` 必须已规范化。
 #[derive(Debug, Clone)]
 pub struct NewRule<'a> {
@@ -163,7 +216,7 @@ pub async fn remove_rule_by_id(pool: &PgPool, site_id: u64, id: &str) -> Result<
 }
 
 /// 8-4-4-4-12 的十六进制文本。
-fn is_uuid_text(s: &str) -> bool {
+pub fn is_uuid_text(s: &str) -> bool {
     s.len() == 36
         && s.bytes().enumerate().all(|(i, b)| match i {
             8 | 13 | 18 | 23 => b == b'-',

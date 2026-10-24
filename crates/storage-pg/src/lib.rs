@@ -1,5 +1,16 @@
 //! PostgreSQL 访问（sqlx）：连接池、迁移记录表与迁移执行，以及站点与盐。
 
+/// SQL 片段：把 timestamptz 列格式化成 UTC、毫秒精度的 RFC 3339 文本（`concat!` 里用，保持 `&'static str`）。
+macro_rules! ts_utc {
+    ($col:literal) => {
+        concat!(
+            "to_char(",
+            $col,
+            r#" AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')"#
+        )
+    };
+}
+
 pub mod access;
 pub mod api_keys;
 pub mod salts;
