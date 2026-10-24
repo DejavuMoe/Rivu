@@ -71,6 +71,62 @@ export interface QueryResult {
   query: Record<string, unknown>;
 }
 
+export interface SiteSettings {
+  week_starts_on: number;
+  collect_enabled: boolean;
+  tracker_hash: boolean;
+  /** null：用实例默认值 */
+  ingest_rate_limit_per_min: number | null;
+  geo_level: "country" | "region" | "city";
+}
+
+export interface Hostname {
+  pattern: string;
+  created_at: string;
+}
+
+export interface SettingsBody {
+  site: { id: number; site_key: string; name: string; timezone: string; is_public: boolean; created_at: string };
+  settings: SiteSettings;
+  hostnames: Hostname[];
+  /** 默认上限为 null：全局没有限流 */
+  limits: { ingest_rate_limit_default_per_min: number | null; shield_max_rules: number; ingest_rate_limit_max_per_min: number };
+  /** 当前加载的地理库能力；没有库为 null */
+  geo_capability: "country" | "city" | null;
+}
+
+export interface SitePatch {
+  name?: string;
+  timezone?: string;
+  week_starts_on?: number;
+  is_public?: boolean;
+  collect_enabled?: boolean;
+  tracker_hash?: boolean;
+  ingest_rate_limit_per_min?: number | null;
+  geo_level?: "country" | "region" | "city";
+}
+
+export type ShieldType = "ip" | "cidr" | "country" | "hostname" | "page";
+
+export interface ShieldRule {
+  id: string;
+  type: ShieldType;
+  action: "deny" | "allow";
+  value: string;
+  description: string | null;
+  created_at: string;
+}
+
+export interface SharedLink {
+  id: number;
+  name: string | null;
+  slug: string;
+  has_password: boolean;
+  expires_at: string | null;
+  created_at: string;
+  created_by: { id: number; name: string | null; email: string } | null;
+}
+
 export class ApiError extends Error {
   constructor(
     readonly status: number,
@@ -139,6 +195,25 @@ export const api = {
   logoutAll: () => request<void>("POST", `${base}/logout-all`),
   me: () => request<Me>("GET", `${base}/me`),
   sites: () => request<{ sites: Site[] }>("GET", `${base}/sites`),
+  createSite: (org: number, body: { domain: string; name?: string; timezone: string }) =>
+    request<{ site: Site }>("POST", `${base}/orgs/${org}/sites`, { body }),
+  siteSettings: (site: number | string) => request<SettingsBody>("GET", `${base}/sites/${site}/settings`),
+  patchSite: (site: number | string, body: SitePatch) => request<SettingsBody>("PATCH", `${base}/sites/${site}`, { body }),
+  deleteSite: (site: number | string, confirm: string) => request<void>("DELETE", `${base}/sites/${site}`, { body: { confirm } }),
+  addHostname: (site: number | string, pattern: string) =>
+    request<{ hostname: Hostname }>("POST", `${base}/sites/${site}/hostnames`, { body: { pattern } }),
+  removeHostname: (site: number | string, pattern: string) =>
+    request<void>("DELETE", `${base}/sites/${site}/hostnames/${encodeURIComponent(pattern)}`),
+  shield: (site: number | string) => request<{ rules: ShieldRule[]; max_rules: number }>("GET", `${base}/sites/${site}/shield`),
+  addShieldRule: (site: number | string, body: { type: ShieldType; action: "deny" | "allow"; value: string; description?: string }) =>
+    request<{ rule: ShieldRule }>("POST", `${base}/sites/${site}/shield`, { body }),
+  removeShieldRule: (site: number | string, id: string) =>
+    request<void>("DELETE", `${base}/sites/${site}/shield/${encodeURIComponent(id)}`),
+  sharedLinks: (site: number | string) => request<{ links: SharedLink[] }>("GET", `${base}/sites/${site}/shared-links`),
+  createSharedLink: (site: number | string, body: { name?: string; password?: string; expires_at?: string }) =>
+    request<{ link: SharedLink }>("POST", `${base}/sites/${site}/shared-links`, { body }),
+  revokeSharedLink: (site: number | string, id: number) =>
+    request<void>("DELETE", `${base}/sites/${site}/shared-links/${id}`),
   sessions: () => request<{ sessions: SessionInfo[] }>("GET", `${base}/sessions`),
   revokeSession: (id: number) => request<void>("DELETE", `${base}/sessions/${id}`),
   query: (site: number | string, spec: unknown, opts: { share?: string; signal?: AbortSignal } = {}) =>

@@ -6,7 +6,7 @@
   页头的在线人数每 30 秒刷新，实时视图下其余数据也每 30 秒刷新。目标卡片要等服务端支持 event:goal。
 -->
 <script lang="ts">
-  import { ChartSpline, CircleAlert, Clock, Hourglass, Inbox, Table2 } from "@lucide/svelte";
+  import { ChartSpline, CircleAlert, Clock, Hourglass, Inbox, Share2, Table2 } from "@lucide/svelte";
   import { page } from "$app/state";
   import PageHeader from "../app/PageHeader.svelte";
   import Card from "../ui/Card.svelte";
@@ -57,8 +57,10 @@
     mode?: "app" | "shared";
     /** 登录用户的站点 id（站内链接用） */
     siteId?: number;
+    /** 能管理共享链接：页头出现「分享」入口（只在 app 模式） */
+    canShare?: boolean;
   }
-  let { source, name, mode = "app", siteId }: Props = $props();
+  let { source, name, mode = "app", siteId, canShare = false }: Props = $props();
   const shared = $derived(mode === "shared");
 
   const POLL_MS = 30_000;
@@ -229,6 +231,11 @@
         >
           <LiveDot off={live === 0} />{t("dash.live", { n: live })}
         </svelte:element>
+      {/if}
+    {/snippet}
+    {#snippet actions()}
+      {#if !shared && canShare}
+        <Button icon={Share2} href="/s/{siteId}/settings/sharing">{t("dash.share")}</Button>
       {/if}
     {/snippet}
   </PageHeader>

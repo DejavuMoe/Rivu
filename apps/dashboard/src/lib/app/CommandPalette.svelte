@@ -4,7 +4,7 @@
   方向键移动，Enter 执行，Esc 关闭（原生 dialog 自带）。站点范围：在某个站点里时取该站点所在组织，否则取当前组织。
 -->
 <script lang="ts">
-  import { CornerDownLeft, LayoutGrid, Languages, Moon, Search, ShieldCheck, Sun } from "@lucide/svelte";
+  import { CornerDownLeft, LayoutGrid, Languages, Moon, Plus, Search, Settings2, ShieldCheck, Sun } from "@lucide/svelte";
   import { goto } from "$app/navigation";
   import { page } from "$app/state";
   import Avatar from "../ui/Avatar.svelte";
@@ -12,7 +12,8 @@
   import type { IconType } from "../ui/types";
   import { t } from "../i18n";
   import { app, setLang, setTheme } from "../state.svelte";
-  import { findSite, orgSites, session } from "../session.svelte";
+  import { visibleSections } from "../admin/sections";
+  import { canAddSite, findSite, orgSites, session } from "../session.svelte";
   import "./shell-strings";
 
   let { open = $bindable(false) }: { open: boolean } = $props();
@@ -64,6 +65,20 @@
       });
     }
     out.push({ id: "p-sites", group: "page", label: t("nav.allSites"), icon: LayoutGrid, run: () => navigate("/sites") });
+    const first = current ? visibleSections(current)[0] : undefined;
+    if (current && first) {
+      out.push({
+        id: "p-settings",
+        group: "page",
+        label: t("nav.settings"),
+        keywords: current.name,
+        icon: Settings2,
+        run: () => navigate(`/s/${current.id}/settings/${first}`),
+      });
+    }
+    if (canAddSite(current?.organization.id ?? session.orgId)) {
+      out.push({ id: "p-add", group: "page", label: t("nav.addSite"), icon: Plus, run: () => navigate("/sites/new") });
+    }
     out.push({ id: "p-acc", group: "page", label: t("nav.account"), icon: ShieldCheck, run: () => navigate("/account") });
     out.push({
       id: "a-theme",
