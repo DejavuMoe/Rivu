@@ -40,10 +40,15 @@ cp "$ROOT/crates/geo/tests/data/test-data/GeoIP2-City-Test.mmdb" "$RIVU_GEOIP_DB
 
 "$RIVU" migrate
 
-# 账号：不存在才建（重复运行不报错）
-if ! "$RIVU" user list | grep -q "$DEMO_EMAIL"; then
-  printf '%s\n' "$DEMO_PASSWORD" | "$RIVU" user add --email "$DEMO_EMAIL" --name "Demo" --password-stdin
-fi
+# 账号：不存在才建（重复运行不报错）。另有编辑者、查看者各一个，用来看按角色显示的界面，密码相同
+add_user() {
+  if ! "$RIVU" user list | grep -q "$1"; then
+    printf '%s\n' "$DEMO_PASSWORD" | "$RIVU" user add --email "$1" --name "$2" --password-stdin
+  fi
+}
+add_user "$DEMO_EMAIL" "Demo"
+add_user "editor@rivu.test" "Editor"
+add_user "viewer@rivu.test" "Viewer"
 
 # 站点：每次新建（site add 没有按名称查重），记下 site_key 用于模拟访问与共享链接。
 # `rivu site add` 把站点放进 id 最小的组织，所以演示账号加入那个组织（成为 owner）
@@ -54,7 +59,9 @@ KEY_MAIN="$(add_site "demo.rivu.test $(date +%H%M)" demo.rivu.test)"
 KEY_EMPTY="$(add_site "empty.rivu.test $(date +%H%M)" empty.rivu.test)"
 ORG_SLUG="$(docker exec rivu-dev-postgres-1 psql -U rivu_migrator -d rivu -Atc 'SELECT slug FROM organizations ORDER BY id LIMIT 1')"
 "$RIVU" org member add --org "$ORG_SLUG" --email "$DEMO_EMAIL" --role owner
-# 有数据的站点设成公开看板（还没有改设置的端点，直接改库）
+"$RIVU" org member add --org "$ORG_SLUG" --email "editor@rivu.test" --role editor
+"$RIVU" org member add --org "$ORG_SLUG" --email "viewer@rivu.test" --role viewer
+# 有数据的站点设成公开看板（还没有登录就直接改库，比走接口省事）
 docker exec rivu-dev-postgres-1 psql -U rivu_migrator -d rivu -qc "UPDATE sites SET is_public = true WHERE site_key = '$KEY_MAIN'"
 SHARE="$(printf '%s\n' "$DEMO_SHARE_PASSWORD" | "$RIVU" share create --site "$KEY_MAIN" --password-stdin | awk '/slug/ {print $NF}' | tail -1)"
 
@@ -91,7 +98,7 @@ done
 cat <<EOF
 
 看板开发后端已就绪：http://127.0.0.1:${PORT}
-  登录：$DEMO_EMAIL / $DEMO_PASSWORD
+  登录：$DEMO_EMAIL / $DEMO_PASSWORD（owner；editor@rivu.test、viewer@rivu.test 同一密码）
   有数据的站点：$KEY_MAIN（公开看板 /public/$KEY_MAIN）
   没有数据的站点：$KEY_EMPTY
   共享链接：/share/$SHARE（密码 $DEMO_SHARE_PASSWORD）
