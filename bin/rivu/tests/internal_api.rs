@@ -15,6 +15,7 @@
 //! - `csrf_*`、`login_is_rate_limited_*`；
 //! - `session_queries_equal_direct_execution_and_site_access_is_uniform`、`shared_links_*`、
 //!   `public_and_shared_access_is_rate_limited`；
+//! - `site_admin_*`：站点管理端点（建站、设置、白名单、屏蔽规则、共享链接、软删除；角色、404/403、CSRF）；
 //! - `cookie_attributes_in_https_mode`、`secrets_never_reach_the_logs_and_metrics_are_recorded`、
 //!   `unknown_accounts_cost_as_much_as_wrong_passwords`（统计方式粗测）。
 
@@ -395,6 +396,20 @@ impl Http {
 
     fn delete(&self, path: &str) -> Rb<'_> {
         self.rb("DELETE", path, Vec::new())
+            .header("Content-Type", "application/json")
+            .header("Origin", &self.origin)
+    }
+
+    /// 带 JSON 请求体的 `PATCH`（同样带 CSRF 要的头）。
+    fn patch(&self, path: &str, body: &Value) -> Rb<'_> {
+        self.rb("PATCH", path, body.to_string().into_bytes())
+            .header("Content-Type", "application/json")
+            .header("Origin", &self.origin)
+    }
+
+    /// 带 JSON 请求体的 `DELETE`（删站点要 `confirm`）。
+    fn delete_with(&self, path: &str, body: &Value) -> Rb<'_> {
+        self.rb("DELETE", path, body.to_string().into_bytes())
             .header("Content-Type", "application/json")
             .header("Origin", &self.origin)
     }
@@ -1366,7 +1381,7 @@ async fn session_lifecycle() {
     assert!(r.header("access-control-allow-origin").is_none());
     for path in [
         "/api/internal/orgs",
-        "/api/internal/sites/1/settings",
+        "/api/internal/sites/1/members",
         "/api/internal",
     ] {
         assert_eq!(http.get(path).send().await.status, 501, "{path}");
@@ -2869,7 +2884,15 @@ async fn public_and_shared_access_is_rate_limited() {
     };
     migrate_once(&env).await;
     let pg = rivu_storage_pg::connect(&env.pg_url, 6).await.unwrap();
-    let server = start(&env, &pg, &config(&env, &[]), DashLimits::default()).await;
+    // 补充速率压到 1 次/分钟（突发仍是默认的 60）：默认的 300 次/分钟每 0.2 秒补一个令牌，并行跑、ClickHouse 慢的时候
+    // 每个查询都比 0.2 秒长，令牌刚好被补回，永远等不到 429。默认值本身由 rivu-common 的配置测试覆盖
+    let server = start(
+        &env,
+        &pg,
+        &config(&env, &[("RIVU_PUBLIC_VIEW_RATE_PER_MIN", "1")]),
+        DashLimits::default(),
+    )
+    .await;
     let http = &server.http;
     let org = make_org(&pg).await;
     let member = make_user(&pg, Some((&org, "owner"))).await;
@@ -2884,7 +2907,7 @@ async fn public_and_shared_access_is_rate_limited() {
         let r = http.get(&info_path).ip("192.0.2.10").send().await;
         assert_eq!(r.status, 200, "第 {i} 次：{}", r.body);
     }
-    // 满 60 个令牌耗尽后，请求的间隔内可能补回 1 个令牌（每 0.2 秒一个）：在前几个请求内必须出现 429
+    // 60 个令牌耗尽后，下一个请求就该 429（每分钟才补 1 个；until_429 只是兜住恰好补回的那一个）
     let r = until_429(|| {
         http.post(&query_path(public.id), &spec)
             .ip("192.0.2.10")
@@ -2906,8 +2929,8 @@ async fn public_and_shared_access_is_rate_limited() {
     assert_eq!(r.json()["error"], "rate_limited");
     let retry: u64 = r.header("retry-after").unwrap().parse().unwrap();
     assert!(
-        (1..=2).contains(&retry),
-        "300 次/分钟 = 每 0.2 秒一个令牌，Retry-After 向上取整为 1 秒：{retry}"
+        (1..=60).contains(&retry),
+        "1 次/分钟：Retry-After 是到下一个令牌的秒数（向上取整），不超过 60：{retry}"
     );
     assert_eq!(
         http.post(&query_path(public.id), &spec)
@@ -3465,4 +3488,1464 @@ async fn unknown_accounts_cost_as_much_as_wrong_passwords() {
             "{name}与错误密码的中位耗时应当同量级：{d:.1} ms 对 {dw:.1} ms"
         );
     }
+}
+
+// ------------------------------------------------------------------ 站点管理端点
+
+/// 断言状态码并返回 JSON 体（204 等没有体的返回 `Null`）。
+fn expect(r: &Resp, status: u16) -> Value {
+    assert_eq!(r.status, status, "响应：{}", r.body);
+    if r.body.trim().is_empty() {
+        Value::Null
+    } else {
+        r.json()
+    }
+}
+
+/// 断言错误响应：状态码、`error` 码；返回 `message`。
+fn expect_err(r: &Resp, status: u16, code: &str) -> String {
+    let v = expect(r, status);
+    assert_eq!(v["error"], code, "响应：{}", r.body);
+    v["message"].as_str().unwrap_or_default().to_owned()
+}
+
+fn site_path(site: impl std::fmt::Display, tail: &str) -> String {
+    format!("/api/internal/sites/{site}{tail}")
+}
+
+async fn guest_of(pg: &PgPool, site: &Site, role: &str) -> User {
+    let u = make_user(pg, None).await;
+    sqlx::query("INSERT INTO site_memberships (site_id, user_id, role) VALUES ($1, $2, $3)")
+        .bind(site.id as i64)
+        .bind(u.id)
+        .bind(role)
+        .execute(pg)
+        .await
+        .unwrap();
+    u
+}
+
+/// 一个组织、四种组织角色、一个外人（别的组织的 owner）。
+struct Cast {
+    org: Org,
+    owner: String,
+    admin: String,
+    editor: String,
+    viewer: String,
+    outsider: String,
+}
+
+async fn cast(pg: &PgPool, http: &Http) -> Cast {
+    let org = make_org(pg).await;
+    let other = make_org(pg).await;
+    let mut cookies = Vec::new();
+    for role in ["owner", "admin", "editor", "viewer"] {
+        let u = make_user(pg, Some((&org, role))).await;
+        cookies.push(login_cookie(http, &u.email).await);
+    }
+    let outsider = make_user(pg, Some((&other, "owner"))).await;
+    let mut it = cookies.into_iter();
+    Cast {
+        org,
+        owner: it.next().unwrap(),
+        admin: it.next().unwrap(),
+        editor: it.next().unwrap(),
+        viewer: it.next().unwrap(),
+        outsider: login_cookie(http, &outsider.email).await,
+    }
+}
+
+async fn create_site_via_api(http: &Http, cookie: &str, org_id: i64, body: &Value) -> Resp {
+    http.post(&format!("/api/internal/orgs/{org_id}/sites"), body)
+        .cookie(cookie)
+        .send()
+        .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn site_admin_create_and_settings() {
+    let Some(env) = test_env("site_admin_settings") else {
+        return;
+    };
+    migrate_once(&env).await;
+    let pg = rivu_storage_pg::connect(&env.pg_url, 6).await.unwrap();
+    let cfg = config(&env, &[]);
+    let server = start(&env, &pg, &cfg, loose()).await;
+    let http = &server.http;
+    let c = cast(&pg, http).await;
+    let org_id = c.org.id;
+
+    // ---- 建站：角色与可见性
+    let body = json!({"domain": "example.com", "timezone": "UTC"});
+    expect_err(
+        &http
+            .post(&format!("/api/internal/orgs/{org_id}/sites"), &body)
+            .send()
+            .await,
+        401,
+        "unauthorized",
+    );
+    for (who, cookie) in [("viewer", &c.viewer), ("editor", &c.editor)] {
+        let m = expect_err(
+            &create_site_via_api(http, cookie, org_id, &body).await,
+            403,
+            "forbidden",
+        );
+        assert_eq!(m, "insufficient role", "{who}");
+    }
+    // 不是该组织成员：404，与组织不存在相同
+    expect_err(
+        &create_site_via_api(http, &c.outsider, org_id, &body).await,
+        404,
+        "not_found",
+    );
+    expect_err(
+        &create_site_via_api(http, &c.admin, i64::MAX, &body).await,
+        404,
+        "not_found",
+    );
+    let r = http
+        .post("/api/internal/orgs/abc/sites", &body)
+        .cookie(&c.admin)
+        .send()
+        .await;
+    expect_err(&r, 404, "not_found");
+
+    // 域名规范化：scheme、www、端口、路径、大小写都去掉；名称缺省 = 域名
+    let v = expect(
+        &create_site_via_api(
+            http,
+            &c.admin,
+            org_id,
+            &json!({"domain": "  HTTPS://WWW.Example.com.:8443/a/b?q=1#f ", "timezone": "Asia/Shanghai"}),
+        )
+        .await,
+        201,
+    );
+    let s = &v["site"];
+    assert_eq!(s["name"], "example.com");
+    assert_eq!(s["timezone"], "Asia/Shanghai");
+    assert_eq!(s["is_public"], false);
+    assert_eq!(s["role"], "admin");
+    assert_eq!(s["access"], "member");
+    assert_eq!(s["organization"]["id"], org_id);
+    assert_eq!(s["organization"]["slug"], c.org.slug);
+    let site_id = s["id"].as_u64().unwrap();
+    let key = s["site_key"].as_str().unwrap().to_owned();
+    assert_eq!(key.len(), 12);
+    let settings = expect(
+        &http
+            .get(&site_path(site_id, "/settings"))
+            .cookie(&c.admin)
+            .send()
+            .await,
+        200,
+    );
+    assert_eq!(settings["hostnames"].as_array().unwrap().len(), 1);
+    assert_eq!(settings["hostnames"][0]["pattern"], "example.com");
+    // 与 `GET /sites` 同形
+    let list = expect(
+        &http
+            .get("/api/internal/sites")
+            .cookie(&c.admin)
+            .send()
+            .await,
+        200,
+    );
+    let listed = list["sites"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["id"] == site_id)
+        .expect("新站点在列表里")
+        .clone();
+    assert_eq!(&listed, s);
+
+    // 自定义名称（trim）；owner 也可以建
+    let v = expect(
+        &create_site_via_api(
+            http,
+            &c.owner,
+            org_id,
+            &json!({"domain": "blog.example.org", "name": "  My Blog ", "timezone": "UTC"}),
+        )
+        .await,
+        201,
+    );
+    assert_eq!(v["site"]["name"], "My Blog");
+    assert_eq!(v["site"]["role"], "owner");
+
+    // 400：时区、域名、名称
+    for (body, prefix) in [
+        (
+            json!({"domain": "a.com", "timezone": "Mars/Base"}),
+            "the timezone",
+        ),
+        (json!({"domain": "a.com", "timezone": ""}), "the timezone"),
+        (
+            json!({"domain": "*.a.com", "timezone": "UTC"}),
+            "the domain",
+        ),
+        (json!({"domain": "", "timezone": "UTC"}), "the domain"),
+        (
+            json!({"domain": "bad domain.com", "timezone": "UTC"}),
+            "the domain",
+        ),
+        (
+            json!({"domain": "www.www.a.com", "timezone": "UTC"}),
+            "the domain",
+        ),
+        (
+            json!({"domain": "a.com", "name": "x".repeat(101), "timezone": "UTC"}),
+            "the name",
+        ),
+        (
+            json!({"domain": "a.com", "name": "a\u{7}b", "timezone": "UTC"}),
+            "the name",
+        ),
+    ] {
+        let m = expect_err(
+            &create_site_via_api(http, &c.admin, org_id, &body).await,
+            400,
+            "invalid_request",
+        );
+        assert!(m.starts_with(prefix), "{body} -> {m}");
+    }
+    expect_err(
+        &create_site_via_api(http, &c.admin, org_id, &json!({"domain": "a.com"})).await,
+        400,
+        "invalid_request",
+    );
+
+    // ---- 读设置：角色
+    let want_geo = server.geo.capability().map(|c| c.as_str());
+    let st = expect(
+        &http
+            .get(&site_path(site_id, "/settings"))
+            .cookie(&c.editor)
+            .send()
+            .await,
+        200,
+    );
+    assert_eq!(st["site"]["id"], site_id);
+    assert_eq!(st["site"]["site_key"], key);
+    assert_eq!(st["site"]["name"], "example.com");
+    assert_eq!(st["site"]["is_public"], false);
+    assert!(st["site"]["created_at"].as_str().unwrap().ends_with('Z'));
+    assert_eq!(
+        st["settings"],
+        json!({"week_starts_on": 1, "collect_enabled": true, "tracker_hash": false,
+               "ingest_rate_limit_per_min": null, "geo_level": "city"})
+    );
+    assert_eq!(
+        st["limits"]["shield_max_rules"],
+        cfg.shield_max_rules_per_site
+    );
+    assert_eq!(
+        st["limits"]["ingest_rate_limit_default_per_min"],
+        json!(cfg.ingest_rate_limit_per_min)
+    );
+    assert!(
+        st["limits"]["ingest_rate_limit_max_per_min"]
+            .as_u64()
+            .unwrap()
+            >= 1_000_000
+    );
+    assert_eq!(st["geo_capability"], json!(want_geo));
+    expect_err(
+        &http
+            .get(&site_path(site_id, "/settings"))
+            .cookie(&c.viewer)
+            .send()
+            .await,
+        403,
+        "forbidden",
+    );
+    expect_err(
+        &http
+            .get(&site_path(site_id, "/settings"))
+            .cookie(&c.outsider)
+            .send()
+            .await,
+        404,
+        "not_found",
+    );
+    expect_err(
+        &http.get(&site_path(site_id, "/settings")).send().await,
+        401,
+        "unauthorized",
+    );
+    expect_err(
+        &http
+            .get(&site_path("nosuchsite1", "/settings"))
+            .cookie(&c.admin)
+            .send()
+            .await,
+        404,
+        "not_found",
+    );
+    // 站点访客：editor 能读设置，写 403；viewer 读也 403
+    let site = Site {
+        id: site_id,
+        key: key.clone(),
+        org_id,
+    };
+    let ge = guest_of(&pg, &site, "editor").await;
+    let gv = guest_of(&pg, &site, "viewer").await;
+    let ge_cookie = login_cookie(http, &ge.email).await;
+    let gv_cookie = login_cookie(http, &gv.email).await;
+    expect(
+        &http
+            .get(&site_path(&key, "/settings"))
+            .cookie(&ge_cookie)
+            .send()
+            .await,
+        200,
+    );
+    expect_err(
+        &http
+            .get(&site_path(&key, "/settings"))
+            .cookie(&gv_cookie)
+            .send()
+            .await,
+        403,
+        "forbidden",
+    );
+    expect_err(
+        &http
+            .patch(&site_path(&key, ""), &json!({"name": "x"}))
+            .cookie(&ge_cookie)
+            .send()
+            .await,
+        403,
+        "forbidden",
+    );
+
+    // ---- PATCH：权限
+    for (cookie, status) in [(&c.viewer, 403), (&c.editor, 403), (&c.outsider, 404)] {
+        let r = http
+            .patch(&site_path(site_id, ""), &json!({"name": "hijack"}))
+            .cookie(cookie)
+            .send()
+            .await;
+        assert_eq!(r.status, status, "{}", r.body);
+    }
+    expect_err(
+        &http
+            .patch(&site_path(site_id, ""), &json!({"name": "hijack"}))
+            .send()
+            .await,
+        401,
+        "unauthorized",
+    );
+    expect_err(
+        &http
+            .patch(&site_path(site_id, ""), &json!({"is_public": true}))
+            .cookie(&c.editor)
+            .send()
+            .await,
+        403,
+        "forbidden",
+    );
+
+    // ---- PATCH：每个字段都能往返
+    let patch = |body: Value| {
+        let cookie = c.admin.clone();
+        let path = site_path(site_id, "");
+        async move { http.patch(&path, &body).cookie(&cookie).send().await }
+    };
+    let v = expect(&patch(json!({"name": "  Renamed  "})).await, 200);
+    assert_eq!(v["site"]["name"], "Renamed");
+    let v = expect(&patch(json!({"timezone": "Europe/Berlin"})).await, 200);
+    assert_eq!(v["site"]["timezone"], "Europe/Berlin");
+    let v = expect(&patch(json!({"week_starts_on": 0})).await, 200);
+    assert_eq!(v["settings"]["week_starts_on"], 0);
+    let v = expect(&patch(json!({"collect_enabled": false})).await, 200);
+    assert_eq!(v["settings"]["collect_enabled"], false);
+    let v = expect(&patch(json!({"geo_level": "country"})).await, 200);
+    assert_eq!(v["settings"]["geo_level"], "country");
+    // 只改一个字段不影响别的
+    assert_eq!(v["site"]["name"], "Renamed");
+    assert_eq!(v["settings"]["week_starts_on"], 0);
+    assert_eq!(v["settings"]["collect_enabled"], false);
+    // 限速：给值、再用 null 恢复默认
+    let v = expect(
+        &patch(json!({"ingest_rate_limit_per_min": 5000})).await,
+        200,
+    );
+    assert_eq!(v["settings"]["ingest_rate_limit_per_min"], 5000);
+    let v = expect(&patch(json!({"name": "Renamed2"})).await, 200);
+    assert_eq!(
+        v["settings"]["ingest_rate_limit_per_min"], 5000,
+        "没提到的字段不被重置"
+    );
+    let v = expect(
+        &patch(json!({"ingest_rate_limit_per_min": null})).await,
+        200,
+    );
+    assert_eq!(v["settings"]["ingest_rate_limit_per_min"], Value::Null);
+    // 公开：之后匿名的公开入口可达
+    expect_err(
+        &http
+            .get(&format!("/api/internal/public/{key}"))
+            .send()
+            .await,
+        404,
+        "not_found",
+    );
+    let v = expect(&patch(json!({"is_public": true})).await, 200);
+    assert_eq!(v["site"]["is_public"], true);
+    expect(
+        &http
+            .get(&format!("/api/internal/public/{key}"))
+            .send()
+            .await,
+        200,
+    );
+    expect(&patch(json!({"is_public": false})).await, 200);
+    expect_err(
+        &http
+            .get(&format!("/api/internal/public/{key}"))
+            .send()
+            .await,
+        404,
+        "not_found",
+    );
+
+    // tracker_hash 只写 `hash` 键，保留 tracker 里的其他键
+    sqlx::query("UPDATE site_settings SET tracker = '{\"other\": 1, \"nested\": {\"a\": true}}' WHERE site_id = $1")
+        .bind(site_id as i64)
+        .execute(&pg)
+        .await
+        .unwrap();
+    let tracker = || async {
+        let t: String =
+            sqlx::query_scalar("SELECT tracker::text FROM site_settings WHERE site_id = $1")
+                .bind(site_id as i64)
+                .fetch_one(&pg)
+                .await
+                .unwrap();
+        serde_json::from_str::<Value>(&t).unwrap()
+    };
+    let v = expect(&patch(json!({"tracker_hash": true})).await, 200);
+    assert_eq!(v["settings"]["tracker_hash"], true);
+    assert_eq!(
+        tracker().await,
+        json!({"other": 1, "nested": {"a": true}, "hash": true})
+    );
+    let v = expect(&patch(json!({"tracker_hash": false})).await, 200);
+    assert_eq!(v["settings"]["tracker_hash"], false);
+    assert_eq!(
+        tracker().await,
+        json!({"other": 1, "nested": {"a": true}, "hash": false})
+    );
+    expect(&patch(json!({"tracker_hash": true})).await, 200);
+
+    // 采集侧读到的是同一份数据（collector 的站点快照来源）
+    let row = rivu_storage_pg::sites::find_site_by_key(&pg, &key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (
+            row.timezone.as_str(),
+            row.collect_enabled,
+            row.geo_level.as_str(),
+            row.tracker_hash,
+            row.ingest_rate_limit_per_min
+        ),
+        ("Europe/Berlin", false, "country", true, None)
+    );
+    let week: i16 =
+        sqlx::query_scalar("SELECT week_starts_on FROM site_settings WHERE site_id = $1")
+            .bind(site_id as i64)
+            .fetch_one(&pg)
+            .await
+            .unwrap();
+    assert_eq!(week, 0);
+
+    // 老数据没有 site_settings 行：GET 给列默认值，PATCH 补行
+    sqlx::query("DELETE FROM site_settings WHERE site_id = $1")
+        .bind(site_id as i64)
+        .execute(&pg)
+        .await
+        .unwrap();
+    let st = expect(
+        &http
+            .get(&site_path(site_id, "/settings"))
+            .cookie(&c.admin)
+            .send()
+            .await,
+        200,
+    );
+    assert_eq!(
+        st["settings"],
+        json!({"week_starts_on": 1, "collect_enabled": true, "tracker_hash": false,
+               "ingest_rate_limit_per_min": null, "geo_level": "city"})
+    );
+    let v = expect(&patch(json!({"week_starts_on": 6})).await, 200);
+    assert_eq!(v["settings"]["week_starts_on"], 6);
+    assert_eq!(v["settings"]["collect_enabled"], true);
+
+    // 400：未知字段、空对象、取值越界、类型错
+    let max = st["limits"]["ingest_rate_limit_max_per_min"]
+        .as_u64()
+        .unwrap();
+    for bad in [
+        json!({"nope": 1}),
+        json!({"name": "ok", "site_key": "x"}),
+        json!({}),
+        json!({"name": ""}),
+        json!({"name": "   "}),
+        json!({"name": "x".repeat(101)}),
+        json!({"timezone": "Not/AZone"}),
+        json!({"week_starts_on": 7}),
+        json!({"week_starts_on": -1}),
+        json!({"week_starts_on": "1"}),
+        json!({"ingest_rate_limit_per_min": 0}),
+        json!({"ingest_rate_limit_per_min": -5}),
+        json!({"ingest_rate_limit_per_min": max + 1}),
+        json!({"ingest_rate_limit_per_min": "many"}),
+        json!({"geo_level": "planet"}),
+        json!({"is_public": "yes"}),
+    ] {
+        expect_err(&patch(bad.clone()).await, 400, "invalid_request");
+    }
+    let r = http
+        .rb("PATCH", &site_path(site_id, ""), b"not json".to_vec())
+        .header("Content-Type", "application/json")
+        .header("Origin", &http.origin)
+        .cookie(&c.admin)
+        .send()
+        .await;
+    expect_err(&r, 400, "invalid_request");
+    // 失败的 PATCH 不改任何东西
+    let st = expect(
+        &http
+            .get(&site_path(site_id, "/settings"))
+            .cookie(&c.admin)
+            .send()
+            .await,
+        200,
+    );
+    assert_eq!(st["site"]["name"], "Renamed2");
+    assert_eq!(st["settings"]["week_starts_on"], 6);
+    // 边界值可以
+    expect(&patch(json!({"ingest_rate_limit_per_min": max})).await, 200);
+    expect(&patch(json!({"ingest_rate_limit_per_min": 1})).await, 200);
+    // 没有 PATCH 以外的写方法
+    assert_eq!(
+        http.post(&site_path(site_id, ""), &json!({}))
+            .cookie(&c.admin)
+            .send()
+            .await
+            .status,
+        405
+    );
+
+    // ---- 白名单
+    let hp = site_path(site_id, "/hostnames");
+    let add = |pattern: &str| {
+        let cookie = c.admin.clone();
+        let hp = hp.clone();
+        let body = json!({"pattern": pattern});
+        async move { http.post(&hp, &body).cookie(&cookie).send().await }
+    };
+    let v = expect(&add(" Blog.Example.COM ").await, 201);
+    assert_eq!(v["hostname"]["pattern"], "blog.example.com");
+    assert!(v["hostname"]["created_at"].as_str().unwrap().ends_with('Z'));
+    expect_err(&add("blog.example.com").await, 409, "conflict");
+    expect_err(&add("example.com").await, 409, "conflict");
+    for bad in [
+        "www.example.com",
+        "*.www.example.com",
+        "",
+        "a b.com",
+        "a.*.com",
+        "http://x.com",
+        "例え.jp",
+    ] {
+        expect_err(&add(bad).await, 400, "invalid_request");
+    }
+    expect(&add("*.example.com").await, 201);
+    expect_err(
+        &http
+            .post(&hp, &json!({"pattern": "x.example.com"}))
+            .cookie(&c.editor)
+            .send()
+            .await,
+        403,
+        "forbidden",
+    );
+    expect_err(
+        &http
+            .post(&hp, &json!({"pattern": "x.example.com"}))
+            .cookie(&c.outsider)
+            .send()
+            .await,
+        404,
+        "not_found",
+    );
+    let hosts = || async {
+        let st = expect(
+            &http
+                .get(&site_path(site_id, "/settings"))
+                .cookie(&c.admin)
+                .send()
+                .await,
+            200,
+        );
+        st["hostnames"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["pattern"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    // 按 created_at 升序：第一个是建站时的主域名
+    assert_eq!(
+        hosts().await,
+        ["example.com", "blog.example.com", "*.example.com"]
+    );
+    // 删除：角色、404、URL 解码后的精确匹配
+    expect_err(
+        &http
+            .delete(&format!("{hp}/blog.example.com"))
+            .cookie(&c.editor)
+            .send()
+            .await,
+        403,
+        "forbidden",
+    );
+    expect(
+        &http
+            .delete(&format!("{hp}/blog.example.com"))
+            .cookie(&c.admin)
+            .send()
+            .await,
+        204,
+    );
+    expect_err(
+        &http
+            .delete(&format!("{hp}/blog.example.com"))
+            .cookie(&c.admin)
+            .send()
+            .await,
+        404,
+        "not_found",
+    );
+    expect_err(
+        &http
+            .delete(&format!("{hp}/nothere.example.com"))
+            .cookie(&c.admin)
+            .send()
+            .await,
+        404,
+        "not_found",
+    );
+    expect(
+        &http
+            .delete(&format!("{hp}/%2A.example.com"))
+            .cookie(&c.admin)
+            .send()
+            .await,
+        204,
+    );
+    assert_eq!(hosts().await, ["example.com"]);
+    // 删掉的可以再加回来；允许删到空（fail-closed 由前端提示）
+    expect(&add("blog.example.com").await, 201);
+    expect(
+        &http
+            .delete(&format!("{hp}/blog.example.com"))
+            .cookie(&c.admin)
+            .send()
+            .await,
+        204,
+    );
+    expect(
+        &http
+            .delete(&format!("{hp}/example.com"))
+            .cookie(&c.admin)
+            .send()
+            .await,
+        204,
+    );
+    assert!(hosts().await.is_empty());
+    let row = rivu_storage_pg::sites::find_site_by_key(&pg, &key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(row.hostnames.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn site_admin_shield_and_shared_links() {
+    let Some(env) = test_env("site_admin_shield_links") else {
+        return;
+    };
+    migrate_once(&env).await;
+    let pg = rivu_storage_pg::connect(&env.pg_url, 6).await.unwrap();
+    let cfg = config(&env, &[("RIVU_SHIELD_MAX_RULES_PER_SITE", "4")]);
+    let server = start(&env, &pg, &cfg, loose()).await;
+    let http = &server.http;
+    let c = cast(&pg, http).await;
+    let site = make_site(&pg, &c.org, false).await;
+    let other = make_site(&pg, &c.org, false).await;
+    let ge = guest_of(&pg, &site, "editor").await;
+    let ge_cookie = login_cookie(http, &ge.email).await;
+    let sp = site_path(site.id, "/shield");
+
+    // ---- 屏蔽规则
+    let add = |body: Value| {
+        let cookie = c.admin.clone();
+        let sp = sp.clone();
+        async move { http.post(&sp, &body).cookie(&cookie).send().await }
+    };
+    let v = expect(
+        &add(json!({"type": "ip", "action": "deny", "value": " 203.0.113.9 "})).await,
+        201,
+    );
+    let rule = &v["rule"];
+    assert_eq!(rule["type"], "ip");
+    assert_eq!(rule["action"], "deny");
+    assert_eq!(rule["value"], "203.0.113.9");
+    assert_eq!(rule["description"], Value::Null);
+    assert_eq!(rule["id"].as_str().unwrap().len(), 36);
+    assert!(rule["created_at"].as_str().unwrap().ends_with('Z'));
+    let ip_rule_id = rule["id"].as_str().unwrap().to_owned();
+    // 规范化后的值：cidr 主机位清零、国家码大写、备注 trim
+    let v = expect(
+        &add(json!({"type": "cidr", "action": "deny", "value": "10.1.2.3/8"})).await,
+        201,
+    );
+    assert_eq!(v["rule"]["value"], "10.0.0.0/8");
+    let v = expect(
+        &add(
+            json!({"type": "country", "action": "allow", "value": "cn", "description": "  home  "}),
+        )
+        .await,
+        201,
+    );
+    assert_eq!(v["rule"]["value"], "CN");
+    assert_eq!(v["rule"]["action"], "allow");
+    assert_eq!(v["rule"]["description"], "home");
+    // 重复（同类型同取值，不论动作）409 conflict
+    expect_err(
+        &add(json!({"type": "ip", "action": "allow", "value": "203.0.113.9"})).await,
+        409,
+        "conflict",
+    );
+    expect_err(
+        &add(json!({"type": "country", "action": "deny", "value": "CN"})).await,
+        409,
+        "conflict",
+    );
+    // 400：类型、动作、取值、备注
+    for bad in [
+        json!({"type": "nope", "action": "deny", "value": "x"}),
+        json!({"type": "ip", "action": "block", "value": "1.2.3.4"}),
+        json!({"type": "ip", "action": "deny", "value": "999.1.1.1"}),
+        json!({"type": "ip", "action": "deny", "value": "10.0.0.0/8"}),
+        json!({"type": "cidr", "action": "deny", "value": "10.0.0.0"}),
+        json!({"type": "country", "action": "deny", "value": "CHN"}),
+        json!({"type": "page", "action": "deny", "value": "no-slash"}),
+        json!({"type": "hostname", "action": "deny", "value": "bad host"}),
+        json!({"type": "ip", "action": "deny", "value": "1.2.3.4", "description": "d".repeat(201)}),
+    ] {
+        let m = expect_err(&add(bad.clone()).await, 400, "invalid_request");
+        assert!(!m.is_empty(), "{bad}");
+    }
+    let m = expect_err(
+        &add(json!({"type": "ip", "action": "deny", "value": "zzz"})).await,
+        400,
+        "invalid_request",
+    );
+    assert!(m.starts_with("the value"), "{m}");
+    // 已满：第 4 条是最后一条，第 5 条 409 limit_reached；重复项在满了之后仍报 conflict
+    expect(
+        &add(json!({"type": "page", "action": "deny", "value": "/admin/*"})).await,
+        201,
+    );
+    let m = expect_err(
+        &add(json!({"type": "page", "action": "deny", "value": "/other"})).await,
+        409,
+        "limit_reached",
+    );
+    assert!(m.contains('4'), "{m}");
+    expect_err(
+        &add(json!({"type": "page", "action": "deny", "value": "/admin/*"})).await,
+        409,
+        "conflict",
+    );
+
+    // 列表：editor 能读（降序，最新的在前），viewer 403，写 403
+    let list = expect(&http.get(&sp).cookie(&c.editor).send().await, 200);
+    assert_eq!(list["max_rules"], 4);
+    let rules = list["rules"].as_array().unwrap();
+    assert_eq!(rules.len(), 4);
+    let kinds: Vec<&str> = rules.iter().map(|r| r["type"].as_str().unwrap()).collect();
+    assert_eq!(kinds, ["page", "country", "cidr", "ip"]);
+    assert_eq!(rules[1]["description"], "home");
+    expect(&http.get(&sp).cookie(&ge_cookie).send().await, 200);
+    expect_err(
+        &http.get(&sp).cookie(&c.viewer).send().await,
+        403,
+        "forbidden",
+    );
+    expect_err(
+        &http.get(&sp).cookie(&c.outsider).send().await,
+        404,
+        "not_found",
+    );
+    expect_err(&http.get(&sp).send().await, 401, "unauthorized");
+    for cookie in [&c.editor, &c.viewer, &ge_cookie] {
+        let r = http
+            .post(
+                &sp,
+                &json!({"type": "ip", "action": "deny", "value": "198.51.100.1"}),
+            )
+            .cookie(cookie)
+            .send()
+            .await;
+        expect_err(&r, 403, "forbidden");
+        expect_err(
+            &http
+                .delete(&format!("{sp}/{ip_rule_id}"))
+                .cookie(cookie)
+                .send()
+                .await,
+            403,
+            "forbidden",
+        );
+    }
+    expect_err(
+        &http
+            .post(
+                &sp,
+                &json!({"type": "ip", "action": "deny", "value": "198.51.100.1"}),
+            )
+            .cookie(&c.outsider)
+            .send()
+            .await,
+        404,
+        "not_found",
+    );
+    assert_eq!(
+        rivu_storage_pg::shield::list_rules(&pg, site.id)
+            .await
+            .unwrap()
+            .len(),
+        4
+    );
+    // 删除：软删除；再删 404；非 UUID 404；别的站点的规则 id 404
+    expect_err(
+        &http
+            .delete(&format!("{sp}/not-a-uuid"))
+            .cookie(&c.admin)
+            .send()
+            .await,
+        404,
+        "not_found",
+    );
+    expect_err(
+        &http
+            .delete(&site_path(other.id, &format!("/shield/{ip_rule_id}")))
+            .cookie(&c.admin)
+            .send()
+            .await,
+        404,
+        "not_found",
+    );
+    expect(
+        &http
+            .delete(&format!("{sp}/{ip_rule_id}"))
+            .cookie(&c.admin)
+            .send()
+            .await,
+        204,
+    );
+    expect_err(
+        &http
+            .delete(&format!("{sp}/{ip_rule_id}"))
+            .cookie(&c.admin)
+            .send()
+            .await,
+        404,
+        "not_found",
+    );
+    assert_eq!(
+        rivu_storage_pg::shield::list_rules(&pg, site.id)
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
+    // 软删除后同值规则可以再加（腾出了名额）
+    expect(
+        &add(json!({"type": "ip", "action": "deny", "value": "203.0.113.9"})).await,
+        201,
+    );
+
+    // ---- 共享链接
+    let lp = site_path(site.id, "/shared-links");
+    let create = |cookie: &str, body: Value| {
+        let lp = lp.clone();
+        let cookie = cookie.to_owned();
+        async move { http.post(&lp, &body).cookie(&cookie).send().await }
+    };
+    let editor_id: i64 = sqlx::query_scalar(
+        "SELECT m.user_id FROM memberships m JOIN users u ON u.id = m.user_id
+         WHERE m.organization_id = $1 AND m.role = 'editor'",
+    )
+    .bind(c.org.id)
+    .fetch_one(&pg)
+    .await
+    .unwrap();
+    let v = expect(&create(&c.editor, json!({})).await, 201);
+    let plain = &v["link"];
+    assert_eq!(plain["name"], Value::Null);
+    assert_eq!(plain["has_password"], false);
+    assert_eq!(plain["expires_at"], Value::Null);
+    assert_eq!(plain["slug"].as_str().unwrap().len(), 43);
+    assert_eq!(plain["created_by"]["id"], editor_id);
+    assert!(
+        plain["created_by"]["email"]
+            .as_str()
+            .unwrap()
+            .ends_with("@example.test")
+    );
+    assert!(plain["created_at"].as_str().unwrap().ends_with('Z'));
+    let plain_slug = plain["slug"].as_str().unwrap().to_owned();
+    let plain_id = plain["id"].as_i64().unwrap();
+    let info = expect(
+        &http
+            .get(&format!("/api/internal/shared/{plain_slug}"))
+            .send()
+            .await,
+        200,
+    );
+    assert_eq!(info["authorized"], true);
+
+    // 名称、密码、过期时间；密码走 argon2id，可以用它换访问凭证
+    let v = expect(
+        &create(
+            &c.admin,
+            json!({"name": "  Weekly report ", "password": PASSWORD, "expires_at": "2099-01-01T08:00:00+08:00"}),
+        )
+        .await,
+        201,
+    );
+    let pw = &v["link"];
+    assert_eq!(pw["name"], "Weekly report");
+    assert_eq!(pw["has_password"], true);
+    assert!(
+        pw["expires_at"]
+            .as_str()
+            .unwrap()
+            .starts_with("2099-01-01T00:00:00")
+    );
+    let pw_slug = pw["slug"].as_str().unwrap().to_owned();
+    let pw_id = pw["id"].as_i64().unwrap();
+    let hash: String = sqlx::query_scalar("SELECT password_hash FROM shared_links WHERE id = $1")
+        .bind(pw_id)
+        .fetch_one(&pg)
+        .await
+        .unwrap();
+    assert!(hash.starts_with("$argon2id$"));
+    let info = expect(
+        &http
+            .get(&format!("/api/internal/shared/{pw_slug}"))
+            .send()
+            .await,
+        200,
+    );
+    assert_eq!(
+        (
+            info["password_required"].as_bool(),
+            info["authorized"].as_bool()
+        ),
+        (Some(true), Some(false))
+    );
+    let r = http
+        .post(
+            &format!("/api/internal/shared/{pw_slug}/auth"),
+            &json!({"password": PASSWORD}),
+        )
+        .send()
+        .await;
+    expect(&r, 200);
+    let m = expect_err(
+        &create(&c.admin, json!({"password": "short-pw-11"})).await,
+        400,
+        "invalid_request",
+    );
+    assert!(m.contains("password"), "{m}");
+    expect_err(
+        &create(&c.admin, json!({"password": "p".repeat(129)})).await,
+        400,
+        "invalid_request",
+    );
+    expect(
+        &create(&c.admin, json!({"password": "p".repeat(12)})).await,
+        201,
+    );
+    expect(
+        &create(&c.admin, json!({"password": "p".repeat(128)})).await,
+        201,
+    );
+    let m = expect_err(
+        &create(&c.admin, json!({"expires_at": "2020-01-01T00:00:00Z"})).await,
+        400,
+        "invalid_request",
+    );
+    assert_eq!(m, "the expires_at must be in the future");
+    for bad in [
+        json!({"expires_at": "tomorrow"}),
+        json!({"expires_at": "2099-01-01"}),
+        json!({"expires_at": 5}),
+    ] {
+        expect_err(&create(&c.admin, bad).await, 400, "invalid_request");
+    }
+    let m = expect_err(
+        &create(&c.admin, json!({"name": "n".repeat(101)})).await,
+        400,
+        "invalid_request",
+    );
+    assert!(m.starts_with("the name"), "{m}");
+    // 角色：viewer 与站点访客不能建（访客读列表可以），外人 404
+    expect_err(&create(&c.viewer, json!({})).await, 403, "forbidden");
+    expect_err(&create(&ge_cookie, json!({})).await, 403, "forbidden");
+    expect_err(&create(&c.outsider, json!({})).await, 404, "not_found");
+
+    // 列表：未吊销的（含已过期的），按创建时间降序，带 slug 与 has_password
+    let expired = user_cmd::issue_link(&pg, &site.key, None, Some("1m"))
+        .await
+        .unwrap();
+    sqlx::query("UPDATE shared_links SET expires_at = now() - interval '1 hour' WHERE id = $1")
+        .bind(expired.id)
+        .execute(&pg)
+        .await
+        .unwrap();
+    let list = expect(&http.get(&lp).cookie(&c.editor).send().await, 200);
+    let links = list["links"].as_array().unwrap();
+    let ids: Vec<i64> = links.iter().map(|l| l["id"].as_i64().unwrap()).collect();
+    assert!(
+        ids.windows(2).all(|w| w[0] > w[1]),
+        "按创建时间降序：{ids:?}"
+    );
+    assert_eq!(ids.len(), 5);
+    let by_id = |id: i64| links.iter().find(|l| l["id"] == id).unwrap();
+    assert_eq!(by_id(plain_id)["slug"], plain_slug);
+    assert_eq!(by_id(pw_id)["name"], "Weekly report");
+    assert_eq!(by_id(pw_id)["has_password"], true);
+    assert_eq!(
+        by_id(expired.id)["created_by"],
+        Value::Null,
+        "命令行建的没有创建者"
+    );
+    assert!(
+        by_id(expired.id)["expires_at"].is_string(),
+        "已过期的也返回"
+    );
+    expect(&http.get(&lp).cookie(&ge_cookie).send().await, 200);
+    expect_err(
+        &http.get(&lp).cookie(&c.viewer).send().await,
+        403,
+        "forbidden",
+    );
+    expect_err(
+        &http.get(&lp).cookie(&c.outsider).send().await,
+        404,
+        "not_found",
+    );
+
+    // 撤销：角色、别的站点的链接 404、吊销后入口 404
+    let other_link = user_cmd::issue_link(&pg, &other.key, None, None)
+        .await
+        .unwrap();
+    let del = |cookie: &str, id: i64| {
+        let p = format!("{lp}/{id}");
+        let cookie = cookie.to_owned();
+        async move { http.delete(&p).cookie(&cookie).send().await }
+    };
+    expect_err(&del(&c.viewer, plain_id).await, 403, "forbidden");
+    expect_err(&del(&ge_cookie, plain_id).await, 403, "forbidden");
+    expect_err(&del(&c.outsider, plain_id).await, 404, "not_found");
+    expect_err(&del(&c.editor, other_link.id).await, 404, "not_found");
+    expect(
+        &http
+            .get(&format!("/api/internal/shared/{}", other_link.slug))
+            .send()
+            .await,
+        200,
+    );
+    expect_err(
+        &http
+            .delete(&format!("{lp}/abc"))
+            .cookie(&c.editor)
+            .send()
+            .await,
+        404,
+        "not_found",
+    );
+    expect(&del(&c.editor, plain_id).await, 204);
+    expect_err(
+        &http
+            .get(&format!("/api/internal/shared/{plain_slug}"))
+            .send()
+            .await,
+        404,
+        "not_found",
+    );
+    expect_err(&del(&c.editor, plain_id).await, 404, "not_found");
+    expect(&del(&c.admin, pw_id).await, 204);
+    expect_err(
+        &http
+            .get(&format!("/api/internal/shared/{pw_slug}"))
+            .send()
+            .await,
+        404,
+        "not_found",
+    );
+    let list = expect(&http.get(&lp).cookie(&c.admin).send().await, 200);
+    let ids: Vec<i64> = list["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l["id"].as_i64().unwrap())
+        .collect();
+    assert!(!ids.contains(&plain_id) && !ids.contains(&pw_id));
+    assert_eq!(ids.len(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn site_admin_delete_site_and_csrf() {
+    let Some(env) = test_env("site_admin_delete_csrf") else {
+        return;
+    };
+    migrate_once(&env).await;
+    let pg = rivu_storage_pg::connect(&env.pg_url, 6).await.unwrap();
+    let server = start(&env, &pg, &config(&env, &[]), loose()).await;
+    let http = &server.http;
+    let c = cast(&pg, http).await;
+
+    let v = expect(
+        &create_site_via_api(
+            http,
+            &c.admin,
+            c.org.id,
+            &json!({"domain": "to-delete.example.com", "name": "To Delete", "timezone": "UTC"}),
+        )
+        .await,
+        201,
+    );
+    let id = v["site"]["id"].as_u64().unwrap();
+    let key = v["site"]["site_key"].as_str().unwrap().to_owned();
+    let site = Site {
+        id,
+        key: key.clone(),
+        org_id: c.org.id,
+    };
+    let sp = site_path(id, "");
+    let confirm = |s: &str| json!({"confirm": s});
+    // 先公开并建一个共享链接，删除后两者都要 404
+    expect(
+        &http
+            .patch(&sp, &json!({"is_public": true}))
+            .cookie(&c.admin)
+            .send()
+            .await,
+        200,
+    );
+    let link = user_cmd::issue_link(&pg, &key, None, None).await.unwrap();
+    let spec = &specs()[0].1;
+    expect(
+        &http
+            .post(&query_path(id), spec)
+            .cookie(&c.admin)
+            .send()
+            .await,
+        200,
+    );
+    expect(
+        &http
+            .get(&format!("/api/internal/public/{key}"))
+            .send()
+            .await,
+        200,
+    );
+
+    // CSRF：每个新的写路由在缺 Origin、别的源、非 JSON 类型时 403 csrf_rejected，且什么都没改
+    let rule_id = "00000000-0000-0000-0000-000000000000";
+    let routes: Vec<(&'static str, String, Value)> = vec![
+        (
+            "POST",
+            format!("/api/internal/orgs/{}/sites", c.org.id),
+            json!({"domain": "csrf.example.com", "timezone": "UTC"}),
+        ),
+        ("PATCH", sp.clone(), json!({"name": "csrf"})),
+        ("DELETE", sp.clone(), confirm("To Delete")),
+        (
+            "POST",
+            site_path(id, "/hostnames"),
+            json!({"pattern": "csrf.example.com"}),
+        ),
+        (
+            "DELETE",
+            site_path(id, "/hostnames/to-delete.example.com"),
+            json!({}),
+        ),
+        (
+            "POST",
+            site_path(id, "/shield"),
+            json!({"type": "ip", "action": "deny", "value": "1.2.3.4"}),
+        ),
+        (
+            "DELETE",
+            site_path(id, &format!("/shield/{rule_id}")),
+            json!({}),
+        ),
+        ("POST", site_path(id, "/shared-links"), json!({})),
+        (
+            "DELETE",
+            site_path(id, &format!("/shared-links/{}", link.id)),
+            json!({}),
+        ),
+    ];
+    for (method, path, body) in &routes {
+        let mk = || {
+            http.rb(method, path, body.to_string().into_bytes())
+                .header("Content-Type", "application/json")
+                .header("Origin", &http.origin)
+                .cookie(&c.admin)
+        };
+        for (what, rb) in [
+            ("缺 Origin", mk().remove("Origin")),
+            ("别的源", mk().header("Origin", "http://evil.example")),
+            ("表单类型", mk().header("Content-Type", "text/plain")),
+        ] {
+            let r = rb.send().await;
+            assert_eq!(r.status, 403, "{method} {path} {what}：{}", r.body);
+            assert_eq!(r.json()["error"], "csrf_rejected", "{method} {path} {what}");
+        }
+    }
+    let st = expect(
+        &http
+            .get(&site_path(id, "/settings"))
+            .cookie(&c.admin)
+            .send()
+            .await,
+        200,
+    );
+    assert_eq!(st["site"]["name"], "To Delete");
+    assert_eq!(st["hostnames"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        expect(
+            &http
+                .get(&site_path(id, "/shield"))
+                .cookie(&c.admin)
+                .send()
+                .await,
+            200
+        )["rules"],
+        json!([])
+    );
+    assert_eq!(
+        expect(
+            &http
+                .get(&site_path(id, "/shared-links"))
+                .cookie(&c.admin)
+                .send()
+                .await,
+            200
+        )["links"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let sites_now: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM sites WHERE organization_id = $1 AND deleted_at IS NULL",
+    )
+    .bind(c.org.id)
+    .fetch_one(&pg)
+    .await
+    .unwrap();
+    assert_eq!(sites_now, 1, "CSRF 被拒的建站请求没有建出站点");
+
+    // 删除：角色、确认名称
+    for (cookie, status) in [(&c.viewer, 403), (&c.editor, 403), (&c.outsider, 404)] {
+        let r = http
+            .delete_with(&sp, &confirm("To Delete"))
+            .cookie(cookie)
+            .send()
+            .await;
+        assert_eq!(r.status, status, "{}", r.body);
+    }
+    expect_err(
+        &http.delete_with(&sp, &confirm("To Delete")).send().await,
+        401,
+        "unauthorized",
+    );
+    for wrong in ["", "to delete", "To Delete ", "To", "example.com"] {
+        let m = expect_err(
+            &http
+                .delete_with(&sp, &confirm(wrong))
+                .cookie(&c.admin)
+                .send()
+                .await,
+            400,
+            "invalid_request",
+        );
+        assert!(m.contains("confirm"), "{m}");
+    }
+    expect_err(
+        &http
+            .delete_with(&sp, &json!({}))
+            .cookie(&c.admin)
+            .send()
+            .await,
+        400,
+        "invalid_request",
+    );
+    expect_err(
+        &http.delete(&sp).cookie(&c.admin).send().await,
+        400,
+        "invalid_request",
+    );
+    expect(
+        &http
+            .get(&site_path(id, "/settings"))
+            .cookie(&c.admin)
+            .send()
+            .await,
+        200,
+    );
+
+    // 删除后：站点从列表消失，设置、统计、公开入口、共享链接、写端点全部 404
+    expect(
+        &http
+            .delete_with(&sp, &confirm("To Delete"))
+            .cookie(&c.admin)
+            .send()
+            .await,
+        204,
+    );
+    let list = expect(
+        &http
+            .get("/api/internal/sites")
+            .cookie(&c.admin)
+            .send()
+            .await,
+        200,
+    );
+    assert!(
+        list["sites"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["id"] != id)
+    );
+    expect_err(
+        &http
+            .get(&site_path(id, "/settings"))
+            .cookie(&c.admin)
+            .send()
+            .await,
+        404,
+        "not_found",
+    );
+    expect_err(
+        &http
+            .post(&query_path(id), spec)
+            .cookie(&c.admin)
+            .send()
+            .await,
+        404,
+        "not_found",
+    );
+    expect_err(
+        &http
+            .post(&query_path(&key), spec)
+            .cookie(&c.admin)
+            .send()
+            .await,
+        404,
+        "not_found",
+    );
+    expect_err(
+        &http
+            .get(&format!("/api/internal/public/{key}"))
+            .send()
+            .await,
+        404,
+        "not_found",
+    );
+    expect_err(
+        &http.post(&query_path(id), spec).send().await,
+        404,
+        "not_found",
+    );
+    expect_err(
+        &http
+            .get(&format!("/api/internal/shared/{}", link.slug))
+            .send()
+            .await,
+        404,
+        "not_found",
+    );
+    expect_err(
+        &http
+            .get(&site_path(id, "/shield"))
+            .cookie(&c.admin)
+            .send()
+            .await,
+        404,
+        "not_found",
+    );
+    expect_err(
+        &http
+            .patch(&sp, &json!({"name": "zombie"}))
+            .cookie(&c.admin)
+            .send()
+            .await,
+        404,
+        "not_found",
+    );
+    expect_err(
+        &http
+            .delete_with(&sp, &confirm("To Delete"))
+            .cookie(&c.admin)
+            .send()
+            .await,
+        404,
+        "not_found",
+    );
+    expect_err(
+        &http
+            .post(
+                &site_path(id, "/hostnames"),
+                &json!({"pattern": "z.example.com"}),
+            )
+            .cookie(&c.admin)
+            .send()
+            .await,
+        404,
+        "not_found",
+    );
+    // 软删除：行还在，采集侧的站点快照里没有它
+    let (deleted, name): (bool, String) =
+        sqlx::query_as("SELECT deleted_at IS NOT NULL, name FROM sites WHERE id = $1")
+            .bind(id as i64)
+            .fetch_one(&pg)
+            .await
+            .unwrap();
+    assert!(deleted);
+    assert_eq!(name, "To Delete");
+    assert!(
+        rivu_storage_pg::sites::find_site_by_key(&pg, &site.key)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }

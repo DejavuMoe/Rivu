@@ -222,6 +222,23 @@ pub fn validate_hostname_pattern(pattern: &str) -> Result<()> {
 /// - `site_key` 是随机的 12 位 base32 小写，撞车时重新生成；
 /// - 白名单就是 `hostnames`（含主域名）：建站时自动加入主域名，白名单不会是空的（§10 Q12）。
 pub async fn create_site(pool: &PgPool, new: &NewSite<'_>) -> Result<CreatedSite> {
+    create_site_impl(pool, None, new).await
+}
+
+/// 在指定组织里建站（看板的建站端点用；调用方已校验组织存在且用户有权）。其余同 [`create_site`]。
+pub async fn create_site_in_org(
+    pool: &PgPool,
+    organization_id: i64,
+    new: &NewSite<'_>,
+) -> Result<CreatedSite> {
+    create_site_impl(pool, Some(organization_id), new).await
+}
+
+async fn create_site_impl(
+    pool: &PgPool,
+    in_org: Option<i64>,
+    new: &NewSite<'_>,
+) -> Result<CreatedSite> {
     let name = new.name.trim();
     if name.is_empty() {
         bail!("站点名称不能为空");
@@ -240,6 +257,21 @@ pub async fn create_site(pool: &PgPool, new: &NewSite<'_>) -> Result<CreatedSite
     }
 
     let mut tx = pool.begin().await.context("开启事务失败")?;
+
+    if let Some(organization_id) = in_org {
+        // 锁住组织行（共享锁足够）：组织在建站事务里被删除时，不会留下挂在已删除组织下的站点
+        let alive: Option<i64> = sqlx::query_scalar(
+            "SELECT id FROM organizations WHERE id = $1 AND deleted_at IS NULL FOR SHARE",
+        )
+        .bind(organization_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .context("查询组织失败")?;
+        if alive.is_none() {
+            bail!("组织 {organization_id} 不存在或已删除");
+        }
+        return insert_site(tx, organization_id, name, new.timezone, &hostnames).await;
+    }
 
     let existing: Option<i64> = sqlx::query_scalar(
         "SELECT id FROM organizations WHERE deleted_at IS NULL ORDER BY id LIMIT 1",
@@ -266,6 +298,17 @@ pub async fn create_site(pool: &PgPool, new: &NewSite<'_>) -> Result<CreatedSite
         }
     };
 
+    insert_site(tx, organization_id, name, new.timezone, &hostnames).await
+}
+
+/// 在已开启的事务里写 `sites`、`site_settings`、`site_hostnames` 并提交。
+async fn insert_site(
+    mut tx: sqlx::Transaction<'_, sqlx::Postgres>,
+    organization_id: i64,
+    name: &str,
+    timezone: &str,
+    hostnames: &[&str],
+) -> Result<CreatedSite> {
     let mut created = None;
     for _ in 0..SITE_KEY_ATTEMPTS {
         let key = generate_site_key();
@@ -276,7 +319,7 @@ pub async fn create_site(pool: &PgPool, new: &NewSite<'_>) -> Result<CreatedSite
         .bind(organization_id)
         .bind(&key)
         .bind(name)
-        .bind(new.timezone)
+        .bind(timezone)
         .fetch_optional(&mut *tx)
         .await
         .context("写入 sites 失败")?;
@@ -294,7 +337,7 @@ pub async fn create_site(pool: &PgPool, new: &NewSite<'_>) -> Result<CreatedSite
         .execute(&mut *tx)
         .await
         .context("写入 site_settings 失败")?;
-    for pattern in hostnames {
+    for pattern in hostnames.iter().copied() {
         sqlx::query("INSERT INTO site_hostnames (site_id, pattern) VALUES ($1, $2)")
             .bind(id)
             .bind(pattern)
@@ -309,6 +352,211 @@ pub async fn create_site(pool: &PgPool, new: &NewSite<'_>) -> Result<CreatedSite
         site_key,
         organization_id,
     })
+}
+
+// ------------------------------------------------------------------------------------------
+// 站点管理（看板的设置页）
+// ------------------------------------------------------------------------------------------
+
+/// 设置页要的站点字段与设置（没有 `site_settings` 行时取列默认值，老数据兜底）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SiteAdminView {
+    pub id: u64,
+    pub site_key: String,
+    pub name: String,
+    pub timezone: String,
+    pub is_public: bool,
+    pub created_at: String,
+    pub week_starts_on: i16,
+    pub collect_enabled: bool,
+    pub tracker_hash: bool,
+    pub ingest_rate_limit_per_min: Option<i32>,
+    pub geo_level: String,
+}
+
+/// 读设置页的站点视图；站点不存在或已软删除返回 `None`。
+pub async fn admin_view(pool: &PgPool, site_id: u64) -> Result<Option<SiteAdminView>> {
+    let id = i64::try_from(site_id).context("site_id 超出范围")?;
+    let row = sqlx::query(concat!(
+        "SELECT s.id, s.site_key, s.name, s.timezone, s.is_public, ",
+        ts_utc!("s.created_at"),
+        " AS created_at,
+                COALESCE(ss.week_starts_on, 1)::smallint AS week_starts_on,
+                COALESCE(ss.collect_enabled, true) AS collect_enabled,
+                COALESCE(ss.tracker -> 'hash' = 'true'::jsonb, false) AS tracker_hash,
+                ss.ingest_rate_limit_per_min,
+                COALESCE(ss.geo_level, 'city') AS geo_level
+         FROM sites s LEFT JOIN site_settings ss ON ss.site_id = s.id
+         WHERE s.id = $1 AND s.deleted_at IS NULL"
+    ))
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .context("查询站点设置失败")?;
+    row.map(|r| {
+        let id: i64 = r.try_get("id")?;
+        Ok(SiteAdminView {
+            id: u64::try_from(id).context("sites.id 为负数")?,
+            site_key: r.try_get("site_key")?,
+            name: r.try_get("name")?,
+            timezone: r.try_get("timezone")?,
+            is_public: r.try_get("is_public")?,
+            created_at: r.try_get("created_at")?,
+            week_starts_on: r.try_get("week_starts_on")?,
+            collect_enabled: r.try_get("collect_enabled")?,
+            tracker_hash: r.try_get("tracker_hash")?,
+            ingest_rate_limit_per_min: r.try_get("ingest_rate_limit_per_min")?,
+            geo_level: r.try_get("geo_level")?,
+        })
+    })
+    .transpose()
+}
+
+/// 站点设置的部分更新：`None` = 不改。取值由调用方校验（PG 的 CHECK 兜底）。
+#[derive(Debug, Clone, Default)]
+pub struct SitePatch<'a> {
+    pub name: Option<&'a str>,
+    pub timezone: Option<&'a str>,
+    pub is_public: Option<bool>,
+    pub week_starts_on: Option<i16>,
+    pub collect_enabled: Option<bool>,
+    /// 只写 `site_settings.tracker` 的 `hash` 键，其他键保留。
+    pub tracker_hash: Option<bool>,
+    /// 外层 `Some` = 要改；内层 `None` = 恢复全局默认。
+    pub ingest_rate_limit_per_min: Option<Option<i32>>,
+    pub geo_level: Option<&'a str>,
+}
+
+/// 一个事务里更新 `sites` 与 `site_settings`（没有 settings 行时先补一行）；站点不存在或已软删除返回 `false`。
+/// `updated_at` 由触发器维护，collector 的缓存据此增量刷新。
+pub async fn update_site(pool: &PgPool, site_id: u64, patch: &SitePatch<'_>) -> Result<bool> {
+    let id = i64::try_from(site_id).context("site_id 超出范围")?;
+    let mut tx = pool.begin().await.context("开启事务失败")?;
+    let touched: Option<i64> = sqlx::query_scalar(
+        "UPDATE sites SET name = COALESCE($2, name), timezone = COALESCE($3, timezone),
+                          is_public = COALESCE($4, is_public)
+         WHERE id = $1 AND deleted_at IS NULL RETURNING id",
+    )
+    .bind(id)
+    .bind(patch.name)
+    .bind(patch.timezone)
+    .bind(patch.is_public)
+    .fetch_optional(&mut *tx)
+    .await
+    .context("更新 sites 失败")?;
+    if touched.is_none() {
+        return Ok(false);
+    }
+    sqlx::query("INSERT INTO site_settings (site_id) VALUES ($1) ON CONFLICT (site_id) DO NOTHING")
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .context("补写 site_settings 失败")?;
+    sqlx::query(
+        "UPDATE site_settings SET
+             week_starts_on = COALESCE($2::smallint, week_starts_on),
+             collect_enabled = COALESCE($3::boolean, collect_enabled),
+             geo_level = COALESCE($4::text, geo_level),
+             ingest_rate_limit_per_min =
+                 CASE WHEN $5::boolean THEN $6::integer ELSE ingest_rate_limit_per_min END,
+             tracker = CASE WHEN $7::boolean IS NULL THEN tracker
+                            ELSE jsonb_set(tracker, '{hash}', to_jsonb($7::boolean), true) END
+         WHERE site_id = $1",
+    )
+    .bind(id)
+    .bind(patch.week_starts_on)
+    .bind(patch.collect_enabled)
+    .bind(patch.geo_level)
+    .bind(patch.ingest_rate_limit_per_min.is_some())
+    .bind(patch.ingest_rate_limit_per_min.flatten())
+    .bind(patch.tracker_hash)
+    .execute(&mut *tx)
+    .await
+    .context("更新 site_settings 失败")?;
+    tx.commit().await.context("提交事务失败")?;
+    Ok(true)
+}
+
+/// 软删除站点（`deleted_at = now()`）；返回是否删除了。统计数据的清理不在这里（多阶段流程以后做）。
+pub async fn soft_delete_site(pool: &PgPool, site_id: u64) -> Result<bool> {
+    let n = sqlx::query("UPDATE sites SET deleted_at = now() WHERE id = $1 AND deleted_at IS NULL")
+        .bind(i64::try_from(site_id).context("site_id 超出范围")?)
+        .execute(pool)
+        .await
+        .context("软删除站点失败")?
+        .rows_affected();
+    Ok(n > 0)
+}
+
+/// 白名单里的一条（未删除）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostnameRow {
+    pub pattern: String,
+    pub created_at: String,
+}
+
+/// 站点的白名单，按创建时间升序（第一条是建站时的主域名）。
+pub async fn list_hostnames(pool: &PgPool, site_id: u64) -> Result<Vec<HostnameRow>> {
+    let rows = sqlx::query(concat!(
+        "SELECT pattern, ",
+        ts_utc!("created_at"),
+        " AS created_at
+         FROM site_hostnames WHERE site_id = $1 AND deleted_at IS NULL ORDER BY site_hostnames.created_at, id"
+    ))
+    .bind(i64::try_from(site_id).context("site_id 超出范围")?)
+    .fetch_all(pool)
+    .await
+    .context("查询站点白名单失败")?;
+    rows.iter()
+        .map(|r| {
+            Ok(HostnameRow {
+                pattern: r.try_get("pattern")?,
+                created_at: r.try_get("created_at")?,
+            })
+        })
+        .collect()
+}
+
+/// 加一条白名单模式（调用方已校验）；已有同一模式的未删除行返回 `None`。
+pub async fn add_hostname(
+    pool: &PgPool,
+    site_id: u64,
+    pattern: &str,
+) -> Result<Option<HostnameRow>> {
+    let row = sqlx::query(concat!(
+        "INSERT INTO site_hostnames (site_id, pattern) VALUES ($1, $2)
+         ON CONFLICT (site_id, pattern) WHERE deleted_at IS NULL DO NOTHING
+         RETURNING pattern, ",
+        ts_utc!("created_at"),
+        " AS created_at"
+    ))
+    .bind(i64::try_from(site_id).context("site_id 超出范围")?)
+    .bind(pattern)
+    .fetch_optional(pool)
+    .await
+    .context("写入 site_hostnames 失败")?;
+    row.map(|r| {
+        Ok(HostnameRow {
+            pattern: r.try_get("pattern")?,
+            created_at: r.try_get("created_at")?,
+        })
+    })
+    .transpose()
+}
+
+/// 按模式精确软删除一条白名单；返回是否删除了。允许删到空（空白名单 = collector 丢弃全部事件，fail-closed）。
+pub async fn remove_hostname(pool: &PgPool, site_id: u64, pattern: &str) -> Result<bool> {
+    let n = sqlx::query(
+        "UPDATE site_hostnames SET deleted_at = now()
+         WHERE site_id = $1 AND pattern = $2 AND deleted_at IS NULL",
+    )
+    .bind(i64::try_from(site_id).context("site_id 超出范围")?)
+    .bind(pattern)
+    .execute(pool)
+    .await
+    .context("删除站点白名单失败")?
+    .rows_affected();
+    Ok(n > 0)
 }
 
 #[cfg(test)]

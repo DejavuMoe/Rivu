@@ -232,7 +232,8 @@ impl OrgRole {
     }
 }
 
-/// API key 可能触发的动作（`platform-and-ops.md` §4.1 矩阵里 key 能碰到的那几行）。
+/// 动作：API key 能碰到的那几行（`platform-and-ops.md` §4.1）加上看板站点管理端点用的几行（`Site*`、`SharedLinkManage`、
+/// `SiteSettingsRead`；key 的 scope 不映射到它们）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
     /// `stats.read`：所有角色。
@@ -243,6 +244,19 @@ pub enum Action {
     SitesWrite,
     /// 读导出：与 `export.create` 同级，owner、admin、editor（矩阵没有「读导出」一行）。
     ExportsRead,
+    /// 看板读站点设置、屏蔽规则与共享链接列表（矩阵没有单独一行；取与它们的写动作之下一级）：owner、admin、editor。
+    SiteSettingsRead,
+    /// `site.settings.write`（设置、hostnames、shield）看板入口：owner、admin。与 [`Action::SitesWrite`] 同级，
+    /// 单列是因为看板的判定只看组织角色，不看 API key 的 scope。
+    SiteSettingsWrite,
+    /// `site.public.toggle`：owner、admin。
+    SitePublicToggle,
+    /// `site.create`：owner、admin。
+    SiteCreate,
+    /// `site.delete`：owner、admin。
+    SiteDelete,
+    /// `shared_link.manage`：owner、admin、editor。
+    SharedLinkManage,
 }
 
 impl Action {
@@ -261,8 +275,14 @@ impl Action {
 pub fn allowed(role: OrgRole, action: Action) -> bool {
     match action {
         Action::StatsRead | Action::SitesRead => true,
-        Action::ExportsRead => role >= OrgRole::Editor,
-        Action::SitesWrite => role >= OrgRole::Admin,
+        Action::ExportsRead | Action::SiteSettingsRead | Action::SharedLinkManage => {
+            role >= OrgRole::Editor
+        }
+        Action::SitesWrite
+        | Action::SiteSettingsWrite
+        | Action::SitePublicToggle
+        | Action::SiteCreate
+        | Action::SiteDelete => role >= OrgRole::Admin,
     }
 }
 
@@ -380,6 +400,12 @@ mod tests {
             (Action::SitesRead, [true, true, true, true]),
             (Action::ExportsRead, [true, true, true, false]),
             (Action::SitesWrite, [true, true, false, false]),
+            (Action::SiteSettingsRead, [true, true, true, false]),
+            (Action::SiteSettingsWrite, [true, true, false, false]),
+            (Action::SitePublicToggle, [true, true, false, false]),
+            (Action::SiteCreate, [true, true, false, false]),
+            (Action::SiteDelete, [true, true, false, false]),
+            (Action::SharedLinkManage, [true, true, true, false]),
         ];
         for (action, expected) in cases {
             for (role, want) in [Owner, Admin, Editor, Viewer].into_iter().zip(expected) {

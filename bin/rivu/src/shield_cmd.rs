@@ -16,6 +16,9 @@ use crate::cli::{
     ShieldAction, ShieldActionKind, ShieldAddArgs, ShieldListArgs, ShieldRemoveArgs, ShieldType,
 };
 
+/// 规则备注的字符数上限（命令行与看板端点共用）。
+pub const DESCRIPTION_MAX_CHARS: usize = 200;
+
 impl From<ShieldType> for RuleType {
     fn from(t: ShieldType) -> Self {
         match t {
@@ -62,8 +65,8 @@ async fn add(config: &Config, args: ShieldAddArgs) -> Result<ExitCode> {
         .as_deref()
         .map(str::trim)
         .filter(|d| !d.is_empty());
-    if description.is_some_and(|d| d.chars().count() > 200) {
-        bail!("备注不能超过 200 个字符");
+    if description.is_some_and(|d| d.chars().count() > DESCRIPTION_MAX_CHARS) {
+        bail!("备注不能超过 {DESCRIPTION_MAX_CHARS} 个字符");
     }
 
     let pool = rivu_storage_pg::connect(config.database_url.expose(), 2).await?;

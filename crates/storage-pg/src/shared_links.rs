@@ -83,13 +83,15 @@ pub struct NewLink<'a> {
     /// 过期时刻（Unix 秒）；`None` 永不过期。
     pub expires_at_unix: Option<i64>,
     pub created_by: Option<i64>,
+    /// 名称（调用方已校验：1 到 100 个字符）；`None` = 没有名称。
+    pub name: Option<&'a str>,
 }
 
 /// 建链接，返回 `shared_links.id`。站点不存在或已删除报错。
 pub async fn create(pool: &PgPool, new: &NewLink<'_>) -> Result<i64> {
     let id: Option<i64> = sqlx::query_scalar(
-        "INSERT INTO shared_links (site_id, slug, password_hash, expires_at, created_by)
-         SELECT s.id, $2, $3, to_timestamp($4::bigint::double precision), $5
+        "INSERT INTO shared_links (site_id, slug, password_hash, expires_at, created_by, name)
+         SELECT s.id, $2, $3, to_timestamp($4::bigint::double precision), $5, $6
          FROM sites s WHERE s.site_key = $1 AND s.deleted_at IS NULL
          RETURNING id",
     )
@@ -98,6 +100,7 @@ pub async fn create(pool: &PgPool, new: &NewLink<'_>) -> Result<i64> {
     .bind(new.password_hash)
     .bind(new.expires_at_unix)
     .bind(new.created_by)
+    .bind(new.name)
     .fetch_optional(pool)
     .await
     .context("写入 shared_links 失败")?;
@@ -147,6 +150,101 @@ pub async fn list(pool: &PgPool, site_key: &str) -> Result<Vec<LinkRow>> {
             })
         })
         .collect()
+}
+
+/// 设置页的一行链接（未吊销的，含已过期的）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkAdminRow {
+    pub id: i64,
+    pub name: Option<String>,
+    pub slug: String,
+    pub has_password: bool,
+    pub expires_at: Option<String>,
+    pub created_at: String,
+    /// 创建者（用户已删除、或命令行建的链接为 `None`）。
+    pub created_by: Option<LinkCreator>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkCreator {
+    pub id: i64,
+    pub name: Option<String>,
+    pub email: String,
+}
+
+macro_rules! admin_select {
+    () => {
+        concat!(
+    "SELECT l.id, l.name, l.slug, (l.password_hash IS NOT NULL) AS has_password, ",
+    ts_utc!("l.expires_at"),
+    " AS expires_at, ",
+    ts_utc!("l.created_at"),
+    " AS created_at, u.id AS creator_id, u.name AS creator_name, u.email::text AS creator_email
+     FROM shared_links l LEFT JOIN users u ON u.id = l.created_by AND u.deleted_at IS NULL
+     WHERE l.site_id = $1 AND l.deleted_at IS NULL"
+        )
+    };
+}
+
+fn admin_row(r: &sqlx::postgres::PgRow) -> Result<LinkAdminRow> {
+    let creator_id: Option<i64> = r.try_get("creator_id")?;
+    let created_by = match creator_id {
+        Some(id) => Some(LinkCreator {
+            id,
+            name: r.try_get("creator_name")?,
+            email: r.try_get("creator_email")?,
+        }),
+        None => None,
+    };
+    Ok(LinkAdminRow {
+        id: r.try_get("id")?,
+        name: r.try_get("name")?,
+        slug: r.try_get("slug")?,
+        has_password: r.try_get("has_password")?,
+        expires_at: r.try_get("expires_at")?,
+        created_at: r.try_get("created_at")?,
+        created_by,
+    })
+}
+
+/// 站点未吊销的链接，按创建时间降序（已过期的也在，由前端标注）。
+pub async fn list_for_site(pool: &PgPool, site_id: u64) -> Result<Vec<LinkAdminRow>> {
+    let rows = sqlx::query(concat!(
+        admin_select!(),
+        " ORDER BY l.created_at DESC, l.id DESC"
+    ))
+    .bind(i64::try_from(site_id).context("site_id 超出范围")?)
+    .fetch_all(pool)
+    .await
+    .context("列出共享链接失败")?;
+    rows.iter().map(admin_row).collect()
+}
+
+/// 按 id 取站点里一条未吊销的链接；不属于该站点返回 `None`。
+pub async fn get_for_site(pool: &PgPool, site_id: u64, id: i64) -> Result<Option<LinkAdminRow>> {
+    let row = sqlx::query(concat!(admin_select!(), " AND l.id = $2"))
+        .bind(i64::try_from(site_id).context("site_id 超出范围")?)
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .context("查询共享链接失败")?;
+    row.as_ref().map(admin_row).transpose()
+}
+
+/// 吊销（软删除）站点里的一个链接并删掉它的访问凭证；链接不属于该站点、不存在或已吊销返回 `false`。
+pub async fn revoke_for_site(pool: &PgPool, site_id: u64, id: i64) -> Result<bool> {
+    let owned: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM shared_links WHERE id = $1 AND site_id = $2)",
+    )
+    .bind(id)
+    .bind(i64::try_from(site_id).context("site_id 超出范围")?)
+    .fetch_one(pool)
+    .await
+    .context("查询共享链接失败")?;
+    if !owned {
+        return Ok(false);
+    }
+    revoke(pool, id).await
 }
 
 /// 吊销（软删除）一个链接，并删掉它的访问凭证；返回是否吊销了。
