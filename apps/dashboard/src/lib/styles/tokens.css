@@ -1,0 +1,123 @@
+/*
+ * Rivu 设计令牌。颜色全部来自 Radix Colors（radix.css 由 scripts/gen-radix.mjs 生成），
+ * 并按 Radix 的分级用法映射成语义令牌：
+ *   1 应用背景 · 2 次级背景 · 3/4/5 控件底（常态/悬停/按下或选中）
+ *   6 不可交互的分隔线 · 7 控件边框 · 8 悬停边框与焦点
+ *   9 实色背景 · 10 实色悬停 · 11 次要文字 · 12 主要文字
+ * 深浅色由 radix.css 切换，这里只定义一次。组件只用这里的语义令牌，不直接写色阶，更不写裸色值。
+ */
+
+:root {
+  color-scheme: light;
+
+  /* ---------- 字体：只有四个字号 ---------- */
+  --font-sans: "IBM Plex Sans", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei",
+    "Noto Sans CJK SC", "Source Han Sans SC", system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", "Cascadia Mono", Menlo, Consolas, monospace;
+  --fs-sm: 12px; /* 辅助信息、表头、坐标轴 */
+  --fs-md: 14px; /* 正文、控件、表格 */
+  --fs-lg: 16px; /* 页面与对话框标题 */
+  --fs-xl: 24px; /* 指标数值 */
+  --lh: 1.5;
+  --lh-tight: 1.25;
+  --fw-regular: 400;
+  --fw-medium: 500;
+  --fw-semibold: 600;
+
+  /* ---------- 间距（4px 网格） ---------- */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+  --sp-8: 32px;
+  --sp-10: 40px;
+  --sp-12: 48px;
+
+  /* ---------- 尺寸 ---------- */
+  --control-sm: 28px;
+  --control-md: 32px;
+  --control-lg: 36px;
+  --sidebar-w: 240px;
+  --content-max: 1200px;
+
+  /* ---------- 线与圆角 ---------- */
+  --hairline: 0.5px;
+  /* 圆角按嵌套关系取值：外层 = 内层 + 间距（浮层 8 = 菜单项 4 + 内边距 4；分段控件 6 = 选项 4 + 2） */
+  --r-xs: 4px; /* 浮层与分段控件内的选项、徽标 */
+  --r-sm: 6px; /* 按钮、输入框、分段控件 */
+  --r-md: 8px; /* 卡片、浮层 */
+  --r-lg: 12px; /* 对话框 */
+  --r-full: 999px;
+
+  /* ---------- 动效：默认没有；确实需要时只用这一档 ---------- */
+  --ease: cubic-bezier(0, 0, 0.2, 1); /* ease-out */
+  --dur: 250ms;
+
+  /* ---------- 中性色（gray） ---------- */
+  --bg-app: var(--gray-1);
+  --bg-subtle: var(--gray-2);
+  --bg-element: var(--gray-3);
+  --bg-hover: var(--gray-4);
+  --bg-active: var(--gray-5);
+  --border-subtle: var(--gray-6);
+  --border: var(--gray-7);
+  --border-hover: var(--gray-8);
+  --text-placeholder: var(--gray-9);
+  --text-muted: var(--gray-11);
+  --text: var(--gray-12);
+
+  /* ---------- 强调色（blue）：主操作、链接、焦点、选中，以及图表主序列 ---------- */
+  --accent-bg: var(--blue-3);
+  --accent-bg-hover: var(--blue-4);
+  --accent-bg-active: var(--blue-5);
+  --accent-border: var(--blue-7);
+  --accent-focus: var(--blue-8);
+  --accent-solid: var(--blue-9);
+  --accent-solid-hover: var(--blue-10);
+  --accent-text: var(--blue-11);
+  --accent-contrast: #fff;
+
+  /* ---------- 状态色：只表达状态，永远配文字 ---------- */
+  --good-bg: var(--grass-3);
+  --good-text: var(--grass-11);
+  --warn-bg: var(--amber-3);
+  --warn-text: var(--amber-11);
+  --bad-bg: var(--red-3);
+  --bad-border: var(--red-7);
+  --bad-solid: var(--red-9);
+  --bad-solid-hover: var(--red-10);
+  --bad-text: var(--red-11);
+  --live: var(--grass-9);
+
+  /* 焦点环：无障碍要求，不受 0.5px 线宽规则约束 */
+  --focus-ring: 0 0 0 2px var(--accent-focus);
+
+  /* ---------- 图表 ---------- */
+  --series-1: var(--blue-9);
+  --series-2: var(--tomato-9);
+  --series-3: var(--violet-9);
+  --series-compare: var(--gray-8);
+  --chart-area: var(--blue-a2);
+  --chart-bar: var(--gray-a3);
+  --chart-bar-hover: var(--gray-a4);
+  --chart-grid: var(--gray-a4);
+  --chart-axis: var(--gray-a6);
+
+  /* ---------- 浮层 ---------- */
+  --shadow-pop: 0 8px 24px -12px rgb(0 0 0 / 0.18);
+  --overlay: var(--gray-a8);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+    --shadow-pop: 0 8px 24px -8px rgb(0 0 0 / 0.6);
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --shadow-pop: 0 8px 24px -8px rgb(0 0 0 / 0.6);
+}

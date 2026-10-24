@@ -179,7 +179,7 @@ Lite 模式要多副本时，Caddy 用 `lb_policy client_ip_hash` 按客户端 I
 rivu/
 ├── apps/
 │   ├── tracker/        # TypeScript + esbuild → core.js / full.js
-│   └── dashboard/      # SvelteKit + Tailwind + ECharts（adapter-static）
+│   └── dashboard/      # SvelteKit + Svelte 5（adapter-static 单页应用），Radix Colors 令牌，自绘 SVG 图表
 ├── crates/
 │   ├── domain/         # 事件、会话、站点、查询 DSL 类型（serde + schemars）
 │   ├── ingest/         # 采集 HTTP、管线各阶段（富化调用下面三个库）
