@@ -188,6 +188,62 @@ pub fn embedded() -> Result<Vec<Migration>, Vec<MigrationError>> {
     }
 }
 
+/// 把迁移与冻结清单对照（`platform-and-ops.md` §9「CI 校验 schema 快照」第 5 条）：
+/// 清单里的迁移必须原样存在（文件名与校验和都不变）；不在清单里的迁移是新增的，版本号必须大于清单里的最高版本。
+/// 返回问题列表；新增的迁移另外给出应当追加到清单的行。
+pub fn check_lock(migrations: &[Migration], lock: &str) -> (Vec<String>, Vec<String>) {
+    let mut problems = Vec::new();
+    let mut locked: BTreeMap<u64, (&str, &str)> = BTreeMap::new();
+    for line in lock.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        match parts.as_slice() {
+            [v, file, sum] if v.parse::<u64>().is_ok() => {
+                locked.insert(v.parse().unwrap_or_default(), (file, sum));
+            }
+            _ => problems.push(format!("checksums.lock 有一行看不懂：{line}")),
+        }
+    }
+    let max_locked = locked.keys().next_back().copied().unwrap_or(0);
+    for (v, (file, sum)) in &locked {
+        match migrations.iter().find(|m| m.version == *v) {
+            None => problems.push(format!(
+                "已冻结的迁移 {file} 不见了：冻结后只能新增迁移，不能删除"
+            )),
+            Some(m) => {
+                let path = format!("{}/{}", m.store, m.file);
+                if path != *file {
+                    problems.push(format!("已冻结的迁移 {file} 被改名为 {path}"));
+                } else if m.checksum != *sum {
+                    problems.push(format!(
+                        "已冻结的迁移 {file} 被修改了（校验和 {} ≠ 清单里的 {sum}）：要改结构请新建一个迁移",
+                        m.checksum
+                    ));
+                }
+            }
+        }
+    }
+    let mut to_append = Vec::new();
+    for m in migrations
+        .iter()
+        .filter(|m| !locked.contains_key(&m.version))
+    {
+        if m.version <= max_locked {
+            problems.push(format!(
+                "新迁移 {}/{} 的版本号不大于已冻结的最高版本 {max_locked}",
+                m.store, m.file
+            ));
+        }
+        to_append.push(format!(
+            "{} {}/{} {}",
+            m.version, m.store, m.file, m.checksum
+        ));
+    }
+    (problems, to_append)
+}
+
 /// 某个库在编译期的最高迁移版本。
 pub fn highest_version(migrations: &[Migration], store: Store) -> Option<u64> {
     migrations
@@ -201,12 +257,68 @@ pub fn highest_version(migrations: &[Migration], store: Store) -> Option<u64> {
 mod tests {
     use super::*;
 
+    /// 已冻结的迁移清单。
+    const LOCK: &str = include_str!("../../../migrations/checksums.lock");
+
     fn src(store: Store, file_name: &'static str) -> SourceFile<'static> {
         SourceFile {
             store,
             file_name,
             content: "SELECT 1;",
         }
+    }
+
+    #[test]
+    fn embedded_migrations_match_the_freeze_lock() {
+        let ms = embedded().expect("迁移文件");
+        let (problems, to_append) = check_lock(&ms, LOCK);
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+        assert!(
+            to_append.is_empty(),
+            "新迁移还没登记到 migrations/checksums.lock，确认要冻结后把这几行追加到末尾：\n{}",
+            to_append.join("\n")
+        );
+    }
+
+    #[test]
+    fn lock_check_catches_edits_renames_deletions_and_old_versions() {
+        let m = |v: u64, file: &str, sql: &str| Migration {
+            version: v,
+            name: "x".into(),
+            store: Store::Postgres,
+            file: file.into(),
+            sql: sql.into(),
+            checksum: checksum(sql),
+        };
+        let a = m(10, "00000000000010_a.sql", "A");
+        let lock = format!("# c\n10 postgres/00000000000010_a.sql {}\n", checksum("A"));
+        assert_eq!(
+            check_lock(std::slice::from_ref(&a), &lock).0,
+            Vec::<String>::new()
+        );
+        // 修改
+        let edited = m(10, "00000000000010_a.sql", "A2");
+        assert!(check_lock(&[edited], &lock).0[0].contains("被修改"));
+        // 改名
+        let renamed = m(10, "00000000000010_b.sql", "A");
+        assert!(check_lock(&[renamed], &lock).0[0].contains("改名"));
+        // 删除
+        assert!(check_lock(&[], &lock).0[0].contains("不见了"));
+        // 新增：版本更大的只提示追加；更小的报错
+        let newer = m(11, "00000000000011_n.sql", "N");
+        let (p, add) = check_lock(&[a.clone(), newer], &lock);
+        assert!(p.is_empty());
+        assert_eq!(
+            add,
+            vec![format!(
+                "11 postgres/00000000000011_n.sql {}",
+                checksum("N")
+            )]
+        );
+        let older = m(9, "00000000000009_o.sql", "O");
+        assert!(check_lock(&[a, older], &lock).0[0].contains("不大于"));
+        // 看不懂的行
+        assert!(!check_lock(&[], "garbage line\n").0.is_empty());
     }
 
     #[test]
