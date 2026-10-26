@@ -890,7 +890,7 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
   | `day` | 今天 |
   | `24h` | `[now − 24h, now]`（时刻区间） |
   | `realtime` | `[now − 5 min, now]`（时刻区间） |
-  | `Nd`（含 `7d` `28d` `30d`） | 截至昨天的 N 个完整本地日，不含今天，与 Plausible 相同（R03 §7.4） |
+  | `Nd`（含 `7d` `28d` `30d`） | 截至今天的 N 个本地日，含今天（与 Plausible 不同，R03 §7.4；新接入的站点打开看板就能看到当天数据） |
   | `month` | 本月 1 日到今天 |
   | `Nmo`（含 `6mo` `12mo`） | 截至上个月月底的 N 个完整自然月 |
   | `year` | 当年 1 月 1 日到今天 |
