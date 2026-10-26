@@ -3,7 +3,7 @@
   状态都在 URL 查询串里，可分享、刷新不丢。
   mode="shared" 用于共享链接与公开看板：只读，没有任何管理入口。
   数据：指标条一个合计查询、主图一个时间序列查询、每张分解卡片查自己当前的标签页；
-  页头的在线人数每 30 秒刷新，实时视图下其余数据也每 30 秒刷新。目标卡片要等服务端支持 event:goal。
+  页头的在线人数每 30 秒刷新，实时视图下其余数据也每 30 秒刷新。目标卡片在没有转化时不显示。
 -->
 <script lang="ts">
   import { ChartSpline, CircleAlert, Clock, Hourglass, Inbox, Share2, Table2 } from "@lucide/svelte";
@@ -26,8 +26,11 @@
   import FilterBar from "./FilterBar.svelte";
   import KpiStrip from "./KpiStrip.svelte";
   import BreakdownCard from "./BreakdownCard.svelte";
+  import GoalsCard from "./GoalsCard.svelte";
   import {
     breakdownSpec,
+    goalsSpec,
+    readGoals,
     CITY_LEVEL_DIMS,
     DIMS,
     encodeFilters,
@@ -199,6 +202,14 @@
         noteGeo(res);
         return readRows(res);
       });
+  });
+
+  /** 目标卡片的查询：看板状态变了换一个新函数，卡片随之重新查询 */
+  const loadGoals = $derived.by(() => {
+    const s = dash;
+    const src = source;
+    void tick;
+    return (signal: AbortSignal) => runQuery(src, goalsSpec(s, new Date()), signal).then(readGoals);
   });
 
   /** 筛选对话框里的候选值：该维度的排行，去掉这个维度自己的筛选 */
@@ -388,6 +399,8 @@
         onpick={addFilter}
       />
     </div>
+
+    <GoalsCard load={loadGoals} onpick={addFilter} />
   {/if}
 </div>
 

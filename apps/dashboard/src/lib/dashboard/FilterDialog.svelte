@@ -13,7 +13,7 @@
   import Field from "../ui/Field.svelte";
   import { t } from "../i18n";
   import { app } from "../state.svelte";
-  import type { Filter, Op } from "./spec";
+  import { opsFor, type Filter, type Op } from "./spec";
   import { isAbort } from "./source";
   import { displayValue } from "./values";
 
@@ -93,6 +93,7 @@
           onchange={(v) => {
             dim = v;
             picked = [];
+            if (!opsFor(v).includes(op)) op = "is";
           }}
           options={dims.map((d) => ({ value: d, label: t(`fdim.${d}`) }))}
         />
@@ -102,11 +103,7 @@
           block
           label={t("filter.operator")}
           bind:value={op}
-          options={[
-            { value: "is", label: t("op.is") },
-            { value: "is_not", label: t("op.is_not") },
-            { value: "contains", label: t("op.contains") },
-          ]}
+          options={opsFor(dim).map((o) => ({ value: o, label: t(`op.${o}`) }))}
         />
       </Field>
     </div>

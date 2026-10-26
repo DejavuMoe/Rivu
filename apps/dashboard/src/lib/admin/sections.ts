@@ -1,7 +1,7 @@
 // 站点设置的分区与可见性（只决定界面上显示与否，服务端仍按自己的规则判定）。
 import type { Role } from "../api.ts";
 
-export type SectionKey = "general" | "hostnames" | "collection" | "privacy" | "shield" | "sharing" | "danger";
+export type SectionKey = "general" | "hostnames" | "collection" | "privacy" | "shield" | "goals" | "sharing" | "danger";
 
 export interface Access {
   role: Role | null;
@@ -9,16 +9,20 @@ export interface Access {
 }
 
 /** 分区顺序即导航顺序。 */
-export const SECTIONS: SectionKey[] = ["general", "hostnames", "collection", "privacy", "shield", "sharing", "danger"];
+export const SECTIONS: SectionKey[] = ["general", "hostnames", "collection", "privacy", "shield", "goals", "sharing", "danger"];
 
 const isMember = (s: Access) => s.access === "member";
 const isManager = (s: Access) => isMember(s) && (s.role === "owner" || s.role === "admin");
 const isEditor = (s: Access) => !!s.role && s.role !== "viewer";
 
-/** 能进入这个分区：设置类与危险操作需要组织的 owner / admin；屏蔽规则 editor 起可看；共享链接要组织角色 editor 起（站点访客不行）。 */
+/**
+ * 能进入这个分区：设置类与危险操作需要组织的 owner / admin；屏蔽规则与目标 editor 起可看（含站点访客 editor）；
+ * 共享链接要组织角色 editor 起（站点访客不行）。
+ */
 export function sectionVisible(key: SectionKey, s: Access): boolean {
   switch (key) {
     case "shield":
+    case "goals":
       return isEditor(s);
     case "sharing":
       return isMember(s) && isEditor(s);
@@ -27,9 +31,11 @@ export function sectionVisible(key: SectionKey, s: Access): boolean {
   }
 }
 
-/** 进入后只读：屏蔽规则只有 owner / admin 能写。 */
+/** 进入后只读：屏蔽规则只有 owner / admin 能写；目标 editor 起都能写（site.content.write）。 */
 export function sectionReadOnly(key: SectionKey, s: Access): boolean {
-  return key === "shield" && !isManager(s);
+  if (key === "shield") return !isManager(s);
+  if (key === "goals") return !isEditor(s);
+  return false;
 }
 
 export function visibleSections(s: Access): SectionKey[] {
