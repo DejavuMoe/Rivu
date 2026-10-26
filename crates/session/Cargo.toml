@@ -17,5 +17,7 @@ rivu-domain.workspace = true
 siphasher.workspace = true
 
 [dev-dependencies]
+# 实测会话内存（tests/memory.rs）：计数分配器
+dhat = "0.3"
 proptest.workspace = true
 rivu-reference.workspace = true
