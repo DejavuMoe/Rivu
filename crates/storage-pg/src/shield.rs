@@ -38,13 +38,20 @@ fn rule_from_row(r: &PgRow) -> Result<ShieldRuleRow> {
 
 /// 全部未删除站点的未删除规则（站点快照用）。
 pub async fn load_all_rules(pool: &PgPool) -> Result<Vec<ShieldRuleRow>> {
+    load_rules(pool, None).await
+}
+
+/// 未删除站点的未删除规则；`site_ids` 为 `Some` 时只取这些站点（增量刷新）。
+pub async fn load_rules(pool: &PgPool, site_ids: Option<&[i64]>) -> Result<Vec<ShieldRuleRow>> {
     let rows = sqlx::query(
         "SELECT r.id::text AS id, r.site_id, r.type, r.action, r.value, r.description
          FROM shield_rules r
          WHERE r.deleted_at IS NULL
+           AND ($1::bigint[] IS NULL OR r.site_id = ANY($1))
            AND EXISTS (SELECT 1 FROM sites s WHERE s.id = r.site_id AND s.deleted_at IS NULL)
          ORDER BY r.site_id, r.created_at, r.id",
     )
+    .bind(site_ids)
     .fetch_all(pool)
     .await
     .context("加载屏蔽规则失败")?;

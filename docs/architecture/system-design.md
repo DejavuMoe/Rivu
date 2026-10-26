@@ -276,8 +276,8 @@ api × M ─► ClickHouse（只读账号）/ PostgreSQL          jobs：运行�
 - `SiteSnapshot` 是 `ArcSwap<HashMap<SiteKey, Arc<SiteConfig>>>`。`SiteConfig` 包含：`site_id`、`org_id`、状态、时区、已编译的 hostname 模式、规则（`deny`、`allow` 各一套：IP 集合、IPv4/IPv6 CIDR 前缀树、国家集合、页面通配、hostname 模式）、限流参数、脚本开关、保留期、地理精度。
 - 刷新有三条路径：
   - 每 5 分钟全量重建；
-  - 每 10 秒按 `updated_at > 水位` 做增量刷新，删除通过 `deleted_at` 墓碑感知（Plausible 的删除要等全量刷新才生效，R01 §6.2）；
-  - PG `LISTEN/NOTIFY` 推送失效通知，新站点 1 秒内可用（Plausible 有约 30 秒的未知站点窗口，R01 §11.2 #11）。
+  - 每 10 秒（`RIVU_SITE_CACHE_REFRESH_SECS`）做增量刷新：`sites`、`site_settings`、`site_hostnames`、`shield_rules` 里 `updated_at >= 水位 − 5 s` 的行（含已软删除的）所属的站点整体重新加载，已删除的从快照摘除（Plausible 的删除要等全量刷新才生效，R01 §6.2）。水位取 PG 的 `now()`，与变更查询在同一条语句里；5 秒余量覆盖读水位时尚未提交的短事务；
+  - PG `LISTEN/NOTIFY`：这四张表的 `AFTER INSERT OR UPDATE` 触发器向频道 `rivu_site_changed` 发 `site_id`，collector 收到后合并 200 ms 内的通知、立即做一次增量刷新，新站点约 1 秒内可用（Plausible 有约 30 秒的未知站点窗口，R01 §11.2 #11）。通知只是加速，断线期间丢失的由定时增量刷新兜底。
 - 热路径不回源。查不到 `site_key` 就按 `unknown_site` 丢弃，这样随机 key 洪水打不到 PG。
 - UA 解析结果缓存用 moka（10 万条，TTL 1 小时）。键是截断到 512 字节后的 UA，空 UA 不进缓存；键占用的内存上界约 50 MB（10 万 × 512 B）。
 - GeoIP 把 mmdb **读入内存**（City 约 121 MiB，Country 约 8 MiB），不用内存映射：`maxminddb` 的 mmap 入口是 `unsafe fn`，而工作区禁止 `unsafe`（§10 Q25）。更新后用 `ArcSwap` 原子替换并热加载（§4.4），每个加载库的进程各占一份。

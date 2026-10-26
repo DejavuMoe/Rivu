@@ -1,12 +1,17 @@
-//! 站点快照与盐缓存：热路径只读内存，后台任务定期从 PG 全量重载。
+//! 站点快照与盐缓存：热路径只读内存，后台任务从 PG 刷新。
 //!
-//! P1 只有全量重载（`RIVU_SITE_CACHE_REFRESH_SECS`，默认 10 s）；增量刷新与 `LISTEN/NOTIFY` 留到以后
-//! （`system-design.md` §4.3）。热路径不回源：查不到 `site_key` 就按 `unknown_site` 丢弃。
+//! 站点快照（`system-design.md` §4.3、`platform-and-ops.md` §3.3）：
+//! - 每 `RIVU_SITE_CACHE_REFRESH_SECS`（默认 10 s）按 `updated_at` 水位增量刷新：只重新加载变更过的站点，
+//!   已删除的从快照摘除（删除是置 `deleted_at`，同样更新 `updated_at`）；
+//! - 每 [`FULL_RELOAD_EVERY`] 全量重载一次兜底；
+//! - `LISTEN rivu_site_changed`：PG 触发器在站点配置变更时 NOTIFY，收到后立即增量刷新，新站点约 1 秒内可用。
+//!
+//! 热路径不回源：查不到 `site_key` 就按 `unknown_site` 丢弃。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use arc_swap::ArcSwap;
@@ -70,10 +75,32 @@ impl SiteConfig {
     }
 }
 
+/// 全量重载的周期（增量刷新之外的兜底，§4.3）。
+pub const FULL_RELOAD_EVERY: Duration = Duration::from_secs(5 * 60);
+/// 收到 NOTIFY 之后等一小会儿再刷新，把同一事务或相邻事务的多条通知合成一次。
+const NOTIFY_DEBOUNCE: Duration = Duration::from_millis(200);
+
+/// 一次刷新做了什么（日志与测试用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refresh {
+    /// 全量重载，站点数。
+    Full(usize),
+    /// 增量刷新：重新加载了 `reloaded` 个站点，摘除了 `removed` 个。
+    Incremental { reloaded: usize, removed: usize },
+}
+
+/// 增量刷新的状态：水位（PG 时间，微秒）与上次全量重载的时刻。
+struct RefreshState {
+    watermark_us: Option<i64>,
+    last_full: Option<Instant>,
+}
+
 /// `site_key -> SiteConfig`。原子替换，读取无锁。
 pub struct SiteSnapshot {
     map: ArcSwap<HashMap<String, Arc<SiteConfig>>>,
     loaded: AtomicBool,
+    /// 串行化刷新（定时与 NOTIFY 两个来源）。
+    state: tokio::sync::Mutex<RefreshState>,
 }
 
 impl Default for SiteSnapshot {
@@ -88,6 +115,10 @@ impl SiteSnapshot {
         SiteSnapshot {
             map: ArcSwap::from_pointee(HashMap::new()),
             loaded: AtomicBool::new(false),
+            state: tokio::sync::Mutex::new(RefreshState {
+                watermark_us: None,
+                last_full: None,
+            }),
         }
     }
 
@@ -130,35 +161,161 @@ impl SiteSnapshot {
         out
     }
 
-    /// 从 PG 全量重载一次，返回站点数。
+    /// 把增量结果并进当前快照：先摘除 `changed` 里的全部站点，再放回仍未删除的 `rows`。
+    /// `changed` 不在 `rows` 里的站点就是被删除了。返回 `(重新加载数, 摘除数)`。
+    pub fn apply_changes(&self, changed: &[u64], rows: &[SiteRow]) -> (usize, usize) {
+        let changed: HashSet<u64> = changed.iter().copied().collect();
+        let mut map = HashMap::clone(&self.map.load());
+        let mut dropped = HashSet::new();
+        map.retain(|_, cfg| {
+            let keep = !changed.contains(&cfg.site_id);
+            if !keep {
+                dropped.insert(cfg.site_id);
+            }
+            keep
+        });
+        let fresh = Self::build(rows);
+        for cfg in fresh.values() {
+            dropped.remove(&cfg.site_id);
+        }
+        let reloaded = fresh.len();
+        map.extend(fresh);
+        self.map.store(Arc::new(map));
+        (reloaded, dropped.len())
+    }
+
+    /// 从 PG 全量重载一次，返回站点数。之后的增量刷新以重载前读到的 PG 时间为水位。
     pub async fn reload(&self, pool: &PgPool) -> Result<usize> {
+        let mut state = self.state.lock().await;
+        self.reload_locked(pool, &mut state).await
+    }
+
+    async fn reload_locked(&self, pool: &PgPool, state: &mut RefreshState) -> Result<usize> {
+        let now_us = rivu_storage_pg::sites::db_now_us(pool).await?;
         let rows = rivu_storage_pg::sites::load_sites(pool).await?;
         let map = Self::build(&rows);
         let n = map.len();
         self.replace(map);
+        state.watermark_us = Some(now_us);
+        state.last_full = Some(Instant::now());
         Ok(n)
     }
 
-    /// 启动后台全量重载：立即加载一次，之后每 `every` 一次。失败只记日志，继续用旧快照。
+    /// 刷新一次：还没有水位或距上次全量重载超过 [`FULL_RELOAD_EVERY`] 时全量重载，否则增量刷新。
+    pub async fn refresh(&self, pool: &PgPool) -> Result<Refresh> {
+        let mut state = self.state.lock().await;
+        let full_due = state
+            .last_full
+            .is_none_or(|t| t.elapsed() >= FULL_RELOAD_EVERY);
+        let Some(since) = state.watermark_us.filter(|_| !full_due) else {
+            return self
+                .reload_locked(pool, &mut state)
+                .await
+                .map(Refresh::Full);
+        };
+        let changes = rivu_storage_pg::sites::changed_sites(pool, since).await?;
+        let (reloaded, removed) = if changes.site_ids.is_empty() {
+            (0, 0)
+        } else {
+            let rows = rivu_storage_pg::sites::load_sites_by_ids(pool, &changes.site_ids).await?;
+            self.apply_changes(&changes.site_ids, &rows)
+        };
+        state.watermark_us = Some(changes.now_us);
+        Ok(Refresh::Incremental { reloaded, removed })
+    }
+
+    async fn refresh_logged(&self, pool: &PgPool, trigger: &'static str) {
+        match self.refresh(pool).await {
+            Ok(Refresh::Full(n)) => tracing::debug!(sites = n, trigger, "站点快照已全量重载"),
+            Ok(Refresh::Incremental { reloaded, removed }) => {
+                if reloaded + removed > 0 {
+                    tracing::debug!(reloaded, removed, trigger, "站点快照已增量刷新");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), trigger, "刷新站点快照失败，继续使用旧快照")
+            }
+        }
+    }
+
+    /// 启动后台刷新：立即刷新一次，之后每 `every` 一次（增量为主，定期全量）；
+    /// 同时 `LISTEN rivu_site_changed`，收到通知后立即增量刷新。失败只记日志，继续用旧快照。
     pub fn spawn_refresh(
         self: &Arc<Self>,
         pool: PgPool,
         every: Duration,
         stop: watch::Receiver<bool>,
     ) -> JoinHandle<()> {
+        let listener = {
+            let this = Arc::clone(self);
+            let pool = pool.clone();
+            let stop = stop.clone();
+            tokio::spawn(async move { this.listen(pool, stop).await })
+        };
         let this = Arc::clone(self);
-        spawn_periodic(every, stop, move || {
+        let periodic = spawn_periodic(every, stop, move || {
             let this = Arc::clone(&this);
             let pool = pool.clone();
-            async move {
-                match this.reload(&pool).await {
-                    Ok(n) => tracing::debug!(sites = n, "站点快照已刷新"),
+            async move { this.refresh_logged(&pool, "timer").await }
+        });
+        tokio::spawn(async move {
+            let _ = periodic.await;
+            let _ = listener.await;
+        })
+    }
+
+    /// 监听变更通知。连接断开时 sqlx 自动重连（断开期间的通知丢失，由定时刷新兜底）；
+    /// 建立监听失败时 30 秒后重试。
+    async fn listen(self: Arc<Self>, pool: PgPool, mut stop: watch::Receiver<bool>) {
+        use sqlx::postgres::PgListener;
+        loop {
+            let mut listener = match PgListener::connect_with(&pool).await {
+                Ok(mut l) => match l.listen(rivu_storage_pg::sites::SITE_CHANGED_CHANNEL).await {
+                    Ok(()) => l,
                     Err(e) => {
-                        tracing::warn!(error = %format!("{e:#}"), "刷新站点快照失败，继续使用旧快照")
+                        tracing::warn!(error = %e, "LISTEN 站点变更失败，30 秒后重试");
+                        if wait_or_stop(&mut stop, Duration::from_secs(30)).await {
+                            return;
+                        }
+                        continue;
                     }
+                },
+                Err(e) => {
+                    tracing::warn!(error = %e, "连接 PG 监听站点变更失败，30 秒后重试");
+                    if wait_or_stop(&mut stop, Duration::from_secs(30)).await {
+                        return;
+                    }
+                    continue;
+                }
+            };
+            loop {
+                tokio::select! {
+                    () = stopped(&mut stop) => return,
+                    n = listener.recv() => match n {
+                        Ok(_) => {
+                            // 合并紧挨着的通知：先等一小会儿，再把已经到达的都取走
+                            if wait_or_stop(&mut stop, NOTIFY_DEBOUNCE).await {
+                                return;
+                            }
+                            while listener.next_buffered().is_some() {}
+                            self.refresh_logged(&pool, "notify").await;
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "接收站点变更通知失败，重新建立监听");
+                            break;
+                        }
+                    },
                 }
             }
-        })
+        }
+    }
+}
+
+/// 等 `d`；期间收到停止信号返回 true。
+async fn wait_or_stop(stop: &mut watch::Receiver<bool>, d: Duration) -> bool {
+    tokio::select! {
+        () = stopped(stop) => true,
+        () = tokio::time::sleep(d) => false,
     }
 }
 
@@ -353,6 +510,36 @@ mod tests {
         // 整体替换：旧站点消失
         s.replace(HashMap::new());
         assert!(s.is_loaded() && s.is_empty());
+    }
+
+    #[test]
+    fn apply_changes_replaces_changed_sites_and_drops_deleted_ones() {
+        let s = SiteSnapshot::new();
+        s.replace(SiteSnapshot::build(&[
+            row(1, "aaaaaaaaaaaa", "UTC", &["a.test"]),
+            row(2, "bbbbbbbbbbbb", "UTC", &["b.test"]),
+            row(3, "cccccccccccc", "UTC", &["c.test"]),
+        ]));
+        // 1 改了白名单，2 被删除，4 是新站点，3 没变
+        let (reloaded, removed) = s.apply_changes(
+            &[1, 2, 4],
+            &[
+                row(1, "aaaaaaaaaaaa", "UTC", &["a2.test"]),
+                row(4, "dddddddddddd", "UTC", &["d.test"]),
+            ],
+        );
+        assert_eq!((reloaded, removed), (2, 1));
+        assert!(s.get("aaaaaaaaaaaa").unwrap().hostnames.matches("a2.test"));
+        assert!(!s.get("aaaaaaaaaaaa").unwrap().hostnames.matches("a.test"));
+        assert!(s.get("bbbbbbbbbbbb").is_none());
+        assert_eq!(s.get("cccccccccccc").unwrap().site_id, 3);
+        assert_eq!(s.get("dddddddddddd").unwrap().site_id, 4);
+        assert_eq!(s.len(), 3);
+        // 变更的站点时区变坏：同样被摘除（build 跳过它）
+        let (reloaded, removed) =
+            s.apply_changes(&[3], &[row(3, "cccccccccccc", "Mars/Olympus", &[])]);
+        assert_eq!((reloaded, removed), (0, 1));
+        assert!(s.get("cccccccccccc").is_none());
     }
 
     #[test]

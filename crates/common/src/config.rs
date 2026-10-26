@@ -279,7 +279,7 @@ pub const DEFAULT_SHIELD_MAX_RULES_PER_SITE: usize = 500;
 /// 小站想更严格就设站点自己的限额；设为 `0` 表示不限流。
 pub const DEFAULT_INGEST_RATE_LIMIT_PER_MIN: u32 = 300_000;
 
-/// 站点缓存的全量重载周期默认值（`RIVU_SITE_CACHE_REFRESH_SECS`）。
+/// 站点缓存的增量刷新周期默认值（`RIVU_SITE_CACHE_REFRESH_SECS`）。
 pub const DEFAULT_SITE_CACHE_REFRESH_SECS: u64 = 10;
 
 /// `RIVU_SITE_RESTORE_DAYS` 的默认值：站点软删除后可以恢复的天数，过后清除统计数据（`platform-and-ops.md` §6）。
@@ -499,7 +499,7 @@ pub struct Config {
     pub shield_max_rules_per_site: usize,
     /// `RIVU_INGEST_RATE_LIMIT_PER_MIN`：站点没有自己的限额时的默认每分钟事件数；`None` 表示不限流（变量设为 0）。
     pub ingest_rate_limit_per_min: Option<u32>,
-    /// `RIVU_SITE_CACHE_REFRESH_SECS`：站点快照全量重载周期（P1 没有增量刷新和 LISTEN/NOTIFY）。
+    /// `RIVU_SITE_CACHE_REFRESH_SECS`：站点快照的增量刷新周期（另有每 5 分钟的全量重载与 LISTEN/NOTIFY）。
     pub site_cache_refresh: Duration,
     /// `RIVU_SITE_RESTORE_DAYS`：站点软删除后的恢复窗口（天）；`0` 表示下一轮 `ch_delete_batch` 就清除统计数据。
     pub site_restore_days: u32,
