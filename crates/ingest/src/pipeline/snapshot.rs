@@ -130,6 +130,11 @@ impl SiteSnapshot {
         self.map.load().len()
     }
 
+    /// 快照里全部站点的 id。
+    pub fn site_ids(&self) -> HashSet<u64> {
+        self.map.load().values().map(|c| c.site_id).collect()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
