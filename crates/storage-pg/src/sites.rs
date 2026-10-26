@@ -57,6 +57,19 @@ fn site_from_row(r: &PgRow) -> Result<SiteRow> {
 
 /// 加载全部未删除的站点：`sites` + `site_hostnames` + `site_settings`（`collect_enabled`、`geo_level`、`tracker.hash`）。
 pub async fn load_sites(pool: &PgPool) -> Result<Vec<SiteRow>> {
+    load_sites_filtered(pool, None).await
+}
+
+/// 只加载 `ids` 里仍未删除的站点（增量刷新用）；已删除或不存在的 id 不出现在结果里。
+pub async fn load_sites_by_ids(pool: &PgPool, ids: &[u64]) -> Result<Vec<SiteRow>> {
+    let ids = ids
+        .iter()
+        .map(|&id| i64::try_from(id).context("site_id 超出范围"))
+        .collect::<Result<Vec<_>>>()?;
+    load_sites_filtered(pool, Some(&ids)).await
+}
+
+async fn load_sites_filtered(pool: &PgPool, ids: Option<&[i64]>) -> Result<Vec<SiteRow>> {
     let rows = sqlx::query(
         "SELECT s.id, s.site_key, s.timezone,
                 COALESCE(ss.collect_enabled, true) AS collect_enabled,
@@ -67,10 +80,11 @@ pub async fn load_sites(pool: &PgPool) -> Result<Vec<SiteRow>> {
          FROM sites s
          LEFT JOIN site_settings ss ON ss.site_id = s.id
          LEFT JOIN site_hostnames h ON h.site_id = s.id AND h.deleted_at IS NULL
-         WHERE s.deleted_at IS NULL
+         WHERE s.deleted_at IS NULL AND ($1::bigint[] IS NULL OR s.id = ANY($1))
          GROUP BY s.id, ss.collect_enabled, ss.geo_level, ss.tracker, ss.ingest_rate_limit_per_min
          ORDER BY s.id",
     )
+    .bind(ids)
     .fetch_all(pool)
     .await
     .context("加载站点失败")?;
@@ -78,7 +92,7 @@ pub async fn load_sites(pool: &PgPool) -> Result<Vec<SiteRow>> {
     // 规则按站点分组挂到站点上（两次查询之间站点被删除的规则会被丢弃）
     let mut by_site: std::collections::HashMap<u64, Vec<ShieldRuleRow>> =
         std::collections::HashMap::new();
-    for rule in crate::shield::load_all_rules(pool).await? {
+    for rule in crate::shield::load_rules(pool, ids).await? {
         by_site.entry(rule.site_id).or_default().push(rule);
     }
     for site in &mut sites {
@@ -86,6 +100,55 @@ pub async fn load_sites(pool: &PgPool) -> Result<Vec<SiteRow>> {
     }
     Ok(sites)
 }
+
+/// 增量刷新一轮的输入：PG 的当前时间（微秒，作为下一轮的水位）与变更过的站点。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SiteChanges {
+    pub now_us: i64,
+    pub site_ids: Vec<u64>,
+}
+
+/// 增量刷新的回看余量：`now()` 是事务开始的时间，比读水位早开始、晚提交的事务写下的
+/// `updated_at` 可能早于水位；余量覆盖 5 秒以内的事务（`platform-and-ops.md` §3.3）。
+pub const CHANGE_LOOKBACK_US: i64 = 5_000_000;
+
+/// `updated_at >= since_us − 5 s` 的站点：`sites`、`site_settings`、`site_hostnames`、`shield_rules`
+/// 任一行变过（**含已软删除的行**：删除也是变更）。`now()` 与查询在同一条语句里，取同一个时刻。
+pub async fn changed_sites(pool: &PgPool, since_us: i64) -> Result<SiteChanges> {
+    let row = sqlx::query(
+        "WITH since AS (SELECT to_timestamp($1::double precision / 1e6) AS t)
+         SELECT (extract(epoch FROM now()) * 1e6)::bigint AS now_us,
+                ARRAY(
+                    SELECT id FROM sites, since WHERE updated_at >= since.t
+                    UNION SELECT site_id FROM site_settings, since WHERE updated_at >= since.t
+                    UNION SELECT site_id FROM site_hostnames, since WHERE updated_at >= since.t
+                    UNION SELECT site_id FROM shield_rules, since WHERE updated_at >= since.t
+                ) AS ids",
+    )
+    .bind(since_us.saturating_sub(CHANGE_LOOKBACK_US))
+    .fetch_one(pool)
+    .await
+    .context("查询变更过的站点失败")?;
+    let ids: Vec<i64> = row.try_get("ids")?;
+    Ok(SiteChanges {
+        now_us: row.try_get("now_us")?,
+        site_ids: ids
+            .into_iter()
+            .filter_map(|id| u64::try_from(id).ok())
+            .collect(),
+    })
+}
+
+/// PG 的当前时间（微秒）：全量重载之前读一次，作为之后增量刷新的水位。
+pub async fn db_now_us(pool: &PgPool) -> Result<i64> {
+    sqlx::query_scalar("SELECT (extract(epoch FROM now()) * 1e6)::bigint")
+        .fetch_one(pool)
+        .await
+        .context("读取 PG 时间失败")
+}
+
+/// 站点配置变更通知的频道（迁移 `…_site_change_notify.sql` 的触发器发送，负载是 `site_id`）。
+pub const SITE_CHANGED_CHANNEL: &str = "rivu_site_changed";
 
 /// 按 `site_key` 查一个未删除的站点。
 pub async fn find_site_by_key(pool: &PgPool, site_key: &str) -> Result<Option<SiteRow>> {
