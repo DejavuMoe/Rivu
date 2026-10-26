@@ -2270,6 +2270,7 @@ name = "rivu-jobs"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clickhouse",
  "flate2",
  "jiff",
  "metrics",
@@ -2278,6 +2279,7 @@ dependencies = [
  "rand 0.9.5",
  "rivu-common",
  "rivu-geo",
+ "rivu-query",
  "rivu-storage-pg",
  "sqlx",
  "tokio",

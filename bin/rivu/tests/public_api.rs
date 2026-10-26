@@ -601,6 +601,7 @@ async fn direct(server: &Server, site: &Site, spec: &Value) -> (String, Value) {
         week_starts_on: site.week_start,
         geo_attribution: server.geo.attribution(),
         geo_capability: server.geo.capability(),
+        goals: Vec::new(),
     };
     let result = execute(
         &server.reader,

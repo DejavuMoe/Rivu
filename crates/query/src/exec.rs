@@ -340,7 +340,7 @@ fn labels(q: &ResolvedQuery, raw: &[String]) -> Vec<String> {
 fn change(m: Metric, new: f64, old: f64) -> f64 {
     if matches!(
         m,
-        Metric::BounceRate | Metric::Percentage | Metric::ExitRate
+        Metric::BounceRate | Metric::Percentage | Metric::ExitRate | Metric::ConversionRate
     ) {
         new - old
     } else if old == 0.0 {

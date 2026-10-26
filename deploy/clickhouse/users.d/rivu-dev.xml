@@ -8,7 +8,8 @@
     rivu_writer      INSERT，外加 schema_migrations 的 SELECT（只跑 collector 时 /readyz 用），collector / worker 使用；
                      mv_sessions 以 rivu_migrator 身份运行（SQL SECURITY DEFINER），writer 不需要 events 的 SELECT
     rivu_reader      readonly=1 的只读账号，api 使用；带配额和查询限制
-    rivu_maintainer  ALTER DELETE（DELETE 与 DROP PARTITION 都由该权限控制）+ SELECT，删除批处理和 rollup 构建使用
+    rivu_maintainer  ALTER DELETE（DELETE 与 DROP PARTITION 都由该权限控制）+ SELECT，删除批处理和 rollup 构建使用；
+                     轻量删除另需 events / sessions / ingest_counters 上 _row_exists 列的 ALTER UPDATE
   default 账号：只允许本机（容器内）访问，不对宿主机端口映射开放。
 
   数据库名固定为 rivu（RIVU_CH_DATABASE 的默认值）；授权对象在库尚未创建时也可以先声明。
@@ -95,6 +96,11 @@
             <quota>default</quota>
             <grants>
                 <query>GRANT SELECT, ALTER DELETE ON rivu.*</query>
+                <!-- 轻量删除（DELETE FROM … WHERE）在 25.8 上实现为改写隐藏列 _row_exists，
+                     除 ALTER DELETE 外还要这一列的 ALTER UPDATE；只授予这一列、只授予 ch_delete_batch 删除的三张表。 -->
+                <query>GRANT ALTER UPDATE(_row_exists) ON rivu.events</query>
+                <query>GRANT ALTER UPDATE(_row_exists) ON rivu.sessions</query>
+                <query>GRANT ALTER UPDATE(_row_exists) ON rivu.ingest_counters</query>
             </grants>
         </rivu_maintainer>
     </users>

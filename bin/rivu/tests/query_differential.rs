@@ -4,7 +4,8 @@
 //! 事件由确定性的随机生成器产生（多人、跨本地午夜与夏令时切换日、多种 UA / IP / referrer / utm / 页面、
 //! engagement 带 sd 或 e、自定义事件），经真实管线（`Pipeline` + 可控时钟）写入 ClickHouse；
 //! 再随机生成数百个合法的 `QuerySpec`（指标子集、0–2 个维度、随机过滤树、随机日期范围与「现在」、order_by、
-//! limit / offset、`include`、对比期），逐个比较两边的结果：计数严格相等，比率 1e-9 容差，
+//! limit / offset、`include`、对比期；目标：事件与页面目标、通配、`event:goal` 维度与过滤、`conversion_rate`），
+//! 逐个比较两边的结果：计数严格相等，比率 1e-9 容差，
 //! 行序、`time_labels`、`total_rows`、对比期都要一致。失败时把请求最小化后打印。
 //!
 //! 需要真实的 PostgreSQL 和 ClickHouse，缺变量时跳过（同 `e2e_lite.rs`）：
@@ -34,10 +35,12 @@ use rivu::migrate;
 use rivu_common::config::{BufferConfig, ChAccount, Config, Env, Role, Secret};
 use rivu_geo::GeoDb;
 use rivu_ingest::pipeline::{Outcome, Pipeline, RequestCtx, SaltCache, SiteSnapshot};
+use rivu_query::resolve::{GoalDef, GoalKind};
 use rivu_query::result::{MetricValue, QueryResult};
 use rivu_query::{ExecOptions, QueryError, QuerySpec, SiteContext, TenantScope, execute};
 use rivu_reference::query::{
-    RefAttrs, RefEvent, RefResult, RefSite, is_count_metric, owned, run as ref_run,
+    RefAttrs, RefEvent, RefGoal, RefGoalKind, RefResult, RefSite, is_count_metric, owned,
+    run as ref_run,
 };
 use rivu_storage_pg::sites::NewSite;
 use rivu_ua::UaParser;
@@ -138,6 +141,47 @@ const UTMS: [Option<&str>; 6] = [
     Some("?utm_source=bing&utm_medium=cpc&utm_campaign=brand"),
     Some("?gclid=abc123"),
 ];
+
+/// 两个站点共用的目标：`(id, kind, 值, 显示名)`。事件目标用生成器的自定义事件名；页面目标覆盖精确路径、
+/// 前缀通配、中间通配、只有 `*`（匹配所有 pageview），以及一个永远完成不了的目标（不出现在结果里）。
+const GOALS: [(i64, &str, &str, Option<&str>); 8] = [
+    (101, "event", "Signup", None),
+    (102, "event", "Download", Some("Got the PDF")),
+    (103, "event", "never-sent", Some("Never")),
+    (104, "page", "/pricing", None),
+    (105, "page", "/docs*", Some("Docs")),
+    (106, "page", "/*/intro", None),
+    (107, "page", "/blog/*", Some("Blog")),
+    (108, "page", "/*", Some("Any page")),
+];
+
+fn goal_defs() -> Vec<GoalDef> {
+    GOALS
+        .iter()
+        .map(|(id, kind, v, d)| {
+            let (e, p) = if *kind == "event" {
+                (Some(*v), None)
+            } else {
+                (None, Some(*v))
+            };
+            GoalDef::from_parts(*id, kind, e, p, *d).expect("合法的目标")
+        })
+        .collect()
+}
+
+fn ref_goals() -> Vec<RefGoal> {
+    goal_defs()
+        .into_iter()
+        .map(|g| RefGoal {
+            id: g.id,
+            label: g.label,
+            kind: match g.kind {
+                GoalKind::Event(n) => RefGoalKind::Event(n),
+                GoalKind::Page(p) => RefGoalKind::Page(p),
+            },
+        })
+        .collect()
+}
 
 struct SiteDef {
     id: u64,
@@ -389,7 +433,8 @@ async fn read_back(reader: &Client, site_id: u64) -> BTreeMap<i64, Stored> {
 // 请求生成
 // ======================================================================================
 
-const METRICS: [&str; 12] = [
+const METRICS: [&str; 13] = [
+    "conversion_rate",
     "visitors",
     "visits",
     "pageviews",
@@ -403,7 +448,15 @@ const METRICS: [&str; 12] = [
     "time_on_page",
     "scroll_depth",
 ];
-const EVENT_DIMS: [&str; 3] = ["event:name", "event:page", "event:hostname"];
+const EVENT_DIMS: [&str; 4] = ["event:name", "event:page", "event:hostname", "event:goal"];
+/// 能与 `event:goal` 维度同用的指标。
+const GOAL_DIM_METRICS: [&str; 5] = [
+    "visitors",
+    "visits",
+    "pageviews",
+    "events",
+    "conversion_rate",
+];
 const VISIT_DIMS: [&str; 18] = [
     "visit:entry_page",
     "visit:exit_page",
@@ -533,7 +586,7 @@ struct Gen<'a> {
 struct FilterRules {
     /// 不要事件级叶子（`exit_rate`）。
     no_event_leaf: bool,
-    /// 不要 `event:name` 叶子（`time_on_page`、`scroll_depth`）。
+    /// 不要 `event:name` 与 `event:goal` 叶子（`time_on_page`、`scroll_depth`）。
     no_event_name: bool,
 }
 
@@ -580,11 +633,14 @@ impl Gen<'_> {
             if rules.no_event_leaf && d.starts_with("event:") {
                 continue;
             }
-            if rules.no_event_name && d == "event:name" {
+            if rules.no_event_name && (d == "event:name" || d == "event:goal") {
                 continue;
             }
             break d;
         };
+        if dim == "event:goal" {
+            return self.goal_leaf();
+        }
         let op = if dim == "visit:city" {
             *pick(&mut self.rng, &["is", "is_not"])
         } else {
@@ -653,6 +709,28 @@ impl Gen<'_> {
                 .collect(),
         };
         let mut f = vec![json!(op), json!(dim), Value::Array(values)];
+        if self.chance(0.3) {
+            f.push(json!({"case_sensitive": self.chance(0.4)}));
+        }
+        Value::Array(f)
+    }
+
+    /// `event:goal` 叶子：`is` / `is_not`，取值是目标的标签（偶尔换大小写）、id（字符串或整数）或不存在的名字。
+    fn goal_leaf(&mut self) -> Value {
+        let op = *pick(&mut self.rng, &["is", "is", "is_not"]);
+        let mut values: Vec<Value> = Vec::new();
+        for _ in 0..self.rng.random_range(1..3) {
+            let (id, _, v, d) = *pick(&mut self.rng, &GOALS);
+            let label = d.unwrap_or(v).to_owned();
+            values.push(match self.rng.random_range(0..10) {
+                0..=4 => json!(label),
+                5 => json!(label.to_uppercase()),
+                6 => json!(id),
+                7 => json!(id.to_string()),
+                _ => json!("no-such-goal"),
+            });
+        }
+        let mut f = vec![json!(op), json!("event:goal"), Value::Array(values)];
         if self.chance(0.3) {
             f.push(json!({"case_sensitive": self.chance(0.4)}));
         }
@@ -855,7 +933,7 @@ impl Gen<'_> {
                 have_time = false;
             }
             "percentage" => {
-                dims.retain(|d| !d.starts_with("time"));
+                dims.retain(|d| !d.starts_with("time") && *d != "event:goal");
                 have_time = false;
                 if dims.is_empty() {
                     dims.push(*pick(&mut self.rng, &VISIT_DIMS));
@@ -863,7 +941,7 @@ impl Gen<'_> {
             }
             "time_on_page" | "scroll_depth" | "views_per_visit" | "bounce_rate"
             | "visit_duration" | "engaged_duration" => {
-                dims.retain(|d| *d != "event:name");
+                dims.retain(|d| *d != "event:name" && *d != "event:goal");
             }
             _ => {}
         }
@@ -880,17 +958,34 @@ impl Gen<'_> {
         for _ in 0..nfilters {
             filters.push(self.node(0, rules));
         }
+        // 转化率要有目标维度或目标过滤：都没有时补一个（目标过滤常与其他过滤组合）
+        if focus == "conversion_rate"
+            && !dims.contains(&"event:goal")
+            && !Value::Array(filters.clone())
+                .to_string()
+                .contains("\"event:goal\"")
+        {
+            if self.chance(0.5) && dims.len() < 3 {
+                dims.insert(0, "event:goal");
+            } else {
+                filters.push(self.goal_leaf());
+            }
+        }
         let filter_json = Value::Array(filters.clone());
         let text = filter_json.to_string();
         let has_event_leaf = text.contains("\"event:name\"")
             || text.contains("\"event:page\"")
-            || text.contains("\"event:hostname\"");
-        let has_event_name_leaf = text.contains("\"event:name\"");
+            || text.contains("\"event:hostname\"")
+            || text.contains("\"event:goal\"");
+        let has_event_name_leaf =
+            text.contains("\"event:name\"") || text.contains("\"event:goal\"");
+        let has_goal_leaf = text.contains("\"event:goal\"");
 
         // 指标
         let dims_has_event_name = dims.contains(&"event:name");
+        let dims_has_goal = dims.contains(&"event:goal");
         let mut eligible: Vec<&str> = vec!["visitors", "visits", "pageviews", "events"];
-        if !dims_has_event_name {
+        if !dims_has_event_name && !dims_has_goal {
             eligible.extend([
                 "views_per_visit",
                 "bounce_rate",
@@ -898,14 +993,20 @@ impl Gen<'_> {
                 "engaged_duration",
             ]);
         }
-        if !dims.is_empty() && !have_time {
+        if !dims.is_empty() && !have_time && !dims_has_goal {
             eligible.push("percentage");
         }
         if dims == ["event:page"] && !has_event_leaf {
             eligible.push("exit_rate");
         }
-        if !dims_has_event_name && !has_event_name_leaf {
+        if !dims_has_event_name && !has_event_name_leaf && !dims_has_goal {
             eligible.extend(["time_on_page", "scroll_depth"]);
+        }
+        if dims_has_goal || has_goal_leaf {
+            eligible.push("conversion_rate");
+        }
+        if dims_has_goal {
+            eligible.retain(|m| GOAL_DIM_METRICS.contains(m));
         }
         let mut metrics: Vec<&str> = Vec::new();
         if eligible.contains(&focus) {
@@ -1175,6 +1276,7 @@ impl Harness {
             week_starts_on: site.week_start,
             geo_attribution: None,
             geo_capability: None,
+            goals: goal_defs(),
         };
         let got = execute(
             &self.reader,
@@ -1200,6 +1302,7 @@ impl Harness {
                 tz: site.tz.clone(),
                 week_start: site.week_start,
                 now_ms: now,
+                goals: ref_goals(),
             },
             &self.events[site_idx],
         ) {
@@ -1628,6 +1731,8 @@ async fn query_engine_matches_the_reference_on_random_specs() {
                     ("matches", "\"matches"),
                     ("contains", "\"contains"),
                     ("case_insensitive", "\"case_sensitive\":false"),
+                    ("goal", "\"event:goal\""),
+                    ("conversion_rate", "\"conversion_rate\""),
                 ] {
                     if text.contains(pat) {
                         *features.entry(k).or_default() += 1;

@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 
 use crate::error::QueryError;
 use crate::exec::explain;
-use crate::resolve::SiteContext;
+use crate::resolve::{GoalDef, SiteContext};
 use crate::spec::QuerySpec;
 use crate::sql::{ParamValue, Params, TenantScope, check_tenant_scoped};
 
@@ -22,6 +22,11 @@ const SITE_ID: u64 = 4242;
 fn site() -> SiteContext {
     let mut s = SiteContext::new(SITE_ID, TimeZone::get("Europe/Berlin").unwrap());
     s.week_starts_on = Weekday::Sunday;
+    s.goals = vec![
+        GoalDef::from_parts(11, "event", Some("Signup"), None, None).unwrap(),
+        GoalDef::from_parts(12, "page", None, Some("/checkout/*/done"), Some("Checkout")).unwrap(),
+        GoalDef::from_parts(13, "page", None, Some("/a_b%c\\d"), None).unwrap(),
+    ];
     s
 }
 
@@ -286,6 +291,50 @@ fn sql_exit_rate_and_percentage() {
             "dimensions": ["visit:source"],
             "filters": [["is_not", "visit:channel", ["Direct"]]]
         }),
+    );
+}
+
+#[test]
+fn sql_goals() {
+    // 目标维度：事件匹配的目标标签 arrayJoin 展开；转化率的分母组件展开成全部目标标签；HAVING 去掉没有转化的行
+    snap(
+        "goal_breakdown",
+        json!({
+            "metrics": ["visitors", "events", "conversion_rate"],
+            "date_range": "30d",
+            "dimensions": ["event:goal"],
+            "filters": [["is", "visit:country", ["DE"]]]
+        }),
+    );
+    // 目标过滤（按标签或 id）：事件组件逐事件判定，会话指标是「存在」语义，分母去掉目标叶子
+    snap(
+        "goal_filter",
+        json!({
+            "metrics": ["visitors", "visits", "bounce_rate", "conversion_rate"],
+            "date_range": "7d",
+            "dimensions": ["visit:source"],
+            "filters": [["is", "event:goal", ["checkout", "11"], {"case_sensitive": false}],
+                        ["is_not", "event:page", ["/admin"]]]
+        }),
+    );
+}
+
+#[test]
+fn goal_filter_values_resolve_by_label_or_id() {
+    // 不认识的目标：恒假（`is`）
+    let (sql, _) = build(json!({"metrics": ["visitors"], "date_range": "day",
+        "filters": [["is", "event:goal", ["nope"]]]}))
+    .unwrap();
+    assert!(sql.contains("AND 0"), "{sql}");
+    // 页面目标的通配转成 LIKE，`%` `_` `\` 被转义
+    let (_, params) = build(json!({"metrics": ["visitors"], "date_range": "day",
+        "filters": [["is", "event:goal", ["13"]]]}))
+    .unwrap();
+    assert!(
+        params
+            .iter()
+            .any(|(_, v)| *v == ParamValue::Str("/a\\_b\\%c\\\\d".to_owned())),
+        "{params:?}"
     );
 }
 
@@ -586,18 +635,13 @@ fn invalid_combinations_and_unsupported_features_fail_with_paths() {
     // 尚未支持
     for (spec, path, what) in [
         (
-            json!({"metrics": ["conversion_rate"], "date_range": "day"}),
+            json!({"metrics": ["group_conversion_rate"], "date_range": "day"}),
             "metrics[0]",
             "not supported yet",
         ),
         (
             json!({"metrics": ["visitors", "total_revenue"], "date_range": "day"}),
             "metrics[1]",
-            "not supported yet",
-        ),
-        (
-            base(json!(["visitors"]), json!(["event:goal"])),
-            "dimensions[0]",
             "not supported yet",
         ),
         (
@@ -615,11 +659,6 @@ fn invalid_combinations_and_unsupported_features_fail_with_paths() {
         ),
         (
             json!({"metrics": ["visitors"], "date_range": "day", "filters": [["is", "segment", [1]]]}),
-            "filters[0][1]",
-            "not supported yet",
-        ),
-        (
-            json!({"metrics": ["visitors"], "date_range": "day", "filters": [["is", "event:goal", ["x"]]]}),
             "filters[0][1]",
             "not supported yet",
         ),
@@ -707,6 +746,39 @@ fn invalid_combinations_and_unsupported_features_fail_with_paths() {
             json!({"metrics": ["visitors"], "date_range": "day", "pagination": {"limit": 10001}}),
             "pagination.limit",
         ),
+        // 目标：转化率要有目标维度或目标过滤；目标维度只配事件计数与转化率；目标过滤只认 is / is_not
+        (base(json!(["conversion_rate"]), json!([])), "metrics[0]"),
+        (
+            base(
+                json!(["visitors", "conversion_rate"]),
+                json!(["visit:source"]),
+            ),
+            "metrics[1]",
+        ),
+        (
+            base(json!(["bounce_rate"]), json!(["event:goal"])),
+            "dimensions[0]",
+        ),
+        (
+            base(json!(["visitors", "percentage"]), json!(["event:goal"])),
+            "dimensions[0]",
+        ),
+        (
+            base(json!(["time_on_page"]), json!(["event:goal"])),
+            "dimensions[0]",
+        ),
+        (
+            json!({"metrics": ["scroll_depth"], "date_range": "day", "filters": [["is", "event:goal", ["Signup"]]]}),
+            "filters[0]",
+        ),
+        (
+            json!({"metrics": ["exit_rate"], "dimensions": ["event:page"], "date_range": "day", "filters": [["is", "event:goal", ["Signup"]]]}),
+            "filters[0]",
+        ),
+        (
+            json!({"metrics": ["visitors"], "date_range": "day", "filters": [["contains", "event:goal", ["Sign"]]]}),
+            "filters[0][0]",
+        ),
     ] {
         let (p, _) = v(spec.clone());
         assert_eq!(p, path, "{spec}");
@@ -748,7 +820,8 @@ fn invalid_combinations_and_unsupported_features_fail_with_paths() {
 #[test]
 fn every_generated_statement_is_tenant_scoped() {
     // 把支持的指标、维度、过滤各种组合起来过一遍（不执行）
-    let metrics: [&str; 12] = [
+    let metrics: [&str; 13] = [
+        "conversion_rate",
         "visitors",
         "visits",
         "pageviews",
@@ -769,6 +842,8 @@ fn every_generated_statement_is_tenant_scoped() {
         json!(["visit:exit_page", "visit:country"]),
         json!(["time:day"]),
         json!(["time", "visit:city"]),
+        json!(["event:goal", "time:day"]),
+        json!(["event:goal", "visit:entry_page"]),
     ];
     let filters = [
         json!([]),
@@ -782,6 +857,13 @@ fn every_generated_statement_is_tenant_scoped() {
             [
                 ["is", "event:hostname", ["a.com"]],
                 ["contains", "visit:source", ["g"]]
+            ]
+        ]]),
+        json!([[
+            "or",
+            [
+                ["is", "event:goal", ["Signup"]],
+                ["not", ["is_not", "event:goal", ["12"]]]
             ]
         ]]),
     ];
