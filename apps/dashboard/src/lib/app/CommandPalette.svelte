@@ -4,7 +4,7 @@
   方向键移动，Enter 执行，Esc 关闭（原生 dialog 自带）。站点范围：在某个站点里时取该站点所在组织，否则取当前组织。
 -->
 <script lang="ts">
-  import { CornerDownLeft, KeyRound, LayoutGrid, Languages, Moon, Plus, Search, Settings2, ShieldCheck, Sun, Users } from "@lucide/svelte";
+  import { Activity, CornerDownLeft, KeyRound, LayoutGrid, Languages, Moon, Plus, Search, Settings2, ShieldCheck, Sun, Users } from "@lucide/svelte";
   import { goto } from "$app/navigation";
   import { page } from "$app/state";
   import Avatar from "../ui/Avatar.svelte";
@@ -13,7 +13,7 @@
   import { t } from "../i18n";
   import { app, setLang, setTheme } from "../state.svelte";
   import { visibleSections } from "../admin/sections";
-  import { canAddSite, currentOrg, findSite, orgSites, session } from "../session.svelte";
+  import { canAddSite, canEdit, currentOrg, findSite, orgSites, session } from "../session.svelte";
   import "./shell-strings";
 
   let { open = $bindable(false) }: { open: boolean } = $props();
@@ -66,6 +66,16 @@
     }
     out.push({ id: "p-sites", group: "page", label: t("nav.allSites"), icon: LayoutGrid, run: () => navigate("/sites") });
     const first = current ? visibleSections(current)[0] : undefined;
+    if (current && canEdit(current)) {
+      out.push({
+        id: "p-diag",
+        group: "page",
+        label: t("nav.diagnostics"),
+        keywords: current.name,
+        icon: Activity,
+        run: () => navigate(`/s/${current.id}/diagnostics`),
+      });
+    }
     if (current && first) {
       out.push({
         id: "p-settings",

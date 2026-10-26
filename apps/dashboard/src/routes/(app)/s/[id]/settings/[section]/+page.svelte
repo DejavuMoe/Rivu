@@ -8,6 +8,7 @@
   import CollectionSection from "../CollectionSection.svelte";
   import PrivacySection from "../PrivacySection.svelte";
   import ShieldSection from "../ShieldSection.svelte";
+  import GoalsSection from "../GoalsSection.svelte";
   import SharingSection from "../SharingSection.svelte";
   import DangerSection from "../DangerSection.svelte";
 
@@ -31,6 +32,8 @@
     <PrivacySection />
   {:else if section === "shield"}
     <ShieldSection {site} {readOnly} />
+  {:else if section === "goals"}
+    <GoalsSection {site} readOnly={sectionReadOnly("goals", site)} />
   {:else if section === "sharing"}
     <SharingSection {site} />
   {:else if section === "danger"}

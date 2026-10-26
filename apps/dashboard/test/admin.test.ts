@@ -99,12 +99,16 @@ test("设置分区可见性", () => {
   const editor = { role: "editor", access: "member" } as const;
   const viewer = { role: "viewer", access: "member" } as const;
   const guestEditor = { role: "editor", access: "guest" } as const;
-  assert.deepEqual(visibleSections(owner), ["general", "hostnames", "collection", "privacy", "shield", "sharing", "danger"]);
-  assert.deepEqual(visibleSections(editor), ["shield", "sharing"]);
+  assert.deepEqual(visibleSections(owner), ["general", "hostnames", "collection", "privacy", "shield", "goals", "sharing", "danger"]);
+  assert.deepEqual(visibleSections(editor), ["shield", "goals", "sharing"]);
   assert.deepEqual(visibleSections(viewer), []);
-  assert.deepEqual(visibleSections(guestEditor), ["shield"]);
+  assert.deepEqual(visibleSections(guestEditor), ["shield", "goals"]);
   assert.equal(sectionReadOnly("shield", editor), true);
   assert.equal(sectionReadOnly("shield", owner), false);
+  // 目标：editor 起（含站点访客 editor）可写
+  assert.equal(sectionReadOnly("goals", editor), false);
+  assert.equal(sectionReadOnly("goals", guestEditor), false);
+  assert.equal(sectionVisible("goals", { role: "viewer", access: "guest" }), false);
   assert.equal(canShareLinks(guestEditor), false);
   assert.equal(canShareLinks(editor), true);
   assert.equal(sectionVisible("general", { role: "admin", access: "guest" }), false);

@@ -117,6 +117,21 @@ export interface ShieldRule {
   created_at: string;
 }
 
+export type GoalKind = "event" | "page";
+
+export interface Goal {
+  id: number;
+  kind: GoalKind;
+  event_name: string | null;
+  page_path: string | null;
+  display_name: string | null;
+  /** 显示名，否则事件名，否则页面路径：看板目标卡片与筛选里用的名字 */
+  label: string;
+  created_at: string;
+}
+
+export type NewGoal = { kind: "event"; event_name: string; display_name?: string } | { kind: "page"; page_path: string; display_name?: string };
+
 export interface SharedLink {
   id: number;
   name: string | null;
@@ -202,6 +217,44 @@ export interface InvitationInfo {
   signed_in_as: string | null;
 }
 
+export type DiagnosticsRange = "1h" | "24h" | "7d";
+
+/** 接入诊断（GET /sites/{site}/diagnostics）：时间为 UTC ISO，桶按范围对齐，没有数据的桶补 0。 */
+export interface Diagnostics {
+  range: DiagnosticsRange;
+  step_seconds: number;
+  buckets: { t: string; accepted: number; dropped: number }[];
+  totals: { accepted: number; dropped: number };
+  /** 指标去掉 dropped_ 前缀，次数从多到少 */
+  reasons: { reason: string; count: number }[];
+  /** 脚本版本（数字；0 表示请求没带版本），新版本在前 */
+  versions: { version: number; events: number; last_seen: string }[];
+  /** 最后一个有 accepted 的分钟（精确到分钟）；从没有过为 null */
+  last_event_at: string | null;
+  /** 最后一个桶包含「现在」，数据未完整 */
+  partial_last: boolean;
+}
+
+/** 恢复窗口内的已删除站点（GET /orgs/{org}/deleted-sites）；purge_at 之后数据被清除、不能再恢复。 */
+export interface DeletedSite {
+  id: number;
+  site_key: string;
+  name: string;
+  domain: string | null;
+  deleted_at: string;
+  purge_at: string;
+}
+
+/** 按日期范围删除统计数据的一条请求；日期是站点本地日期 YYYY-MM-DD。 */
+export interface StatsDeletion {
+  id: number;
+  from: string;
+  to: string;
+  status: "pending" | "running" | "done" | "failed" | "cancelled";
+  created_at: string;
+  completed_at: string | null;
+}
+
 export class ApiError extends Error {
   constructor(
     readonly status: number,
@@ -275,6 +328,12 @@ export const api = {
   siteSettings: (site: number | string) => request<SettingsBody>("GET", `${base}/sites/${site}/settings`),
   patchSite: (site: number | string, body: SitePatch) => request<SettingsBody>("PATCH", `${base}/sites/${site}`, { body }),
   deleteSite: (site: number | string, confirm: string) => request<void>("DELETE", `${base}/sites/${site}`, { body: { confirm } }),
+  deletedSites: (org: number) => request<{ sites: DeletedSite[] }>("GET", `${base}/orgs/${org}/deleted-sites`),
+  restoreSite: (site: number | string) => request<{ site: Site }>("POST", `${base}/sites/${site}/restore`),
+  statsDeletions: (site: number | string) =>
+    request<{ deletions: StatsDeletion[] }>("GET", `${base}/sites/${site}/stats-deletions`),
+  deleteStats: (site: number | string, body: { from: string; to: string; confirm: string }) =>
+    request<{ deletion: StatsDeletion }>("POST", `${base}/sites/${site}/stats-deletions`, { body }),
   addHostname: (site: number | string, pattern: string) =>
     request<{ hostname: Hostname }>("POST", `${base}/sites/${site}/hostnames`, { body: { pattern } }),
   removeHostname: (site: number | string, pattern: string) =>
@@ -284,11 +343,18 @@ export const api = {
     request<{ rule: ShieldRule }>("POST", `${base}/sites/${site}/shield`, { body }),
   removeShieldRule: (site: number | string, id: string) =>
     request<void>("DELETE", `${base}/sites/${site}/shield/${encodeURIComponent(id)}`),
+  goals: (site: number | string) => request<{ goals: Goal[]; max_goals: number }>("GET", `${base}/sites/${site}/goals`),
+  addGoal: (site: number | string, body: NewGoal) => request<{ goal: Goal }>("POST", `${base}/sites/${site}/goals`, { body }),
+  removeGoal: (site: number | string, id: number) => request<void>("DELETE", `${base}/sites/${site}/goals/${id}`),
   sharedLinks: (site: number | string) => request<{ links: SharedLink[] }>("GET", `${base}/sites/${site}/shared-links`),
   createSharedLink: (site: number | string, body: { name?: string; password?: string; expires_at?: string }) =>
     request<{ link: SharedLink }>("POST", `${base}/sites/${site}/shared-links`, { body }),
   revokeSharedLink: (site: number | string, id: number) =>
     request<void>("DELETE", `${base}/sites/${site}/shared-links/${id}`),
+  /** 成功后服务端撤销全部旧会话并通过 Set-Cookie 签发新会话 */
+  changePassword: (body: { current: string; new: string }) => request<Record<string, never>>("POST", `${base}/me/password`, { body }),
+  diagnostics: (site: number | string, range: DiagnosticsRange, opts: { signal?: AbortSignal } = {}) =>
+    request<Diagnostics>("GET", `${base}/sites/${site}/diagnostics?range=${range}`, opts),
   sessions: () => request<{ sessions: SessionInfo[] }>("GET", `${base}/sessions`),
   revokeSession: (id: number) => request<void>("DELETE", `${base}/sessions/${id}`),
   members: (org: number) => request<MembersBody>("GET", `${base}/orgs/${org}/members`),

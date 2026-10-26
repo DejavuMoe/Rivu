@@ -5,6 +5,9 @@ import {
   breakdownSpec,
   decodeFilters,
   encodeFilters,
+  goalsSpec,
+  opsFor,
+  readGoals,
   readRows,
   readSeries,
   readState,
@@ -41,7 +44,10 @@ test("筛选的编解码：往返、未知维度与操作符丢弃、同维度�
     { dim: "country", op: "is_not" as const, values: ["CN"] },
   ];
   assert.deepEqual(decodeFilters(encodeFilters(fs)), fs);
-  assert.deepEqual(decodeFilters("goal~is~Signup;page~regex~x;page~is~"), []);
+  assert.deepEqual(decodeFilters("hostnamex~is~a;page~regex~x;page~is~"), []);
+  // 目标只认等于 / 不等于
+  assert.deepEqual(decodeFilters("goal~is~Signup"), [{ dim: "goal", op: "is", values: ["Signup"] }]);
+  assert.deepEqual(decodeFilters("goal~contains~Sign"), []);
   assert.deepEqual(decodeFilters("page~is~%2Fa;page~contains~b"), [{ dim: "page", op: "contains", values: ["b"] }]);
   assert.deepEqual(decodeFilters("page~is~%E0%A4%A"), [{ dim: "page", op: "is", values: ["%E0%A4%A"] }]);
 });
@@ -113,6 +119,30 @@ test("标签按站点墙上时间解析，不做时区换算", () => {
     ["2 分钟前", "1 分钟前", "现在"],
   );
   assert.deepEqual(axisLabels(["2026-10-24T09:00:00+08:00"], "hour", "en"), ["09:00"]);
+});
+
+test("目标卡片的 QuerySpec、目标筛选与结果", () => {
+  const s = q("range=7d&f=" + encodeURIComponent("goal~is~Signup;country~is~CN"));
+  assert.deepEqual(goalsSpec(s, now), {
+    metrics: ["visitors", "events", "conversion_rate"],
+    date_range: "7d",
+    dimensions: ["event:goal"],
+    pagination: { limit: 100 },
+    filters: [
+      ["is", "event:goal", ["Signup"]],
+      ["is", "visit:country", ["CN"]],
+    ],
+  });
+  assert.deepEqual(totalsSpec(s, now).filters, [
+    ["is", "event:goal", ["Signup"]],
+    ["is", "visit:country", ["CN"]],
+  ]);
+  assert.deepEqual(goalsSpec(q("range=realtime"), now).date_range, realtimeRange(now));
+  assert.deepEqual(opsFor("goal"), ["is", "is_not"]);
+  assert.deepEqual(opsFor("page"), ["is", "is_not", "contains"]);
+  assert.deepEqual(readGoals(result({ results: [{ dimensions: ["Signup"], metrics: [3, 5, 0.25] }] })), [
+    { label: "Signup", visitors: 3, events: 5, cr: 0.25 },
+  ]);
 });
 
 test("分解行", () => {

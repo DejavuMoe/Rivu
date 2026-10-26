@@ -5,7 +5,7 @@
 -->
 <script lang="ts">
   import { untrack, type Snippet } from "svelte";
-  import { CircleAlert, EyeOff, Globe, Radio, Settings2, Share2, ShieldBan, TriangleAlert } from "@lucide/svelte";
+  import { CircleAlert, EyeOff, Globe, Radio, Settings2, Share2, ShieldBan, Target, TriangleAlert } from "@lucide/svelte";
   import { goto } from "$app/navigation";
   import { page } from "$app/state";
   import NotFound from "#lib/app/NotFound.svelte";
@@ -30,10 +30,11 @@
     collection: Radio,
     privacy: EyeOff,
     shield: ShieldBan,
+    goals: Target,
     sharing: Share2,
     danger: TriangleAlert,
   };
-  /** 这些分区要用站点的 settings；屏蔽规则与共享链接各自加载自己的列表 */
+  /** 这些分区要用站点的 settings；屏蔽规则、目标与共享链接各自加载自己的列表 */
   const NEEDS_SETTINGS = new Set<SectionKey>(["general", "hostnames", "collection", "privacy"]);
 
   const site = $derived(findSite(Number(page.params.id)));
