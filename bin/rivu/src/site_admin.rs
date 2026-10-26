@@ -778,7 +778,10 @@ async fn revoke_link(
 // ------------------------------------------------------------------------------------------
 
 /// 一个路由允许的方法之外一律 405 + Allow。
-fn only(h: MethodRouter<Arc<DashApi>>, allow: &'static str) -> MethodRouter<Arc<DashApi>> {
+pub(crate) fn only(
+    h: MethodRouter<Arc<DashApi>>,
+    allow: &'static str,
+) -> MethodRouter<Arc<DashApi>> {
     h.fallback(move || async move { method_not_allowed(allow).await })
 }
 

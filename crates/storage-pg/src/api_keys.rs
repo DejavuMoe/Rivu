@@ -167,6 +167,105 @@ pub async fn revoke_key(pool: &PgPool, id: i64) -> Result<bool> {
     Ok(n > 0)
 }
 
+/// 看板「我的 API key」列表里的一行（只含调用者自己的 key；不含哈希与明文）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnKeyRow {
+    pub id: i64,
+    pub name: String,
+    pub key_prefix: String,
+    pub scopes: Vec<String>,
+    /// UTC ISO 文本（秒精度）。
+    pub created_at: String,
+    pub last_used_at: Option<String>,
+    pub expires_at: Option<String>,
+}
+
+/// 用户在组织里未吊销的 key（过期的仍列出，由看板标注），新的在前；`only_id` 给出时只取这一把。
+pub async fn list_own(
+    pool: &PgPool,
+    org_id: i64,
+    user_id: i64,
+    only_id: Option<i64>,
+) -> Result<Vec<OwnKeyRow>> {
+    let rows = sqlx::query(concat!(
+        "SELECT k.id, k.name, k.key_prefix, k.scopes, ",
+        ts_sec!("k.created_at"),
+        " AS created_at, ",
+        ts_sec!("k.last_used_at"),
+        " AS last_used_at, ",
+        ts_sec!("k.expires_at"),
+        " AS expires_at
+         FROM api_keys k
+         WHERE k.organization_id = $1 AND k.user_id = $2 AND k.deleted_at IS NULL
+           AND ($3::bigint IS NULL OR k.id = $3)
+         ORDER BY k.created_at DESC, k.id DESC"
+    ))
+    .bind(org_id)
+    .bind(user_id)
+    .bind(only_id)
+    .fetch_all(pool)
+    .await
+    .context("列出 API key 失败")?;
+    rows.iter()
+        .map(|r| {
+            Ok(OwnKeyRow {
+                id: r.try_get("id")?,
+                name: r.try_get("name")?,
+                key_prefix: r.try_get("key_prefix")?,
+                scopes: r.try_get("scopes")?,
+                created_at: r.try_get("created_at")?,
+                last_used_at: r.try_get("last_used_at")?,
+                expires_at: r.try_get("expires_at")?,
+            })
+        })
+        .collect()
+}
+
+/// 吊销用户自己在这个组织里未吊销的 key；别人的、别的组织的、不存在或已吊销的返回 `false`。
+pub async fn revoke_own(pool: &PgPool, org_id: i64, user_id: i64, id: i64) -> Result<bool> {
+    let n = sqlx::query(
+        "UPDATE api_keys SET deleted_at = now()
+         WHERE id = $1 AND organization_id = $2 AND user_id = $3 AND deleted_at IS NULL",
+    )
+    .bind(id)
+    .bind(org_id)
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .context("吊销 API key 失败")?
+    .rows_affected();
+    Ok(n > 0)
+}
+
+/// 组织里未删除站点中 `site_key` 在给定列表里的 `(site_key, 名称)`（校验 scope 目标、解析列表里的站点名）。
+pub async fn resolve_sites(
+    pool: &PgPool,
+    org_id: i64,
+    site_keys: &[String],
+) -> Result<Vec<(String, String)>> {
+    sqlx::query_as(
+        "SELECT site_key, name FROM sites
+         WHERE organization_id = $1 AND deleted_at IS NULL AND site_key = ANY($2)
+         ORDER BY id",
+    )
+    .bind(org_id)
+    .bind(site_keys)
+    .fetch_all(pool)
+    .await
+    .context("查询站点失败")
+}
+
+/// 组织的 API 小时配额（`organizations.api_hourly_limit`，`None` 用全局默认）；组织不存在也是 `None`。
+pub async fn org_hourly_limit(pool: &PgPool, org_id: i64) -> Result<Option<i32>> {
+    let v: Option<Option<i32>> =
+        sqlx::query_scalar("SELECT api_hourly_limit FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .fetch_optional(pool)
+            .await
+            .context("查询组织配额失败")?;
+    Ok(v.flatten())
+}
+
 /// 按 slug（不区分大小写）找未删除的组织，返回 id。
 pub async fn find_org_id_by_slug(pool: &PgPool, slug: &str) -> Result<Option<i64>> {
     sqlx::query_scalar(
