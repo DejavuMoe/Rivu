@@ -111,7 +111,7 @@ expression: "crate::schema_json()"
           "type": "string"
         }
       ],
-      "description": "A dimension. `event:goal` and `event:props:<key>` are accepted by the schema but not supported yet."
+      "description": "A dimension. `event:goal` groups by the site's goals (values are goal labels). `event:props:<key>` is accepted by the schema but not supported yet."
     },
     "Filter": {
       "anyOf": [
@@ -231,7 +231,7 @@ expression: "crate::schema_json()"
       "type": "object"
     },
     "Metric": {
-      "description": "指标。后四项（目标转化与收入）在本轮不支持：能解析，resolve 阶段报 `not supported yet`。",
+      "description": "指标。`group_conversion_rate` 与收入（`total_revenue` `average_revenue`）在本轮不支持：能解析，resolve 阶段报 `not supported yet`。",
       "enum": [
         "visitors",
         "visits",

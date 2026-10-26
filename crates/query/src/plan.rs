@@ -15,6 +15,7 @@
 //! | `time_on_page` `scroll_depth` | `events` 的 engagement 事件：**engagement 组件** |
 //! | `exit_rate` | 会话组件（按退出页分组的退出次数）÷ 事件组件的 `pageviews`：**退出组件** |
 //! | `percentage` | `visitors` ÷ 无维度的访客总数（另一次查询） |
+//! | `conversion_rate` | 事件组件的 `visitors` ÷ **转化分母组件**：`events` 上去掉 `event:goal` 叶子的过滤、同样的其余维度的访客数，`event:goal` 维度在这个组件里展开成全部目标标签（`arrayJoin`），所以每个目标行都拿到同一组其余维度值的分母；有维度时外层 `HAVING` 去掉没有转化访客的行 |
 //!
 //! 「组合」表：事件组件遇到会话级的过滤，用 `session_id IN (…sessions…)`；遇到会话级的维度（入口页、退出页）用
 //! `ANY LEFT JOIN` 一个按会话聚合的子查询；会话组件遇到事件级的过滤，用 `session_id IN (…events…)`（「浏览过」语义）。
@@ -59,6 +60,8 @@ pub(crate) enum Measure {
     TpN,
     ScSum,
     ScN,
+    /// `conversion_rate` 的分母：去掉目标过滤后的访客数（转化分母组件）。
+    CrBase,
 }
 
 impl Measure {
@@ -80,6 +83,7 @@ impl Measure {
             Measure::TpN => "c_tp_n",
             Measure::ScSum => "c_sc_sum",
             Measure::ScN => "c_sc_n",
+            Measure::CrBase => "c_cr_base",
         }
     }
 }
@@ -107,6 +111,9 @@ pub(crate) struct Plan {
     pub(crate) exits: bool,
     /// `percentage`：先查无维度的访客总数。
     pub(crate) needs_total: bool,
+    /// `conversion_rate`：转化分母组件（去掉目标过滤的访客数，`event:goal` 维度展开成全部目标标签）；
+    /// 有维度时外层 `HAVING` 去掉没有转化访客的行。
+    pub(crate) conv_base: bool,
 }
 
 pub(crate) fn plan(q: &ResolvedQuery) -> Plan {
@@ -141,10 +148,10 @@ pub(crate) fn plan(q: &ResolvedQuery) -> Plan {
             Metric::ExitRate => need(&[Measure::Exits, Measure::Pageviews]),
             Metric::TimeOnPage => need(&[Measure::TpMs, Measure::TpN]),
             Metric::ScrollDepth => need(&[Measure::ScSum, Measure::ScN]),
-            Metric::ConversionRate
-            | Metric::GroupConversionRate
-            | Metric::TotalRevenue
-            | Metric::AverageRevenue => unreachable!("不支持的指标已在 resolve 阶段被拒绝"),
+            Metric::ConversionRate => need(&[Measure::Visitors, Measure::CrBase]),
+            Metric::GroupConversionRate | Metric::TotalRevenue | Metric::AverageRevenue => {
+                unreachable!("不支持的指标已在 resolve 阶段被拒绝")
+            }
         }
     }
     measures.sort();
@@ -179,6 +186,7 @@ pub(crate) fn plan(q: &ResolvedQuery) -> Plan {
         bounce_separate,
         exits: measures.contains(&Measure::Exits),
         needs_total: q.metrics.contains(&Metric::Percentage),
+        conv_base: measures.contains(&Measure::CrBase),
         measures,
     }
 }
@@ -195,6 +203,10 @@ pub(crate) fn metric_semantics(q: &ResolvedQuery, p: &Plan) -> BTreeMap<String, 
         .dims
         .iter()
         .any(|d| matches!(d, RDim::Col(Col::EventPage | Col::EventHostname)));
+    let goal_dim = q
+        .dims
+        .iter()
+        .any(|d| matches!(d, RDim::Col(Col::EventGoal)));
     let mut out = BTreeMap::new();
     for m in &q.metrics {
         let mut text = match m {
@@ -213,12 +225,23 @@ pub(crate) fn metric_semantics(q: &ResolvedQuery, p: &Plan) -> BTreeMap<String, 
             Metric::ExitRate => "Exits of the page divided by its pageviews: sessions active in the range whose last pageview is the page, over pageviews of the page in the range. Can exceed 1 when the exit happens after the range.".to_owned(),
             Metric::TimeOnPage => "Average engagement time in seconds per session that has engagement events matching the row, computed from engagement events only.".to_owned(),
             Metric::ScrollDepth => "Average over sessions of the maximum scroll depth (0 to 100) reported by engagement events matching the row; engagement events without a scroll depth are ignored.".to_owned(),
-            Metric::ConversionRate | Metric::GroupConversionRate | Metric::TotalRevenue | Metric::AverageRevenue => String::new(),
+            Metric::ConversionRate => "Visitors of the row who completed the goal (a matching non-engagement event in the range) divided by the visitors of the same range with the same filters except the event:goal filter conditions (removed from the filter tree), counted per value of the row's other dimensions (0 to 1). With dimensions, rows without converting visitors are omitted.".to_owned(),
+            Metric::GroupConversionRate | Metric::TotalRevenue | Metric::AverageRevenue => String::new(),
         };
+        if goal_dim
+            && matches!(
+                m,
+                Metric::Visitors | Metric::Visits | Metric::Events | Metric::Pageviews
+            )
+        {
+            text.push_str(
+                " With an event:goal dimension each row counts the events that complete the goal (event goals: the event name; page goals: pageviews whose pathname matches the pattern); an event completing several goals counts in each.",
+            );
+        }
         if event_filter {
             match m {
                 Metric::Visitors | Metric::Pageviews | Metric::Events => text.push_str(
-                    " With event-level filters (event:page, event:hostname, event:name) only the matching events are counted: visitors and pageviews are those who viewed the matching pages.",
+                    " With event-level filters (event:page, event:hostname, event:name, event:goal) only the matching events are counted: visitors and pageviews are those who viewed the matching pages or completed the goal.",
                 ),
                 Metric::BounceRate if page_filter => text.push_str(
                     " With an event:page or event:hostname filter only sessions whose entry page matches are counted (and the session must also have a matching event in the range).",
@@ -228,7 +251,7 @@ pub(crate) fn metric_semantics(q: &ResolvedQuery, p: &Plan) -> BTreeMap<String, 
                 | Metric::VisitDuration
                 | Metric::EngagedDuration
                 | Metric::BounceRate => text.push_str(
-                    " With event-level filters the sessions that viewed a matching page in the range are counted.",
+                    " With event-level filters the sessions that have a matching event in the range (viewed a matching page, completed the goal) are counted.",
                 ),
                 _ => {}
             }

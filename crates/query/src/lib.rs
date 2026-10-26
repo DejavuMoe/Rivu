@@ -36,7 +36,7 @@ pub use exec::{ExecOptions, execute, explain};
 pub use presets::{
     BreakdownRow, Dimension, NO_CHANNEL, NO_SOURCE, NOT_SET, Overview, breakdown, overview,
 };
-pub use resolve::{ResolvedQuery, SiteContext};
+pub use resolve::{GoalDef, GoalKind, ResolvedQuery, SiteContext};
 pub use result::QueryResult;
 pub use spec::QuerySpec;
 pub use sql::TenantScope;

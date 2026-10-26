@@ -1,4 +1,4 @@
-//! 看板的站点管理端点（建站、设置、白名单、屏蔽规则、共享链接、软删除）。路由在 [`routes`]，由
+//! 看板的站点管理端点（建站、设置、白名单、屏蔽规则、共享链接、软删除与恢复、按日期范围删除统计数据）。路由在 [`routes`]，由
 //! [`crate::dash_api::router`] 合并；端点表见 `dash_api.rs` 顶部，字段与错误体的约定见 `platform-and-ops.md` §4。
 //!
 //! # 权限
@@ -29,6 +29,7 @@ use rivu_storage_pg::access::{self, SiteRef, UserSiteRoles, VisibleSite};
 use rivu_storage_pg::shared_links::{self, LinkAdminRow, NewLink};
 use rivu_storage_pg::shield::{self, AddOutcome, NewRule, RuleAdminRow};
 use rivu_storage_pg::sites::{self, NewSite, SiteOwner, SitePatch};
+use rivu_storage_pg::stats_deletions::{self, RestoreOutcome};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 
@@ -46,9 +47,9 @@ const INGEST_RATE_LIMIT_MAX_PER_MIN: u32 = 1_000_000;
 // ------------------------------------------------------------------------------------------
 
 /// 通过鉴权的调用者与站点。
-struct Caller {
-    session: SessionCtx,
-    site: SiteOwner,
+pub(crate) struct Caller {
+    pub(crate) session: SessionCtx,
+    pub(crate) site: SiteOwner,
     /// 有效角色：max(组织角色, 站点访客角色)。
     role: OrgRole,
 }
@@ -56,7 +57,7 @@ struct Caller {
 impl DashApi {
     /// 站点管理端点的鉴权：会话（401）→ 站点可见（404）→ 角色够不够（403）。
     /// `org_only`：只认组织角色（写动作与 `shared_link.manage`：站点访客不是组织成员）。
-    async fn authorize_admin(
+    pub(crate) async fn authorize_admin(
         &self,
         headers: &axum::http::HeaderMap,
         site_seg: &str,
@@ -97,11 +98,11 @@ fn check_role(
     }
 }
 
-fn done(api: &DashApi, c: &Caller, status: StatusCode, body: Value) -> Response {
+pub(crate) fn done(api: &DashApi, c: &Caller, status: StatusCode, body: Value) -> Response {
     api.finish(json_response(status, body), &c.session)
 }
 
-fn no_content(api: &DashApi, c: &Caller) -> Response {
+pub(crate) fn no_content(api: &DashApi, c: &Caller) -> Response {
     api.finish(ns(StatusCode::NO_CONTENT.into_response()), &c.session)
 }
 
@@ -418,15 +419,240 @@ async fn delete_site(
             "the confirm value must exactly match the site name".into(),
         ));
     }
-    if !sites::soft_delete_site(&api.pg, c.site.id).await? {
+    // 同一事务里写入 scope='site' 的删除意图：恢复窗口过后由 ch_delete_batch 清除统计数据
+    if !stats_deletions::soft_delete_site(
+        &api.pg,
+        c.site.id,
+        Some(c.session.s.user_id),
+        api.site_restore_days,
+    )
+    .await?
+    {
         return Err(DashError::NotFound);
     }
     tracing::info!(
         user_id = c.session.s.user_id,
         site_id = c.site.id,
-        "删除站点（软删除）"
+        restore_days = api.site_restore_days,
+        "删除站点（软删除，恢复窗口内可恢复）"
     );
     Ok(no_content(&api, &c))
+}
+
+// ------------------------------------------------------------------------------------------
+// 已删除的站点与恢复
+// ------------------------------------------------------------------------------------------
+
+/// 组织级的鉴权：不是该组织（未删除）的成员 404，角色不够 403。返回会话与组织角色。
+async fn authorize_org(
+    api: &DashApi,
+    headers: &axum::http::HeaderMap,
+    org_id: i64,
+    action: Action,
+) -> Res<SessionCtx> {
+    let ctx = api.require_session(headers).await?;
+    let org = rivu_storage_pg::users::list_user_orgs(&api.pg, ctx.s.user_id)
+        .await?
+        .into_iter()
+        .find(|o| o.id == org_id)
+        .ok_or(DashError::NotFound)?;
+    OrgRole::parse(&org.role)
+        .filter(|r| allowed(*r, action))
+        .ok_or(DashError::Forbidden)?;
+    Ok(ctx)
+}
+
+async fn list_deleted_sites(
+    State(api): State<Arc<DashApi>>,
+    Path(org_seg): Path<String>,
+    req: Request,
+) -> Res<Response> {
+    let org_id: i64 = org_seg.parse().map_err(|_| DashError::NotFound)?;
+    let ctx = authorize_org(&api, req.headers(), org_id, Action::SiteDelete).await?;
+    let rows = stats_deletions::list_deleted_sites(&api.pg, org_id).await?;
+    let sites: Vec<Value> = rows
+        .iter()
+        .map(|s| {
+            json!({
+                "id": s.id, "site_key": s.site_key, "name": s.name, "domain": s.domain,
+                "deleted_at": s.deleted_at, "purge_at": s.purge_at,
+            })
+        })
+        .collect();
+    Ok(api.finish(json_response(StatusCode::OK, json!({"sites": sites})), &ctx))
+}
+
+async fn restore_site(
+    State(api): State<Arc<DashApi>>,
+    Path(site): Path<String>,
+    req: Request,
+) -> Res<Response> {
+    let ctx = api.require_session(req.headers()).await?;
+    // 已删除的站点不在可见性查询里：按引用找已删除的站点，再看调用者在它的组织里的角色
+    let site_ref = SiteRef::parse(&site).ok_or(DashError::NotFound)?;
+    let (id, key) = match &site_ref {
+        SiteRef::Id(id) => (Some(*id), None),
+        SiteRef::Key(k) => (None, Some(k.as_str())),
+    };
+    let owner = stats_deletions::find_deleted_site(&api.pg, id, key)
+        .await?
+        .ok_or(DashError::NotFound)?;
+    let org = rivu_storage_pg::users::list_user_orgs(&api.pg, ctx.s.user_id)
+        .await?
+        .into_iter()
+        .find(|o| o.id == owner.organization_id)
+        .ok_or(DashError::NotFound)?;
+    OrgRole::parse(&org.role)
+        .filter(|r| allowed(*r, Action::SiteDelete))
+        .ok_or(DashError::Forbidden)?;
+    match stats_deletions::restore_site(&api.pg, owner.id).await? {
+        RestoreOutcome::Restored => {}
+        RestoreOutcome::NotFound => return Err(DashError::NotFound),
+        RestoreOutcome::NotRestorable => {
+            return Err(DashError::Conflict(
+                "conflict",
+                "this site can no longer be restored: the restore window has passed or its data is being deleted".into(),
+            ));
+        }
+    }
+    tracing::info!(user_id = ctx.s.user_id, site_id = owner.id, "恢复站点");
+    let restored = access::list_visible_sites(&api.pg, ctx.s.user_id)
+        .await?
+        .into_iter()
+        .find(|s| s.id == owner.id)
+        .ok_or(DashError::Internal)?;
+    let item = site_list_item(
+        &restored,
+        effective_role(&restored.roles),
+        restored.roles.org_role.is_some(),
+    );
+    Ok(api.finish(json_response(StatusCode::OK, json!({"site": item})), &ctx))
+}
+
+// ------------------------------------------------------------------------------------------
+// 按日期范围删除统计数据
+// ------------------------------------------------------------------------------------------
+
+/// 一次删除最多覆盖的天数（含两端）：原始数据保留 731 天（`events` 的 TTL），更长的范围没有意义。
+pub(crate) const STATS_DELETE_MAX_DAYS: i64 = 731;
+
+/// 列表最多返回的条数。
+const STATS_DELETIONS_LIST_LIMIT: i64 = 50;
+
+/// 校验日期范围（站点本地日期）：格式 `YYYY-MM-DD`、`from <= to`、`to` 不晚于站点时区的今天、
+/// 跨度不超过 [`STATS_DELETE_MAX_DAYS`] 天。错误是给用户看的英文提示。
+pub(crate) fn validate_stats_range(
+    from: &str,
+    to: &str,
+    today: jiff::civil::Date,
+) -> Result<(jiff::civil::Date, jiff::civil::Date), &'static str> {
+    let parse = |s: &str| -> Option<jiff::civil::Date> {
+        // 只接受严格的 YYYY-MM-DD
+        let b = s.as_bytes();
+        let shape = b.len() == 10
+            && b[4] == b'-'
+            && b[7] == b'-'
+            && b.iter()
+                .enumerate()
+                .all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit());
+        if !shape {
+            return None;
+        }
+        s.parse().ok()
+    };
+    let (Some(f), Some(t)) = (parse(from), parse(to)) else {
+        return Err("the from and to dates must be valid dates in YYYY-MM-DD format");
+    };
+    if f > t {
+        return Err("the from date must not be after the to date");
+    }
+    if t > today {
+        return Err("the to date must not be after today in the site's time zone");
+    }
+    let days = i64::from((t - f).get_days()) + 1;
+    if days > STATS_DELETE_MAX_DAYS {
+        return Err("the date range must span at most 731 days");
+    }
+    Ok((f, t))
+}
+
+fn deletion_json(d: &stats_deletions::DateRangeRow) -> Value {
+    json!({
+        "id": d.id, "from": d.from, "to": d.to, "status": d.status,
+        "created_at": d.created_at, "completed_at": d.completed_at,
+    })
+}
+
+#[derive(Deserialize)]
+struct StatsDeletionBody {
+    from: String,
+    to: String,
+    confirm: String,
+}
+
+async fn create_stats_deletion(
+    State(api): State<Arc<DashApi>>,
+    Path(site): Path<String>,
+    req: Request,
+) -> Res<Response> {
+    let headers = req.headers().clone();
+    let c = api
+        .authorize_admin(&headers, &site, Action::StatsDelete, true)
+        .await?;
+    let body: StatsDeletionBody = read_json(req, AUTH_BODY_MAX).await?;
+    let view = sites::admin_view(&api.pg, c.site.id)
+        .await?
+        .ok_or(DashError::NotFound)?;
+    let tz = TimeZone::get(&view.timezone).unwrap_or(TimeZone::UTC);
+    let today = (api.clock)().to_zoned(tz).date();
+    let (from, to) = validate_stats_range(body.from.trim(), body.to.trim(), today)
+        .map_err(|m| DashError::Invalid(m.into()))?;
+    if body.confirm != view.name {
+        return Err(DashError::Invalid(
+            "the confirm value must exactly match the site name".into(),
+        ));
+    }
+    let row = stats_deletions::create_date_range(
+        &api.pg,
+        c.site.id,
+        &from.to_string(),
+        &to.to_string(),
+        Some(c.session.s.user_id),
+    )
+    .await?;
+    if let Some(kick) = &api.stats_delete_kick {
+        kick.notify_one();
+    }
+    tracing::info!(
+        user_id = c.session.s.user_id,
+        site_id = c.site.id,
+        deletion_id = row.id,
+        "请求按日期范围删除统计数据"
+    );
+    Ok(done(
+        &api,
+        &c,
+        StatusCode::CREATED,
+        json!({"deletion": deletion_json(&row)}),
+    ))
+}
+
+async fn list_stats_deletions(
+    State(api): State<Arc<DashApi>>,
+    Path(site): Path<String>,
+    req: Request,
+) -> Res<Response> {
+    let c = api
+        .authorize_admin(req.headers(), &site, Action::StatsDelete, true)
+        .await?;
+    let rows =
+        stats_deletions::list_date_ranges(&api.pg, c.site.id, STATS_DELETIONS_LIST_LIMIT).await?;
+    Ok(done(
+        &api,
+        &c,
+        StatusCode::OK,
+        json!({"deletions": rows.iter().map(deletion_json).collect::<Vec<_>>()}),
+    ))
 }
 
 // ------------------------------------------------------------------------------------------
@@ -808,6 +1034,27 @@ pub(crate) fn routes(api: &Arc<DashApi>) -> Router {
         ))
         .merge(endpoint(
             a,
+            "internal.deleted_sites",
+            "/api/internal/orgs/{org_id}/deleted-sites",
+            only(get(list_deleted_sites), "GET, HEAD"),
+        ))
+        .merge(endpoint(
+            a,
+            "internal.site_restore",
+            "/api/internal/sites/{site}/restore",
+            only(post(restore_site), "POST"),
+        ))
+        .merge(endpoint(
+            a,
+            "internal.stats_deletions",
+            "/api/internal/sites/{site}/stats-deletions",
+            only(
+                get(list_stats_deletions).post(create_stats_deletion),
+                "GET, HEAD, POST",
+            ),
+        ))
+        .merge(endpoint(
+            a,
             "internal.hostname_add",
             "/api/internal/sites/{site}/hostnames",
             only(post(add_hostname), "POST"),
@@ -885,6 +1132,37 @@ mod tests {
         }
         // 去掉一个 www. 之后仍以 www. 开头：采集侧会再去一次，存下去永远匹配不到
         assert_eq!(normalize_domain("www.www.example.com"), Err(WWW_LEFT));
+    }
+
+    #[test]
+    fn stats_ranges_are_validated() {
+        use jiff::civil::date;
+        let today = date(2026, 10, 26);
+        assert_eq!(
+            validate_stats_range("2026-10-01", "2026-10-26", today),
+            Ok((date(2026, 10, 1), today))
+        );
+        assert_eq!(
+            validate_stats_range("2026-10-05", "2026-10-05", today),
+            Ok((date(2026, 10, 5), date(2026, 10, 5)))
+        );
+        // 731 天（含两端）可以，732 天不行
+        assert!(validate_stats_range("2024-10-26", "2026-10-26", today).is_ok());
+        assert!(validate_stats_range("2024-10-25", "2026-10-26", today).is_err());
+        for (from, to) in [
+            ("2026-10-02", "2026-10-01"),
+            ("2026-10-01", "2026-10-27"),
+            ("2026-10-1", "2026-10-02"),
+            ("2026/10/01", "2026-10-02"),
+            ("2026-02-30", "2026-03-01"),
+            ("", "2026-10-01"),
+            ("2026-10-01T00:00", "2026-10-02"),
+        ] {
+            assert!(
+                validate_stats_range(from, to, today).is_err(),
+                "{from:?} {to:?}"
+            );
+        }
     }
 
     #[test]

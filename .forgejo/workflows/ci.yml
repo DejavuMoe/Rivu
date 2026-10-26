@@ -108,6 +108,8 @@ jobs:
       RIVU_TEST_CH_WRITER_PASSWORD: rivu_ci
       RIVU_TEST_CH_READER_USER: rivu_ci
       RIVU_TEST_CH_READER_PASSWORD: rivu_ci
+      RIVU_TEST_CH_MAINTAINER_USER: rivu_ci
+      RIVU_TEST_CH_MAINTAINER_PASSWORD: rivu_ci
     steps:
       - uses: actions/checkout@v4
       - name: Rust 工具链

@@ -25,7 +25,10 @@
 use std::collections::BTreeSet;
 
 use crate::plan::{Measure, Plan, VisitsForm};
-use crate::resolve::{Col, Gran, Interval, Leaf, OrderKey, Pred, RDim, ResolvedQuery, Test};
+use crate::resolve::{
+    Col, GoalKind, Gran, Interval, Leaf, OrderKey, Pred, RDim, ResolvedQuery, Test,
+    wildcard_to_like,
+};
 use crate::spec::{Direction, Metric};
 
 /// 租户范围：每个 `FROM` 都必须带它。构造它的是鉴权之后的调用方。
@@ -173,6 +176,8 @@ fn ev_expr(col: Col) -> &'static str {
         Col::EventName => "name",
         Col::EventPage => "pathname",
         Col::EventHostname => "hostname",
+        // 不是列：目标叶子由 `Builder::goal_cond` 生成条件，目标维度由 `Builder::goal_dim_expr` 生成取值，不会用到这里
+        Col::EventGoal => "name",
         Col::Source => "referrer_source",
         Col::Channel => "channel",
         Col::Referrer => "referrer",
@@ -242,7 +247,7 @@ fn sess_alias(col: Col) -> Option<&'static str> {
         Col::OsVersion => "a_os_version",
         Col::EntryPage => "s_entry_path",
         Col::ExitPage => "s_exit_path",
-        Col::EventName | Col::EventPage | Col::EventHostname => return None,
+        Col::EventName | Col::EventPage | Col::EventHostname | Col::EventGoal => return None,
     })
 }
 
@@ -266,6 +271,8 @@ enum DimMode {
     SessEntry,
     /// 退出组件：`event:page` 换成退出页。
     SessExit,
+    /// 转化分母组件：同 `Events`，但 `event:goal` 展开成全部目标标签（每个目标行都拿到同样的分母）。
+    ConvBase,
 }
 
 struct Builder<'a> {
@@ -424,7 +431,7 @@ impl<'a> Builder<'a> {
                 col => self.cond(ev_expr(col), l),
             },
             Ctx::Sess { entry } => match l.col {
-                Col::EventName | Col::EventPage | Col::EventHostname => {
+                Col::EventName | Col::EventPage | Col::EventHostname | Col::EventGoal => {
                     if entry && l.col == Col::EventPage {
                         needs.insert("s_entry_path");
                         return self.cond("s_entry_path", l);
@@ -487,7 +494,64 @@ impl<'a> Builder<'a> {
                 let ph = self.p(ParamValue::U32Array(ids.clone()));
                 wrap_neg(format!("{e} IN {ph}"), *negated)
             }
+            Test::Goal { goals, negated } => {
+                let c = self.goal_cond(goals);
+                wrap_neg(c, *negated)
+            }
         }
+    }
+
+    /// 事件满足任一目标的完成条件（在 `events` 的列上求值）：事件目标 `name = …`；
+    /// 页面目标 `name = 'pageview' AND pathname LIKE …`（通配转成 `LIKE`，区分大小写、整串匹配）。没有目标时恒假。
+    fn goal_cond(&mut self, goals: &[GoalKind]) -> String {
+        if goals.is_empty() {
+            return "0".to_owned();
+        }
+        let parts: Vec<String> = goals
+            .iter()
+            .map(|g| match g {
+                GoalKind::Event(name) => {
+                    let ph = self.p(ParamValue::Str(name.clone()));
+                    format!("name = {ph}")
+                }
+                GoalKind::Page(pattern) => {
+                    let ph = self.p(ParamValue::Str(wildcard_to_like(pattern)));
+                    format!("(name = 'pageview' AND pathname LIKE {ph})")
+                }
+            })
+            .collect();
+        format!("({})", parts.join(" OR "))
+    }
+
+    /// `event:goal` 维度在事件组件里的取值：事件匹配的目标标签（去重），`arrayJoin` 展开成一行一个；
+    /// 不匹配任何目标的事件展开成零行，不进结果。
+    fn goal_dim_expr(&mut self) -> String {
+        let goals = self.q.goals.clone();
+        if goals.is_empty() {
+            return "arrayJoin(emptyArrayString())".to_owned();
+        }
+        let items: Vec<String> = goals
+            .iter()
+            .map(|g| {
+                let c = self.goal_cond(std::slice::from_ref(&g.kind));
+                let label = self.p(ParamValue::Str(g.label.clone()));
+                format!("if({c}, {label}, '')")
+            })
+            .collect();
+        format!(
+            "arrayJoin(arrayDistinct(arrayFilter(g_l -> g_l != '', [{}])))",
+            items.join(", ")
+        )
+    }
+
+    /// 转化分母组件里的 `event:goal` 取值：全部目标标签（去重），每个事件都展开成每个标签一行。
+    fn goal_labels_expr(&mut self) -> String {
+        let labels: BTreeSet<String> = self.q.goals.iter().map(|g| g.label.clone()).collect();
+        if labels.is_empty() {
+            return "arrayJoin(emptyArrayString())".to_owned();
+        }
+        let ph = self.p(ParamValue::StrArray(labels.into_iter().collect()));
+        format!("arrayJoin({ph})")
     }
 
     // ---- 维度 ----
@@ -510,17 +574,21 @@ impl<'a> Builder<'a> {
         }
     }
 
-    fn dim_expr(&self, d: RDim, mode: DimMode, needs: &mut Needs) -> String {
+    fn dim_expr(&mut self, d: RDim, mode: DimMode, needs: &mut Needs) -> String {
         match d {
             RDim::Time(g) => match mode {
-                DimMode::Events => Self::time_expr(g, "ts"),
+                DimMode::Events | DimMode::ConvBase => Self::time_expr(g, "ts"),
                 DimMode::SessEntry | DimMode::SessExit => Self::time_expr(
                     g,
                     "greatest(s_start, fromUnixTimestamp64Milli({from_ms:Int64}, 'UTC'))",
                 ),
             },
+            RDim::Col(Col::EventGoal) => match mode {
+                DimMode::ConvBase => self.goal_labels_expr(),
+                _ => self.goal_dim_expr(),
+            },
             RDim::Col(col) => match mode {
-                DimMode::Events => match col {
+                DimMode::Events | DimMode::ConvBase => match col {
                     Col::City => {
                         "if(city_geoname_id = 0, '', toString(city_geoname_id))".to_owned()
                     }
@@ -549,9 +617,9 @@ impl<'a> Builder<'a> {
     }
 
     /// `d0 AS d0`-风格的维度列表，以及 `GROUP BY` 的列名。
-    fn dim_select(&self, mode: DimMode, needs: &mut Needs) -> String {
-        self.q
-            .dims
+    fn dim_select(&mut self, mode: DimMode, needs: &mut Needs) -> String {
+        let q = self.q;
+        q.dims
             .iter()
             .enumerate()
             .map(|(i, d)| format!("{} AS d{i}", self.dim_expr(*d, mode, needs)))
@@ -667,6 +735,27 @@ impl<'a> Builder<'a> {
             own.push((Measure::Visits, "uniq(session_id)"));
         }
         let measures = self.measure_cols(&own);
+        let cons = self.constraint_sql();
+        let where_ = Self::where_clause(cons.into_iter().collect());
+        format!(
+            "SELECT {dims}{measures} FROM ({scan}) AS e{join}{where_}{}",
+            self.group_by()
+        )
+    }
+
+    /// 转化分母组件：`conversion_rate` 的分母（§6.5）。与事件组件相同的扫描，但过滤去掉了 `event:goal` 叶子，
+    /// `event:goal` 维度展开成全部目标标签；只给出 `c_cr_base = uniq(visitor_id)`。
+    fn comp_conv_base(&mut self) -> String {
+        let mut needs = Needs::new();
+        let mut extra = String::from("name != 'engagement'");
+        if let Some(t) = self.q.filter.as_ref().and_then(Pred::without_goal_leaves) {
+            extra.push_str(" AND ");
+            extra.push_str(&self.pred(&t, Ctx::Events, &mut needs));
+        }
+        let scan = self.events_scan("*", Some(&extra));
+        let dims = self.dim_select(DimMode::ConvBase, &mut needs);
+        let join = self.join_clause(&needs);
+        let measures = self.measure_cols(&[(Measure::CrBase, "uniq(visitor_id)")]);
         let cons = self.constraint_sql();
         let where_ = Self::where_clause(cons.into_iter().collect());
         format!(
@@ -839,10 +928,14 @@ impl<'a> Builder<'a> {
                 s(Measure::ScSum),
                 s(Measure::ScN)
             ),
-            Metric::ConversionRate
-            | Metric::GroupConversionRate
-            | Metric::TotalRevenue
-            | Metric::AverageRevenue => unreachable!("不支持的指标已在 resolve 阶段被拒绝"),
+            Metric::ConversionRate => format!(
+                "ifNotFinite({} / {}, 0)",
+                s(Measure::Visitors),
+                s(Measure::CrBase)
+            ),
+            Metric::GroupConversionRate | Metric::TotalRevenue | Metric::AverageRevenue => {
+                unreachable!("不支持的指标已在 resolve 阶段被拒绝")
+            }
         }
     }
 
@@ -904,6 +997,15 @@ impl<'a> Builder<'a> {
         if self.plan.engagement {
             comps.push(self.comp_engagement());
         }
+        if self.plan.conv_base {
+            comps.push(self.comp_conv_base());
+        }
+        // 转化率：分母组件会给出没有转化的维度值（例如每个目标），有维度时只保留有转化访客的行
+        let having = if self.plan.conv_base && !self.q.dims.is_empty() {
+            format!(" HAVING sum({}) > 0", Measure::Visitors.col())
+        } else {
+            String::new()
+        };
         let n = self.q.dims.len();
         let mut select: Vec<String> = (0..n).map(|i| format!("d{i}")).collect();
         for (i, m) in self.q.metrics.iter().enumerate() {
@@ -916,7 +1018,7 @@ impl<'a> Builder<'a> {
         let limit = self.p(ParamValue::U64(o.limit));
         let offset = self.p(ParamValue::U64(o.offset));
         format!(
-            "SELECT {} FROM ({from}){}{} LIMIT {limit} OFFSET {offset}",
+            "SELECT {} FROM ({from}){}{having}{} LIMIT {limit} OFFSET {offset}",
             select.join(", "),
             self.group_by(),
             self.order_by(o.order),

@@ -1,0 +1,80 @@
+---
+source: crates/query/src/sql_tests.rs
+expression: "render(&sql, &params)"
+---
+SELECT d0, sum(c_visitors) AS m0, sum(c_visits) AS m1, ifNotFinite(sum(c_b_bounces) / sum(c_b_n), 0) AS m2, ifNotFinite(sum(c_visitors) / sum(c_cr_base), 0) AS m3
+FROM (
+  SELECT toString(referrer_source) AS d0, uniq(visitor_id) AS c_visitors, toUInt64(0) AS c_visits, toUInt64(0) AS c_b_n, toUInt64(0) AS c_b_bounces, toUInt64(0) AS c_cr_base
+  FROM (
+    SELECT *
+    FROM events
+    WHERE site_id = {site:UInt64} AND toDate(ts) >= {from_date:Date} AND toDate(ts) <= {to_date:Date} AND ts >= fromUnixTimestamp64Milli({from_ms:Int64}, 'UTC') AND ts < fromUnixTimestamp64Milli({to_ms:Int64}, 'UTC') AND name != 'engagement' AND ((name = {p0:String} OR (name = 'pageview' AND pathname LIKE {p1:String})) AND NOT (pathname IN {p2:Array(String)}))) AS e
+  GROUP BY d0
+  UNION ALL SELECT toString(a_source) AS d0, toUInt64(0) AS c_visitors, count() AS c_visits, toUInt64(0) AS c_b_n, toUInt64(0) AS c_b_bounces, toUInt64(0) AS c_cr_base
+  FROM (
+    SELECT session_id, min(started_at) AS s_start, max(last_event_at) AS s_last, sum(pageviews) AS s_pv, sum(interactive_events) AS s_inter, sum(engagement_ms) AS s_eng, any(referrer_source) AS a_source
+    FROM sessions
+    WHERE site_id = {site:UInt64} AND start_date >= {s_from:Date} AND start_date <= {to_date:Date}
+    GROUP BY site_id, start_date, session_id
+    HAVING s_last >= fromUnixTimestamp64Milli({from_ms:Int64}, 'UTC') AND s_start < fromUnixTimestamp64Milli({to_ms:Int64}, 'UTC'))
+  WHERE (session_id IN (
+      SELECT session_id
+      FROM events
+      WHERE site_id = {site:UInt64} AND toDate(ts) >= {from_date:Date} AND toDate(ts) <= {to_date:Date} AND ts >= fromUnixTimestamp64Milli({from_ms:Int64}, 'UTC') AND ts < fromUnixTimestamp64Milli({to_ms:Int64}, 'UTC') AND name != 'engagement' AND (name = {p3:String} OR (name = 'pageview' AND pathname LIKE {p4:String}))) AND session_id IN (
+      SELECT session_id
+      FROM events
+      WHERE site_id = {site:UInt64} AND toDate(ts) >= {from_date:Date} AND toDate(ts) <= {to_date:Date} AND ts >= fromUnixTimestamp64Milli({from_ms:Int64}, 'UTC') AND ts < fromUnixTimestamp64Milli({to_ms:Int64}, 'UTC') AND name != 'engagement' AND NOT (pathname IN {p5:Array(String)})))
+  GROUP BY d0
+  UNION ALL SELECT toString(a_source) AS d0, toUInt64(0) AS c_visitors, toUInt64(0) AS c_visits, count() AS c_b_n, countIf(s_pv <= 1 AND s_inter = 0) AS c_b_bounces, toUInt64(0) AS c_cr_base
+  FROM (
+    SELECT session_id, min(started_at) AS s_start, max(last_event_at) AS s_last, sum(pageviews) AS s_pv, sum(interactive_events) AS s_inter, any(referrer_source) AS a_source, tupleElement(argMinIfMerge(entry_page), 2) AS s_entry_path
+    FROM sessions
+    WHERE site_id = {site:UInt64} AND start_date >= {s_from:Date} AND start_date <= {to_date:Date}
+    GROUP BY site_id, start_date, session_id
+    HAVING s_last >= fromUnixTimestamp64Milli({from_ms:Int64}, 'UTC') AND s_start < fromUnixTimestamp64Milli({to_ms:Int64}, 'UTC'))
+  WHERE (session_id IN (
+      SELECT session_id
+      FROM events
+      WHERE site_id = {site:UInt64} AND toDate(ts) >= {from_date:Date} AND toDate(ts) <= {to_date:Date} AND ts >= fromUnixTimestamp64Milli({from_ms:Int64}, 'UTC') AND ts < fromUnixTimestamp64Milli({to_ms:Int64}, 'UTC') AND name != 'engagement' AND (name = {p6:String} OR (name = 'pageview' AND pathname LIKE {p7:String}))) AND session_id IN (
+      SELECT session_id
+      FROM events
+      WHERE site_id = {site:UInt64} AND toDate(ts) >= {from_date:Date} AND toDate(ts) <= {to_date:Date} AND ts >= fromUnixTimestamp64Milli({from_ms:Int64}, 'UTC') AND ts < fromUnixTimestamp64Milli({to_ms:Int64}, 'UTC') AND name != 'engagement' AND NOT (pathname IN {p8:Array(String)}))) AND (session_id IN (
+      SELECT session_id
+      FROM events
+      WHERE site_id = {site:UInt64} AND toDate(ts) >= {from_date:Date} AND toDate(ts) <= {to_date:Date} AND ts >= fromUnixTimestamp64Milli({from_ms:Int64}, 'UTC') AND ts < fromUnixTimestamp64Milli({to_ms:Int64}, 'UTC') AND name != 'engagement' AND (name = {p9:String} OR (name = 'pageview' AND pathname LIKE {p10:String}))) AND NOT (s_entry_path IN {p11:Array(String)}))
+  GROUP BY d0
+  UNION ALL SELECT toString(referrer_source) AS d0, toUInt64(0) AS c_visitors, toUInt64(0) AS c_visits, toUInt64(0) AS c_b_n, toUInt64(0) AS c_b_bounces, uniq(visitor_id) AS c_cr_base
+  FROM (
+    SELECT *
+    FROM events
+    WHERE site_id = {site:UInt64} AND toDate(ts) >= {from_date:Date} AND toDate(ts) <= {to_date:Date} AND ts >= fromUnixTimestamp64Milli({from_ms:Int64}, 'UTC') AND ts < fromUnixTimestamp64Milli({to_ms:Int64}, 'UTC') AND name != 'engagement' AND (NOT (pathname IN {p12:Array(String)}))) AS e
+  GROUP BY d0)
+GROUP BY d0
+HAVING sum(c_visitors) > 0
+ORDER BY m0 DESC, d0 ASC
+LIMIT {p13:UInt64} OFFSET {p14:UInt64}
+
+-- params
+site: UInt64 = 4242
+from_ms: Int64 = 1792101600000
+to_ms: Int64 = 1792706400000
+from_date: Date = "2026-10-15"
+to_date: Date = "2026-10-22"
+s_from: Date = "2026-10-08"
+tz: String = "Europe/Berlin"
+wk: UInt8 = 7
+p0: String = "Signup"
+p1: String = "/checkout/%/done"
+p2: Array(String) = ["/admin"]
+p3: String = "Signup"
+p4: String = "/checkout/%/done"
+p5: Array(String) = ["/admin"]
+p6: String = "Signup"
+p7: String = "/checkout/%/done"
+p8: Array(String) = ["/admin"]
+p9: String = "Signup"
+p10: String = "/checkout/%/done"
+p11: Array(String) = ["/admin"]
+p12: Array(String) = ["/admin"]
+p13: UInt64 = 10000
+p14: UInt64 = 0

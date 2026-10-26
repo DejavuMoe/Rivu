@@ -79,7 +79,9 @@ use rivu_auth::{
     ApiError, ApiGuard, AuthContext, AuthStore, Required, Resource, ScopeAction, protect,
 };
 use rivu_geo::GeoDb;
-use rivu_query::{ExecOptions, QueryError, QueryResult, QuerySpec, SiteContext, TenantScope};
+use rivu_query::{
+    ExecOptions, GoalDef, QueryError, QueryResult, QuerySpec, SiteContext, TenantScope,
+};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -186,6 +188,24 @@ pub(crate) async fn load_site_context(
             );
             ApiError::Internal
         })?;
+    // 目标（§6.3 build 阶段「加载目标」）：`event:goal` 维度与过滤、`conversion_rate` 用；每次查询现读，增删立即生效
+    let goals = rivu_storage_pg::goals::list_goals(pg, site_id)
+        .await
+        .map_err(|e| {
+            tracing::error!(site_id, error = %format!("{e:#}"), "读取站点目标失败");
+            ApiError::Internal
+        })?
+        .iter()
+        .filter_map(|g| {
+            GoalDef::from_parts(
+                g.id,
+                &g.kind,
+                g.event_name.as_deref(),
+                g.page_path.as_deref(),
+                g.display_name.as_deref(),
+            )
+        })
+        .collect();
     Ok(SiteContext {
         site_id,
         site_key: Some(site_key.to_owned()),
@@ -193,6 +213,7 @@ pub(crate) async fn load_site_context(
         week_starts_on,
         geo_attribution: geo.and_then(|g| g.attribution()),
         geo_capability: geo.and_then(|g| g.capability()),
+        goals,
     })
 }
 // ------------------------------------------------------------------------------------------
