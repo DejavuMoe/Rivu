@@ -2015,6 +2015,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "reconcile"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "clickhouse",
+ "rivu-common",
+ "rivu-storage-ch",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"

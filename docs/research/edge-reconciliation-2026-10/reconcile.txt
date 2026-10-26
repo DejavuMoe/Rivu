@@ -1,0 +1,11 @@
+对账窗口：[1793056260, 1793056380)（Unix 秒，按分钟），站点 [0, 2180, 2181, 2182]
+边缘（POST /api/event）按类别：{"accepted": 17803, "dropped": 238, "http_layer": 2, "rejected": 40}
+边缘按状态码：{202: 18041, 400: 40, 413: 2}
+ingest_counters 按指标：{"accepted": 17803, "dropped_bot": 56, "dropped_no_session": 67, "dropped_spam_referrer": 75, "dropped_unknown_site": 40}
+  [OK] 202 未丢弃 = accepted：边缘 17803 / 计数 17803
+  [OK] 202 + x-rivu-dropped = dropped_*（不含 overloaded）：边缘 238 / 计数 238
+  [OK] 503 = dropped_overloaded：边缘 0 / 计数 0
+  [OK] 合计：202 + 503 = 全部计数：边缘 18041 / 计数 18041
+逐分钟：全部一致
+结论：严格一致
+events 行数	17803
