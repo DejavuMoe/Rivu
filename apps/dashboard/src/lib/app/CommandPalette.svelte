@@ -4,7 +4,7 @@
   方向键移动，Enter 执行，Esc 关闭（原生 dialog 自带）。站点范围：在某个站点里时取该站点所在组织，否则取当前组织。
 -->
 <script lang="ts">
-  import { CornerDownLeft, LayoutGrid, Languages, Moon, Plus, Search, Settings2, ShieldCheck, Sun } from "@lucide/svelte";
+  import { CornerDownLeft, KeyRound, LayoutGrid, Languages, Moon, Plus, Search, Settings2, ShieldCheck, Sun, Users } from "@lucide/svelte";
   import { goto } from "$app/navigation";
   import { page } from "$app/state";
   import Avatar from "../ui/Avatar.svelte";
@@ -13,7 +13,7 @@
   import { t } from "../i18n";
   import { app, setLang, setTheme } from "../state.svelte";
   import { visibleSections } from "../admin/sections";
-  import { canAddSite, findSite, orgSites, session } from "../session.svelte";
+  import { canAddSite, currentOrg, findSite, orgSites, session } from "../session.svelte";
   import "./shell-strings";
 
   let { open = $bindable(false) }: { open: boolean } = $props();
@@ -78,6 +78,10 @@
     }
     if (canAddSite(current?.organization.id ?? session.orgId)) {
       out.push({ id: "p-add", group: "page", label: t("nav.addSite"), icon: Plus, run: () => navigate("/sites/new") });
+    }
+    if (currentOrg()?.role) {
+      out.push({ id: "p-mem", group: "page", label: t("nav.members"), icon: Users, run: () => navigate("/org/members") });
+      out.push({ id: "p-key", group: "page", label: t("nav.apiKeys"), icon: KeyRound, run: () => navigate("/org/api-keys") });
     }
     out.push({ id: "p-acc", group: "page", label: t("nav.account"), icon: ShieldCheck, run: () => navigate("/account") });
     out.push({

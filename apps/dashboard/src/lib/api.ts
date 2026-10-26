@@ -127,6 +127,81 @@ export interface SharedLink {
   created_by: { id: number; name: string | null; email: string } | null;
 }
 
+export interface OrgMember {
+  user_id: number;
+  name: string | null;
+  email: string;
+  role: Role;
+  joined_at: string;
+  last_active_at: string | null;
+  me: boolean;
+}
+
+export interface SiteRef {
+  id: number;
+  name: string;
+}
+
+export interface OrgInvitation {
+  id: number;
+  email: string;
+  /** 站点访客邀请没有组织角色 */
+  role: Exclude<Role, "owner"> | null;
+  site: SiteRef | null;
+  site_role: "editor" | "viewer" | null;
+  expires_at: string;
+  invited_by: string | null;
+}
+
+export interface SiteGuest {
+  id: number;
+  user_id: number;
+  name: string | null;
+  email: string;
+  site: SiteRef;
+  role: "editor" | "viewer";
+}
+
+export interface MembersBody {
+  members: OrgMember[];
+  invitations: OrgInvitation[];
+  guests: SiteGuest[];
+  can_manage: boolean;
+  my_role: Role;
+}
+
+export type InviteBody =
+  | { email: string; role: Exclude<Role, "owner"> }
+  | { email: string; site_id: number; site_role: "editor" | "viewer" };
+
+export interface ApiKeyItem {
+  id: number;
+  name: string;
+  key_prefix: string;
+  scopes: string[];
+  sites: { site_key: string; name: string }[];
+  created_at: string;
+  last_used_at: string | null;
+  expires_at: string | null;
+}
+
+export interface ApiKeysBody {
+  keys: ApiKeyItem[];
+  limits: { hourly: number; burst: number; concurrency: number };
+}
+
+export interface InvitationInfo {
+  email: string;
+  organization: { id: number; name: string };
+  role: Exclude<Role, "owner"> | null;
+  site: SiteRef | null;
+  site_role: "editor" | "viewer" | null;
+  inviter: string | null;
+  expires_at: string;
+  account_exists: boolean;
+  signed_in_as: string | null;
+}
+
 export class ApiError extends Error {
   constructor(
     readonly status: number,
@@ -216,6 +291,25 @@ export const api = {
     request<void>("DELETE", `${base}/sites/${site}/shared-links/${id}`),
   sessions: () => request<{ sessions: SessionInfo[] }>("GET", `${base}/sessions`),
   revokeSession: (id: number) => request<void>("DELETE", `${base}/sessions/${id}`),
+  members: (org: number) => request<MembersBody>("GET", `${base}/orgs/${org}/members`),
+  setMemberRole: (org: number, user: number, role: Role) =>
+    request<OrgMember>("PATCH", `${base}/orgs/${org}/members/${user}`, { body: { role } }),
+  removeMember: (org: number, user: number) => request<void>("DELETE", `${base}/orgs/${org}/members/${user}`),
+  invite: (org: number, body: InviteBody) =>
+    request<{ invitation: OrgInvitation; url: string }>("POST", `${base}/orgs/${org}/invitations`, { body }),
+  revokeInvitation: (org: number, id: number) => request<void>("DELETE", `${base}/orgs/${org}/invitations/${id}`),
+  removeGuest: (org: number, id: number) => request<void>("DELETE", `${base}/orgs/${org}/guests/${id}`),
+  apiKeys: (org: number) => request<ApiKeysBody>("GET", `${base}/orgs/${org}/api-keys`),
+  createApiKey: (org: number, body: { name: string; sites: string[] | null; expires_in_days: number | null }) =>
+    request<{ key: string; item: ApiKeyItem }>("POST", `${base}/orgs/${org}/api-keys`, { body }),
+  revokeApiKey: (org: number, id: number) => request<void>("DELETE", `${base}/orgs/${org}/api-keys/${id}`),
+  invitation: (token: string) => request<InvitationInfo>("GET", `${base}/invitations/${encodeURIComponent(token)}`),
+  acceptInvitation: (token: string, body: { name?: string; password?: string } = {}) =>
+    request<{ organization_id: number; site_id: number | null }>(
+      "POST",
+      `${base}/invitations/${encodeURIComponent(token)}/accept`,
+      { body },
+    ),
   query: (site: number | string, spec: unknown, opts: { share?: string; signal?: AbortSignal } = {}) =>
     request<QueryResult>("POST", `${base}/sites/${site}/query`, { ...opts, body: spec }),
   realtime: (site: number | string, opts: { share?: string; signal?: AbortSignal } = {}) =>
