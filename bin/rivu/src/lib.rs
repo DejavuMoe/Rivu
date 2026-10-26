@@ -7,6 +7,7 @@ pub mod cli;
 pub mod dash_api;
 pub mod internal;
 pub mod migrate;
+pub mod org_admin;
 pub mod public;
 pub mod query_api;
 pub mod run;

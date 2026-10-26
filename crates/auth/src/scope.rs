@@ -257,6 +257,12 @@ pub enum Action {
     SiteDelete,
     /// `shared_link.manage`：owner、admin、editor。
     SharedLinkManage,
+    /// `member.invite`、`member.remove`、`member.role.change`：owner、admin（admin 能碰到哪些角色见 [`can_assign`]、[`can_modify`]）。
+    MemberManage,
+    /// `site_membership.manage`（站点访客的邀请与移除）：owner、admin。
+    SiteMembershipManage,
+    /// `api_key.manage_own`（管理自己的 API key）：所有组织角色（站点访客不是组织成员，没有 key）。
+    ApiKeyManageOwn,
 }
 
 impl Action {
@@ -274,7 +280,7 @@ impl Action {
 /// 角色 × 动作矩阵（纯函数，穷举 `match`：新增动作必须补全）。
 pub fn allowed(role: OrgRole, action: Action) -> bool {
     match action {
-        Action::StatsRead | Action::SitesRead => true,
+        Action::StatsRead | Action::SitesRead | Action::ApiKeyManageOwn => true,
         Action::ExportsRead | Action::SiteSettingsRead | Action::SharedLinkManage => {
             role >= OrgRole::Editor
         }
@@ -282,7 +288,28 @@ pub fn allowed(role: OrgRole, action: Action) -> bool {
         | Action::SiteSettingsWrite
         | Action::SitePublicToggle
         | Action::SiteCreate
-        | Action::SiteDelete => role >= OrgRole::Admin,
+        | Action::SiteDelete
+        | Action::MemberManage
+        | Action::SiteMembershipManage => role >= OrgRole::Admin,
+    }
+}
+
+/// `actor` 能不能把某个成员的角色设成（或以此角色邀请）`target`：owner 可以给任何角色，admin 只能给 admin、editor、viewer
+/// （不能造出 owner），editor 与 viewer 不能管理成员。调用方仍要先过 [`Action::MemberManage`]。
+pub fn can_assign(actor: OrgRole, target: OrgRole) -> bool {
+    match actor {
+        OrgRole::Owner => true,
+        OrgRole::Admin => target <= OrgRole::Admin,
+        OrgRole::Editor | OrgRole::Viewer => false,
+    }
+}
+
+/// `actor` 能不能改动或移除当前角色是 `member` 的成员：owner 可以改任何人，admin 不能碰 owner。
+pub fn can_modify(actor: OrgRole, member: OrgRole) -> bool {
+    match actor {
+        OrgRole::Owner => true,
+        OrgRole::Admin => member != OrgRole::Owner,
+        OrgRole::Editor | OrgRole::Viewer => false,
     }
 }
 
@@ -406,6 +433,9 @@ mod tests {
             (Action::SiteCreate, [true, true, false, false]),
             (Action::SiteDelete, [true, true, false, false]),
             (Action::SharedLinkManage, [true, true, true, false]),
+            (Action::MemberManage, [true, true, false, false]),
+            (Action::SiteMembershipManage, [true, true, false, false]),
+            (Action::ApiKeyManageOwn, [true, true, true, true]),
         ];
         for (action, expected) in cases {
             for (role, want) in [Owner, Admin, Editor, Viewer].into_iter().zip(expected) {
@@ -417,6 +447,31 @@ mod tests {
         assert_eq!(OrgRole::parse("guest"), None);
         for r in [Owner, Admin, Editor, Viewer] {
             assert_eq!(OrgRole::parse(r.as_str()), Some(r));
+        }
+    }
+
+    #[test]
+    fn member_role_assignment_and_modification_rules() {
+        use OrgRole::*;
+        let all = [Owner, Admin, Editor, Viewer];
+        // owner：任何角色都能给、任何人都能改
+        for r in all {
+            assert!(can_assign(Owner, r), "owner 给 {r:?}");
+            assert!(can_modify(Owner, r), "owner 改 {r:?}");
+        }
+        // admin：不能造出 owner，也不能碰 owner
+        assert!(!can_assign(Admin, Owner));
+        for r in [Admin, Editor, Viewer] {
+            assert!(can_assign(Admin, r), "admin 给 {r:?}");
+            assert!(can_modify(Admin, r), "admin 改 {r:?}");
+        }
+        assert!(!can_modify(Admin, Owner));
+        // editor、viewer：什么都不行
+        for actor in [Editor, Viewer] {
+            for r in all {
+                assert!(!can_assign(actor, r), "{actor:?} 给 {r:?}");
+                assert!(!can_modify(actor, r), "{actor:?} 改 {r:?}");
+            }
         }
     }
 
