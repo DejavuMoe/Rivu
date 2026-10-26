@@ -291,7 +291,7 @@ mod tests {
                 collect_enabled: true,
                 hostnames: rivu_ingest::hostname::HostnamePatterns::new(["example.test"]),
                 geo_level: GeoLevel::City,
-                tracker_hash: false,
+                tracker: Default::default(),
                 shield: Default::default(),
                 ingest_rate_limit_per_min: None,
             }),

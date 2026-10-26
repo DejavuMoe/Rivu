@@ -16,6 +16,77 @@ const SITE_KEY_LEN: usize = 12;
 /// 随机 key 撞车时的重试次数。32^12 的空间里撞车几乎不可能，这里只是兜底。
 const SITE_KEY_ATTEMPTS: usize = 8;
 
+/// 站点脚本的开关（`site_settings.tracker`，`tracker-and-protocol.md` §2.2–§2.4）。键缺失或不是布尔时取默认值：
+/// `engagement`、`tagged` 默认开，其余默认关（与 tracker 的 `data-*` 默认值一致）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrackerSwitches {
+    /// hash 路由模式（core 也读）。
+    pub hash: bool,
+    pub engagement: bool,
+    pub outbound: bool,
+    /// 文件下载（开时用 tracker 的默认扩展名表）。
+    pub downloads: bool,
+    pub forms: bool,
+    pub tagged: bool,
+}
+
+impl Default for TrackerSwitches {
+    fn default() -> Self {
+        TrackerSwitches {
+            hash: false,
+            engagement: true,
+            outbound: false,
+            downloads: false,
+            forms: false,
+            tagged: true,
+        }
+    }
+}
+
+impl TrackerSwitches {
+    /// JSON 里的键名，也是看板 API 与脚本配置前缀里的键名。
+    pub const KEYS: [&'static str; 6] = [
+        "hash",
+        "engagement",
+        "outbound",
+        "downloads",
+        "forms",
+        "tagged",
+    ];
+
+    /// 从 `site_settings.tracker`（JSON 文本）读取；解析失败时全用默认值。
+    pub fn from_json_text(text: &str) -> Self {
+        let v: serde_json::Value = serde_json::from_str(text).unwrap_or_default();
+        let d = Self::default();
+        let b = |k: &str, def: bool| v.get(k).and_then(serde_json::Value::as_bool).unwrap_or(def);
+        TrackerSwitches {
+            hash: b("hash", d.hash),
+            engagement: b("engagement", d.engagement),
+            outbound: b("outbound", d.outbound),
+            downloads: b("downloads", d.downloads),
+            forms: b("forms", d.forms),
+            tagged: b("tagged", d.tagged),
+        }
+    }
+
+    pub fn get(&self, key: &str) -> Option<bool> {
+        Some(match key {
+            "hash" => self.hash,
+            "engagement" => self.engagement,
+            "outbound" => self.outbound,
+            "downloads" => self.downloads,
+            "forms" => self.forms,
+            "tagged" => self.tagged,
+            _ => return None,
+        })
+    }
+
+    /// 是否需要 `full` 构建：开了任一 full 专属能力（§2.4；hash 两个构建都支持）。
+    pub fn needs_full(&self) -> bool {
+        self.engagement || self.outbound || self.downloads || self.forms || self.tagged
+    }
+}
+
 /// 一个站点的缓存所需字段（未删除）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SiteRow {
@@ -30,8 +101,8 @@ pub struct SiteRow {
     /// `site_settings.geo_level`：`country` | `region` | `city`（PG 的 CHECK 保证取值；没有 settings 行时按 `city`，与列默认值一致）。
     /// 这里保持字符串，解析在 `rivu-ingest`（storage 层不依赖 `rivu-geo`）。
     pub geo_level: String,
-    /// `site_settings.tracker->'hash'` 是否为 JSON `true`（hash 路由模式，站点脚本配置前缀用）。
-    pub tracker_hash: bool,
+    /// `site_settings.tracker`：站点脚本的开关（配置前缀与 core / full 的选择用）。
+    pub tracker: TrackerSwitches,
     /// `site_settings.ingest_rate_limit_per_min`：每分钟事件数上限，`None` 用全局默认。
     pub ingest_rate_limit_per_min: Option<u32>,
     /// 未删除的屏蔽规则。只有 [`load_sites`]（站点快照用）会填，[`find_site_by_key`] 不加载（留空）。
@@ -47,7 +118,7 @@ fn site_from_row(r: &PgRow) -> Result<SiteRow> {
         collect_enabled: r.try_get("collect_enabled")?,
         hostnames: r.try_get("hostnames")?,
         geo_level: r.try_get("geo_level")?,
-        tracker_hash: r.try_get("tracker_hash")?,
+        tracker: TrackerSwitches::from_json_text(&r.try_get::<String, _>("tracker")?),
         ingest_rate_limit_per_min: r
             .try_get::<Option<i32>, _>("ingest_rate_limit_per_min")?
             .and_then(|n| u32::try_from(n).ok()),
@@ -55,7 +126,7 @@ fn site_from_row(r: &PgRow) -> Result<SiteRow> {
     })
 }
 
-/// 加载全部未删除的站点：`sites` + `site_hostnames` + `site_settings`（`collect_enabled`、`geo_level`、`tracker.hash`）。
+/// 加载全部未删除的站点：`sites` + `site_hostnames` + `site_settings`（`collect_enabled`、`geo_level`、`tracker`）。
 pub async fn load_sites(pool: &PgPool) -> Result<Vec<SiteRow>> {
     load_sites_filtered(pool, None).await
 }
@@ -74,7 +145,7 @@ async fn load_sites_filtered(pool: &PgPool, ids: Option<&[i64]>) -> Result<Vec<S
         "SELECT s.id, s.site_key, s.timezone,
                 COALESCE(ss.collect_enabled, true) AS collect_enabled,
                 COALESCE(ss.geo_level, 'city') AS geo_level,
-                COALESCE(ss.tracker -> 'hash' = 'true'::jsonb, false) AS tracker_hash,
+                COALESCE(ss.tracker, '{}'::jsonb)::text AS tracker,
                 ss.ingest_rate_limit_per_min,
                 COALESCE(array_agg(h.pattern ORDER BY h.pattern) FILTER (WHERE h.id IS NOT NULL), '{}') AS hostnames
          FROM sites s
@@ -156,7 +227,7 @@ pub async fn find_site_by_key(pool: &PgPool, site_key: &str) -> Result<Option<Si
         "SELECT s.id, s.site_key, s.timezone,
                 COALESCE(ss.collect_enabled, true) AS collect_enabled,
                 COALESCE(ss.geo_level, 'city') AS geo_level,
-                COALESCE(ss.tracker -> 'hash' = 'true'::jsonb, false) AS tracker_hash,
+                COALESCE(ss.tracker, '{}'::jsonb)::text AS tracker,
                 ss.ingest_rate_limit_per_min,
                 COALESCE(array_agg(h.pattern ORDER BY h.pattern) FILTER (WHERE h.id IS NOT NULL), '{}') AS hostnames
          FROM sites s
@@ -432,7 +503,7 @@ pub struct SiteAdminView {
     pub created_at: String,
     pub week_starts_on: i16,
     pub collect_enabled: bool,
-    pub tracker_hash: bool,
+    pub tracker: TrackerSwitches,
     pub ingest_rate_limit_per_min: Option<i32>,
     pub geo_level: String,
 }
@@ -446,7 +517,7 @@ pub async fn admin_view(pool: &PgPool, site_id: u64) -> Result<Option<SiteAdminV
         " AS created_at,
                 COALESCE(ss.week_starts_on, 1)::smallint AS week_starts_on,
                 COALESCE(ss.collect_enabled, true) AS collect_enabled,
-                COALESCE(ss.tracker -> 'hash' = 'true'::jsonb, false) AS tracker_hash,
+                COALESCE(ss.tracker, '{}'::jsonb)::text AS tracker,
                 ss.ingest_rate_limit_per_min,
                 COALESCE(ss.geo_level, 'city') AS geo_level
          FROM sites s LEFT JOIN site_settings ss ON ss.site_id = s.id
@@ -467,7 +538,7 @@ pub async fn admin_view(pool: &PgPool, site_id: u64) -> Result<Option<SiteAdminV
             created_at: r.try_get("created_at")?,
             week_starts_on: r.try_get("week_starts_on")?,
             collect_enabled: r.try_get("collect_enabled")?,
-            tracker_hash: r.try_get("tracker_hash")?,
+            tracker: TrackerSwitches::from_json_text(&r.try_get::<String, _>("tracker")?),
             ingest_rate_limit_per_min: r.try_get("ingest_rate_limit_per_min")?,
             geo_level: r.try_get("geo_level")?,
         })
@@ -483,8 +554,8 @@ pub struct SitePatch<'a> {
     pub is_public: Option<bool>,
     pub week_starts_on: Option<i16>,
     pub collect_enabled: Option<bool>,
-    /// 只写 `site_settings.tracker` 的 `hash` 键，其他键保留。
-    pub tracker_hash: Option<bool>,
+    /// 要改的脚本开关（键名见 [`TrackerSwitches::KEYS`]），只覆盖这些键，`site_settings.tracker` 的其他键保留。
+    pub tracker: Vec<(&'static str, bool)>,
     /// 外层 `Some` = 要改；内层 `None` = 恢复全局默认。
     pub ingest_rate_limit_per_min: Option<Option<i32>>,
     pub geo_level: Option<&'a str>,
@@ -522,8 +593,7 @@ pub async fn update_site(pool: &PgPool, site_id: u64, patch: &SitePatch<'_>) -> 
              geo_level = COALESCE($4::text, geo_level),
              ingest_rate_limit_per_min =
                  CASE WHEN $5::boolean THEN $6::integer ELSE ingest_rate_limit_per_min END,
-             tracker = CASE WHEN $7::boolean IS NULL THEN tracker
-                            ELSE jsonb_set(tracker, '{hash}', to_jsonb($7::boolean), true) END
+             tracker = CASE WHEN $7::text IS NULL THEN tracker ELSE tracker || $7::jsonb END
          WHERE site_id = $1",
     )
     .bind(id)
@@ -532,7 +602,16 @@ pub async fn update_site(pool: &PgPool, site_id: u64, patch: &SitePatch<'_>) -> 
     .bind(patch.geo_level)
     .bind(patch.ingest_rate_limit_per_min.is_some())
     .bind(patch.ingest_rate_limit_per_min.flatten())
-    .bind(patch.tracker_hash)
+    .bind((!patch.tracker.is_empty()).then(|| {
+        serde_json::Value::Object(
+            patch
+                .tracker
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), serde_json::Value::Bool(*v)))
+                .collect(),
+        )
+        .to_string()
+    }))
     .execute(&mut *tx)
     .await
     .context("更新 site_settings 失败")?;

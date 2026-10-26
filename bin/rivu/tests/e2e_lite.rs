@@ -812,6 +812,7 @@ async fn http_endpoint_end_to_end() {
     let assets = Arc::new(TrackerAssets::from_parts(
         std::path::Path::new("/test"),
         b"/*core*/".to_vec(),
+        b"/*full*/".to_vec(),
         3,
     ));
     let scripts = Arc::new(ScriptService::new(
@@ -850,7 +851,7 @@ async fn http_endpoint_end_to_end() {
     // 没有 User-Agent 头 = 空 UA = 机器人：202 + x-rivu-dropped，计 dropped_bot
     let r = http_post_with_ua(addr, &pageview(&created.site_key, "/bot"), None).await;
     assert_eq!((r.status, r.header("x-rivu-dropped")), (202, Some("1")));
-    // 站点脚本：前缀 + core.js，同一个 HTTP 服务
+    // 站点脚本：前缀 + 产物，同一个 HTTP 服务。新站点的默认开关（engagement、tagged 开）选 full
     let r = http_get(addr, &format!("/js/{}.js", created.site_key)).await;
     assert_eq!(r.status, 200);
     assert!(
@@ -860,13 +861,14 @@ async fn http_endpoint_end_to_end() {
     );
     assert!(
         r.body.contains(&format!(
-            "rivu.c={{\"site\":\"{}\",\"endpoint\":\"https://stats.example.test/api/event\",\"hash\":false}};",
+            "rivu.c={{\"site\":\"{}\",\"endpoint\":\"https://stats.example.test/api/event\",\"hash\":false,\
+             \"engagement\":true,\"outbound\":false,\"downloads\":false,\"forms\":false,\"tagged\":true}};",
             created.site_key
         )),
         "{}",
         r.body
     );
-    assert!(r.body.ends_with("/*core*/"));
+    assert!(r.body.ends_with("/*full*/"));
     assert_eq!(r.header("cache-control"), Some("public, max-age=300"));
     assert_eq!(http_get(addr, "/js/zzzzzzzzzzzz.js").await.status, 404);
 

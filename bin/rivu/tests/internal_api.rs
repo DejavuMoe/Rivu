@@ -3746,7 +3746,7 @@ async fn site_admin_create_and_settings() {
     assert!(st["site"]["created_at"].as_str().unwrap().ends_with('Z'));
     assert_eq!(
         st["settings"],
-        json!({"week_starts_on": 1, "collect_enabled": true, "tracker_hash": false,
+        json!({"week_starts_on": 1, "collect_enabled": true, "tracker": {"hash": false, "engagement": true, "outbound": false, "downloads": false, "forms": false, "tagged": true},
                "ingest_rate_limit_per_min": null, "geo_level": "city"})
     );
     assert_eq!(
@@ -3924,7 +3924,7 @@ async fn site_admin_create_and_settings() {
         "not_found",
     );
 
-    // tracker_hash 只写 `hash` 键，保留 tracker 里的其他键
+    // tracker 只覆盖给出的键，保留 tracker 里的其他键（含不认识的）
     sqlx::query("UPDATE site_settings SET tracker = '{\"other\": 1, \"nested\": {\"a\": true}}' WHERE site_id = $1")
         .bind(site_id as i64)
         .execute(&pg)
@@ -3939,19 +3939,34 @@ async fn site_admin_create_and_settings() {
                 .unwrap();
         serde_json::from_str::<Value>(&t).unwrap()
     };
-    let v = expect(&patch(json!({"tracker_hash": true})).await, 200);
-    assert_eq!(v["settings"]["tracker_hash"], true);
+    let v = expect(&patch(json!({"tracker": {"hash": true}})).await, 200);
+    assert_eq!(v["settings"]["tracker"]["hash"], true);
     assert_eq!(
         tracker().await,
         json!({"other": 1, "nested": {"a": true}, "hash": true})
     );
-    let v = expect(&patch(json!({"tracker_hash": false})).await, 200);
-    assert_eq!(v["settings"]["tracker_hash"], false);
+    let v = expect(
+        &patch(json!({"tracker": {"hash": false, "outbound": true, "engagement": false}})).await,
+        200,
+    );
+    assert_eq!(
+        v["settings"]["tracker"],
+        json!({"hash": false, "engagement": false, "outbound": true, "downloads": false,
+               "forms": false, "tagged": true})
+    );
     assert_eq!(
         tracker().await,
-        json!({"other": 1, "nested": {"a": true}, "hash": false})
+        json!({"other": 1, "nested": {"a": true}, "hash": false, "outbound": true, "engagement": false})
     );
-    expect(&patch(json!({"tracker_hash": true})).await, 200);
+    expect(&patch(json!({"tracker": {"hash": true}})).await, 200);
+    // 未知键、非布尔、空对象：400
+    for bad in [
+        json!({"tracker": {"nope": true}}),
+        json!({"tracker": {"hash": "yes"}}),
+        json!({"tracker": {}}),
+    ] {
+        expect_err(&patch(bad.clone()).await, 400, "invalid_request");
+    }
 
     // 采集侧读到的是同一份数据（collector 的站点快照来源）
     let row = rivu_storage_pg::sites::find_site_by_key(&pg, &key)
@@ -3963,7 +3978,7 @@ async fn site_admin_create_and_settings() {
             row.timezone.as_str(),
             row.collect_enabled,
             row.geo_level.as_str(),
-            row.tracker_hash,
+            row.tracker.hash,
             row.ingest_rate_limit_per_min
         ),
         ("Europe/Berlin", false, "country", true, None)
@@ -3992,7 +4007,7 @@ async fn site_admin_create_and_settings() {
     );
     assert_eq!(
         st["settings"],
-        json!({"week_starts_on": 1, "collect_enabled": true, "tracker_hash": false,
+        json!({"week_starts_on": 1, "collect_enabled": true, "tracker": {"hash": false, "engagement": true, "outbound": false, "downloads": false, "forms": false, "tagged": true},
                "ingest_rate_limit_per_min": null, "geo_level": "city"})
     );
     let v = expect(&patch(json!({"week_starts_on": 6})).await, 200);

@@ -1,21 +1,23 @@
-//! 站点专属脚本 `GET /js/<site_key>.js`（`tracker-and-protocol.md` §2.1、§2.3、§2.4）。
+//! 站点脚本 `GET /js/<site_key>.js` 与通用脚本 `GET /js/t.js`（`tracker-and-protocol.md` §2.1–§2.4）。
 //!
-//! 响应 = **配置前缀** + `core.js` 的字节：
+//! 站点脚本 = **配置前缀** + 构建产物：
 //!
 //! ```js
-//! window.rivu=window.rivu||function(){(rivu.q=rivu.q||[]).push(arguments)};rivu.c={"site":"…","endpoint":"…","hash":false};
+//! window.rivu=window.rivu||function(){(rivu.q=rivu.q||[]).push(arguments)};rivu.c={"site":"…","endpoint":"…","hash":false,…};
 //! ```
 //!
-//! - 前缀由唯一的映射函数 [`tracker_prefix`] 从站点配置生成（有测试，防止库中开关与脚本脱节）；
+//! - 前缀由唯一的映射函数 [`tracker_prefix`] 从站点配置（`site_settings.tracker`）生成（有测试，防止库中开关与脚本脱节）；
 //!   `endpoint` 来自配置项 `RIVU_PUBLIC_BASE_URL`，**不取请求的 `Host`**（防止 CDN 缓存被污染）；
 //!   字符串按 JSON 转义并额外转义 `<`、U+2028、U+2029。
-//! - 只发 `core`：`full` 尚未实现（`apps/tracker/README.md`）；站点启用 full 专属能力的选择逻辑留到 full 之后。
-//!   前缀里只有 core 读取的键（`site`、`endpoint`、`hash`）。
-//! - `core.js` 不在 cargo 构建里生成（构建里不跑 pnpm）：启动时从 `RIVU_TRACKER_DIR`（默认 `apps/tracker/dist`）
-//!   读入 `core.js` 与 `meta.json`（`{"sv": 构建号}`）并缓存字节，之后不再读盘。目录缺失或文件不全时，
+//! - 构建选择（§2.4）：站点开了任一 full 专属能力（`engagement`、`outbound`、`downloads`、`forms`、`tagged`）就发 `full`，
+//!   否则发 `core`；`core` 的前缀只有它读取的键（`site`、`endpoint`、`hash`），`full` 的前缀带全部开关。
+//! - `t.js`（通用脚本，`full` 的逐字节副本，无前缀，配置来自 `data-*`）：`/js/t.js` 缓存 1 天，
+//!   `/js/t.<sv>.js` 是当前构建号的不可变地址（缓存 1 年，`immutable`）；别的构建号 404。
+//! - 产物不在 cargo 构建里生成（构建里不跑 pnpm）：启动时从 `RIVU_TRACKER_DIR`（默认 `apps/tracker/dist`）
+//!   读入 `core.js`、`full.js` 与 `meta.json`（`{"sv": 构建号}`）并缓存字节，之后不再读盘。目录缺失或文件不全时，
 //!   本路由对已知站点返回 `503`，并在 `/readyz` 的 `checks.tracker` 里报告，但**不判就绪失败**
 //!   （采集本身不依赖脚本分发）。`sv` 来自产物，服务端不改写。生产镜像应把 CI 构建的 `dist/` 放进该目录。
-//! - 响应头：`Content-Type: application/javascript; charset=utf-8`、`ETag`、`Cache-Control: public, max-age=300`、
+//! - 响应头：`Content-Type: application/javascript; charset=utf-8`、`ETag`、`Cache-Control`、
 //!   `X-Content-Type-Options: nosniff`、`Cross-Origin-Resource-Policy: cross-origin`、`Access-Control-Allow-Origin: *`；
 //!   `If-None-Match` 命中返回 `304`。
 //! - 未知 `site_key`（含已删除的站点，它们不在快照里）与已停用（`collect_enabled = false`）的站点：
@@ -31,18 +33,24 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use rivu_ingest::pipeline::SiteSnapshot;
+use rivu_storage_pg::sites::TrackerSwitches;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 /// 站点脚本的缓存时间（秒）：开关变更最多这么久生效（§2.4，以 ETag 换更长缓存）。
 pub const SCRIPT_MAX_AGE_SECS: u32 = 300;
 
-/// `core.js` 的最大字节数：防止目录里放错文件而被整个读进内存（预算是 1 KiB gzip，几 KB 原文）。
-const MAX_CORE_BYTES: u64 = 256 * 1024;
+const SITE_CACHE: &str = "public, max-age=300";
+const T_CACHE: &str = "public, max-age=86400";
+const T_IMMUTABLE: &str = "public, max-age=31536000, immutable";
+
+/// 单个产物的最大字节数：防止目录里放错文件而被整个读进内存（预算是几 KiB gzip，原文十几 KB）。
+const MAX_SCRIPT_BYTES: u64 = 256 * 1024;
 
 /// 已读入内存的 tracker 构建产物。
 struct Loaded {
     core: Vec<u8>,
+    full: Vec<u8>,
     /// 构建号，来自 `meta.json`。
     sv: u32,
 }
@@ -53,13 +61,27 @@ pub struct TrackerAssets {
     loaded: Result<Loaded, String>,
 }
 
+fn read_script(dir: &Path, name: &str) -> Result<Vec<u8>, String> {
+    let path = dir.join(name);
+    let md = std::fs::metadata(&path).map_err(|e| format!("读取 {} 失败: {e}", path.display()))?;
+    if !md.is_file() || md.len() == 0 || md.len() > MAX_SCRIPT_BYTES {
+        return Err(format!(
+            "{} 不是 1 B–{} KiB 的普通文件（实际 {} B）",
+            path.display(),
+            MAX_SCRIPT_BYTES / 1024,
+            md.len()
+        ));
+    }
+    std::fs::read(&path).map_err(|e| format!("读取 {} 失败: {e}", path.display()))
+}
+
 impl TrackerAssets {
-    /// 从目录读入 `core.js` 与 `meta.json`。缺失或无效不是致命错误：记 `warn`，路由返回 503。
+    /// 从目录读入 `core.js`、`full.js` 与 `meta.json`。缺失或无效不是致命错误：记 `warn`，路由返回 503。
     pub fn load(dir: &Path) -> Self {
         let loaded = Self::read(dir);
         match &loaded {
             Ok(l) => tracing::info!(
-                dir = %dir.display(), sv = l.sv, bytes = l.core.len(),
+                dir = %dir.display(), sv = l.sv, core_bytes = l.core.len(), full_bytes = l.full.len(),
                 "tracker 构建产物已加载"
             ),
             Err(e) => tracing::warn!(
@@ -74,20 +96,9 @@ impl TrackerAssets {
     }
 
     fn read(dir: &Path) -> Result<Loaded, String> {
-        let core_path = dir.join("core.js");
+        let core = read_script(dir, "core.js")?;
+        let full = read_script(dir, "full.js")?;
         let meta_path = dir.join("meta.json");
-        let md = std::fs::metadata(&core_path)
-            .map_err(|e| format!("读取 {} 失败: {e}", core_path.display()))?;
-        if !md.is_file() || md.len() == 0 || md.len() > MAX_CORE_BYTES {
-            return Err(format!(
-                "{} 不是 1 B–{} KiB 的普通文件（实际 {} B）",
-                core_path.display(),
-                MAX_CORE_BYTES / 1024,
-                md.len()
-            ));
-        }
-        let core = std::fs::read(&core_path)
-            .map_err(|e| format!("读取 {} 失败: {e}", core_path.display()))?;
         let meta = std::fs::read_to_string(&meta_path)
             .map_err(|e| format!("读取 {} 失败: {e}", meta_path.display()))?;
         let meta: Value = serde_json::from_str(&meta)
@@ -97,14 +108,14 @@ impl TrackerAssets {
             .and_then(Value::as_u64)
             .and_then(|v| u32::try_from(v).ok())
             .ok_or_else(|| format!("{} 缺少整数字段 sv", meta_path.display()))?;
-        Ok(Loaded { core, sv })
+        Ok(Loaded { core, full, sv })
     }
 
     /// 直接用内存里的字节构造（测试用）。
-    pub fn from_parts(dir: &Path, core: Vec<u8>, sv: u32) -> Self {
+    pub fn from_parts(dir: &Path, core: Vec<u8>, full: Vec<u8>, sv: u32) -> Self {
         TrackerAssets {
             dir: dir.to_owned(),
-            loaded: Ok(Loaded { core, sv }),
+            loaded: Ok(Loaded { core, full, sv }),
         }
     }
 
@@ -120,6 +131,7 @@ impl TrackerAssets {
             Ok(l) => {
                 v["sv"] = json!(l.sv);
                 v["core_bytes"] = json!(l.core.len());
+                v["full_bytes"] = json!(l.full.len());
             }
             Err(e) => v["error"] = json!(e),
         }
@@ -172,29 +184,41 @@ fn valid_site_key(s: &str) -> bool {
 }
 
 /// 站点脚本的配置前缀：**唯一**的「站点配置 → 脚本配置」映射（§2.3）。
-/// 键序固定：`site`、`endpoint`、`hash`（core 读取的键；full 的开关等 full 实现后再加）。
+/// 键序固定：`site`、`endpoint`、`hash`，`full` 再接 `engagement`、`outbound`、`downloads`、`forms`、`tagged`
+/// （`downloads` 是布尔：`true` 用 tracker 的默认扩展名表）。是否 `full` 由 [`TrackerSwitches::needs_full`] 决定。
 /// `site_key` 含非法字符时返回 `None`（调用方已按路径校验过，这里再守一次，因为它会进入 JS 源码）。
-pub fn tracker_prefix(site_key: &str, endpoint: &str, hash: bool) -> Option<String> {
+pub fn tracker_prefix(site_key: &str, endpoint: &str, t: &TrackerSwitches) -> Option<String> {
     if !valid_site_key(site_key) {
         return None;
     }
-    Some(format!(
-        "window.rivu=window.rivu||function(){{(rivu.q=rivu.q||[]).push(arguments)}};rivu.c={{\"site\":{},\"endpoint\":{},\"hash\":{hash}}};",
+    let mut cfg = format!(
+        "{{\"site\":{},\"endpoint\":{},\"hash\":{}",
         js_string(site_key),
         js_string(endpoint),
+        t.hash
+    );
+    if t.needs_full() {
+        let _ = write!(
+            cfg,
+            ",\"engagement\":{},\"outbound\":{},\"downloads\":{},\"forms\":{},\"tagged\":{}",
+            t.engagement, t.outbound, t.downloads, t.forms, t.tagged
+        );
+    }
+    Some(format!(
+        "window.rivu=window.rivu||function(){{(rivu.q=rivu.q||[]).push(arguments)}};rivu.c={cfg}}};"
     ))
 }
 
-/// ETag：`sha256(构建号 ‖ 前缀 ‖ core.js)` 的前 16 字节，十六进制，带引号。
+/// ETag：`sha256(构建号 ‖ 前缀 ‖ 产物)` 的前 16 字节，十六进制，带引号。
 /// 文档（§2.4）写的是 `sha256(构建号 ‖ 前缀)`；这里额外混入产物字节，这样同一构建号下重新构建出不同的产物
 /// 也不会被旧 ETag 误判为未变化。
-fn etag(sv: u32, prefix: &str, core: &[u8]) -> String {
+fn etag(sv: u32, prefix: &str, script: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(sv.to_be_bytes());
     h.update([0]);
     h.update(prefix.as_bytes());
     h.update([0]);
-    h.update(core);
+    h.update(script);
     let digest = h.finalize();
     let mut out = String::with_capacity(34);
     out.push('"');
@@ -245,41 +269,25 @@ pub fn router(svc: Arc<ScriptService>) -> Router {
         .with_state(svc)
 }
 
-async fn serve(
-    State(svc): State<Arc<ScriptService>>,
-    UrlPath(file): UrlPath<String>,
-    headers: HeaderMap,
+/// 前缀 + 产物，带 ETag 与 304。
+fn script_response(
+    headers: &HeaderMap,
+    sv: u32,
+    prefix: &str,
+    script: &[u8],
+    cache_control: &'static str,
 ) -> Response {
-    // 路径必须是 `<site_key>.js`；其它形态（含将来的 `t.js`、`t.<sv>.js`）在这里一律 404
-    let Some(key) = file.strip_suffix(".js").filter(|k| valid_site_key(k)) else {
-        return no_store(StatusCode::NOT_FOUND);
-    };
-    let Some(site) = svc.sites.get(key).filter(|s| s.collect_enabled) else {
-        return no_store(StatusCode::NOT_FOUND);
-    };
-    let Ok(loaded) = &svc.assets.loaded else {
-        let mut resp = no_store(StatusCode::SERVICE_UNAVAILABLE);
-        resp.headers_mut()
-            .insert(header::RETRY_AFTER, HeaderValue::from_static("30"));
-        return resp;
-    };
-    let Some(prefix) = tracker_prefix(key, &svc.endpoint, site.tracker_hash) else {
-        return no_store(StatusCode::NOT_FOUND);
-    };
-
-    let etag = etag(loaded.sv, &prefix, &loaded.core);
+    let etag = etag(sv, prefix, script);
     let etag_value = HeaderValue::from_str(&etag).expect("ETag 是 ASCII");
-    let cache_control = "public, max-age=300";
-    if if_none_match_hits(&headers, &etag) {
+    if if_none_match_hits(headers, &etag) {
         let mut resp = StatusCode::NOT_MODIFIED.into_response();
         script_headers(resp.headers_mut(), cache_control);
         resp.headers_mut().insert(header::ETAG, etag_value);
         return resp;
     }
-
-    let mut body = Vec::with_capacity(prefix.len() + loaded.core.len());
+    let mut body = Vec::with_capacity(prefix.len() + script.len());
     body.extend_from_slice(prefix.as_bytes());
-    body.extend_from_slice(&loaded.core);
+    body.extend_from_slice(script);
     let mut resp = (StatusCode::OK, body).into_response();
     let h = resp.headers_mut();
     script_headers(h, cache_control);
@@ -289,6 +297,53 @@ async fn serve(
     );
     h.insert(header::ETAG, etag_value);
     resp
+}
+
+fn unavailable() -> Response {
+    let mut resp = no_store(StatusCode::SERVICE_UNAVAILABLE);
+    resp.headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("30"));
+    resp
+}
+
+async fn serve(
+    State(svc): State<Arc<ScriptService>>,
+    UrlPath(file): UrlPath<String>,
+    headers: HeaderMap,
+) -> Response {
+    // 通用脚本：`t.js` 与当前构建号的 `t.<sv>.js`
+    if let Some(rest) = file.strip_prefix("t.").and_then(|r| r.strip_suffix("js")) {
+        let Ok(loaded) = &svc.assets.loaded else {
+            return unavailable();
+        };
+        let cache = if rest.is_empty() {
+            T_CACHE
+        } else if rest.strip_suffix('.') == Some(loaded.sv.to_string().as_str()) {
+            T_IMMUTABLE
+        } else {
+            return no_store(StatusCode::NOT_FOUND);
+        };
+        return script_response(&headers, loaded.sv, "", &loaded.full, cache);
+    }
+    // 站点脚本：路径必须是 `<site_key>.js`
+    let Some(key) = file.strip_suffix(".js").filter(|k| valid_site_key(k)) else {
+        return no_store(StatusCode::NOT_FOUND);
+    };
+    let Some(site) = svc.sites.get(key).filter(|s| s.collect_enabled) else {
+        return no_store(StatusCode::NOT_FOUND);
+    };
+    let Ok(loaded) = &svc.assets.loaded else {
+        return unavailable();
+    };
+    let Some(prefix) = tracker_prefix(key, &svc.endpoint, &site.tracker) else {
+        return no_store(StatusCode::NOT_FOUND);
+    };
+    let script = if site.tracker.needs_full() {
+        &loaded.full
+    } else {
+        &loaded.core
+    };
+    script_response(&headers, loaded.sv, &prefix, script, SITE_CACHE)
 }
 
 #[cfg(test)]
@@ -306,17 +361,31 @@ mod tests {
     const KEY: &str = "k7qm2xv5atbr";
     const OFF_KEY: &str = "dddddddddddd";
     const HASH_KEY: &str = "hhhhhhhhhhhh";
-    const CORE: &str = "(function(){window.rivu.sv=7})();";
+    const CORE_KEY: &str = "cccccccccccc";
+    const CORE: &str = "(function(){window.rivu.b='core'})();";
+    const FULL: &str = "(function(){window.rivu.b='full'})();";
     const BASE: &str = "https://stats.example.com";
 
-    fn site(collect_enabled: bool, tracker_hash: bool) -> Arc<SiteConfig> {
+    /// 所有 full 能力都关：发 core。
+    fn core_only(hash: bool) -> TrackerSwitches {
+        TrackerSwitches {
+            hash,
+            engagement: false,
+            outbound: false,
+            downloads: false,
+            forms: false,
+            tagged: false,
+        }
+    }
+
+    fn site(collect_enabled: bool, tracker: TrackerSwitches) -> Arc<SiteConfig> {
         Arc::new(SiteConfig {
             site_id: 1,
             timezone: TimeZone::UTC,
             collect_enabled,
             hostnames: HostnamePatterns::new(["example.test"]),
             geo_level: GeoLevel::Country,
-            tracker_hash,
+            tracker,
             shield: Default::default(),
             ingest_rate_limit_per_min: None,
         })
@@ -325,30 +394,75 @@ mod tests {
     fn service(assets: TrackerAssets) -> Arc<ScriptService> {
         let sites = Arc::new(SiteSnapshot::new());
         sites.replace(HashMap::from([
-            (KEY.to_owned(), site(true, false)),
-            (OFF_KEY.to_owned(), site(false, false)),
-            (HASH_KEY.to_owned(), site(true, true)),
+            (KEY.to_owned(), site(true, TrackerSwitches::default())),
+            (OFF_KEY.to_owned(), site(false, TrackerSwitches::default())),
+            (
+                HASH_KEY.to_owned(),
+                site(
+                    true,
+                    TrackerSwitches {
+                        hash: true,
+                        ..TrackerSwitches::default()
+                    },
+                ),
+            ),
+            (CORE_KEY.to_owned(), site(true, core_only(false))),
         ]));
         Arc::new(ScriptService::new(sites, Arc::new(assets), BASE))
     }
 
-    fn loaded_service() -> Arc<ScriptService> {
-        service(TrackerAssets::from_parts(
+    fn assets(sv: u32) -> TrackerAssets {
+        TrackerAssets::from_parts(
             Path::new("/x"),
             CORE.as_bytes().to_vec(),
-            7,
-        ))
+            FULL.as_bytes().to_vec(),
+            sv,
+        )
+    }
+
+    fn loaded_service() -> Arc<ScriptService> {
+        service(assets(7))
     }
 
     #[test]
     fn prefix_has_the_documented_shape() {
         assert_eq!(
-            tracker_prefix(KEY, "https://stats.example.com/api/event", false).unwrap(),
+            tracker_prefix(
+                KEY,
+                "https://stats.example.com/api/event",
+                &core_only(false)
+            )
+            .unwrap(),
             "window.rivu=window.rivu||function(){(rivu.q=rivu.q||[]).push(arguments)};\
              rivu.c={\"site\":\"k7qm2xv5atbr\",\"endpoint\":\"https://stats.example.com/api/event\",\"hash\":false};"
         );
-        let hash = tracker_prefix(KEY, "https://s/api/event", true).unwrap();
+        // 默认开关（engagement、tagged 开）：full，前缀带全部开关
+        assert_eq!(
+            tracker_prefix(KEY, "https://s/api/event", &TrackerSwitches::default()).unwrap(),
+            "window.rivu=window.rivu||function(){(rivu.q=rivu.q||[]).push(arguments)};\
+             rivu.c={\"site\":\"k7qm2xv5atbr\",\"endpoint\":\"https://s/api/event\",\"hash\":false,\
+             \"engagement\":true,\"outbound\":false,\"downloads\":false,\"forms\":false,\"tagged\":true};"
+        );
+        let hash = tracker_prefix(KEY, "https://s/api/event", &core_only(true)).unwrap();
         assert!(hash.ends_with("\"hash\":true};"), "{hash}");
+    }
+
+    #[test]
+    fn any_full_only_switch_selects_full() {
+        assert!(!core_only(true).needs_full(), "hash 两个构建都支持");
+        for k in ["engagement", "outbound", "downloads", "forms", "tagged"] {
+            let mut t = core_only(false);
+            match k {
+                "engagement" => t.engagement = true,
+                "outbound" => t.outbound = true,
+                "downloads" => t.downloads = true,
+                "forms" => t.forms = true,
+                _ => t.tagged = true,
+            }
+            assert!(t.needs_full(), "{k}");
+            let p = tracker_prefix(KEY, "https://s/api/event", &t).unwrap();
+            assert!(p.contains(&format!("\"{k}\":true")), "{p}");
+        }
     }
 
     #[test]
@@ -359,7 +473,7 @@ mod tests {
         let stub = "window.rivu=window.rivu||function(){(rivu.q=rivu.q||[]).push(arguments)};";
         assert!(fixture.contains(stub), "夹具里的队列桩与服务端的前缀不一致");
         assert!(
-            tracker_prefix(KEY, "http://e/api/event", false)
+            tracker_prefix(KEY, "http://e/api/event", &TrackerSwitches::default())
                 .unwrap()
                 .starts_with(stub)
         );
@@ -369,7 +483,7 @@ mod tests {
     fn prefix_is_valid_json_config_and_escapes_dangerous_characters() {
         // 额外转义 `<`、U+2028、U+2029：即使 endpoint 里有它们，也不会提前结束 <script> 或断行
         let ep = "https://a.test/</script>\u{2028}\u{2029}\"\\x";
-        let p = tracker_prefix(KEY, ep, false).unwrap();
+        let p = tracker_prefix(KEY, ep, &TrackerSwitches::default()).unwrap();
         assert!(
             !p.contains('<') && !p.contains('\u{2028}') && !p.contains('\u{2029}'),
             "{p}"
@@ -383,18 +497,21 @@ mod tests {
         assert_eq!(v["endpoint"], ep);
         assert_eq!(v["site"], KEY);
         assert_eq!(v["hash"], false);
+        assert_eq!(v["engagement"], true);
+        assert_eq!(v["downloads"], false);
     }
 
     #[test]
     fn prefix_refuses_site_keys_outside_the_allowed_alphabet() {
+        let t = TrackerSwitches::default();
         for bad in ["", "a b", "a\"b", "a;b", "a/b", "a.b", "</script>", "密钥"] {
             assert_eq!(
-                tracker_prefix(bad, "https://s/api/event", false),
+                tracker_prefix(bad, "https://s/api/event", &t),
                 None,
                 "{bad:?}"
             );
         }
-        assert!(tracker_prefix("A-z_09", "https://s/api/event", false).is_some());
+        assert!(tracker_prefix("A-z_09", "https://s/api/event", &t).is_some());
     }
 
     #[test]
@@ -409,13 +526,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn known_site_gets_prefix_plus_core_with_the_documented_headers() {
+    async fn default_site_gets_prefix_plus_full_with_the_documented_headers() {
         let svc = loaded_service();
         let r = request(router(svc), "GET", &format!("/js/{KEY}.js")).await;
         assert_eq!(r.status, 200);
         let want = format!(
-            "{}{CORE}",
-            tracker_prefix(KEY, "https://stats.example.com/api/event", false).unwrap()
+            "{}{FULL}",
+            tracker_prefix(
+                KEY,
+                "https://stats.example.com/api/event",
+                &TrackerSwitches::default()
+            )
+            .unwrap()
         );
         assert_eq!(r.body, want);
         assert_eq!(
@@ -432,6 +554,19 @@ mod tests {
         assert_eq!(r.header("set-cookie"), None);
         let etag = r.header("etag").unwrap();
         assert!(etag.starts_with('"') && etag.len() == 34, "{etag}");
+    }
+
+    #[tokio::test]
+    async fn sites_without_full_features_get_core() {
+        let r = request(
+            router(loaded_service()),
+            "GET",
+            &format!("/js/{CORE_KEY}.js"),
+        )
+        .await;
+        assert_eq!(r.status, 200);
+        assert!(r.body.ends_with(CORE), "{}", r.body);
+        assert!(r.body.contains("\"hash\":false};"), "{}", r.body);
     }
 
     #[tokio::test]
@@ -496,12 +631,7 @@ mod tests {
     #[tokio::test]
     async fn etag_changes_when_the_build_changes() {
         let a = request(router(loaded_service()), "GET", &format!("/js/{KEY}.js")).await;
-        let other = service(TrackerAssets::from_parts(
-            Path::new("/x"),
-            CORE.as_bytes().to_vec(),
-            8,
-        ));
-        let b = request(router(other), "GET", &format!("/js/{KEY}.js")).await;
+        let b = request(router(service(assets(8))), "GET", &format!("/js/{KEY}.js")).await;
         assert_ne!(a.header("etag"), b.header("etag"));
     }
 
@@ -514,13 +644,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn t_js_is_full_without_a_prefix_and_t_sv_js_is_immutable() {
+        let r = request(router(loaded_service()), "GET", "/js/t.js").await;
+        assert_eq!(r.status, 200);
+        assert_eq!(r.body, FULL, "无前缀，与 full.js 逐字节相同");
+        assert_eq!(r.header("cache-control"), Some("public, max-age=86400"));
+        let r = request(router(loaded_service()), "GET", "/js/t.7.js").await;
+        assert_eq!(r.status, 200);
+        assert_eq!(r.body, FULL);
+        assert_eq!(
+            r.header("cache-control"),
+            Some("public, max-age=31536000, immutable")
+        );
+        for path in ["/js/t.6.js", "/js/t.8.js", "/js/t..js", "/js/t.x.js"] {
+            let r = request(router(loaded_service()), "GET", path).await;
+            assert_eq!(r.status, 404, "{path}");
+        }
+    }
+
+    #[tokio::test]
     async fn unknown_and_disabled_sites_are_404_no_store_with_an_empty_body() {
         for path in [
             "/js/zzzzzzzzzzzz.js",        // 未知（含已删除：不在快照里）
             &format!("/js/{OFF_KEY}.js"), // 已停用
             "/js/.js",
-            "/js/t.js",
-            "/js/t.7.js",
             &format!("/js/{KEY}"),
             "/js/a%20b.js",
         ] {
@@ -549,6 +696,12 @@ mod tests {
         assert_eq!(r.status, 503);
         assert_eq!(r.header("cache-control"), Some("no-store"));
         assert!(r.header("retry-after").is_some());
+        assert_eq!(
+            request(router(Arc::clone(&svc)), "GET", "/js/t.js")
+                .await
+                .status,
+            503
+        );
         let r = request(router(svc), "GET", "/js/zzzzzzzzzzzz.js").await;
         assert_eq!(r.status, 404);
     }
@@ -569,8 +722,16 @@ mod tests {
         );
         assert!(s["error"].as_str().unwrap().contains("core.js"));
 
-        // 只有 core.js：缺 meta.json（没有构建号，不能当产物用）
+        // 只有 core.js：缺 full.js
         std::fs::write(dir.join("core.js"), CORE).unwrap();
+        assert!(
+            TrackerAssets::load(&dir).status()["error"]
+                .as_str()
+                .unwrap()
+                .contains("full.js")
+        );
+        // 缺 meta.json（没有构建号，不能当产物用）
+        std::fs::write(dir.join("full.js"), FULL).unwrap();
         assert!(
             TrackerAssets::load(&dir).status()["error"]
                 .as_str()
@@ -600,6 +761,7 @@ mod tests {
         let s = a.status();
         assert_eq!(s["sv"], 42);
         assert_eq!(s["core_bytes"], CORE.len());
+        assert_eq!(s["full_bytes"], FULL.len());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

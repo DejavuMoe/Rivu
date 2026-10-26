@@ -2367,6 +2367,7 @@ dependencies = [
  "jiff",
  "rand 0.9.5",
  "rivu-common",
+ "serde_json",
  "sqlx",
 ]
 
