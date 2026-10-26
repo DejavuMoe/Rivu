@@ -2,10 +2,10 @@
   左侧栏：组织切换与搜索 → 全部站点 → 当前组织的站点 → 组织（成员、API 密钥）→ 用户菜单。
   当前站点展开看板 / 站点设置二级项；owner / admin 在「站点」标题行右侧有添加站点的加号。
   组织菜单里也有成员、API 密钥入口；只以站点访客身份可见的组织没有这两页。
-  当前项用背景色表示，不加色条。服务端还没有的管理页（接入诊断）暂不出现。
+  当前项用背景色表示，不加色条。接入诊断 editor 起可见（与服务端一致）。
 -->
 <script lang="ts">
-  import { ChartSpline, ChevronsUpDown, KeyRound, LayoutGrid, LogOut, Plus, Search, Settings2, ShieldCheck, Users } from "@lucide/svelte";
+  import { Activity, ChartSpline, ChevronsUpDown, KeyRound, LayoutGrid, LogOut, Plus, Search, Settings2, ShieldCheck, Users } from "@lucide/svelte";
   import { goto } from "$app/navigation";
   import { page } from "$app/state";
   import Popover from "../ui/Popover.svelte";
@@ -19,7 +19,7 @@
   import type { Role } from "../api";
   import { app, setLang, setTheme, type ThemePref, type Lang } from "../state.svelte";
   import { visibleSections } from "../admin/sections";
-  import { canAddSite, currentOrg, displayName, orgSites, orgs, session, setOrg } from "../session.svelte";
+  import { canAddSite, canEdit, currentOrg, displayName, orgSites, orgs, session, setOrg } from "../session.svelte";
   import { signOut } from "./sign-out";
 
   let { onsearch }: { onsearch?: () => void } = $props();
@@ -28,11 +28,13 @@
   const sites = $derived(orgSites());
   const path = $derived(page.url.pathname);
   const currentSite = $derived(page.params.id ? Number(page.params.id) : null);
-  /** 当前站点所在的子页：看板、设置，其余（安装页）都不高亮二级项 */
+  /** 当前站点所在的子页：看板、接入诊断、设置，其余（安装页）都不高亮二级项 */
   const tab = $derived.by(() => {
     if (currentSite === null) return null;
     const rest = path.slice(`/s/${currentSite}`.length);
-    return rest === "" || rest === "/" ? "dashboard" : rest.startsWith("/settings") ? "settings" : null;
+    if (rest === "" || rest === "/") return "dashboard";
+    if (rest.startsWith("/diagnostics")) return "diagnostics";
+    return rest.startsWith("/settings") ? "settings" : null;
   });
   /** 设置入口指向第一个可见分区；一个都看不到时不显示 */
   function settingsHref(s: { id: number; role: Role | null; access: "member" | "guest" }) {
@@ -114,16 +116,24 @@
         <Avatar name={s.name} shape="square" size={16} />
         <span class="grow">{s.name}</span>
       </a>
-      {#if open && settings}
+      {#if open && (settings || canEdit(s))}
         <div class="sub">
           <a class="item" href="/s/{s.id}" aria-current={tab === "dashboard" ? "page" : undefined}>
             <ChartSpline size={16} strokeWidth={1.75} />
             <span class="grow">{t("nav.dashboard")}</span>
           </a>
-          <a class="item" href={settings} aria-current={tab === "settings" ? "page" : undefined}>
-            <Settings2 size={16} strokeWidth={1.75} />
-            <span class="grow">{t("nav.settings")}</span>
-          </a>
+          {#if canEdit(s)}
+            <a class="item" href="/s/{s.id}/diagnostics" aria-current={tab === "diagnostics" ? "page" : undefined}>
+              <Activity size={16} strokeWidth={1.75} />
+              <span class="grow">{t("nav.diagnostics")}</span>
+            </a>
+          {/if}
+          {#if settings}
+            <a class="item" href={settings} aria-current={tab === "settings" ? "page" : undefined}>
+              <Settings2 size={16} strokeWidth={1.75} />
+              <span class="grow">{t("nav.settings")}</span>
+            </a>
+          {/if}
         </div>
       {/if}
     {/each}

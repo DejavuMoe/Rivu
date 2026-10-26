@@ -32,8 +32,9 @@ export const METRICS: MetricKey[] = ["visitors", "visits", "pageviews", "views_p
 /** 实时视图的时间窗：过去 30 分钟，按分钟。 */
 export const REALTIME_MINUTES = 30;
 
-/** 界面上的维度名 → QuerySpec 的维度。目标（event:goal）服务端尚不支持，不在这里。 */
+/** 界面上的维度名 → QuerySpec 的维度。 */
 export const DIMS: Record<string, string> = {
+  goal: "event:goal",
   page: "event:page",
   entry_page: "visit:entry_page",
   exit_page: "visit:exit_page",
@@ -82,12 +83,18 @@ export function grans(range: RangeKey): Gran[] {
 
 const OPS = new Set<Op>(["is", "is_not", "contains", "contains_not"]);
 
+/** 维度允许的筛选条件：目标只能按名字等于 / 不等于（服务端只支持 is、is_not）。 */
+export function opsFor(dim: string): Op[] {
+  return dim === "goal" ? ["is", "is_not"] : ["is", "is_not", "contains"];
+}
+
 export function decodeFilters(s: string | null): Filter[] {
   if (!s) return [];
   const out: Filter[] = [];
   for (const p of s.split(";")) {
     const [dim, op, v] = p.split("~");
     if (!dim || !(dim in DIMS) || !OPS.has(op as Op)) continue;
+    if (dim === "goal" && op !== "is" && op !== "is_not") continue;
     const values = (v ?? "")
       .split("|")
       .filter(Boolean)
@@ -193,7 +200,40 @@ export function breakdownSpec(s: DashState, dim: string, limit: number, now: Dat
   return spec;
 }
 
+/** 目标卡片：每个目标一行（只有有转化的目标），访客、完成次数、转化率。 */
+export const GOAL_LIMIT = 100;
+
+export function goalsSpec(s: DashState, now: Date): Spec {
+  const spec: Spec = {
+    metrics: ["visitors", "events", "conversion_rate"],
+    date_range: dateRange(s, now),
+    dimensions: ["event:goal"],
+    pagination: { limit: GOAL_LIMIT },
+  };
+  if (s.filters.length) spec.filters = filtersSpec(s.filters);
+  return spec;
+}
+
 // ---------- 结果 ----------
+
+export interface GoalRow {
+  /** 目标的名字（显示名，否则事件名或页面路径） */
+  label: string;
+  visitors: number;
+  /** 完成次数 */
+  events: number;
+  /** 0–1 */
+  cr: number;
+}
+
+export function readGoals(res: QueryResult): GoalRow[] {
+  return res.results.map((r) => ({
+    label: r.dimensions[0],
+    visitors: r.metrics[0] ?? 0,
+    events: r.metrics[1] ?? 0,
+    cr: r.metrics[2] ?? 0,
+  }));
+}
 
 export interface Kpi {
   /** current：当前在线（只在实时视图出现，不能作为主图指标） */

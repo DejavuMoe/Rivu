@@ -1,6 +1,6 @@
 <!--
-  账号与安全：个人资料（只读）、登录会话。主题与语言在侧栏用户菜单里设置。
-  后端目前只支持会话管理，没有改名、改密码、改邮箱的接口。
+  账号与安全：个人资料（只读）、修改密码、登录会话。主题与语言在侧栏用户菜单里设置。
+  后端目前没有改名、改邮箱的接口。改密码成功后服务端撤销全部旧会话并换发新会话（cookie 已更新），会话列表重新加载。
 -->
 <script lang="ts">
   import { Monitor, Smartphone, TriangleAlert } from "@lucide/svelte";
@@ -12,6 +12,7 @@
   import Dialog from "#lib/ui/Dialog.svelte";
   import EmptyState from "#lib/ui/EmptyState.svelte";
   import Field from "#lib/ui/Field.svelte";
+  import Input from "#lib/ui/Input.svelte";
   import Skeleton from "#lib/ui/Skeleton.svelte";
   import Table from "#lib/ui/Table.svelte";
   import type { Column } from "#lib/ui/types.ts";
@@ -53,6 +54,47 @@
     }
   }
   void load();
+
+  // ---- 修改密码 ----
+  let cur = $state("");
+  let next = $state("");
+  let again = $state("");
+  let pwTried = $state(false);
+  let pwBusy = $state(false);
+  /** 服务端返回的字段错误（输入变了就清掉） */
+  let serverErr = $state<{ cur?: string; next?: string }>({});
+  const nextLen = $derived([...next].length);
+  const pwErr = $derived({
+    cur: serverErr.cur ?? (cur ? "" : t("ac.pw.currentRequired")),
+    next: serverErr.next ?? (nextLen < 12 ? t("ac.pw.short") : nextLen > 128 ? t("ac.pw.long") : ""),
+    again: again === next ? "" : t("ac.pw.mismatch"),
+  });
+
+  async function changePassword(e: SubmitEvent) {
+    e.preventDefault();
+    pwTried = true;
+    if (pwErr.cur || pwErr.next || pwErr.again || pwBusy) return;
+    pwBusy = true;
+    try {
+      await api.changePassword({ current: cur, new: next });
+    } catch (err) {
+      pwBusy = false;
+      if (await unauthorized(err)) return;
+      if (err instanceof ApiError && err.code === "wrong_password") serverErr = { cur: t("ac.pw.wrong") };
+      else if (err instanceof ApiError && err.code === "invalid_new_password") serverErr = { next: nextLen > 128 ? t("ac.pw.long") : t("ac.pw.short") };
+      else if (err instanceof ApiError && err.code === "same_password") serverErr = { next: t("ac.pw.same") };
+      else if (err instanceof ApiError && err.status === 429) toast(t("ac.pw.rate"), "bad");
+      else toast(t("ac.failed"), "bad");
+      return;
+    }
+    pwBusy = false;
+    cur = next = again = "";
+    pwTried = false;
+    serverErr = {};
+    toast(t("ac.pw.done"), "good");
+    // 其他设备的会话已被服务端撤销，只剩换发的这一个
+    void load();
+  }
 
   async function revoke(s: SessionInfo) {
     try {
@@ -106,6 +148,40 @@
       </Field>
     </div>
   </Card>
+
+  <form onsubmit={changePassword} novalidate>
+    <Card title={t("ac.password")}>
+      <div class="rows">
+        <Field layout="row" label={t("ac.pw.current")} for="ac-cur" error={pwTried ? pwErr.cur : ""}>
+          <Input
+            id="ac-cur"
+            type="password"
+            autocomplete="current-password"
+            bind:value={cur}
+            oninput={() => (serverErr = { ...serverErr, cur: undefined })}
+            invalid={pwTried && !!pwErr.cur}
+          />
+        </Field>
+        <Field layout="row" label={t("ac.pw.new")} for="ac-new" hint={t("ac.pw.newHint")} error={pwTried || nextLen > 128 ? pwErr.next : ""}>
+          <Input
+            id="ac-new"
+            type="password"
+            autocomplete="new-password"
+            bind:value={next}
+            oninput={() => (serverErr = { ...serverErr, next: undefined })}
+            invalid={(pwTried || nextLen > 128) && !!pwErr.next}
+          />
+        </Field>
+        <Field layout="row" label={t("ac.pw.confirm")} for="ac-again" error={pwTried ? pwErr.again : ""}>
+          <Input id="ac-again" type="password" autocomplete="new-password" bind:value={again} invalid={pwTried && !!pwErr.again} />
+        </Field>
+      </div>
+      {#snippet footer()}
+        <span></span>
+        <Button type="submit" variant="primary" size="sm" loading={pwBusy}>{t("ac.pw.submit")}</Button>
+      {/snippet}
+    </Card>
+  </form>
 
   <Card title={t("ac.sessions")} flush>
     {#snippet actions()}

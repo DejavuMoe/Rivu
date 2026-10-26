@@ -2,7 +2,7 @@
   站点列表：当前组织的站点网格。卡片整体可点进看板；24 小时内没有数据的站点链到安装页。
   每张卡片各查两次：按小时的访客走势，以及 24 小时去重访客总数（分小时的访客数不能相加）。
   卡片进入视口才查询，同时最多 4 张卡片在查（站点多时不一次把查询并发打满）。
-  站点多于 6 个时才出现搜索框。owner / admin 在页头和空状态里有「添加站点」入口。
+  站点多于 6 个时才出现搜索框。owner / admin 在页头和空状态里有「添加站点」入口，列表下方是恢复期内的已删除站点。
 -->
 <script lang="ts">
   import { Inbox, Plus, Search, X } from "@lucide/svelte";
@@ -16,12 +16,15 @@
   import Input from "#lib/ui/Input.svelte";
   import LiveDot from "#lib/ui/LiveDot.svelte";
   import Skeleton from "#lib/ui/Skeleton.svelte";
-  import { api } from "#lib/api.ts";
+  import { api, ApiError, type DeletedSite } from "#lib/api.ts";
   import { compact } from "#lib/format.ts";
   import { t } from "#lib/i18n.ts";
-  import { canAddSite, orgSites } from "#lib/session.svelte.ts";
-  import { app } from "#lib/state.svelte.ts";
+  import { canAddSite, orgSites, refreshSites, session } from "#lib/session.svelte.ts";
+  import { app, toast } from "#lib/state.svelte.ts";
   import { inview, limiter } from "#lib/lazy.ts";
+  import Dialog from "#lib/ui/Dialog.svelte";
+  import Table from "#lib/ui/Table.svelte";
+  import { daysLeft } from "#lib/admin/deletion.ts";
   import "./strings";
 
   type Stat = { values: number[]; total: number } | "error";
@@ -61,6 +64,52 @@
     const mine = ctl;
     return () => mine.abort();
   });
+
+  // ---- 已删除的站点（恢复窗口内，只有 owner / admin 看得到） ----
+  let deleted = $state<DeletedSite[]>([]);
+
+  async function loadDeleted(org: number | null) {
+    if (org === null || !canAddSite(org)) {
+      deleted = [];
+      return;
+    }
+    try {
+      const sites = (await api.deletedSites(org)).sites;
+      if (session.orgId === org) deleted = sites;
+    } catch {
+      deleted = [];
+    }
+  }
+
+  $effect(() => {
+    loadDeleted(session.orgId);
+  });
+
+  let restoring = $state<DeletedSite | null>(null);
+  let restoreOpen = $state(false);
+  let restoreBusy = $state(false);
+
+  function askRestore(s: DeletedSite) {
+    restoring = s;
+    restoreOpen = true;
+  }
+
+  async function restore() {
+    const s = restoring;
+    if (!s || restoreBusy) return;
+    restoreBusy = true;
+    try {
+      await api.restoreSite(s.id);
+      restoreOpen = false;
+      toast(t("sl.deleted.restored", { name: s.name }), "good");
+      await refreshSites();
+    } catch (e) {
+      toast(e instanceof ApiError && e.status === 409 ? t("sl.deleted.expired") : t("sl.deleted.failed"), "bad");
+    } finally {
+      restoreBusy = false;
+      await loadDeleted(session.orgId);
+    }
+  }
 
   function visible(id: number) {
     const signal = ctl.signal;
@@ -156,7 +205,40 @@
       {/each}
     </ul>
   {/if}
+
+  {#if deleted.length}
+    <Card title={t("sl.deleted.title")} flush>
+      <Table
+        caption={t("sl.deleted.title")}
+        rows={deleted}
+        rowKey={(s) => s.id}
+        columns={[
+          { key: "n", label: t("sl.deleted.name") },
+          { key: "d", label: t("as.domain"), optional: true },
+          { key: "p", label: t("sl.deleted.purge"), width: "160px" },
+          { key: "a", label: "", width: "88px", align: "right" },
+        ]}
+      >
+        {#snippet cell(s, c)}
+          {#if c.key === "n"}{s.name}
+          {:else if c.key === "d"}<span class="muted">{s.domain ?? "—"}</span>
+          {:else if c.key === "p"}
+            {@const n = daysLeft(s.purge_at, new Date())}
+            <span class="muted">{n === 0 ? t("sl.deleted.today") : t("sl.deleted.days", { n })}</span>
+          {:else}<Button size="sm" onclick={() => askRestore(s)}>{t("sl.deleted.restore")}</Button>{/if}
+        {/snippet}
+      </Table>
+    </Card>
+  {/if}
 </div>
+
+<Dialog bind:open={restoreOpen} size="sm" title={t("sl.deleted.dlg.title", { name: restoring?.name ?? "" })}>
+  <p>{t("sl.deleted.dlg.body")}</p>
+  {#snippet footer()}
+    <Button onclick={() => (restoreOpen = false)}>{t("common.cancel")}</Button>
+    <Button variant="primary" loading={restoreBusy} onclick={restore}>{t("sl.deleted.restore")}</Button>
+  {/snippet}
+</Dialog>
 
 <style>
   .page {
