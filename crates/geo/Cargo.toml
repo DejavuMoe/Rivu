@@ -16,6 +16,7 @@ flate2.workspace = true
 jiff.workspace = true
 maxminddb.workspace = true
 metrics.workspace = true
+parking_lot.workspace = true
 reqwest.workspace = true
 rivu-common.workspace = true
 rustls.workspace = true
