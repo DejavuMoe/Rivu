@@ -448,9 +448,9 @@ impl Clock<'_> {
                     } else if let Some(n) = other.strip_suffix('d') {
                         let n: i64 = n.parse().map_err(|_| "days")?;
                         let from = today
-                            .checked_sub(Span::new().days(n))
+                            .checked_sub(Span::new().days(n - 1))
                             .map_err(|e| e.to_string())?;
-                        self.day_iv(from, today.yesterday().map_err(|e| e.to_string())?)
+                        self.day_iv(from, today)
                     } else {
                         return Err(format!("unknown range {other}"));
                     }

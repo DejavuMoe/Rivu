@@ -273,7 +273,7 @@
           {#if !shared && neverReceived}
             <Button variant="primary" href="/s/{siteId}/install">{t("dash.installGuide")}</Button>
           {:else if !neverReceived && dash.range !== "day"}
-            <!-- Nd、Nmo 不含今天：刚接入的站点只有今天的数据 -->
+            <!-- Nmo 不含本月：刚接入的站点只有今天的数据 -->
             <Button onclick={() => setQuery({ range: "day", gran: null })}>{t("dash.viewToday")}</Button>
           {/if}
         {/snippet}

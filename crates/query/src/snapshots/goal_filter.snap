@@ -56,11 +56,11 @@ LIMIT {p13:UInt64} OFFSET {p14:UInt64}
 
 -- params
 site: UInt64 = 4242
-from_ms: Int64 = 1792101600000
-to_ms: Int64 = 1792706400000
-from_date: Date = "2026-10-15"
-to_date: Date = "2026-10-22"
-s_from: Date = "2026-10-08"
+from_ms: Int64 = 1792188000000
+to_ms: Int64 = 1792749600001
+from_date: Date = "2026-10-16"
+to_date: Date = "2026-10-23"
+s_from: Date = "2026-10-09"
 tz: String = "Europe/Berlin"
 wk: UInt8 = 7
 p0: String = "Signup"

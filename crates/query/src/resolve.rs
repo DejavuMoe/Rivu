@@ -13,7 +13,7 @@
 //! - 「本地日」是站点时区的自然日；本地日 `d` 的起点是 `d 00:00`（落在 DST 缺口里取缺口之后的第一个时刻），
 //!   所以 23 / 25 小时的日子都恰好是一个本地日。
 //! - `day`：今天；`24h`：`[now - 24h, now]`；`realtime`：`[now - 5 min, now]`；
-//!   `Nd`（含 `7d` `28d` `30d`）：截至**昨天**的 N 个完整本地日，不含今天；`month`：本月 1 日到今天；
+//!   `Nd`（含 `7d` `28d` `30d`）：截至**今天**的 N 个本地日，含今天；`month`：本月 1 日到今天；
 //!   `Nmo`（含 `6mo` `12mo`）：截至上个月月底的 N 个完整自然月；`year`：当年 1 月 1 日到今天；
 //!   `all`：站点最早事件所在本地日到今天（最早事件由 ClickHouse 查一次，没有数据时只含今天）。
 //! - 所有区间的终点都**封顶到 `now`**（`end = min(end, now + 1 ms)`）：未来没有数据，这样 `month`、`year`、`day`
@@ -839,9 +839,8 @@ pub(crate) fn resolve_range(
             kind: IntervalKind::Instants,
         },
         DateRange::Days(n) => {
-            let from = checked_days(today, -i64::from(*n), "date_range")?;
-            let to = checked_days(today, -1, "date_range")?;
-            dates_interval(tz, from, to)?
+            let from = checked_days(today, 1 - i64::from(*n), "date_range")?;
+            dates_interval(tz, from, today)?
         }
         DateRange::Month => dates_interval(tz, today.first_of_month(), today)?,
         DateRange::Months(n) => {
@@ -1599,23 +1598,19 @@ mod tests {
     }
 
     #[test]
-    fn seven_days_ends_yesterday_and_excludes_today() {
+    fn seven_days_end_today_and_are_capped_at_now() {
         let berlin = tz("Europe/Berlin");
         // 2026-04-02 (周四) 15:00 柏林
         let now = ms(&berlin, 2026, 4, 2, 15, 0);
         let r = iv(DateRange::Days(7), &berlin, now);
-        assert_eq!(dates(&r), (date(2026, 3, 26), date(2026, 4, 1)));
-        assert_eq!(r.start_ms, ms(&berlin, 2026, 3, 26, 0, 0));
-        assert_eq!(
-            r.end_ms,
-            ms(&berlin, 2026, 4, 2, 0, 0),
-            "终点是今天 00:00，不含今天"
-        );
-        // 跨越 3/29 的夏令时切换：7 个本地日 = 7*24 - 1 小时
-        assert_eq!(r.end_ms - r.start_ms, (7 * 24 - 1) * 3_600_000);
+        assert_eq!(dates(&r), (date(2026, 3, 27), date(2026, 4, 2)));
+        assert_eq!(r.start_ms, ms(&berlin, 2026, 3, 27, 0, 0));
+        assert_eq!(r.end_ms, now + 1, "含今天，终点封顶到 now");
+        // 跨越 3/29 的夏令时切换：6 个整本地日 = 6*24 - 1 小时，加上今天的 15 小时
+        assert_eq!(r.end_ms - 1 - r.start_ms, (6 * 24 - 1 + 15) * 3_600_000);
         assert_eq!(
             dates(&iv(DateRange::Days(1), &berlin, now)),
-            (date(2026, 4, 1), date(2026, 4, 1))
+            (date(2026, 4, 2), date(2026, 4, 2))
         );
     }
 
@@ -1948,11 +1943,12 @@ mod tests {
     fn previous_period_and_year_over_year() {
         let berlin = tz("Europe/Berlin");
         let now = ms(&berlin, 2026, 10, 23, 12, 0);
-        let main = iv(DateRange::Days(7), &berlin, now); // 10/16..10/22
+        let main = iv(DateRange::Days(7), &berlin, now); // 10/17..10/23
         let prev = resolve_compare(&Compare::PreviousPeriod, &main, &berlin, now).unwrap();
-        assert_eq!(dates(&prev), (date(2026, 10, 9), date(2026, 10, 15)));
+        assert_eq!(dates(&prev), (date(2026, 10, 10), date(2026, 10, 16)));
+        assert_eq!(prev.end_ms, main.start_ms);
         let yoy = resolve_compare(&Compare::YearOverYear, &main, &berlin, now).unwrap();
-        assert_eq!(dates(&yoy), (date(2025, 10, 16), date(2025, 10, 22)));
+        assert_eq!(dates(&yoy), (date(2025, 10, 17), date(2025, 10, 23)));
         // 本月（到今天）：N = 23，前一个同样长度的区间
         let month = iv(DateRange::Month, &berlin, now);
         let prev = resolve_compare(&Compare::PreviousPeriod, &month, &berlin, now).unwrap();
