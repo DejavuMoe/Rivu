@@ -28,7 +28,7 @@ use rivu_ingest::shield::{RuleAction, RuleType, normalize_value};
 use rivu_storage_pg::access::{self, SiteRef, UserSiteRoles, VisibleSite};
 use rivu_storage_pg::shared_links::{self, LinkAdminRow, NewLink};
 use rivu_storage_pg::shield::{self, AddOutcome, NewRule, RuleAdminRow};
-use rivu_storage_pg::sites::{self, NewSite, SiteOwner, SitePatch};
+use rivu_storage_pg::sites::{self, NewSite, SiteOwner, SitePatch, TrackerSwitches};
 use rivu_storage_pg::stats_deletions::{self, RestoreOutcome};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
@@ -267,7 +267,7 @@ async fn settings_body(api: &DashApi, site_id: u64) -> Res<Value> {
         "settings": {
             "week_starts_on": v.week_starts_on,
             "collect_enabled": v.collect_enabled,
-            "tracker_hash": v.tracker_hash,
+            "tracker": tracker_json(&v.tracker),
             "ingest_rate_limit_per_min": v.ingest_rate_limit_per_min,
             "geo_level": v.geo_level,
         },
@@ -295,6 +295,48 @@ async fn get_settings(
     Ok(done(&api, &c, StatusCode::OK, body))
 }
 
+/// 站点脚本开关的响应形态（键名同 [`TrackerSwitches::KEYS`]）。
+fn tracker_json(t: &TrackerSwitches) -> Value {
+    Value::Object(
+        TrackerSwitches::KEYS
+            .iter()
+            .map(|k| ((*k).to_owned(), Value::Bool(t.get(k).unwrap_or(false))))
+            .collect(),
+    )
+}
+
+/// `PATCH` 里的 `tracker`：每个键可选。
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct TrackerPatch {
+    hash: Option<bool>,
+    engagement: Option<bool>,
+    outbound: Option<bool>,
+    downloads: Option<bool>,
+    forms: Option<bool>,
+    tagged: Option<bool>,
+}
+
+impl TrackerPatch {
+    fn pairs(&self) -> Vec<(&'static str, bool)> {
+        [
+            ("hash", self.hash),
+            ("engagement", self.engagement),
+            ("outbound", self.outbound),
+            ("downloads", self.downloads),
+            ("forms", self.forms),
+            ("tagged", self.tagged),
+        ]
+        .into_iter()
+        .filter_map(|(k, v)| v.map(|v| (k, v)))
+        .collect()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pairs().is_empty()
+    }
+}
+
 /// `Option<Option<T>>`：字段缺失 = `None`，`null` = `Some(None)`，有值 = `Some(Some(v))`。
 fn double_option<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
 where
@@ -312,7 +354,8 @@ struct PatchBody {
     week_starts_on: Option<i64>,
     is_public: Option<bool>,
     collect_enabled: Option<bool>,
-    tracker_hash: Option<bool>,
+    /// 只覆盖给出的键；未知键 400。
+    tracker: Option<TrackerPatch>,
     #[serde(default, deserialize_with = "double_option")]
     ingest_rate_limit_per_min: Option<Option<i64>>,
     geo_level: Option<String>,
@@ -333,7 +376,7 @@ async fn patch_site(
         && body.week_starts_on.is_none()
         && body.is_public.is_none()
         && body.collect_enabled.is_none()
-        && body.tracker_hash.is_none()
+        && body.tracker.as_ref().is_none_or(TrackerPatch::is_empty)
         && body.ingest_rate_limit_per_min.is_none()
         && body.geo_level.is_none();
     if empty {
@@ -379,7 +422,11 @@ async fn patch_site(
         is_public: body.is_public,
         week_starts_on,
         collect_enabled: body.collect_enabled,
-        tracker_hash: body.tracker_hash,
+        tracker: body
+            .tracker
+            .as_ref()
+            .map(TrackerPatch::pairs)
+            .unwrap_or_default(),
         ingest_rate_limit_per_min: ingest,
         geo_level: body.geo_level.as_deref(),
     };

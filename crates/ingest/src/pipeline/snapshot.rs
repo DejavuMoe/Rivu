@@ -20,7 +20,7 @@ use jiff::civil::Date;
 use jiff::tz::TimeZone;
 use rivu_geo::GeoLevel;
 use rivu_storage_pg::salts::Salt;
-use rivu_storage_pg::sites::SiteRow;
+use rivu_storage_pg::sites::{SiteRow, TrackerSwitches};
 use sqlx::PgPool;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -37,8 +37,8 @@ pub struct SiteConfig {
     pub hostnames: HostnamePatterns,
     /// 地理精度（`site_settings.geo_level`）：第 6 步按它截断，更细的字段不存。
     pub geo_level: GeoLevel,
-    /// 站点脚本是否用 hash 路由模式（`site_settings.tracker.hash`，只影响 `/js/<site_key>.js` 的配置前缀）。
-    pub tracker_hash: bool,
+    /// 站点脚本的开关（`site_settings.tracker`）：只影响 `/js/<site_key>.js` 的配置前缀与 core / full 的选择。
+    pub tracker: TrackerSwitches,
     /// 屏蔽规则（`shield_rules`）：IP 集合、CIDR 前缀树、国家集合、页面通配、hostname 规则，
     /// 随快照整体替换；管线第 3、4、6 步使用。
     pub shield: ShieldRules,
@@ -68,7 +68,7 @@ impl SiteConfig {
             collect_enabled: row.collect_enabled,
             hostnames: HostnamePatterns::new(row.hostnames.iter().map(String::as_str)),
             geo_level,
-            tracker_hash: row.tracker_hash,
+            tracker: row.tracker,
             shield,
             ingest_rate_limit_per_min: row.ingest_rate_limit_per_min,
         })
@@ -455,7 +455,7 @@ mod tests {
             collect_enabled: true,
             hostnames: hosts.iter().map(|s| (*s).to_owned()).collect(),
             geo_level: "city".into(),
-            tracker_hash: false,
+            tracker: TrackerSwitches::default(),
             ingest_rate_limit_per_min: None,
             shield_rules: Vec::new(),
         }
@@ -478,11 +478,16 @@ mod tests {
     }
 
     #[test]
-    fn tracker_hash_flag_is_carried_into_the_config() {
+    fn tracker_switches_are_carried_into_the_config() {
         let mut r = row(1, "aaaaaaaaaaaa", "UTC", &["a.test"]);
-        assert!(!SiteConfig::from_row(&r).unwrap().tracker_hash);
-        r.tracker_hash = true;
-        assert!(SiteConfig::from_row(&r).unwrap().tracker_hash);
+        assert_eq!(
+            SiteConfig::from_row(&r).unwrap().tracker,
+            TrackerSwitches::default()
+        );
+        r.tracker.hash = true;
+        r.tracker.outbound = true;
+        let t = SiteConfig::from_row(&r).unwrap().tracker;
+        assert!(t.hash && t.outbound);
     }
 
     #[test]

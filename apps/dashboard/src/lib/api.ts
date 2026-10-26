@@ -74,11 +74,15 @@ export interface QueryResult {
 export interface SiteSettings {
   week_starts_on: number;
   collect_enabled: boolean;
-  tracker_hash: boolean;
+  /** 站点脚本开关（tracker-and-protocol.md §2.2）；开了任一 hash 以外的项就发 full 脚本 */
+  tracker: TrackerSwitches;
   /** null：用实例默认值 */
   ingest_rate_limit_per_min: number | null;
   geo_level: "country" | "region" | "city";
 }
+
+export type TrackerKey = "hash" | "engagement" | "outbound" | "downloads" | "forms" | "tagged";
+export type TrackerSwitches = Record<TrackerKey, boolean>;
 
 export interface Hostname {
   pattern: string;
@@ -101,7 +105,8 @@ export interface SitePatch {
   week_starts_on?: number;
   is_public?: boolean;
   collect_enabled?: boolean;
-  tracker_hash?: boolean;
+  /** 只改给出的键 */
+  tracker?: Partial<TrackerSwitches>;
   ingest_rate_limit_per_min?: number | null;
   geo_level?: "country" | "region" | "city";
 }

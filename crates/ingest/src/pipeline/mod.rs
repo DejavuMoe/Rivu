@@ -719,7 +719,7 @@ mod tests {
             collect_enabled: true,
             hostnames: crate::hostname::HostnamePatterns::new(["example.test", "*.example.test"]),
             geo_level: GeoLevel::Country,
-            tracker_hash: false,
+            tracker: Default::default(),
             shield,
             ingest_rate_limit_per_min: None,
         })
@@ -744,7 +744,7 @@ mod tests {
                 collect_enabled: collect,
                 hostnames: crate::hostname::HostnamePatterns::new(hosts.iter().copied()),
                 geo_level,
-                tracker_hash: false,
+                tracker: Default::default(),
                 shield: Default::default(),
                 ingest_rate_limit_per_min: None,
             })
