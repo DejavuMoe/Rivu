@@ -44,7 +44,7 @@ expression: "crate::schema_json()"
           "type": "string"
         },
         {
-          "description": "N full local days ending yesterday (1 to 5000), e.g. 7d, 28d, 30d.",
+          "description": "N local days ending today, today included (1 to 5000), e.g. 7d, 28d, 30d.",
           "pattern": "^[0-9]{1,9}d$",
           "type": "string"
         },
@@ -68,7 +68,7 @@ expression: "crate::schema_json()"
           "type": "array"
         }
       ],
-      "description": "The period to query. Relative ranges follow the site's time zone; `7d` ends yesterday and does not include today."
+      "description": "The period to query. Relative ranges follow the site's time zone; `7d` is the last 7 local days including today."
     },
     "Dimension": {
       "anyOf": [

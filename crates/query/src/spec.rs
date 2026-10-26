@@ -443,7 +443,7 @@ pub enum DateRange {
     All,
     /// 最近 5 分钟。
     Realtime,
-    /// 截至昨天的 N 个完整本地日（不含今天）。`7d`、`28d`、`30d` 都是它。
+    /// 截至今天的 N 个本地日（含今天）。`7d`、`28d`、`30d` 都是它。
     Days(u32),
     /// 截至上个月月底的 N 个完整自然月。`6mo`、`12mo` 都是它。
     Months(u32),
@@ -550,10 +550,10 @@ impl JsonSchema for DateRange {
 
     fn json_schema(_: &mut SchemaGenerator) -> Schema {
         schema(json!({
-            "description": "The period to query. Relative ranges follow the site's time zone; `7d` ends yesterday and does not include today.",
+            "description": "The period to query. Relative ranges follow the site's time zone; `7d` is the last 7 local days including today.",
             "anyOf": [
                 {"type": "string", "enum": ["day", "24h", "month", "year", "all", "realtime"]},
-                {"type": "string", "pattern": "^[0-9]{1,9}d$", "description": "N full local days ending yesterday (1 to 5000), e.g. 7d, 28d, 30d."},
+                {"type": "string", "pattern": "^[0-9]{1,9}d$", "description": "N local days ending today, today included (1 to 5000), e.g. 7d, 28d, 30d."},
                 {"type": "string", "pattern": "^[0-9]{1,9}mo$", "description": "N full calendar months ending last month (1 to 100), e.g. 6mo, 12mo."},
                 custom_range_schema()
             ]

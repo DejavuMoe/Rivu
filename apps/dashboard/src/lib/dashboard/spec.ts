@@ -298,7 +298,7 @@ export function labelDate(label: string): Date {
 
 /** 最后一个桶是否还没结束（范围包含现在）。 */
 export function partialLast(range: RangeKey): boolean {
-  return ["realtime", "day", "24h", "month", "year", "all"].includes(range);
+  return !["6mo", "12mo"].includes(range);
 }
 
 /** 分解行：维度取值与访客数。 */
