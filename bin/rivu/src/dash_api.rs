@@ -24,7 +24,15 @@
 //! | `GET /api/internal/sites/{site}/shield`（editor+）、`POST`（admin+）、`DELETE …/shield/{id}`（admin+） | 会话 | 屏蔽规则 |
 //! | `GET /api/internal/sites/{site}/shared-links`、`POST`、`DELETE …/shared-links/{id}` | 会话，组织 editor+ | 共享链接的列表、创建、吊销 |
 //!
-//! 站点管理端点的实现在 [`crate::site_admin`]：站点对调用者不可见一律 404，可见但角色不够 403 `forbidden`。
+//! | `GET /api/internal/orgs/{org_id}/members` | 会话，任一组织成员 | 成员、待处理邀请、站点访客，带 `can_manage` 与 `my_role` |
+//! | `PATCH /api/internal/orgs/{org_id}/members/{user_id}`、`DELETE` | 会话，组织 admin+ | 改角色、移除成员（移除同时吊销其在该组织的 API key）；admin 不能碰 owner，不能改自己，最后一名 owner 409 |
+//! | `POST /api/internal/orgs/{org_id}/invitations`、`DELETE …/invitations/{id}`、`DELETE …/guests/{id}` | 会话，组织 admin+ | 邀请（组织成员或站点访客，返回一次性链接，不发邮件）、撤销邀请、移除站点访客 |
+//! | `GET /api/internal/invitations/{token}` | 无（限流） | 邀请页信息；无效、过期、已接受、已撤销一律 404 |
+//! | `POST /api/internal/invitations/{token}/accept` | 无（限流）；已有账号须是该邮箱的会话 | 接受邀请；没有账号则建账号并登录 |
+//! | `GET /api/internal/orgs/{org_id}/api-keys`、`POST`、`DELETE …/api-keys/{id}` | 会话，任一组织成员 | 只管理自己的 API key（明文仅创建时返回一次） |
+//!
+//! 站点管理端点的实现在 [`crate::site_admin`]：站点对调用者不可见一律 404，可见但角色不够 403 `forbidden`；
+//! 成员、邀请与 API key 端点的实现在 [`crate::org_admin`]（组织不存在或调用者不是成员 404，角色不够 403）。
 //!
 //! 其余 `/api/internal/*` 仍是 501（`public.rs` 的通配）。`{site}` 是站点的数字 id（`sites.id`，文档里的 `{site_id}`）
 //! 或 12 位的 `site_key`；匿名的公开看板只知道 `site_key`，所以两种都收。
@@ -277,6 +285,8 @@ struct Limiters {
     login_pair: PolicyLimiter,
     setup_ip: PolicyLimiter,
     share_view: PolicyLimiter,
+    /// 邀请页（查询与接受）：每客户端 IP 一桶，参数同共享链接与公开看板。
+    invite_view: PolicyLimiter,
     share_password: PolicyLimiter,
     public_view: PolicyLimiter,
 }
@@ -296,6 +306,7 @@ impl Limiters {
             login_pair: login(),
             setup_ip: login(),
             share_view: view(),
+            invite_view: view(),
             share_password: PolicyLimiter::per_window(
                 l.password_per_min,
                 l.password_per_min,
@@ -319,6 +330,10 @@ pub struct DashApi {
     pub(crate) shield_max_rules: usize,
     /// `RIVU_INGEST_RATE_LIMIT_PER_MIN`（`None` = 不限流）：站点没有自己的限额时用它，设置页展示。
     pub(crate) ingest_rate_default: Option<u32>,
+    /// `RIVU_BASE_URL`：邀请链接的前缀。
+    pub(crate) base_url: String,
+    /// 公开 API 的限额（`RIVU_API_RATE_PER_HOUR`、`RIVU_API_BURST`、`RIVU_API_MAX_CONCURRENCY`），API key 列表展示。
+    pub(crate) api_rate: rivu_common::config::ApiRateConfig,
     csrf: Csrf,
     cookies: CookieConfig,
     /// `RIVU_SETUP_TOKEN` 的 SHA-256：比较时两边都是定长摘要，常数时间。
@@ -349,6 +364,8 @@ impl DashApi {
             passwords: PasswordService::new(rivu_auth::password::DEFAULT_CONCURRENCY),
             shield_max_rules: config.shield_max_rules_per_site,
             ingest_rate_default: config.ingest_rate_limit_per_min,
+            base_url: config.base_url.clone(),
+            api_rate: config.api_rate,
             csrf,
             cookies: CookieConfig {
                 secure: config.cookie_secure,
@@ -412,7 +429,16 @@ impl DashApi {
         }
     }
 
-    fn client_ip(&self, peer: SocketAddr, headers: &HeaderMap) -> IpAddr {
+    /// 邀请页的限流：按客户端 IP（在查库之前，所以乱猜令牌也消耗配额）。
+    pub(crate) fn check_invite_rate(&self, peer: SocketAddr, headers: &HeaderMap) -> Res<()> {
+        let ip = ip_bucket(self.client_ip(peer, headers));
+        self.limiters
+            .invite_view
+            .check(&ip)
+            .map_err(|w| rate_limited("invite_view", w))
+    }
+
+    pub(crate) fn client_ip(&self, peer: SocketAddr, headers: &HeaderMap) -> IpAddr {
         let xff: Vec<&str> = headers
             .get_all("x-forwarded-for")
             .iter()
@@ -438,6 +464,8 @@ pub(crate) enum DashError {
     InvalidPassword,
     /// 403：缺少或错误的首次初始化令牌。
     BadSetupToken,
+    /// 403：邀请的邮箱与当前登录的账号不是同一个。
+    EmailMismatch,
     /// 403：CSRF 判定失败。
     Csrf(CsrfError),
     /// 404：不存在、无权访问、已关闭（全部同一个响应）。
@@ -508,6 +536,11 @@ impl IntoResponse for DashError {
                     "the request was rejected by the cross-site request check",
                 )
             }
+            DashError::EmailMismatch => error_body(
+                StatusCode::FORBIDDEN,
+                "email_mismatch",
+                "the invitation was sent to a different email address than the account you are signed in with",
+            ),
             DashError::NotFound => error_body(StatusCode::NOT_FOUND, "not_found", "not found"),
             DashError::Forbidden => {
                 error_body(StatusCode::FORBIDDEN, "forbidden", "insufficient role")
@@ -550,13 +583,13 @@ fn csrf_reason(r: CsrfError) -> &'static str {
 
 pub(crate) type Res<T> = Result<T, DashError>;
 
-fn rate_limited(scope: &'static str, wait: Duration) -> DashError {
+pub(crate) fn rate_limited(scope: &'static str, wait: Duration) -> DashError {
     metrics::counter!("rivu_ratelimit_rejected_total", "scope" => scope).increment(1);
     DashError::RateLimited(wait)
 }
 
 /// 响应加一条 `Set-Cookie`。
-fn with_cookie(mut resp: Response, cookie: &str) -> Response {
+pub(crate) fn with_cookie(mut resp: Response, cookie: &str) -> Response {
     if let Ok(v) = HeaderValue::from_str(cookie) {
         resp.headers_mut().append(header::SET_COOKIE, v);
     }
@@ -606,7 +639,7 @@ pub(crate) struct SessionCtx {
 
 impl DashApi {
     /// 从 cookie 认出有效会话；距上次续期超过 10 分钟就续期（写库）。没有 cookie 或无效返回 `None`。
-    async fn session(&self, headers: &HeaderMap) -> Res<Option<SessionCtx>> {
+    pub(crate) async fn session(&self, headers: &HeaderMap) -> Res<Option<SessionCtx>> {
         let name = self.cookies.session_name();
         let Some(token) = cookie_value(headers, name).filter(|t| session::is_well_formed(t)) else {
             return Ok(None);
@@ -643,7 +676,7 @@ impl DashApi {
     }
 
     /// 建会话并返回 `Set-Cookie` 的值。
-    async fn start_session(
+    pub(crate) async fn start_session(
         &self,
         user_id: i64,
         client_label: Option<&str>,
@@ -1545,6 +1578,7 @@ pub fn router(api: Arc<DashApi>) -> Router {
             get_only(get(public_info)),
         ))
         .merge(crate::site_admin::routes(a))
+        .merge(crate::org_admin::routes(a))
 }
 // ------------------------------------------------------------------------------------------
 // 后台：活跃会话数与清理

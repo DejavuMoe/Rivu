@@ -11,8 +11,20 @@ macro_rules! ts_utc {
     };
 }
 
+/// 同 [`ts_utc`]，但秒精度（`2026-10-26T08:00:00Z`，成员与 API key 的看板端点用）。
+macro_rules! ts_sec {
+    ($col:literal) => {
+        concat!(
+            "to_char(",
+            $col,
+            r#" AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')"#
+        )
+    };
+}
+
 pub mod access;
 pub mod api_keys;
+pub mod members;
 pub mod salts;
 pub mod sessions;
 pub mod shared_links;
