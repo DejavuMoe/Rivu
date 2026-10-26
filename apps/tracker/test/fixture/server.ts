@@ -3,8 +3,8 @@
 //  - site 服务器：托管测试页面（普通页、SPA、hash 路由、预渲染、bfcache ……），模拟「站点所有者的网站」。
 //    它同时有一个 `POST /api/event`，模拟站点第一方反代的采集路径（测试 `credentials: 'omit'` 用）。
 //  - rivu 服务器：模拟 Rivu 自己（另一个 origin，所以脚本发出的是跨域请求）：
-//      GET  /js/<site_key>.js   站点专属脚本 = 配置前缀（规范 §2.3）+ dist/core.js
-//      GET  /t.js               通用脚本（无前缀，配置来自 data-*，规范 §2.2）
+//      GET  /js/<site_key>.js   站点专属脚本 = 配置前缀（规范 §2.3）+ dist/core.js（`?v=full` 时 dist/full.js）
+//      GET  /t.js               通用脚本（无前缀，配置来自 data-*，规范 §2.2）；同样按 `?v=` 选变体
 //      POST /api/event          采集端：记录方法、Content-Type、Cookie 头与请求体，回 202（规范 §6.1）
 //      OPTIONS /api/event       也记录（测试断言「没有预检」），回 204
 //
@@ -51,6 +51,8 @@ export interface PageOpts {
    *  - `none`：不加载脚本（用于对比 window 全局变量）
    */
   mode?: 'prefix' | 'data' | 'data-default' | 'none';
+  /** 脚本变体，默认 `core`。 */
+  variant?: 'core' | 'full';
   /** 采集端点：`rivu`（默认，跨域）、`site`（第一方反代路径）、`dead`（连不上的端口）。 */
   endpoint?: 'rivu' | 'site' | 'dead';
   /** 在脚本之前放队列桩与几条命令（规范 §2.1）。 */
@@ -124,6 +126,8 @@ const header = (req: http.IncomingMessage, name: string): string | undefined => 
 
 export async function startFixture(): Promise<Fixture> {
   const coreJs = await readFile(distUrl('core.js'), 'utf8');
+  const fullJs = await readFile(distUrl('full.js'), 'utf8');
+  const js = (u: URL) => (u.searchParams.get('v') === 'full' ? fullJs : coreJs);
   const events: Recorded[] = [];
   let siteOrigin = '';
   let rivuOrigin = '';
@@ -181,12 +185,12 @@ export async function startFixture(): Promise<Fixture> {
         // 站点脚本的配置前缀：`site` 来自路径，`endpoint` 默认指向本服务器。
         const prefix = buildPrefix({ site: m[1], endpoint: `${rivuOrigin}/api/event`, ...cfg });
         res.writeHead(200, script);
-        res.end(prefix + coreJs);
+        res.end(prefix + js(u));
         return;
       }
       if (u.pathname === '/t.js' && req.method === 'GET') {
         res.writeHead(200, script);
-        res.end(coreJs);
+        res.end(js(u));
         return;
       }
       res.writeHead(404, { 'Cache-Control': 'no-store' });
@@ -242,16 +246,19 @@ export async function startFixture(): Promise<Fixture> {
         : opts.endpoint === 'dead'
           ? 'http://127.0.0.1:1/api/event'
           : `${rivuOrigin}/api/event`;
+    const v = `v=${opts.variant ?? 'core'}`;
     let tag: string;
     if (mode === 'prefix') {
       const c = JSON.stringify({ ...cfg, endpoint });
-      tag = `<script defer src="${rivuOrigin}/js/${site}.js?c=${encodeURIComponent(c)}"></script>`;
+      tag = `<script defer src="${rivuOrigin}/js/${site}.js?c=${encodeURIComponent(c)}&${v}"></script>`;
     } else {
       const attrs = [`data-site="${site}"`];
       if (mode === 'data') attrs.push(`data-api="${endpoint}"`);
-      if (cfg.local) attrs.push('data-local="true"');
-      if (cfg.hash) attrs.push('data-hash="true"');
-      tag = `<script defer src="${rivuOrigin}/t.js" ${attrs.join(' ')}></script>`;
+      // 其余配置键原样写成 data-*（布尔与字符串；false 不写）
+      for (const [k, val] of Object.entries(cfg)) {
+        if (val !== undefined && val !== false) attrs.push(`data-${k}="${String(val)}"`);
+      }
+      tag = `<script defer src="${rivuOrigin}/t.js?${v}" ${attrs.join(' ')}></script>`;
     }
     return opts.twice ? tag + tag : tag;
   }
@@ -300,6 +307,28 @@ export async function startFixture(): Promise<Fixture> {
       body = `<h1>bfcache-a</h1><script>window.__marker='alive'</script>${link('away', '/bfcache-b', 'away')}`;
     } else if (pathname === '/bfcache-b') {
       body = `<h1>bfcache-b</h1>`;
+    } else if (pathname === '/tall') {
+      // engagement 的滚动深度：文档高度约 4 个视口
+      body = `<h1>tall</h1><div id="filler" style="height:3200px"></div><p id="end">end</p>`;
+    } else if (pathname === '/capture') {
+      // 自动捕获（full）。带 data-stay 的链接由页面自己 preventDefault（在 tracker 的捕获阶段监听之后），测试页不跳走；
+      // 表单都 `return false`，不提交。
+      const stay =
+        `<script>for(const t of ['click','auxclick'])document.addEventListener(t,e=>{` +
+        `if(e.target.closest('[data-stay]'))e.preventDefault()})</script>`;
+      body =
+        stay +
+        `<a id="out" data-stay href="${rivuOrigin}/away?q=1#x">out</a>` +
+        `<a id="dl" data-stay href="/files/Report.PDF?x=1#h">dl</a>` +
+        `<a id="same" data-stay href="/other">same</a>` +
+        `<a id="dlout" data-stay href="${rivuOrigin}/f/a.zip">dlout</a>` +
+        `<div class="rivu-event-name=Outer"><button id="tag" class="rivu-event-name=Signup rivu-event-plan=pro+plan">tag</button></div>` +
+        `<div class="rivu-event-name=Wrap rivu-revenue-amount=9.5 rivu-revenue-currency=USD"><span><b id="deep">deep</b></span></div>` +
+        `<div class="rivu-event-name=TooFar"><div><div><div><i id="far">far</i></div></div></div></div>` +
+        `<a id="taglink" data-stay class="rivu-event-name=Docs" href="${rivuOrigin}/docs">docs</a>` +
+        `<form id="f1" onsubmit="return false"><input name="q"><button id="f1b">go</button></form>` +
+        `<form id="f2" onsubmit="return false"><input required name="r"><button id="f2b">go</button></form>` +
+        `<form id="f3" class="rivu-event-name=Lead" onsubmit="return false"><button id="f3b" class="rivu-event-name=Inner">go</button></form>`;
     } else {
       return undefined;
     }

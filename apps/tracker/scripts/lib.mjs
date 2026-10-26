@@ -10,13 +10,13 @@ export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '
 export const DIST = path.join(ROOT, 'dist');
 
 /**
- * 已实现的变体、各自的编译期常量与 gzip -9 体积预算（字节，规范 §1.1 / §3.2）。
- * full 尚未实现（src/full/index.ts 只是挂载点），实现后在这里加一行：
- *   full: { full: true, budget: 2048 }
- * 并补 `t.js` 与 `full.js` 逐字节相同的检查（规范 §11.3）。
+ * 变体、各自的编译期常量与 gzip -9 体积预算（字节，规范 §1.1 / §3.2）。
+ * `t.js` 是 `full.js` 的逐字节副本（规范 §2.2、§11.3），由 build.mjs 写出、size.mjs 检查。
  */
 export const VARIANTS = {
   core: { full: false, budget: 1024 },
+  // 原定 2048，实现后实测约 2.6 KB，2026-10-27 上调（规范附录第 1 条）
+  full: { full: true, budget: 2816 },
 };
 
 /** 构建号：CI 传 `RIVU_SV`（如 `${{ github.run_number }}`，单调递增）；本地默认 1。 */

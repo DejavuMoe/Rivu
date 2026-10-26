@@ -1,8 +1,8 @@
 # apps/tracker
 
-浏览器采集脚本（TypeScript + esbuild，产出 `core.js` / `full.js`），零运行时依赖。
+浏览器采集脚本（TypeScript + esbuild，产出 `core.js` / `full.js`，`t.js` 是 `full.js` 的副本），零运行时依赖。
 
-**状态：`core` 已实现并通过三内核测试；`full` 尚未实现**（`src/full/index.ts` 只是挂载点）。
+**状态：`core` 与 `full` 都已实现并通过三内核测试**。体积（gzip -9）：core 约 870 B（预算 1024 B），full 约 2620 B（预算 2816 B，2026-10-27 由 2048 B 上调，见规范附录第 1 条）。
 
 线协议、字段、体积预算和行为规范见 [`docs/architecture/tracker-and-protocol.md`](../../docs/architecture/tracker-and-protocol.md)。
 
@@ -12,11 +12,11 @@
 |---|---|
 | `src/index.ts` | 入口：幂等守卫、配置解析、启动、探测字段 |
 | `src/config.ts` `guard.ts` `payload.ts` `send.ts` `pageview.ts` `router.ts` | 规范 §3.2 的模块；`config`/`guard.isLocalHost`/`payload` 是纯函数 |
-| `src/full/` | full 独有功能的挂载点。core 构建里 `if (__FULL__)` 整体被删除，`pnpm size` 断言 core 不含这里的任何字节 |
+| `src/full/` | full 独有功能：`config`（full 开关与纯函数）、`beacon`、`engagement`（状态机）、`api`（手动 API 与事件组装）、`capture`（外链、下载、表单、tagged）。core 构建里 `if (__FULL__)` 整体被删除，`pnpm size` 断言 core 不含这里的任何字节 |
 | `scripts/build.mjs` `size.mjs` `lib.mjs` | 构建与产物检查（体积预算、回归、模块泄漏、禁用 API、es2018 语法、构建确定性） |
 | `test/unit/` | 纯函数单元测试（`node:test`） |
 | `test/fixture/server.ts` | 浏览器测试夹具：站点服务器 + 模拟 Rivu 的采集端（记录方法、Content-Type、Cookie 头、请求体） |
-| `test/e2e/` | Playwright（chromium / firefox / webkit）行为测试 |
+| `test/e2e/` | Playwright（chromium / firefox / webkit）行为测试：`core.spec.ts`、`full.spec.ts`（夹具按 `?v=full` 发 full） |
 | `test/e2e-rivu/` | 真实浏览器 → 真实运行的 rivu → ClickHouse → `rivu stats`：脚本从 rivu 的 `/js/<site_key>.js` 加载，断言系统里的数字与已知动作完全一致（「已知答案探针」雏形）。由 `scripts/e2e-rivu.sh` 编排，配置 `playwright.rivu.config.ts`，不在 `pnpm test` 里 |
 | `test/wire.ts` | 线协议 `v=1` 请求体校验器，对照规范 §5.1 与 `crates/ingest/src/protocol.rs` |
 | `size-baseline.json` | 体积基线，`pnpm size` 与之对照 |
@@ -31,7 +31,7 @@
 
 | 脚本 | 作用 |
 |---|---|
-| `pnpm build` | 产出 `dist/core.js`、`dist/meta.json`。构建号取环境变量 `RIVU_SV`（缺省 1） |
+| `pnpm build` | 产出 `dist/core.js`、`dist/full.js`、`dist/t.js`（full 的副本）、`dist/meta.json`。构建号取环境变量 `RIVU_SV`（缺省 1） |
 | `pnpm size` | 产物检查，任一项失败退出码非 0；`node scripts/size.mjs --update-baseline` 刷新基线 |
 | `pnpm typecheck` | `tsc --noEmit` |
 | `pnpm test:unit` | 单元测试 |
@@ -49,20 +49,21 @@
   因此源码要遵守「可擦除语法」（`erasableSyntaxOnly`：不用 enum、namespace、参数属性），导入带 `.ts` 扩展名。
 - **core 不含手动 API**（规范 §2.5、§4.8）：加载前入队的命令不回放，`window.rivu` 被换成空函数，
   所以 `callback`、`init`、`set` 在 core 里都不生效；它们属于 full。
+- **full 的忽略原因**：`guard.ts` 在 full 构建里返回原因字符串（`debug` 时输出），core 构建里返回 1（编译期折叠，不占体积）。
 - **发送**：core 只用 `fetch keepalive`（`credentials: 'omit'`，体为字符串，故 `Content-Type: text/plain`，无预检）。
-  `sendBeacon` 优先属于 full 的 engagement。
+  full 的 engagement 与页面隐藏时的事件 `sendBeacon` 优先，失败回退 fetch。
 - **构建号 `sv`**：CI 用 `github.run_number`（单调递增）。「不得小于上一发布」目前没有检查。
 
 ## 接入服务端（rivu 已实现）
 
 - `GET /js/<site_key>.js`（collector / all 角色）：响应 = 配置前缀（规范 §2.3，唯一的映射函数是 `bin/rivu/src/script.rs` 的 `tracker_prefix`；`endpoint` 取 `RIVU_PUBLIC_BASE_URL`，不取请求的 `Host`）+ `core.js` 的字节；
   头与缓存按规范 §2.4（`ETag`、`public, max-age=300`、`nosniff`、CORP、CORS `*`，`If-None-Match` 命中 304）；
-  未知、已删除、已停用（`collect_enabled = false`）的站点返回 404 + `no-store`。目前只发 `core`，站点启用 full 专属能力时改发 full 留到 full 实现之后。
-- `core.js` 与构建号来自 `RIVU_TRACKER_DIR`（默认 `apps/tracker/dist`，相对进程工作目录）里的 `core.js` 和 `meta.json`：rivu 启动时读入并缓存，不在 cargo 构建里跑 pnpm，也不改写 `sv`。
+  未知、已删除、已停用（`collect_enabled = false`）的站点返回 404 + `no-store`。站点开了任一 full 专属能力（`site_settings.tracker` 的 `engagement`、`outbound`、`downloads`、`forms`、`tagged`；新站点默认开 engagement 与 tagged）就发 full，否则发 core。
+- `core.js`、`full.js` 与构建号来自 `RIVU_TRACKER_DIR`（默认 `apps/tracker/dist`，相对进程工作目录）里的 `core.js`、`full.js` 和 `meta.json`：rivu 启动时读入并缓存，不在 cargo 构建里跑 pnpm，也不改写 `sv`。
   目录缺失时该路由对已知站点返回 503，`/readyz` 的 `checks.tracker` 报告原因，但不判就绪失败（采集不依赖脚本分发）。
   **生产镜像应把 CI 构建的 `dist/`（`pnpm build`，`RIVU_SV` = `github.run_number`）放进该目录**。
 - `POST /api/event`：协议见规范 §5、§6。
-- `GET /t.js`：`full.js` 的副本（full 实现之后）。
+- `GET /js/t.js`：`full.js` 的副本（无前缀，配置来自 `data-*`，缓存 1 天）；`GET /js/t.<sv>.js` 是当前构建号的不可变地址。
 
 ## 真实浏览器端到端
 

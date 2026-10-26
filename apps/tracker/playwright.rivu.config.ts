@@ -13,16 +13,24 @@ export default defineConfig({
   reporter: process.env.CI ? [['list'], ['html', { open: 'never', outputFolder: 'playwright-report-rivu' }]] : 'list',
   timeout: 60_000,
   expect: { timeout: 5_000 },
+  // Firefox 与 WebKit 不用设备预设里的 userAgent：Playwright 改写 UA 只覆盖页面发出的 fetch，它们的 sendBeacon
+  // 仍带浏览器自己的 UA，同一个人的 pageview 与 engagement 就成了两个访客（engagement 全部 no_session）。
+  // 真实浏览器没有这个问题。Chromium 也一样（卸载页面时发的 beacon 不跟随改写），但无头 Chromium 自带的 UA 含
+  // HeadlessChrome、会被判为机器人，所以改用启动参数 --user-agent 在整个浏览器层面设置 UA。
   projects: [
     {
       name: 'chromium',
       use: {
         ...devices['Desktop Chrome'],
+        userAgent: undefined,
         // 去掉 Playwright 默认的 `--disable-back-forward-cache`，才有机会测到真正的 bfcache 恢复。
-        launchOptions: { ignoreDefaultArgs: ['--disable-back-forward-cache'] },
+        launchOptions: {
+          ignoreDefaultArgs: ['--disable-back-forward-cache'],
+          args: [`--user-agent=${devices['Desktop Chrome'].userAgent}`],
+        },
       },
     },
-    { name: 'firefox', use: { ...devices['Desktop Firefox'] } },
-    { name: 'webkit', use: { ...devices['Desktop Safari'] } },
+    { name: 'firefox', use: { ...devices['Desktop Firefox'], userAgent: undefined } },
+    { name: 'webkit', use: { ...devices['Desktop Safari'], userAgent: undefined } },
   ],
 });

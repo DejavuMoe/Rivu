@@ -17,6 +17,8 @@ interface TestFixtures {
   fx: Fixture;
   /** 测试页面设 `window.__rivu = true`（规范 §11.2），放行自动化检测。`test.use({ bypassAutomation: false })` 关闭。 */
   bypassAutomation: boolean;
+  /** 被测的变体：`core`（默认）的请求只能是 pageview 且只用 core 的键；`full` 只做线协议检查。 */
+  variant: 'core' | 'full';
   /** 自动夹具：用例结束后对所有记录的请求做线协议与请求形态的通用检查。 */
   wireCheck: void;
 }
@@ -39,6 +41,7 @@ export const test = base.extend<TestFixtures, WorkerFixtures>({
     await use(fixture);
   },
   bypassAutomation: [true, { option: true }],
+  variant: ['core', { option: true }],
   context: async ({ context, bypassAutomation }, use) => {
     if (bypassAutomation) {
       await context.addInitScript(() => {
@@ -48,12 +51,18 @@ export const test = base.extend<TestFixtures, WorkerFixtures>({
     await use(context);
   },
   wireCheck: [
-    async ({ fx, page }, use) => {
+    async ({ fx, page, variant }, use) => {
       // 脚本不得向宿主页面抛异常：任何用例里出现未捕获异常或未处理的 Promise 拒绝都算失败。
       const pageErrors: string[] = [];
       page.on('pageerror', (e) => pageErrors.push(String(e)));
       await use();
       expect(pageErrors, '页面不应出现未捕获异常').toEqual([]);
+      if (variant === 'full') {
+        // 关页面时 full 会 flush engagement（beacon）。在这里关并等它到达：既检查这些请求的形态，
+        // 也免得它落到下一个用例的记录里（夹具服务器是 worker 级共享的）。
+        await page.close();
+        await new Promise((r) => setTimeout(r, 300));
+      }
       // 无论用例测什么，core 发出的每个请求都必须符合线协议与请求形态规范。
       for (const e of fx.events) {
         const where = `${e.method} ${e.server}${e.path}`;
@@ -65,8 +74,10 @@ export const test = base.extend<TestFixtures, WorkerFixtures>({
         expect(e.json, `${where} 的体必须是 JSON 对象：${e.text}`).toBeDefined();
         expect(validateWire(e.json, e.bytes), `${where} 违反线协议：${e.text}`).toEqual([]);
         // core 只发 pageview，且只用这些键。
-        expect(e.json!.n, where).toBe('pageview');
-        for (const k of Object.keys(e.json!)) expect(CORE_KEYS, `${where} 多发了字段 ${k}`).toContain(k);
+        if (variant === 'core') {
+          expect(e.json!.n, where).toBe('pageview');
+          for (const k of Object.keys(e.json!)) expect(CORE_KEYS, `${where} 多发了字段 ${k}`).toContain(k);
+        }
         expect(e.json!.sv, `${where} 的 sv`).toBe(BUILD_SV);
       }
     },
