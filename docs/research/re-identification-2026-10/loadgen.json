@@ -1,0 +1,76 @@
+{
+  "events": 751093,
+  "sites": 24,
+  "days": 24,
+  "visitor_ids": 122300,
+  "visitor_ids_spanning_over_48h": 0,
+  "sessions_over_24h": 0,
+  "longest_session_hours": 0.11893027777777777,
+  "k_distribution": {
+    "1": 34499,
+    "2": 11878,
+    "3": 7008,
+    "4": 5076,
+    "5": 4055,
+    "6": 3342,
+    "7": 2345,
+    "8": 2144,
+    "9": 1899,
+    "10": 50084
+  },
+  "unique_visitor_share": 0.28201585874274504,
+  "pii_hits": {
+    "entry_pathname": {
+      "email": 0,
+      "ipv4": 0,
+      "long_digits": 322
+    },
+    "pathname": {
+      "email": 0,
+      "ipv4": 0,
+      "long_digits": 322
+    },
+    "props": {
+      "email": 0,
+      "ipv4": 0,
+      "long_digits": 0
+    },
+    "referrer": {
+      "email": 0,
+      "ipv4": 0,
+      "long_digits": 0
+    },
+    "utm": {
+      "email": 0,
+      "ipv4": 0,
+      "long_digits": 0
+    }
+  },
+  "pii_examples": [
+    "pathname/long_digits: 225*********",
+    "pathname/long_digits: 768******",
+    "entry_pathname/long_digits: 768******",
+    "entry_pathname/long_digits: 225*********"
+  ],
+  "salt_dates": [
+    "2026-10-24",
+    "2026-10-25",
+    "2026-10-26",
+    "2026-10-27",
+    "2026-10-28",
+    "2026-10-29",
+    "2026-10-30",
+    "2026-10-31",
+    "2026-11-01",
+    "2026-11-02",
+    "2026-11-03",
+    "2026-11-04",
+    "2026-11-05",
+    "2026-11-06",
+    "2026-11-07",
+    "2026-11-08"
+  ],
+  "siphash_per_sec": 19143021.595633183,
+  "ipv4_sweep_one_ua_secs": 224.36203577076608,
+  "ipv4_sweep_ua_candidates_hours": 62.32278771410169
+}
