@@ -1,6 +1,6 @@
 <!--
-  数据采集：开关（启用采集、Hash 路由）立即生效；每分钟上限是文本字段，有改动时才出现「保存」。
-  上限留空 = 用实例默认值（placeholder 显示默认值）。
+  数据采集：开关（启用采集、脚本功能）立即生效；每分钟上限是文本字段，有改动时才出现「保存」。
+  上限留空 = 用实例默认值（placeholder 显示默认值）。脚本功能开了 Hash 路由以外的任一项，站点脚本就是 full 版。
 -->
 <script lang="ts">
   import { untrack } from "svelte";
@@ -9,6 +9,7 @@
   import Field from "#lib/ui/Field.svelte";
   import Input from "#lib/ui/Input.svelte";
   import Switch from "#lib/ui/Switch.svelte";
+  import type { TrackerKey } from "#lib/api.ts";
   import { full } from "#lib/format.ts";
   import { t } from "#lib/i18n.ts";
   import { app, toast } from "#lib/state.svelte.ts";
@@ -20,8 +21,11 @@
   const store = $derived(getStore());
   const data = $derived(store.data!);
 
+  /** 顺序同原型。 */
+  const features: TrackerKey[] = ["outbound", "downloads", "forms", "hash", "tagged", "engagement"];
+
   let enabled = $state(untrack(() => store.data!.settings.collect_enabled));
-  let hash = $state(untrack(() => store.data!.settings.tracker_hash));
+  let script = $state(untrack(() => ({ ...store.data!.settings.tracker })));
   let rate = $state(untrack(() => String(store.data!.settings.ingest_rate_limit_per_min ?? "")));
   let busy = $state(false);
 
@@ -35,9 +39,9 @@
     if (await store.patch({ collect_enabled: v })) toast(v ? t("set.coll.on") : t("set.coll.off"), "good");
     else enabled = !v;
   }
-  async function toggleHash(v: boolean) {
-    if (await store.patch({ tracker_hash: v })) toast(t("common.saved"), "good");
-    else hash = !v;
+  async function toggleFeature(k: TrackerKey, v: boolean) {
+    if (await store.patch({ tracker: { [k]: v } })) toast(t("common.saved"), "good");
+    else script[k] = !v;
   }
   async function save() {
     busy = true;
@@ -59,11 +63,16 @@
       <Callout tone="warn">{t("set.coll.offWarn")}</Callout>
     {/if}
   </Field>
-  <Field layout="row" label={t("set.coll.hash")} for="s-hash">
-    <div class="sw">
-      <Switch id="s-hash" label={t("set.coll.hash")} bind:checked={hash} onchange={toggleHash} />
-    </div>
-  </Field>
+</Card>
+
+<Card title={t("set.coll.script")}>
+  {#each features as f (f)}
+    <Field layout="row" label={t(`set.coll.script.${f}`)} for="s-f-{f}">
+      <div class="sw">
+        <Switch id="s-f-{f}" label={t(`set.coll.script.${f}`)} bind:checked={script[f]} onchange={(v: boolean) => toggleFeature(f, v)} />
+      </div>
+    </Field>
+  {/each}
 </Card>
 
 <Card title={t("set.coll.limits")}>
