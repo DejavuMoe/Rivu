@@ -19,6 +19,7 @@ use rivu_jobs::GeoRefreshState;
 use serde_json::{Value, json};
 
 use crate::script::TrackerAssets;
+use crate::session_warm::WarmStatus;
 
 /// 单项检查的超时：依赖卡住时 `/readyz` 也要及时返回 503，而不是挂起。
 const CHECK_TIMEOUT: Duration = Duration::from_secs(3);
@@ -51,10 +52,12 @@ impl Probe {
 }
 
 /// collector 角色的就绪条件：站点快照已加载、盐已加载（今天前后各一天）。
+/// 会话预热在开始服务之前同步完成，`sessions` 只报告结果，不判失败。
 #[derive(Clone)]
 pub struct CollectorReadiness {
     pub sites: Arc<SiteSnapshot>,
     pub salts: Arc<SaltCache>,
+    pub sessions: Arc<WarmStatus>,
 }
 
 /// `/readyz` 里 geoip 项的数据来源。**只报告状态，永远不判失败**：库可能还在后台下载
@@ -192,6 +195,9 @@ async fn readyz(State(state): State<Arc<InternalState>>) -> impl IntoResponse {
         ready = ready && sites_ok && salts_ok;
         checks["sites"] = sites;
         checks["salts"] = salts;
+        let mut sessions = json!(*c.sessions);
+        sessions["ok"] = json!(true);
+        checks["sessions"] = sessions;
     }
     checks["geoip"] = geoip_check(&state.geo);
     if let Some(t) = &state.tracker {

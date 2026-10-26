@@ -367,7 +367,7 @@ partition         = SipHash-2-4(routing_secret,       site_id ‖ len‖ip ‖ l
 - **按站点本地日期选盐**（D5）。Plausible 在 UTC 午夜轮换全局盐，对 UTC+8 的站点来说 ID 在本地 08:00 切换。同一个人 07:30 来一次、09:00 再来一次，当天会被算成 2 个访客。
 - **盐的数量**：全球时区横跨 UTC−12 到 +14，任意时刻需要保留 `utc_date-2 … utc_date+1` 共 4 份盐。后台任务提前生成次日的盐，删除更早的盐（见 `platform-and-ops.md`）。
 - **输入用长度前缀拼接**。Plausible 直接拼接、没有分隔符，存在边界歧义（R01 §11.2 #18）。哈希输入用 `site_id` 而不用域名：站点就是隐私边界，改域名也不会让访客 ID 断开。
-- **`partition` 用长期不变的 `routing_secret`**，不随盐轮换。所以跨午夜时，`prev_visitor_id` 对应的会话和新事件仍在同一个分区。持久化的只有分区号（5 bit），不能识别个人。
+- **`partition` 用长期不变的 `routing_secret`**，不随盐轮换。所以跨午夜时，`prev_visitor_id` 对应的会话和新事件仍在同一个分区。持久化的只有分区号（5 bit），不能识别个人。密钥本身存在 PG 的 `instance_secrets`（`name = 'routing'`，16 字节），第一个启动的 collector 写入随机值，之后所有进程只读：重启前后、各副本之间分片一致，关停快照与 ClickHouse 预热（§4.6）才对得上。
 - **原始 IP 和 UA 不进入** ClickHouse、JetStream、日志和错误上报。Plausible 把整个 Request 放进了 Sentry 上下文（R01 §8.2），这是反例。
 
 ### 4.6 SessionAssigner
@@ -494,7 +494,7 @@ AggregatingMergeTree 的状态本身不幂等，一旦漏掉去重，就会永�
 
 目标版本为 ClickHouse 25.8 LTS 及以上。26.2 起多项默认值发生变化（`async_insert`、MV 去重），Rivu 对写入和查询相关的设置一律显式指定，不依赖默认值（见[核实报告](../research/clickhouse-verification.md)「版本陷阱」一节，下文以「#编号」引用其中的条目，以「E 编号」引用其末尾 P0 在 25.8 上的实测结果）。
 
-ClickHouse 账号按职责分为四个：`rivu_writer` 只能 INSERT（另可读 `schema_migrations`，供 `/readyz` 使用）；`rivu_reader` 只读（`readonly=1`），带配额；`rivu_maintainer` 负责删除批处理和汇总层构建；`rivu_migrator` 执行 DDL。物化视图以 `SQL SECURITY DEFINER` 绑定到 `rivu_migrator`，所以 writer 不需要源表的 SELECT（E3）。详见 `platform-and-ops.md` 第 8 节。
+ClickHouse 账号按职责分为四个：`rivu_writer` 只能 INSERT（另可读 `schema_migrations` 供 `/readyz` 使用、读 `sessions` 供会话预热）；`rivu_reader` 只读（`readonly=1`），带配额；`rivu_maintainer` 负责删除批处理和汇总层构建；`rivu_migrator` 执行 DDL。物化视图以 `SQL SECURITY DEFINER` 绑定到 `rivu_migrator`，所以 writer 不需要源表的 SELECT（E3）。详见 `platform-and-ops.md` 第 8 节。
 
 ### 5.2 `events`
 

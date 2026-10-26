@@ -5,7 +5,8 @@
 
   Rivu 的四个 ClickHouse 账号（docs/architecture/platform-and-ops.md §8）：
     rivu_migrator    DDL（CREATE/ALTER/DROP/TRUNCATE）+ INSERT + SELECT，仅 `rivu migrate` 使用
-    rivu_writer      INSERT，外加 schema_migrations 的 SELECT（只跑 collector 时 /readyz 用），collector / worker 使用；
+    rivu_writer      INSERT，外加 schema_migrations 的 SELECT（只跑 collector 时 /readyz 用）与 sessions 的 SELECT
+                     （collector 启动时从 ClickHouse 预热会话），collector / worker 使用；
                      mv_sessions 以 rivu_migrator 身份运行（SQL SECURITY DEFINER），writer 不需要 events 的 SELECT
     rivu_reader      readonly=1 的只读账号，api 使用；带配额和查询限制
     rivu_maintainer  ALTER DELETE（DELETE 与 DROP PARTITION 都由该权限控制）+ SELECT，删除批处理和 rollup 构建使用；
@@ -76,6 +77,7 @@
             <grants>
                 <query>GRANT INSERT ON rivu.*</query>
                 <query>GRANT SELECT ON rivu.schema_migrations</query>
+                <query>GRANT SELECT ON rivu.sessions</query>
             </grants>
         </rivu_writer>
 
