@@ -12,7 +12,7 @@
 | 隐私 | 客户端不发送屏幕尺寸、语言、时区等指纹字段；设备与地理由服务端从 UA、IP 短暂推导，IP 不落库 | `[01 §8.2]` `[01 §9.1]` |
 | 隐私 | URL 在服务端收敛为 hostname、pathname、白名单 query 参数；其余 query 与 fragment 直接丢弃 | 决策 5 |
 | 可信 | 时间戳只由服务端在接收时生成（毫秒，UTC）；客户端不可传时间 | 决策 4；`[01 §0 #3]` |
-| 体积 | `core` gzip ≤ 1 KB；`full` gzip ≤ 2 KB；CI 强制 | 决策 6 |
+| 体积 | `core` gzip ≤ 1 KB；`full` gzip ≤ 2.75 KB（2026-10-27 由 2 KB 上调，见附录第 1 条）；CI 强制 | 决策 6 |
 | 可靠 | 不重试；engagement 与页面隐藏时的事件 beacon 优先；任何失败静默，脚本不得向宿主页面抛异常 | 决策 7 |
 | 可运维 | 被过滤一律 `202`，原因只进内部计数器；`400` 只给协议错误 | 决策 2；`[01 §3.3]` |
 | 可演进 | 协议版本 `v` 与构建号 `sv` 分离；服务端至少兼容 N−1 | 决策 4；`[01 §4.1]` |
@@ -70,10 +70,10 @@
 `GET /js/<site_key>.js` 的响应 = 前缀 + 构建产物。前缀由服务端从站点配置的**唯一映射函数**生成（该函数有测试，防止库中开关与脚本脱节 `[01 §0 #7]` `[01 §11.2 #12]`）：
 
 ```js
-window.rivu=window.rivu||function(){(rivu.q=rivu.q||[]).push(arguments)};rivu.c={"site":"k7qm2xv5atbr","endpoint":"https://stats.example.com/api/event","hash":false,"engagement":true,"outbound":true,"downloads":["pdf","zip"],"forms":false,"tagged":true};
+window.rivu=window.rivu||function(){(rivu.q=rivu.q||[]).push(arguments)};rivu.c={"site":"k7qm2xv5atbr","endpoint":"https://stats.example.com/api/event","hash":false,"engagement":true,"outbound":true,"downloads":false,"forms":false,"tagged":true};
 ```
 
-规则：`endpoint` 来自服务端配置项 `public_base_url`，不得取请求的 `Host`（防止 CDN 缓存被污染）；字符串用 JSON 转义并额外转义 `<`、U+2028/2029；`site_key` 仅含 `[A-Za-z0-9_-]`。`t.js` 无前缀，配置来自 `data-*`。
+规则：`endpoint` 来自服务端配置项 `public_base_url`，不得取请求的 `Host`（防止 CDN 缓存被污染）；字符串用 JSON 转义并额外转义 `<`、U+2028/2029；`site_key` 仅含 `[A-Za-z0-9_-]`。开关来自 `site_settings.tracker`（看板「脚本功能」）；前缀里的 `downloads` 是布尔（`true` 用默认扩展名表，自定义扩展名列表只能经 `t.js` 的 `data-downloads` 或 `init` 设置）。发 `core` 时前缀只有 `site`、`endpoint`、`hash`。`t.js` 无前缀，配置来自 `data-*`。
 
 ### 2.4 构建选择与缓存
 | 项 | 规则 |
@@ -117,14 +117,15 @@ window.rivu=window.rivu||function(){(rivu.q=rivu.q||[]).push(arguments)};rivu.c=
 | `api` | 队列回放、`rivu()` 命令、全局/单次属性、收入、callback、`url` | — | 260 |
 | `debug` | 忽略原因 `console.warn` | — | 50 |
 | **合计估算** | | **≈ 780** | **≈ 2,030** |
-| **预算** | | **≤ 1,024** | **≤ 2,048** |
+| **预算** | | **≤ 1,024** | **≤ 2,816** |
+| **实测（2026-10-27，sv=1）** | | **869** | **≈ 2,600** |
 
 `full` 估算仅余约 18 B，**视为高风险**。超预算时按此顺序削减（不改变决策 6 的功能范围）：① `debug` 日志；② 下载扩展名表缩回 26 项；③ tagged 父层搜索 3 层→1 层；④ tagged 的 revenue 标记；⑤ 仍超则需拍板调整预算（见附录）。
 
 ### 3.3 CI 检查
 | 检查 | 方法 | 失败条件 |
 |---|---|---|
-| 体积预算 | 构建后 `gzip -9` 与 `brotli -q 11` 测量（brotli 仅报告） | core > 1,024 B 或 full > 2,048 B |
+| 体积预算 | 构建后 `gzip -9` 与 `brotli -q 11` 测量（brotli 仅报告） | core > 1,024 B 或 full > 2,816 B |
 | 体积回归 | 与仓库内 `tracker/size-baseline.json` 比较，输出基线/当前对照表（做法参考 Plausible `compiler/analyze-sizes.js`，该脚本只比 brotli/gzip/原始三列） | 增长 > 16 B 在 PR 评论预警；> 64 B 需 label 批准 |
 | 模块泄漏 | esbuild `--metafile`，断言 core 的 inputs 不含 full 专属模块 | 出现即失败 |
 | 禁用 API | 扫描产物：`cookie`、`sessionStorage`、`indexedDB`、`setItem`、`XMLHttpRequest`、`eval`、`new Function`、`console.log` | 命中即失败；`localStorage` 只允许出现 1 次且紧接 `rivu_ignore` |
@@ -440,13 +441,13 @@ rivu('event', 'Video Play', { interactive: false })   // 发 i:false，不影响
 ### 11.3 体积与产物测试
 | 测试 | 断言 |
 |---|---|
-| 预算 | core ≤ 1,024 B、full ≤ 2,048 B（`gzip -9`）；输出表含 brotli 与原始大小 |
+| 预算 | core ≤ 1,024 B、full ≤ 2,816 B（`gzip -9`）；输出表含 brotli 与原始大小 |
 | 回归 | 与基线对照，按 3.3 阈值预警/拦截 |
 | 泄漏与禁用 API | core 不含 full 模块；扫描结果见 3.3 |
 | 其他 | 最坏配置前缀 ≤ 512 B；`t.js` 与 `full.js` 逐字节相同；两次构建哈希一致；`es-check es2018` 通过 |
 
 ## 附录：待拍板问题
-1. `full` 估算仅余约 18 B；超预算时是否允许把预算提到 2.5 KB，还是按 3.2 顺序削功能。
+1. ~~`full` 估算仅余约 18 B；超预算时是否允许把预算提到 2.5 KB，还是按 3.2 顺序削功能~~：已定（2026-10-27），实现后实测 gzip 约 2,600 B，按 3.2 的顺序削减也只省约 100 B；预算上调到 2,816 B（2.75 KB），保留全部功能。
 2. `r` 超长是截断（本稿，同 Plausible）还是按决策 2 的「超长」返回 400。
 3. ~~`u` 超 2000 B 返回 400 会丢整条 pageview~~：已定，服务端对超长 `u` 不回 400，先丢弃白名单以外的 query，再把 pathname 截断到 1024 字节（§5.1、`system-design.md` §10 Q18）；客户端不需要预先剥离。
 4. 兼容层 `d` 含逗号（多站点扇出）按 400 拒绝，是否可接受。

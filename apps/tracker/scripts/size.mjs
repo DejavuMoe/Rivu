@@ -113,6 +113,14 @@ for (const [name, v] of Object.entries(VARIANTS)) {
   }
 }
 
+// 7. t.js 与 full.js 逐字节相同（规范 §11.3）。
+try {
+  const [t, full] = await Promise.all([readFile(path.join(DIST, 't.js')), readFile(path.join(DIST, 'full.js'))]);
+  if (!t.equals(full)) fail('dist/t.js 与 dist/full.js 不一致');
+} catch {
+  fail('dist/t.js 或 dist/full.js 不存在，先运行 pnpm build');
+}
+
 console.table(rows);
 for (const w of warnings) console.warn(`警告：${w}`);
 
