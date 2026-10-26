@@ -495,7 +495,17 @@ impl Pipeline {
         self.assigner.sweep()
     }
 
-    /// 每 `every`（默认 60 s）清扫一次，直到收到停止信号。
+    /// 丢掉已不在站点快照里的站点（被删除）的限流桶，返回剩下的桶数。
+    pub fn prune_limiter(&self) -> usize {
+        // 快照还没加载时什么都不删，免得启动瞬间清空全部桶
+        if self.sites.is_loaded() {
+            let live = self.sites.site_ids();
+            self.limiter.retain(|site_id| live.contains(&site_id));
+        }
+        self.limiter.len()
+    }
+
+    /// 每 `every`（默认 60 s）清扫一次过期会话与已删除站点的限流桶，直到收到停止信号。
     pub fn spawn_sweeper(
         self: &Arc<Self>,
         every: Duration,
@@ -510,6 +520,7 @@ impl Pipeline {
                 if removed > 0 {
                     tracing::debug!(removed, "已清扫过期会话");
                 }
+                this.prune_limiter();
             }
         })
     }
@@ -1111,6 +1122,21 @@ mod tests {
         assert_eq!(r.rx.try_recv().unwrap().pathname, "/");
         assert!(r.rx.try_recv().is_err(), "机器人事件不写入");
         assert_eq!(r.pipeline.assigner().len(), 1, "机器人不开会话");
+    }
+
+    #[test]
+    fn limiter_buckets_of_deleted_sites_are_pruned() {
+        let r = rig(10);
+        let t = at(date(2026, 3, 28), 12, 0);
+        let pv = body(LIMIT_KEY, "pageview", "https://example.test/");
+        assert_eq!(
+            r.pipeline.process(&pv, ctx("1.1.1.1", CHROME_WIN, t)),
+            Outcome::Accepted
+        );
+        assert_eq!(r.pipeline.prune_limiter(), 1, "站点还在，桶保留");
+        // 站点被删除（增量刷新把它摘掉）：下一轮清扫丢掉它的桶
+        r.pipeline.sites().apply_changes(&[LIMIT_SITE], &[]);
+        assert_eq!(r.pipeline.prune_limiter(), 0);
     }
 
     #[test]
