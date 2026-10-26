@@ -464,11 +464,11 @@ PG 与 ClickHouse 迁移放在同一目录、同一版本序列（14 位时间�
 **滚动升级兼容（expand/contract）**：版本 N 的迁移必须兼容 N−1 的二进制：先加列/表，下个发布才删旧列/表，同一次发布不得同时删除与改写。这样滚动重启期间新旧二进制可共存，expand 阶段的代码回滚是安全的。
 
 **CI 校验 schema 快照**（修正 Plausible `structure.sql` 停在 2024-09、迁移已到 2026-10 且 CE/EE 分叉的问题，04§0#1、04§1.1、04§9.6）：
-1. CI 拉起与生产同版本的 PG 与 ClickHouse，执行 `rivu migrate`。
-2. `pg_dump --schema-only --no-owner --no-privileges` 与 `SHOW CREATE TABLE`（全部表与物化视图，按名排序）生成规范化文本。
-3. 与提交的 `schema/postgres.sql`、`schema/clickhouse.sql` 比对，不一致则失败；`just schema-update` 重新生成。
-4. 反向校验：快照加载到空库后的结构与「迁移后的库」一致。
-5. 已合入主分支的迁移文件校验和不可变，被修改即失败。
+1. CI 拉起与生产同版本的 PG 与 ClickHouse，执行 `rivu migrate`（测试 `bin/rivu/tests/schema_snapshot.rs` 先执行迁移）。
+2. 生成规范化文本：PG 不依赖 `pg_dump`，从系统目录读 `public` 模式的表（列、约束、非约束索引、触发器）、扩展名与函数，按名字排序（NOT NULL 只写在列上，PG 18 起它也是有名字的约束，排除以免随版本变化）；ClickHouse 取库里全部表与视图的 `SHOW CREATE`，按名字排序，库名写作 `{{database}}`。
+3. 与提交的 `schema/postgres.sql`、`schema/clickhouse.sql` 比对，不一致则失败并指出第一处不同的行；`RIVU_SCHEMA_UPDATE=1 cargo test -p rivu --test schema_snapshot` 重新生成。
+4. ~~反向校验：快照加载到空库后的结构与「迁移后的库」一致~~：快照是结构的描述而不是可执行的 SQL，这一步不做；「迁移是唯一来源」由第 5 步保证。
+5. 迁移冻结：`migrations/checksums.lock` 逐行登记版本、文件与校验和，单元测试 `embedded_migrations_match_the_freeze_lock`（不需要数据库）检查登记过的迁移没有被修改、改名或删除，新迁移的版本号大于已登记的最高版本，并提示要追加的行。2026-10-27 起全部现有迁移已登记（brief-p1「发布前冻结 schema，此后只能新增迁移」），此后改结构只能新建迁移。
 
 ## 10. 可观测性
 | 项 | 设计 |
