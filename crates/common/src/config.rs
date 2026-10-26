@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -419,6 +419,41 @@ impl GeoConfig {
     }
 }
 
+/// 数据中心网段过滤（`system-design.md` §4.2 第 5 步，丢弃原因 `datacenter_ip`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatacenterConfig {
+    /// `RIVU_DATACENTER_FILTER`（`off` | `on`，默认 `off`）：不少 VPN 与企业代理的出口在云上，打开会丢掉这部分真实访问。
+    pub enabled: bool,
+    /// `RIVU_DATACENTER_SOURCES`：逗号分隔的清单地址，默认 [`DatacenterConfig::DEFAULT_SOURCES`]。
+    pub sources: Vec<String>,
+    /// 合并后的清单文件：`${RIVU_DATA_DIR}/datacenter/ranges.txt`。
+    pub path: PathBuf,
+}
+
+impl DatacenterConfig {
+    /// 云厂商公开的机器可读网段清单（`brief-p1.md`「原始素材」）。Azure 的 Service Tags 文件没有固定地址，不在其中。
+    pub const DEFAULT_SOURCES: &'static [&'static str] = &[
+        "https://ip-ranges.amazonaws.com/ip-ranges.json",
+        "https://www.gstatic.com/ipranges/cloud.json",
+        "https://docs.oracle.com/en-us/iaas/tools/public_ip_ranges.json",
+        "https://www.digitalocean.com/geo/google.csv",
+        "https://geoip.linode.com/",
+    ];
+    /// 清单的刷新周期。
+    pub const REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 3600);
+
+    pub fn new(data_dir: &Path) -> Self {
+        DatacenterConfig {
+            enabled: false,
+            sources: Self::DEFAULT_SOURCES
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+            path: data_dir.join("datacenter").join("ranges.txt"),
+        }
+    }
+}
+
 /// 去掉 URL 里的用户信息、查询串和片段，只留 scheme、主机、路径，用于日志与来源标识。
 /// 不依赖 `url` crate；无法识别 scheme 时返回占位符，绝不原样回显。
 pub fn redact_url(raw: &str) -> String {
@@ -526,6 +561,8 @@ pub struct Config {
     pub tracker_dir: PathBuf,
     /// GeoIP 数据源、刷新与署名（`migrate` 不校验，取默认值）。
     pub geo: GeoConfig,
+    /// 数据中心网段过滤（默认关闭）。
+    pub datacenter: DatacenterConfig,
 }
 
 impl Config {
@@ -787,6 +824,30 @@ impl Config {
         // GeoIP 变量对 migrate 没有意义：解析但丢弃问题，避免无关变量挡住迁移。
         let problems_before_geo = l.problems.len();
         let geo = l.geo();
+        let mut datacenter = DatacenterConfig::new(&geo.data_dir);
+        match l.optional("RIVU_DATACENTER_FILTER").as_deref() {
+            None | Some("off") => {}
+            Some("on") => datacenter.enabled = true,
+            Some(other) => l.problems.push(format!(
+                "RIVU_DATACENTER_FILTER=`{other}` 无效，可选 off | on"
+            )),
+        }
+        if let Some(raw) = l.optional("RIVU_DATACENTER_SOURCES") {
+            let sources: Vec<String> = raw
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect();
+            if sources.is_empty() {
+                l.problems
+                    .push("RIVU_DATACENTER_SOURCES 至少要有一个地址".into());
+            }
+            for u in &sources {
+                l.check_http_url("RIVU_DATACENTER_SOURCES", u);
+            }
+            datacenter.sources = sources;
+        }
         if role == Role::Migrate {
             l.problems.truncate(problems_before_geo);
         }
@@ -836,6 +897,7 @@ impl Config {
             setup_token,
             tracker_dir,
             geo,
+            datacenter,
         })
     }
 }
@@ -1638,6 +1700,35 @@ mod tests {
         assert!(cfg.ignored.is_empty());
         assert!(cfg.warnings().is_empty());
         assert_eq!(cfg.attribution_text, None);
+    }
+
+    #[test]
+    fn datacenter_filter_is_off_by_default_and_sources_are_validated() {
+        let cfg = with_env(&[("RIVU_DATA_DIR", "/srv/rivu")])
+            .unwrap()
+            .datacenter;
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.sources.len(), DatacenterConfig::DEFAULT_SOURCES.len());
+        assert_eq!(cfg.path, PathBuf::from("/srv/rivu/datacenter/ranges.txt"));
+        let cfg = with_env(&[
+            ("RIVU_DATACENTER_FILTER", "on"),
+            (
+                "RIVU_DATACENTER_SOURCES",
+                " https://a.example/x.json , https://b.example/y.csv,",
+            ),
+        ])
+        .unwrap()
+        .datacenter;
+        assert!(cfg.enabled);
+        assert_eq!(
+            cfg.sources,
+            vec!["https://a.example/x.json", "https://b.example/y.csv"]
+        );
+        let err = with_env(&[("RIVU_DATACENTER_FILTER", "yes")]).unwrap_err();
+        assert!(err.to_string().contains("RIVU_DATACENTER_FILTER"), "{err}");
+        let err = with_env(&[("RIVU_DATACENTER_SOURCES", "ftp://x/y")]).unwrap_err();
+        assert!(err.to_string().contains("RIVU_DATACENTER_SOURCES"), "{err}");
+        assert!(with_env(&[("RIVU_DATACENTER_SOURCES", " , ")]).is_err());
     }
 
     #[test]

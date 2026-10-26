@@ -412,6 +412,8 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 | `RIVU_MAXMIND_LICENSE_KEY`、`RIVU_MAXMIND_ACCOUNT_ID`、`RIVU_MAXMIND_EDITION` | 空；空；`GeoLite2-City` | 配置 key 后使用 MaxMind GeoLite2 并自动更新；优先级低于 `RIVU_GEOIP_DB_URL`。现行下载接口是 HTTP Basic（Account ID + license key），所以**设置 key 时 Account ID 必填**，缺失则配置校验报错（不回显 key）。返回 `tar.gz`，取其中的 `.mmdb`；每日下载上限 30 次（`system-design.md` §10 Q27） |
 | `RIVU_DBIP_EDITION` | `city` | 默认来源 DB-IP Lite 的版本：`city` \| `country`（CC BY 4.0，需署名）。下载的 gz 约 60 MB / 4 MB，解压后约 121 MiB / 8 MiB 读入内存；两个版本都只有国家码，没有子区划码和 GeoNames id（`system-design.md` §10 Q24） |
 | `RIVU_GEOIP_REFRESH_INTERVAL` | `24h`；下限 `1h`；`0` 关闭 | 条件 GET 的刷新周期（加 ±10% 抖动），对三种来源都生效；MaxMind 每日下载额度 30 次，不要设得太短 |
+| `RIVU_DATACENTER_FILTER` | `off` | `on` 开启数据中心网段过滤（`system-design.md` §4.4）：worker 每天下载 `datacenter_refresh`，collector 每 5 分钟检查文件并热加载，命中按 `datacenter_ip` 丢弃 |
+| `RIVU_DATACENTER_SOURCES` | AWS、Google Cloud、Oracle、DigitalOcean、Linode 五个公开清单 | 逗号分隔，替换默认清单；只接受 http(s) |
 | `RIVU_GEOIP_ATTRIBUTION_TEXT`、`RIVU_GEOIP_ATTRIBUTION_URL` | 空 | 自定义来源（或手工放置的文件）的署名文本和链接，看板显示、查询 API 的 `meta.geo_attribution` 返回；DB-IP 和 MaxMind 使用内置署名，不读这两个变量 |
 | `RIVU_DATA_DIR` | `/var/lib/rivu` | GeoIP、本地导出、会话关停快照（`sessions.snapshot`，`system-design.md` §4.6） |
 | `RIVU_JOBS`、`RIVU_JOBS_CONCURRENCY` | 见 1.1；`4` | 任务开关与同进程并发数 |

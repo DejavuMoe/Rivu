@@ -287,6 +287,7 @@ api × M ─► ClickHouse（只读账号）/ PostgreSQL          jobs：运行�
 | 用途 | 选型 | 许可与注意 |
 |---|---|---|
 | UA 解析 | `ua-parser` 0.2（uap-core 官方 Rust 实现）+ 固定 commit 的 `regexes.yaml`，随仓库嵌入（`crates/ua/data/uap-core/`），运行期不读文件、不联网。固定 commit 与升级流程见该目录的 `PROVENANCE.md`；uap-core 自带测试集 100% 通过（`test_ua` 1601、`test_os` 483、`test_device` 16129，见 `docs/research/enrich-ua.md` §6.1） | Apache-2.0。Plausible 用的 Matomo device-detector 数据是 LGPL-3.0，不用。上游在固定 commit 没有 `NOTICE`，仓库里的 `NOTICE` 是我们写的署名说明 |
+| 数据中心网段（可选，`RIVU_DATACENTER_FILTER=on`，默认关） | AWS `ip-ranges.json`、Google Cloud `cloud.json`、Oracle Cloud `public_ip_ranges.json`、DigitalOcean 与 Linode 的 geofeed（RFC 8805），worker 每天下载、合并成 `${RIVU_DATA_DIR}/datacenter/ranges.txt`，全部来源成功才替换；collector 按修改时间热加载，管线第 5 步在 UA 机器人判定之后查（合并后的区间二分查找），命中记 `datacenter_ip`。Azure 的 Service Tags 没有固定地址，需要时用 `RIVU_DATACENTER_SOURCES` 指向自己镜像的文件。默认关闭：不少 VPN 与企业代理的出口在云上。2026-10-27 实测五个来源去重后约 2.06 万条 | 各家公开发布、供客户配置防火墙的清单，只下载到本地、不随仓库分发 |
 | 机器人 | uap-core 的 device=Spider，加自维护的 Headless、自动化框架、脚本 HTTP 客户端、爬虫名与自报家门规则（全是子串或前缀比较，没有正则）；空 UA 算机器人（§10 Q21）。在 crawler-user-agents 的 2120 个样例 UA 上检测率 84.58%（uap-core 单独 62.36%）；这是对一份名单的数字，不代表线上流量（§6.10） | 规则库同上；自维护名字表每条要有证据。crawler-user-agents 是 MIT，只当测试输入，不嵌入其正则 |
 | GeoIP | 默认 DB-IP Lite；可选 MaxMind GeoLite2；可选自定义 mmdb 直链（§10 Q5，详见下） | DB-IP Lite 为 CC BY 4.0，必须署名；GeoLite2 需要 Account ID 加 license key 并遵守其 EULA，也要求署名；自定义库的许可由运维者负责 |
 | 地名 | GeoNames（查询时经 CH 字典转换，与 Plausible 的 `location_data_dict` 做法相同） | CC BY 4.0。默认来源 DB-IP Lite 没有城市的 GeoNames id、也没有子区划代码（§10 Q24），字典只在 MaxMind 或同结构的自定义库下有数据可转换 |
