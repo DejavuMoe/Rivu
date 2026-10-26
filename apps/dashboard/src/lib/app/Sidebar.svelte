@@ -1,10 +1,11 @@
 <!--
-  左侧栏：组织切换与搜索 → 全部站点 → 当前组织的站点 → 用户菜单。
+  左侧栏：组织切换与搜索 → 全部站点 → 当前组织的站点 → 组织（成员、API 密钥）→ 用户菜单。
   当前站点展开看板 / 站点设置二级项；owner / admin 在「站点」标题行右侧有添加站点的加号。
-  当前项用背景色表示，不加色条。服务端还没有的管理页（接入诊断、成员、API 密钥）暂不出现。
+  组织菜单里也有成员、API 密钥入口；只以站点访客身份可见的组织没有这两页。
+  当前项用背景色表示，不加色条。服务端还没有的管理页（接入诊断）暂不出现。
 -->
 <script lang="ts">
-  import { ChartSpline, ChevronsUpDown, LayoutGrid, LogOut, Plus, Search, Settings2, ShieldCheck } from "@lucide/svelte";
+  import { ChartSpline, ChevronsUpDown, KeyRound, LayoutGrid, LogOut, Plus, Search, Settings2, ShieldCheck, Users } from "@lucide/svelte";
   import { goto } from "$app/navigation";
   import { page } from "$app/state";
   import Popover from "../ui/Popover.svelte";
@@ -64,6 +65,23 @@
             {o.name}
           </MenuItem>
         {/each}
+        {#if org?.role}
+          <MenuLabel separator />
+          <MenuItem
+            icon={Users}
+            onclick={() => {
+              close();
+              void goto("/org/members");
+            }}>{t("nav.members")}</MenuItem
+          >
+          <MenuItem
+            icon={KeyRound}
+            onclick={() => {
+              close();
+              void goto("/org/api-keys");
+            }}>{t("nav.apiKeys")}</MenuItem
+          >
+        {/if}
       {/snippet}
     </Popover>
 
@@ -112,6 +130,12 @@
   </nav>
 
   <div class="bottom">
+    {#if org?.role}
+      <a class="item" href="/org/members" aria-current={path.startsWith("/org/") ? "page" : undefined}>
+        <Users size={16} strokeWidth={1.75} />
+        <span class="grow">{t("nav.org")}</span>
+      </a>
+    {/if}
     <Popover width={248} side="top">
       {#snippet trigger({ toggle, props })}
         <button type="button" class="item me" onclick={toggle} {...props}>
