@@ -2,7 +2,7 @@
 //!
 //! 直接连 PostgreSQL（`RIVU_DATABASE_URL`，应用账号）。写入前按类型校验并规范化取值
 //! （`rivu_ingest::shield::normalize_value`），并在事务内检查每站上限 `RIVU_SHIELD_MAX_RULES_PER_SITE`。
-//! 规则写库后，运行中的 collector 在下一次站点快照重载（`RIVU_SITE_CACHE_REFRESH_SECS`，默认 10 秒）内生效。
+//! 规则写库后，运行中的 collector 经 NOTIFY 约 1 秒内生效；通知丢失时在下一次增量刷新（`RIVU_SITE_CACHE_REFRESH_SECS`，默认 10 秒）内生效。
 
 use std::process::ExitCode;
 
@@ -92,7 +92,7 @@ async fn add(config: &Config, args: ShieldAddArgs) -> Result<ExitCode> {
             println!("action: {action}");
             println!("value: {value}");
             println!(
-                "已写入；运行中的 collector 会在下一次站点快照重载（RIVU_SITE_CACHE_REFRESH_SECS，默认 10 秒）内生效"
+                "已写入；运行中的 collector 约 1 秒内生效（最迟在下一次站点快照刷新，RIVU_SITE_CACHE_REFRESH_SECS，默认 10 秒）"
             );
             Ok(ExitCode::SUCCESS)
         }

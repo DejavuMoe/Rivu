@@ -406,7 +406,7 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 | `RIVU_STATS_DELETE_INTERVAL_SECS` | `300`；`10`–`86400` | `ch_delete_batch` 检查到期删除意图的周期（worker、all） |
 | `RIVU_PUBLIC_BASE_URL` | `http://<RIVU_LISTEN_ADDR>`（仅开发；未设置时启动打 warn，生产必须设置） | 站点脚本前缀里 `endpoint` 的来源（`tracker-and-protocol.md` §2.3 的 `public_base_url`），不取请求的 `Host` |
 | `RIVU_TRACKER_DIR` | `apps/tracker/dist` | CI 构建的 tracker 产物目录（`core.js`、`meta.json`），启动时读入内存；生产镜像应把 `dist/` 放进该目录 |
-| `RIVU_SITE_CACHE_REFRESH_SECS` | `10` | 站点缓存刷新周期。P1 每个周期全量重载；按 `updated_at` 水位的增量刷新与 `pg_notify` 主动失效尚未实现（`system-design.md` §4.3） |
+| `RIVU_SITE_CACHE_REFRESH_SECS` | `10` | 站点缓存的增量刷新周期（按 `updated_at` 水位，含软删除）；另外每 5 分钟全量重载一次，并 `LISTEN rivu_site_changed` 在配置变更后立即增量刷新（`system-design.md` §4.3） |
 | `RIVU_GEOIP_DB_PATH` | `${RIVU_DATA_DIR}/geoip/geoip.mmdb` | 当前生效的 mmdb。所有来源都落在这个文件，旁边有 `.meta.json` 记录来源、ETag、SHA-256（解压后内容）、署名。没有 meta 的文件视为手工放置：默认来源时直接使用、不自动刷新；配置了 URL 或 key 时立即下载（`system-design.md` §10 Q28） |
 | `RIVU_GEOIP_DB_URL` | 空 | 自定义 mmdb 直链（http/https，`.mmdb` 或 `.mmdb.gz`），优先级最高；支持 `_FILE`。许可由运维者负责 |
 | `RIVU_MAXMIND_LICENSE_KEY`、`RIVU_MAXMIND_ACCOUNT_ID`、`RIVU_MAXMIND_EDITION` | 空；空；`GeoLite2-City` | 配置 key 后使用 MaxMind GeoLite2 并自动更新；优先级低于 `RIVU_GEOIP_DB_URL`。现行下载接口是 HTTP Basic（Account ID + license key），所以**设置 key 时 Account ID 必填**，缺失则配置校验报错（不回显 key）。返回 `tar.gz`，取其中的 `.mmdb`；每日下载上限 30 次（`system-design.md` §10 Q27） |

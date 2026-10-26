@@ -66,7 +66,9 @@ use uuid::Uuid;
 use crate::client_ip::client_ip;
 use crate::protocol::{ProtocolErrors, parse_event};
 
-pub use snapshot::{SaltCache, SiteConfig, SiteSnapshot, salt_window, utc_today};
+pub use snapshot::{
+    FULL_RELOAD_EVERY, Refresh, SaltCache, SiteConfig, SiteSnapshot, salt_window, utc_today,
+};
 
 /// 一次请求的上下文：来自 HTTP 层，不来自请求体。
 #[derive(Clone, Debug)]
