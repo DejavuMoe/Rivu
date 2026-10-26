@@ -490,9 +490,10 @@ impl Pipeline {
         Outcome::Dropped(reason)
     }
 
-    /// 清扫过期会话（按分片内事件时间水位，不用墙钟），返回移除的会话数。
+    /// 清扫过期会话（按分片内事件时间水位，水位封顶到墙钟），返回移除的会话数。
     pub fn sweep(&self) -> usize {
-        self.assigner.sweep()
+        self.assigner
+            .sweep_at(jiff::Timestamp::now().as_millisecond())
     }
 
     /// 丢掉已不在站点快照里的站点（被删除）的限流桶，返回剩下的桶数。
@@ -1122,6 +1123,42 @@ mod tests {
         assert_eq!(r.rx.try_recv().unwrap().pathname, "/");
         assert!(r.rx.try_recv().is_err(), "机器人事件不写入");
         assert_eq!(r.pipeline.assigner().len(), 1, "机器人不开会话");
+    }
+
+    #[test]
+    fn sessions_continue_after_export_and_restore_into_a_new_pipeline() {
+        let mut a = rig(10_000);
+        let t = at(date(2026, 3, 28), 12, 0);
+        let n = 400;
+        let ip = |i: u32| format!("198.51.{}.{}", i / 250, i % 250 + 1);
+        let mut first = Vec::new();
+        for i in 0..n {
+            let ua = format!("{CHROME_WIN} v{i}");
+            assert_eq!(
+                a.pipeline
+                    .process(&pageview("/a"), ctx(&ip(i), &ua, t + i64::from(i))),
+                Outcome::Accepted
+            );
+            first.push(a.rx.try_recv().unwrap().session_id);
+        }
+        let records = a.pipeline.assigner().export();
+        assert_eq!(records.len(), n as usize);
+
+        let mut b = rig(10_000);
+        assert_eq!(b.pipeline.assigner().restore(records), n as usize);
+        for i in 0..n {
+            let ua = format!("{CHROME_WIN} v{i}");
+            let eng = json!({"v":1,"s":KEY,"n":"engagement","u":"https://example.test/a","e":1000,"sd":50})
+                .to_string()
+                .into_bytes();
+            assert_eq!(
+                b.pipeline
+                    .process(&eng, ctx(&ip(i), &ua, t + 60_000 + i64::from(i))),
+                Outcome::Accepted,
+                "访客 {i}"
+            );
+            assert_eq!(b.rx.try_recv().unwrap().session_id, first[i as usize]);
+        }
     }
 
     #[test]

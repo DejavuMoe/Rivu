@@ -23,6 +23,16 @@ use serde::Serialize;
 const WARM_WINDOW_MS: i64 = 31 * 60 * 1000;
 /// 预热查询的时间上限。
 const WARM_TIMEOUT: Duration = Duration::from_secs(30);
+/// 最后活跃时间超过「现在 + 1 分钟」的会话不放回：未来的时间戳只能来自时钟回拨或别的节点时钟快，
+/// 放回只会占内存（清扫的水位封顶到墙钟，它们不会再把同一分片的活跃会话清掉）。
+const FUTURE_TOLERANCE_MS: i64 = 60_000;
+
+/// 去掉时间戳在未来的会话，返回去掉的个数。
+fn drop_future(records: &mut Vec<SessionRecord>, now_ms: i64) -> usize {
+    let before = records.len();
+    records.retain(|r| r.last_seen_ms <= now_ms + FUTURE_TOLERANCE_MS);
+    before - records.len()
+}
 
 /// 预热的结果，`/readyz` 报告用。
 #[derive(Clone, Debug, Serialize)]
@@ -30,6 +40,8 @@ pub struct WarmStatus {
     /// `snapshot`、`clickhouse` 或 `none`（两者都没有得到数据）。
     pub source: &'static str,
     pub sessions: usize,
+    /// 最后活跃时间在未来、没有放回的会话数。
+    pub future_dropped: usize,
     pub elapsed_ms: u64,
     /// 快照不可用的原因（文件不存在不算）。
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -84,6 +96,7 @@ pub async fn warm(pipeline: &Pipeline, data_dir: &Path, ch: &Client) -> WarmStat
     let mut status = WarmStatus {
         source: "none",
         sessions: 0,
+        future_dropped: 0,
         elapsed_ms: 0,
         snapshot_error: None,
         clickhouse_error: None,
@@ -94,8 +107,9 @@ pub async fn warm(pipeline: &Pipeline, data_dir: &Path, ch: &Client) -> WarmStat
         tokio::task::spawn_blocking(move || snapshot::read_file(&path, now_ms())).await
     };
     match read {
-        Ok(Ok(Some(records))) => {
+        Ok(Ok(Some(mut records))) => {
             status.source = "snapshot";
+            status.future_dropped = drop_future(&mut records, now_ms());
             status.sessions = pipeline.assigner().restore(records);
         }
         Ok(Ok(None)) => {}
@@ -118,9 +132,9 @@ pub async fn warm(pipeline: &Pipeline, data_dir: &Path, ch: &Client) -> WarmStat
         {
             Ok(Ok(rows)) => {
                 status.source = "clickhouse";
-                status.sessions = pipeline
-                    .assigner()
-                    .restore(rows.into_iter().map(from_warm).collect());
+                let mut records: Vec<SessionRecord> = rows.into_iter().map(from_warm).collect();
+                status.future_dropped = drop_future(&mut records, now_ms());
+                status.sessions = pipeline.assigner().restore(records);
             }
             Ok(Err(e)) => status.clickhouse_error = Some(e.to_string()),
             Err(_) => {
@@ -139,6 +153,7 @@ pub async fn warm(pipeline: &Pipeline, data_dir: &Path, ch: &Client) -> WarmStat
     tracing::info!(
         source = status.source,
         sessions = status.sessions,
+        future_dropped = status.future_dropped,
         elapsed_ms = status.elapsed_ms,
         "会话预热完成"
     );
