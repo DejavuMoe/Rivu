@@ -166,8 +166,8 @@ pub struct Pipeline {
     assigner: SessionAssigner,
     writer: WriterHandle,
     trusted_proxies: Vec<Cidr>,
-    /// 分片号用的长期密钥。Lite 不持久化它：重启后随机重新生成，内存里的会话也随之清空
-    /// （从 ClickHouse 预热留到以后，§4.6「预热」、§10 Q15）。
+    /// 分片号用的长期密钥（§4.5）。[`Pipeline::new`] 先给一个随机值，装配代码用
+    /// [`Pipeline::with_routing_secret`] 换成 PG 里持久化的那一个：重启前后、各副本之间分片一致，预热才对得上（§4.6）。
     routing_secret: Salt,
     ua: Arc<UaParser>,
     geo: Arc<GeoDb>,
@@ -216,6 +216,12 @@ impl Pipeline {
     /// 各富化步骤已执行的次数。
     pub fn enrich_work(&self) -> &EnrichWork {
         &self.work
+    }
+
+    /// 换成持久化的 routing 密钥（`instance_secrets`）。
+    pub fn with_routing_secret(mut self, routing_secret: Salt) -> Self {
+        self.routing_secret = routing_secret;
+        self
     }
 
     /// 换成指定的 routing 密钥和会话参数（测试用，让分片和 `session_id` 可复现）。

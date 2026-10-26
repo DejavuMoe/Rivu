@@ -3,7 +3,7 @@
 //! 装配（按角色）：
 //! - collector / all：BatchWriter（`rivu_writer` 账号）、站点快照（含屏蔽规则与站点限额）、盐缓存、UA 解析器、
 //!   接入管线（hostname、限流、垃圾引荐、屏蔽规则、机器人、地理、UA、来源）、
-//!   会话清扫、站点脚本分发（`GET /js/<site_key>.js`，`core.js` 启动时从 `RIVU_TRACKER_DIR` 读入）；
+//!   会话预热（关停快照或 ClickHouse，开始服务之前完成）与清扫、站点脚本分发（`GET /js/<site_key>.js`，`core.js` 启动时从 `RIVU_TRACKER_DIR` 读入）；
 //! - worker / all：后台任务 `salts_rotate`（启动时补跑一次，之后每小时一次）、`geoip_refresh`
 //!   （无本地副本时立即下载，之后按 `RIVU_GEOIP_REFRESH_INTERVAL` 条件 GET）、`ch_delete_batch`
 //!   （启动后一轮，之后每 `RIVU_STATS_DELETE_INTERVAL_SECS` 一轮，`rivu_maintainer` 账号）；
@@ -12,7 +12,7 @@
 //!   `rivu_reader` 账号的 ClickHouse 客户端、API key 鉴权与按组织限流（[`crate::api_auth::build_guard`]）；
 //!   api 角色也持有 GeoIP 库（只用来在 `meta` 里回显署名与精度），其余 `/api/*` 返回 501，也可用命令行 `rivu stats` 查询。
 //!
-//! 关停顺序：停止接收（HTTP 服务优雅关停）→ 停止后台刷新任务 → 排空 BatchWriter 并 flush →
+//! 关停顺序：停止接收（HTTP 服务优雅关停）→ 停止后台刷新任务 → 写会话快照 → 排空 BatchWriter 并 flush →
 //! 刷出全部接入计数（包括还没结束的 10 秒桶）。
 
 use std::net::SocketAddr;
@@ -40,12 +40,15 @@ use crate::internal::{self, CollectorReadiness, GeoReadiness, InternalState, Pro
 use crate::public;
 use crate::query_api::{self, QueryApi};
 use crate::script::{ScriptService, TrackerAssets};
+use crate::session_warm;
 
 /// collector 比较 GeoIP 库文件修改时间的周期（`platform-and-ops.md` §6：每小时）。
 const GEO_RELOAD_CHECK_INTERVAL: Duration = Duration::from_secs(3600);
 
 /// 盐缓存的重载周期（`platform-and-ops.md` §3.3：各进程每 60 秒从 PG 刷新）。
 const SALT_CACHE_REFRESH: Duration = Duration::from_secs(60);
+/// 启动时读取 routing 密钥的时间上限。
+const ROUTING_SECRET_TIMEOUT: Duration = Duration::from_secs(10);
 /// 会话清扫周期（§4.6「过期」）。
 const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -132,7 +135,10 @@ async fn start_collector(
         .as_ref()
         .context("collector 需要 RIVU_CH_WRITER_USER / RIVU_CH_WRITER_PASSWORD")?;
     let ch = rivu_storage_ch::writer_client(&config.clickhouse_url, account, &config.ch_database);
-    let writer = BatchWriter::spawn(Arc::new(ChSink::new(ch)), WriterOptions::new(config.buffer));
+    let writer = BatchWriter::spawn(
+        Arc::new(ChSink::new(ch.clone())),
+        WriterOptions::new(config.buffer),
+    );
 
     let sites = Arc::new(SiteSnapshot::new());
     let salts = Arc::new(SaltCache::new());
@@ -147,6 +153,25 @@ async fn start_collector(
     }
     background.push(sites.spawn_refresh(pg.clone(), config.site_cache_refresh, stop.clone()));
     background.push(salts.spawn_refresh(pg.clone(), SALT_CACHE_REFRESH, stop.clone()));
+
+    // 分片号的 routing 密钥：PG 里持久化，重启前后一致，会话预热才对得上（§4.5、§4.6）。
+    // 读不到时用随机值照常启动，代价是本次运行之前的会话无法续上。
+    let routing_secret = match tokio::time::timeout(
+        ROUTING_SECRET_TIMEOUT,
+        rivu_storage_pg::salts::routing_secret(pg),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            tracing::warn!(error = %format!("{e:#}"), "读取 routing 密钥失败，本次运行用随机值：会话无法预热");
+            rand::random()
+        }
+        Err(_) => {
+            tracing::warn!("读取 routing 密钥超时，本次运行用随机值：会话无法预热");
+            rand::random()
+        }
+    };
 
     // uap-core 规则的编译约 130 ms（release），放到阻塞线程里，不占用异步工作线程。
     let ua = Arc::new(
@@ -164,8 +189,11 @@ async fn start_collector(
             ua,
             geo_db,
         )
-        .with_default_ingest_rate(config.ingest_rate_limit_per_min),
+        .with_default_ingest_rate(config.ingest_rate_limit_per_min)
+        .with_routing_secret(routing_secret),
     );
+    // 开始服务之前预热会话：关停快照，或从 ClickHouse 重建（§4.6「预热」）。
+    let sessions = Arc::new(session_warm::warm(&pipeline, &config.geo.data_dir, &ch).await);
     background.push(pipeline.spawn_sweeper(SESSION_SWEEP_INTERVAL, stop.clone()));
 
     // 站点脚本：core.js 启动时读入并缓存；缺失不阻止启动，路由返回 503，/readyz 报告。
@@ -184,7 +212,11 @@ async fn start_collector(
 
     Ok(Collector {
         pipeline,
-        readiness: CollectorReadiness { sites, salts },
+        readiness: CollectorReadiness {
+            sites,
+            salts,
+            sessions,
+        },
         writer,
         tracker,
         scripts,
@@ -431,6 +463,7 @@ pub async fn run(config: Config) -> Result<ExitCode> {
     }
     let drained = match collector {
         Some(c) => {
+            session_warm::save(&c.pipeline, &config.geo.data_dir).await;
             drop(c.pipeline);
             c.writer.shutdown().await
         }
