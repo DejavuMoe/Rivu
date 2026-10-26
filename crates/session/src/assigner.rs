@@ -104,6 +104,22 @@ pub struct SessionView {
     pub key_count: usize,
 }
 
+/// 一个会话的完整状态，供关停快照与预热用（`system-design.md` §4.6「预热」）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionRecord {
+    pub site_id: u64,
+    pub session_id: u64,
+    /// 第一个是会话的原始 ID，其余是别名；从 ClickHouse 预热时只有 `last_visitor_id` 一个。
+    pub keys: Vec<u64>,
+    pub started_at_ms: i64,
+    pub last_seen_ms: i64,
+    /// 会话第一个 pageview 的 pathname；还没有 pageview 时为 `None`。
+    pub entry: Option<String>,
+    pub attrs: SessionAttrs,
+    /// 分片号，即 `routing % 32`（Q15）。
+    pub partition: u8,
+}
+
 struct Session {
     site_id: u64,
     id: u64,
@@ -291,6 +307,65 @@ impl Shard {
         Assignment::Stamped(stamp)
     }
 
+    /// 放回一个会话。会话已满、id 重复或没有 key 时跳过，返回是否放回。
+    /// 调用方按 `last_seen` 升序放回：同一个 key 指向多个会话时，最近活跃的那个占用索引。
+    fn restore(&mut self, cap: usize, empty: &Arc<str>, r: SessionRecord) -> bool {
+        if r.keys.is_empty()
+            || r.session_id == 0
+            || self.sessions.len() >= cap
+            || self.sessions.contains_key(&r.session_id)
+        {
+            return false;
+        }
+        self.next_tick += 1;
+        let tick = self.next_tick;
+        let mut keys = r.keys;
+        keys.truncate(MAX_KEYS);
+        for k in &keys {
+            self.index.insert((r.site_id, *k), r.session_id);
+        }
+        let (entry, has_entry) = match r.entry {
+            Some(p) => (Arc::from(p), true),
+            None => (Arc::clone(empty), false),
+        };
+        self.sessions.insert(
+            r.session_id,
+            Session {
+                site_id: r.site_id,
+                id: r.session_id,
+                keys,
+                started_at: r.started_at_ms,
+                last_seen: r.last_seen_ms,
+                entry,
+                has_entry,
+                attrs: Arc::new(r.attrs),
+                tick,
+            },
+        );
+        self.lru.insert(tick, r.session_id);
+        self.watermark = self.watermark.max(r.last_seen_ms);
+        true
+    }
+
+    fn export(&self, partition: u8, out: &mut Vec<SessionRecord>) {
+        // 按 LRU 顺序导出，放回时保持相对顺序。
+        for sid in self.lru.values() {
+            let Some(s) = self.sessions.get(sid) else {
+                continue;
+            };
+            out.push(SessionRecord {
+                site_id: s.site_id,
+                session_id: s.id,
+                keys: s.keys.clone(),
+                started_at_ms: s.started_at,
+                last_seen_ms: s.last_seen,
+                entry: s.has_entry.then(|| s.entry.to_string()),
+                attrs: (*s.attrs).clone(),
+                partition,
+            });
+        }
+    }
+
     fn sweep(&mut self, timeout_ms: i64) -> usize {
         if self.watermark == i64::MIN {
             return 0;
@@ -357,6 +432,39 @@ impl SessionAssigner {
             .iter()
             .map(|s| s.lock().sweep(self.cfg.timeout_ms))
             .sum()
+    }
+
+    /// 导出全部会话（含别名 key），写关停快照用。逐片加锁，分片之间不是同一时刻的视图，
+    /// 所以只在停止接收事件之后调用。
+    pub fn export(&self) -> Vec<SessionRecord> {
+        let mut out = Vec::with_capacity(self.len());
+        for (i, s) in self.shards.iter().enumerate() {
+            s.lock().export(i as u8, &mut out);
+        }
+        out
+    }
+
+    /// 放回会话（预热），返回放回的个数。按 `last_seen` 升序处理：同一个 key 指向多个会话时，
+    /// 最近活跃的会话占用索引；每片超过 `max_sessions` 的部分丢弃最久未活跃的。
+    /// 不计入 `sessions_started`。
+    pub fn restore(&self, mut records: Vec<SessionRecord>) -> usize {
+        records.sort_by_key(|r| r.last_seen_ms);
+        // 每片只保留最近的 shard_cap 个，避免先放满旧会话、新会话反而放不进去。
+        let mut per_shard: Vec<Vec<SessionRecord>> = (0..SHARDS).map(|_| Vec::new()).collect();
+        for r in records {
+            per_shard[usize::from(r.partition) % SHARDS].push(r);
+        }
+        let mut restored = 0;
+        for (i, mut list) in per_shard.into_iter().enumerate() {
+            let skip = list.len().saturating_sub(self.shard_cap);
+            let mut shard = self.shards[i].lock();
+            for r in list.drain(skip..) {
+                if shard.restore(self.shard_cap, &self.empty, r) {
+                    restored += 1;
+                }
+            }
+        }
+        restored
     }
 
     /// 当前保留的会话数（含已超时但尚未清扫的）。
@@ -710,6 +818,77 @@ mod tests {
             stamped(a.assign(&ev(1, None, 0, EventKind::Pageview, "/"))).session_id,
             0
         );
+    }
+
+    #[test]
+    fn export_then_restore_continues_sessions_with_aliases() {
+        let a = assigner();
+        let s0 = stamped(a.assign(&ev(10, None, 0, EventKind::Custom, "/x")));
+        // 跨午夜，加别名 11；入口页在别名之后才出现
+        stamped(a.assign(&ev(11, Some(10), MIN, EventKind::Pageview, "/entry")));
+        let other = stamped(a.assign(&Incoming {
+            routing: 77,
+            ..ev(50, None, 2 * MIN, EventKind::Pageview, "/o")
+        }));
+        let records = a.export();
+        assert_eq!(records.len(), 2);
+
+        let b = SessionAssigner::with_seed(SessionConfig::default(), 99);
+        assert_eq!(b.restore(records), 2);
+        assert_eq!(b.len(), 2);
+        assert_eq!(b.stats().sessions_started, 0, "放回不算新会话");
+        // 原始 key 与别名都能续上，会话字段不变
+        let late = stamped(b.assign(&ev(10, None, 3 * MIN, EventKind::Pageview, "/y")));
+        assert_eq!(late.session_id, s0.session_id);
+        assert_eq!(late.session_start_ms, 0);
+        assert_eq!(&*late.entry_pathname, "/entry");
+        let alias = stamped(b.assign(&ev(11, None, 4 * MIN, EventKind::Engagement, "/y")));
+        assert_eq!(alias.session_id, s0.session_id);
+        assert_eq!(b.peek(SITE, ROUTING, 11).unwrap().key_count, 2);
+        let o = stamped(b.assign(&Incoming {
+            routing: 77,
+            ..ev(50, None, 5 * MIN, EventKind::Pageview, "/o2")
+        }));
+        assert_eq!(o.session_id, other.session_id);
+        // 水位随放回推进：超时后清扫照常
+        stamped(b.assign(&ev(99, None, 60 * MIN, EventKind::Pageview, "/")));
+        assert_eq!(b.sweep(), 1, "会话 s0 在同一分片，已超时");
+    }
+
+    #[test]
+    fn restore_gives_shared_key_to_most_recent_session_and_respects_cap() {
+        let rec = |sid: u64, key: u64, seen: i64| SessionRecord {
+            site_id: SITE,
+            session_id: sid,
+            keys: vec![key],
+            started_at_ms: seen,
+            last_seen_ms: seen,
+            entry: Some("/".into()),
+            attrs: SessionAttrs::default(),
+            partition: (ROUTING % SHARDS as u64) as u8,
+        };
+        let a = assigner();
+        // 先给新的，再给旧的：仍由最近活跃的会话占用 key 7
+        assert_eq!(a.restore(vec![rec(2, 7, 10 * MIN), rec(1, 7, MIN)]), 2);
+        assert_eq!(a.peek(SITE, ROUTING, 7).unwrap().session_id, 2);
+        // id 为 0、没有 key、id 重复的都跳过
+        let mut no_keys = rec(3, 8, MIN);
+        no_keys.keys.clear();
+        assert_eq!(a.restore(vec![rec(0, 9, MIN), no_keys, rec(2, 10, MIN)]), 0);
+
+        // 每片上限 2：只留最近的两个
+        let small = SessionAssigner::with_seed(
+            SessionConfig {
+                max_sessions: 64,
+                ..SessionConfig::default()
+            },
+            1,
+        );
+        let n = small.restore((1..=5).map(|i| rec(i, 100 + i, i as i64 * MIN)).collect());
+        assert_eq!(n, 2);
+        assert!(small.peek(SITE, ROUTING, 105).is_some());
+        assert!(small.peek(SITE, ROUTING, 104).is_some());
+        assert!(small.peek(SITE, ROUTING, 103).is_none());
     }
 
     #[test]

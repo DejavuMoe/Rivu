@@ -32,6 +32,28 @@ pub async fn ensure_salts(pool: &PgPool, days: &[Date]) -> Result<u64> {
     Ok(inserted)
 }
 
+/// 分片号用的 routing 密钥（`instance_secrets` 里 `name = 'routing'`）：不存在就写入一个随机值，
+/// 并发启动的 collector 以先写入的为准，之后所有进程读到同一个值（`system-design.md` §4.5）。
+pub async fn routing_secret(pool: &PgPool) -> Result<Salt> {
+    let mut fresh = [0u8; 16];
+    rand::rng().fill_bytes(&mut fresh);
+    sqlx::query(
+        "INSERT INTO instance_secrets (name, value) VALUES ('routing', $1) ON CONFLICT (name) DO NOTHING",
+    )
+    .bind(fresh.as_slice())
+    .execute(pool)
+    .await
+    .context("写入 routing 密钥失败")?;
+    let value: Vec<u8> =
+        sqlx::query_scalar("SELECT value FROM instance_secrets WHERE name = 'routing'")
+            .fetch_one(pool)
+            .await
+            .context("读取 routing 密钥失败")?;
+    value
+        .try_into()
+        .map_err(|v: Vec<u8>| anyhow::anyhow!("routing 密钥长度是 {} 字节，应为 16", v.len()))
+}
+
 /// 删除 `day` 之前（不含）的盐。返回删除的行数。
 pub async fn delete_salts_before(pool: &PgPool, day: Date) -> Result<u64> {
     let result = sqlx::query("DELETE FROM salts WHERE day < ($1::text)::date")

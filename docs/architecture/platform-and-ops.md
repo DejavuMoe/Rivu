@@ -30,7 +30,7 @@ Lite 的会话分配依赖单写者，只允许一个 `all`（或一个 `collect
 - 密码走 Docker secrets（`secrets:` + `*_FILE`），不写进 `environment`。
 - 固定 compose 网络子网（如 `172.28.0.0/24`），`RIVU_TRUSTED_PROXIES` 设为该子网；`stop_grace_period: 40s`，配合进程内优雅关闭（停止接收、flush 写缓冲，最长 30s）。
 - 同一 Dockerfile 两个 target：`rivu`（二进制）与 `web`（Caddy + 构建好的 `apps/dashboard` 静态文件），使 Caddy 可托管后台而 `rivu` 子命令仍共用一个镜像。
-- 命名卷：`rivu-pg-data`（postgres）、`rivu-ch-data`（clickhouse）、`rivu-nats-data`（nats，JetStream 保留 24–72h）、`rivu-data`（`RIVU_DATA_DIR`：GeoIP 库与本地导出，单机共享，对 collector 只读）、`caddy-data`、`caddy-config`。
+- 命名卷：`rivu-pg-data`（postgres）、`rivu-ch-data`（clickhouse）、`rivu-nats-data`（nats，JetStream 保留 24–72h）、`rivu-data`（`RIVU_DATA_DIR`：GeoIP 库、本地导出与会话关停快照 `sessions.snapshot`，单机共享；collector 只写会话快照）、`caddy-data`、`caddy-config`。
 
 ### 1.3 Caddy 路由
 | 优先级 | 匹配 | 上游 |
@@ -413,7 +413,7 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 | `RIVU_DBIP_EDITION` | `city` | 默认来源 DB-IP Lite 的版本：`city` \| `country`（CC BY 4.0，需署名）。下载的 gz 约 60 MB / 4 MB，解压后约 121 MiB / 8 MiB 读入内存；两个版本都只有国家码，没有子区划码和 GeoNames id（`system-design.md` §10 Q24） |
 | `RIVU_GEOIP_REFRESH_INTERVAL` | `24h`；下限 `1h`；`0` 关闭 | 条件 GET 的刷新周期（加 ±10% 抖动），对三种来源都生效；MaxMind 每日下载额度 30 次，不要设得太短 |
 | `RIVU_GEOIP_ATTRIBUTION_TEXT`、`RIVU_GEOIP_ATTRIBUTION_URL` | 空 | 自定义来源（或手工放置的文件）的署名文本和链接，看板显示、查询 API 的 `meta.geo_attribution` 返回；DB-IP 和 MaxMind 使用内置署名，不读这两个变量 |
-| `RIVU_DATA_DIR` | `/var/lib/rivu` | GeoIP 与本地导出 |
+| `RIVU_DATA_DIR` | `/var/lib/rivu` | GeoIP、本地导出、会话关停快照（`sessions.snapshot`，`system-design.md` §4.6） |
 | `RIVU_JOBS`、`RIVU_JOBS_CONCURRENCY` | 见 1.1；`4` | 任务开关与同进程并发数 |
 | `RIVU_API_RATE_PER_HOUR`、`RIVU_API_BURST` | `10000`、`60`（范围 1–100000000、1–1000000） | org 默认小时配额（`organizations.api_hourly_limit` 可覆盖）与突发令牌桶容量，实际容量为 `min(RIVU_API_BURST, 配额)`（§4.4） |
 | `RIVU_PUBLIC_VIEW_RATE_PER_MIN`、`RIVU_PUBLIC_VIEW_BURST` | `300`、`60`（范围都是 1–1000000） | 公开看板与共享链接每个 `(客户端 IP, 站点或链接)` 的每分钟请求数与突发令牌桶容量，实际容量为 `min(RIVU_PUBLIC_VIEW_BURST, 每分钟次数)`（§4.4） |
@@ -434,7 +434,7 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 | PostgreSQL | `rivu_migrator` | `migrate` | 库 owner，可 DDL | 仅 `migrate` 持有 |
 | PostgreSQL | `rivu_app` | collector、worker、api、all | 表 `SELECT/INSERT/UPDATE/DELETE`、序列 `USAGE`；无 DDL | `ALTER DEFAULT PRIVILEGES FOR ROLE rivu_migrator` 使新表自动授权 |
 | ClickHouse | `rivu_migrator` | `migrate` | `CREATE, ALTER, DROP, TRUNCATE, INSERT, SELECT, SHOW ON rivu.*`（含建库） | 仅 `migrate` 持有凭据。物化视图在迁移里显式写 `DEFINER = CURRENT_USER SQL SECURITY DEFINER`，以它的身份运行，所以这个账号不能删除（25.8 已验证，核实报告 E3） |
-| ClickHouse | `rivu_writer` | collector、worker | `INSERT ON rivu.*`；`SELECT ON rivu.schema_migrations` | 只跑 collector 时 `/readyz` 用它读迁移版本；没有其他 `SELECT`，无 DDL。INSERT 的 settings 见 `system-design.md` |
+| ClickHouse | `rivu_writer` | collector、worker | `INSERT ON rivu.*`；`SELECT ON rivu.schema_migrations`、`SELECT ON rivu.sessions` | 只跑 collector 时 `/readyz` 用它读迁移版本；collector 启动时用它从 `sessions` 预热会话（`system-design.md` §4.6）；没有其他 `SELECT`，无 DDL。INSERT 的 settings 见 `system-design.md` |
 | ClickHouse | `rivu_reader` | api | `SELECT ON rivu.*`；profile `readonly=1` | `max_execution_time` 上限 20s、`max_memory_usage`（默认 4GiB，按机器调）、`max_rows_to_read`、`max_result_rows`、`max_concurrent_queries_for_user`；按小时限查询数的 quota |
 | ClickHouse | `rivu_maintainer`（本文新增） | worker 的 jobs | `ALTER DELETE`、`SELECT`，以及 `events`、`sessions`、`ingest_counters` 上 `ALTER UPDATE(_row_exists)`（25.8 的轻量删除改写这一隐藏列，缺它报 `ACCESS_DENIED`，见 `deploy/clickhouse/users.d/rivu-dev.xml`）；rollup 表（P2）建好后再授予这些表的 `INSERT` | ClickHouse 没有单独的 DROP PARTITION 权限，`DROP PARTITION` 也由 `ALTER DELETE` 控制（E7）。删除批处理与 rollup 构建需要；不让 `rivu_writer` 带这些权限，也不复用 migrator |
 | ClickHouse | `rivu_backup`（运维） | 备份脚本 | `BACKUP`、`SELECT` | 与应用凭据分离 |

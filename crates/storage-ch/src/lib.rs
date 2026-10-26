@@ -2,6 +2,7 @@
 
 pub mod diagnostics;
 pub mod rows;
+pub mod sessions_warm;
 
 use anyhow::{Context, Result};
 use clickhouse::{Client, Compression, Row};

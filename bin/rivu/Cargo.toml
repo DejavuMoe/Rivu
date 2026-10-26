@@ -31,11 +31,13 @@ moka.workspace = true
 rand.workspace = true
 rivu-auth.workspace = true
 rivu-common.workspace = true
+rivu-domain.workspace = true
 rivu-geo.workspace = true
 rivu-ingest.workspace = true
 rivu-jobs.workspace = true
 rivu-query.workspace = true
 rivu-ratelimit.workspace = true
+rivu-session.workspace = true
 rivu-storage-ch.workspace = true
 rivu-storage-pg.workspace = true
 rivu-ua.workspace = true
@@ -49,9 +51,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 clickhouse = { workspace = true, features = ["time", "uuid"] }
-rivu-domain.workspace = true
 rivu-reference.workspace = true
-rivu-session.workspace = true
 serde_json.workspace = true
 time.workspace = true
 tower.workspace = true
