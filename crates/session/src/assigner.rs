@@ -366,11 +366,12 @@ impl Shard {
         }
     }
 
-    fn sweep(&mut self, timeout_ms: i64) -> usize {
+    fn sweep(&mut self, timeout_ms: i64, now_ms: i64) -> usize {
         if self.watermark == i64::MIN {
             return 0;
         }
-        let horizon = self.watermark.saturating_sub(timeout_ms);
+        // 水位不超过墙钟：一个时间戳在未来的会话（时钟回拨、别的节点时钟快）不能把整片的活跃会话都判成过期
+        let horizon = self.watermark.min(now_ms).saturating_sub(timeout_ms);
         let expired: Vec<u64> = self
             .sessions
             .values()
@@ -425,12 +426,18 @@ impl SessionAssigner {
             .assign(&self.cfg, self.shard_cap, &self.empty, ev, shard as u8)
     }
 
-    /// 按各分片「事件时间水位 − timeout」清扫过期会话，返回移除的会话数。
+    /// 按各分片「事件时间水位 − timeout」清扫过期会话，返回移除的会话数（纯事件时间，测试与重放用）。
     /// 一次移除会话的全部 key，且只删除仍指向该会话的索引项。
     pub fn sweep(&self) -> usize {
+        self.sweep_at(i64::MAX)
+    }
+
+    /// 同 [`sweep`](Self::sweep)，但水位不超过 `now_ms`（墙钟）：未来时间戳的会话不会让同一分片的活跃会话被清掉；
+    /// 积压重放时水位落后于墙钟，不受影响。
+    pub fn sweep_at(&self, now_ms: i64) -> usize {
         self.shards
             .iter()
-            .map(|s| s.lock().sweep(self.cfg.timeout_ms))
+            .map(|s| s.lock().sweep(self.cfg.timeout_ms, now_ms))
             .sum()
     }
 
@@ -772,6 +779,20 @@ mod tests {
     }
 
     #[test]
+    fn a_future_session_does_not_sweep_live_sessions_when_capped_by_wall_clock() {
+        let now = 10 * DAY;
+        let a = assigner();
+        // 同一分片：一个正常会话，一个时间戳在一天之后的会话（时钟回拨或别的节点时钟快）
+        stamped(a.assign(&ev(10, None, now - MIN, EventKind::Pageview, "/")));
+        stamped(a.assign(&ev(11, None, now + DAY, EventKind::Pageview, "/")));
+        assert_eq!(a.sweep_at(now), 0, "水位封顶到墙钟，正常会话不过期");
+        assert!(a.peek(SITE, ROUTING, 10).is_some());
+        // 纯事件时间的清扫会把它清掉（这正是要避免的）
+        assert_eq!(a.sweep(), 1);
+        assert!(a.peek(SITE, ROUTING, 10).is_none());
+    }
+
+    #[test]
     fn lru_evicts_least_recently_used_whole_session() {
         // 每片上限 = ceil(64 / 32) = 2。
         let cfg = SessionConfig {
@@ -853,6 +874,29 @@ mod tests {
         // 水位随放回推进：超时后清扫照常
         stamped(b.assign(&ev(99, None, 60 * MIN, EventKind::Pageview, "/")));
         assert_eq!(b.sweep(), 1, "会话 s0 在同一分片，已超时");
+    }
+
+    #[test]
+    fn many_sessions_survive_export_and_restore() {
+        let a = SessionAssigner::with_seed(SessionConfig::default(), 3);
+        let mut want = Vec::new();
+        for i in 0..5_000u64 {
+            let v = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let e = Incoming {
+                routing: v.rotate_left(17),
+                ..ev(v, None, i as i64, EventKind::Pageview, "/")
+            };
+            want.push((v, stamped(a.assign(&e)).session_id));
+        }
+        let b = SessionAssigner::with_seed(SessionConfig::default(), 4);
+        assert_eq!(b.restore(a.export()), 5_000);
+        for (i, (v, sid)) in want.iter().enumerate() {
+            let e = Incoming {
+                routing: v.rotate_left(17),
+                ..ev(*v, None, 5_000 + i as i64, EventKind::Engagement, "/")
+            };
+            assert_eq!(stamped(b.assign(&e)).session_id, *sid, "访客 {i}");
+        }
     }
 
     #[test]
