@@ -1,0 +1,75 @@
+{
+  "window": [
+    1793056260,
+    1793056380
+  ],
+  "sites": [
+    0,
+    2180,
+    2181,
+    2182
+  ],
+  "edge": {
+    "by_class": {
+      "accepted": 17803,
+      "dropped": 238,
+      "http_layer": 2,
+      "rejected": 40
+    },
+    "by_status": {
+      "202": 18041,
+      "400": 40,
+      "413": 2
+    },
+    "per_minute": {
+      "1793056260": [
+        7536,
+        109,
+        0
+      ],
+      "1793056320": [
+        10267,
+        129,
+        0
+      ]
+    },
+    "first_ts": 1793056294.20945,
+    "last_ts": 1793056354.5835876,
+    "unparsable_lines": 0
+  },
+  "counters_by_metric": {
+    "accepted": 17803,
+    "dropped_bot": 56,
+    "dropped_no_session": 67,
+    "dropped_spam_referrer": 75,
+    "dropped_unknown_site": 40
+  },
+  "checks": [
+    {
+      "name": "202 未丢弃 = accepted",
+      "edge": 17803,
+      "counters": 17803,
+      "ok": true
+    },
+    {
+      "name": "202 + x-rivu-dropped = dropped_*（不含 overloaded）",
+      "edge": 238,
+      "counters": 238,
+      "ok": true
+    },
+    {
+      "name": "503 = dropped_overloaded",
+      "edge": 0,
+      "counters": 0,
+      "ok": true
+    },
+    {
+      "name": "合计：202 + 503 = 全部计数",
+      "edge": 18041,
+      "counters": 18041,
+      "ok": true
+    }
+  ],
+  "minute_diffs": [],
+  "ok": true
+}

@@ -21,6 +21,7 @@ members = [
     "crates/ua",
     "crates/writer",
     "tools/loadgen",
+    "tools/reconcile",
 ]
 
 [workspace.package]
