@@ -440,11 +440,11 @@ impl Clock<'_> {
                 other => {
                     if let Some(n) = other.strip_suffix("mo") {
                         let n: i64 = n.parse().map_err(|_| "months")?;
-                        let this_month = today.first_of_month();
-                        let from = this_month
-                            .checked_sub(Span::new().months(n))
+                        let from = today
+                            .first_of_month()
+                            .checked_sub(Span::new().months(n - 1))
                             .map_err(|e| e.to_string())?;
-                        self.day_iv(from, this_month.yesterday().map_err(|e| e.to_string())?)
+                        self.day_iv(from, today)
                     } else if let Some(n) = other.strip_suffix('d') {
                         let n: i64 = n.parse().map_err(|_| "days")?;
                         let from = today

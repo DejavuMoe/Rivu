@@ -49,7 +49,7 @@ expression: "crate::schema_json()"
           "type": "string"
         },
         {
-          "description": "N full calendar months ending last month (1 to 100), e.g. 6mo, 12mo.",
+          "description": "N calendar months ending today, this month included (1 to 100), e.g. 6mo, 12mo.",
           "pattern": "^[0-9]{1,9}mo$",
           "type": "string"
         },
