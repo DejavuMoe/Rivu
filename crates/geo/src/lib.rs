@@ -5,8 +5,11 @@
 //! - [`Attribution`]：署名，跟随实际加载的库。
 //!
 //! 管线接入（第 6 步「地理」）另行进行；刷新任务在 `rivu-jobs` 里（`geoip_refresh`）。
+//!
+//! [`datacenter`]：可选的数据中心网段表（第 5 步，`datacenter_ip`），同样是「下载 → 文件 → 热加载」。
 
 mod attribution;
+pub mod datacenter;
 mod db;
 mod meta;
 mod refresh;
