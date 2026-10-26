@@ -1,0 +1,24 @@
+[package]
+name = "reident"
+description = "重识别测试：对 ClickHouse 的事件数据（与 PG 的盐）检查跨天关联、准标识符唯一性、URL 与属性里的个人信息、盐的寿命与暴力还原成本"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap = { workspace = true, features = ["env"] }
+clickhouse.workspace = true
+rivu-common.workspace = true
+rivu-session.workspace = true
+rivu-storage-ch.workspace = true
+rivu-storage-pg.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
