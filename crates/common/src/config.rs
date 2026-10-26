@@ -282,6 +282,12 @@ pub const DEFAULT_INGEST_RATE_LIMIT_PER_MIN: u32 = 300_000;
 /// 站点缓存的全量重载周期默认值（`RIVU_SITE_CACHE_REFRESH_SECS`）。
 pub const DEFAULT_SITE_CACHE_REFRESH_SECS: u64 = 10;
 
+/// `RIVU_SITE_RESTORE_DAYS` 的默认值：站点软删除后可以恢复的天数，过后清除统计数据（`platform-and-ops.md` §6）。
+pub const DEFAULT_SITE_RESTORE_DAYS: u32 = 7;
+
+/// `RIVU_STATS_DELETE_INTERVAL_SECS` 的默认值：`ch_delete_batch` 检查到期删除意图的周期。
+pub const DEFAULT_STATS_DELETE_INTERVAL_SECS: u64 = 300;
+
 /// `RIVU_TRACKER_DIR` 的默认值：仓库里 `apps/tracker` 的构建输出（相对进程工作目录）。
 pub const DEFAULT_TRACKER_DIR: &str = "apps/tracker/dist";
 
@@ -495,6 +501,10 @@ pub struct Config {
     pub ingest_rate_limit_per_min: Option<u32>,
     /// `RIVU_SITE_CACHE_REFRESH_SECS`：站点快照全量重载周期（P1 没有增量刷新和 LISTEN/NOTIFY）。
     pub site_cache_refresh: Duration,
+    /// `RIVU_SITE_RESTORE_DAYS`：站点软删除后的恢复窗口（天）；`0` 表示下一轮 `ch_delete_batch` 就清除统计数据。
+    pub site_restore_days: u32,
+    /// `RIVU_STATS_DELETE_INTERVAL_SECS`：`ch_delete_batch`（统计数据删除）的检查周期，worker / all 运行。
+    pub stats_delete_interval: Duration,
     /// `RIVU_PUBLIC_BASE_URL`（去掉结尾的 `/`）：站点脚本前缀里 `endpoint` 的来源（`tracker-and-protocol.md` §2.3，
     /// 不取请求的 `Host`）。未设置时取 `http://<RIVU_LISTEN_ADDR>`，只适合开发。
     pub public_base_url: String,
@@ -725,6 +735,13 @@ impl Config {
             DEFAULT_SITE_CACHE_REFRESH_SECS,
             1..=3600,
         );
+        let site_restore_days =
+            l.parse_in_range("RIVU_SITE_RESTORE_DAYS", DEFAULT_SITE_RESTORE_DAYS, 0..=365);
+        let stats_delete_interval_secs = l.parse_in_range(
+            "RIVU_STATS_DELETE_INTERVAL_SECS",
+            DEFAULT_STATS_DELETE_INTERVAL_SECS,
+            10..=86_400,
+        );
 
         let public_base_url = l.optional("RIVU_PUBLIC_BASE_URL");
         if let Some(u) = &public_base_url {
@@ -809,6 +826,8 @@ impl Config {
             shield_max_rules_per_site,
             ingest_rate_limit_per_min,
             site_cache_refresh: Duration::from_secs(site_cache_refresh_secs),
+            site_restore_days,
+            stats_delete_interval: Duration::from_secs(stats_delete_interval_secs),
             public_base_url,
             public_base_url_explicit,
             base_url,
@@ -1158,6 +1177,8 @@ mod tests {
         assert_eq!(cfg.buffer.max_bytes, 8_388_608);
         assert_eq!(cfg.buffer.channel_capacity, 200_000);
         assert_eq!(cfg.site_cache_refresh, Duration::from_secs(10));
+        assert_eq!(cfg.site_restore_days, 7);
+        assert_eq!(cfg.stats_delete_interval, Duration::from_secs(300));
         // 查询超时按调用方分三档（§6.8、§10 Q14）
         assert_eq!(
             cfg.query_timeouts,
@@ -1253,8 +1274,12 @@ mod tests {
             ("RIVU_BUFFER_MAX_BYTES", "1048576"),
             ("RIVU_BUFFER_CHANNEL_CAPACITY", "20000"),
             ("RIVU_SITE_CACHE_REFRESH_SECS", "3"),
+            ("RIVU_SITE_RESTORE_DAYS", "0"),
+            ("RIVU_STATS_DELETE_INTERVAL_SECS", "60"),
         ])
         .unwrap();
+        assert_eq!(cfg.site_restore_days, 0);
+        assert_eq!(cfg.stats_delete_interval, Duration::from_secs(60));
         assert_eq!(cfg.buffer.flush_interval, Duration::from_millis(250));
         assert_eq!(cfg.buffer.max_rows, 5000);
         assert_eq!(cfg.buffer.max_bytes, 1_048_576);
@@ -1276,6 +1301,9 @@ mod tests {
             ("RIVU_BUFFER_CHANNEL_CAPACITY", "0"),
             ("RIVU_SITE_CACHE_REFRESH_SECS", "0"),
             ("RIVU_SITE_CACHE_REFRESH_SECS", "3601"),
+            ("RIVU_SITE_RESTORE_DAYS", "366"),
+            ("RIVU_SITE_RESTORE_DAYS", "-1"),
+            ("RIVU_STATS_DELETE_INTERVAL_SECS", "9"),
         ] {
             let err = with_env(&[(name, bad)]).unwrap_err();
             assert_eq!(err.problems.len(), 1, "{name}={bad}: {err}");

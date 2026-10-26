@@ -10,6 +10,7 @@
 //! | `GET /api/internal/sessions` | 会话 | 当前用户的有效会话（设备标签、最近使用、是否当前） |
 //! | `DELETE /api/internal/sessions/{id}` | 会话 | 撤销自己的某个会话 |
 //! | `GET /api/internal/me` | 会话 | 用户与所属组织、角色 |
+//! | `POST /api/internal/me/password` | 会话 | 改密码，请求体 `{"current","new"}`；当前密码不对 400 `wrong_password`（总是做哈希校验）、新密码长度不合 400 `invalid_new_password`、与当前相同 400 `same_password`；`(用户, IP)` 5 次 / 60 秒（429）；同一事务换哈希并撤销全部会话，再签发新会话（`Set-Cookie`），响应 `{}` |
 //! | `GET /api/internal/sites` | 会话 | 可见的站点（按组织） |
 //! | `POST /api/internal/sites/{site}/query` | 会话、共享链接或公开站点 | 看板查询，请求体是 `QuerySpec` |
 //! | `GET /api/internal/sites/{site}/realtime` | 同上 | 最近 5 分钟的访客，等价于 `date_range: "realtime"` 的 `visitors` 查询 |
@@ -18,11 +19,16 @@
 //! | `GET /api/internal/public/{site}` | 无（限流） | 公开站点（`is_public`）的入口信息 |
 //! | `POST /api/internal/orgs/{org_id}/sites` | 会话，组织 admin+ | 建站（域名规范化、白名单 = [域名]） |
 //! | `GET /api/internal/sites/{site}/settings` | 会话，有效角色 editor+ | 站点设置、白名单、限额与地理库能力 |
+//! | `GET /api/internal/sites/{site}/diagnostics?range=1h\|24h\|7d` | 会话，有效角色 editor+ | 接入诊断：按 `ingest_counters` 聚合的时间桶（已接收 / 已丢弃）、合计、丢弃原因、脚本版本、最后收到事件的时间；实现在 [`crate::diagnostics`] |
 //! | `PATCH /api/internal/sites/{site}` | 会话，组织 admin+ | 改名称、时区、周起始日、公开、采集、hash 路由、限速、地理精度 |
-//! | `DELETE /api/internal/sites/{site}` | 会话，组织 admin+ | 软删除（请求体 `confirm` 须等于站点名） |
+//! | `DELETE /api/internal/sites/{site}` | 会话，组织 admin+ | 软删除（请求体 `confirm` 须等于站点名），同一事务写入站点删除意图，`RIVU_SITE_RESTORE_DAYS`（默认 7）天内可恢复，之后 `ch_delete_batch` 清除统计数据 |
+//! | `GET /api/internal/orgs/{org_id}/deleted-sites` | 会话，组织 admin+ | 恢复窗口内的已删除站点 `{"sites":[{id,site_key,name,domain,deleted_at,purge_at}]}` |
+//! | `POST /api/internal/sites/{site}/restore` | 会话，站点所属组织 admin+（非成员 404） | 恢复已删除的站点，响应同站点列表的一项；窗口已过或清除已开始 409 `conflict` |
+//! | `GET /api/internal/sites/{site}/stats-deletions`、`POST` | 会话，组织 admin+ | 按日期范围删除统计数据：列表（最近 50 条，新的在前）与请求（`{"from","to","confirm"}`，站点本地日期，`to` 不晚于今天，最多 731 天，`confirm` 须等于站点名） |
 //! | `POST /api/internal/sites/{site}/hostnames`、`DELETE …/hostnames/{pattern}` | 会话，组织 admin+ | 白名单增删 |
 //! | `GET /api/internal/sites/{site}/shield`（editor+）、`POST`（admin+）、`DELETE …/shield/{id}`（admin+） | 会话 | 屏蔽规则 |
 //! | `GET /api/internal/sites/{site}/shared-links`、`POST`、`DELETE …/shared-links/{id}` | 会话，组织 editor+ | 共享链接的列表、创建、吊销 |
+//! | `GET /api/internal/sites/{site}/goals`、`POST`、`DELETE …/goals/{id}` | 会话，有效角色 editor+（含站点访客 editor，`site.content.write`） | 目标的列表、添加（`{"kind":"event","event_name"}` 或 `{"kind":"page","page_path"}`，可带 `display_name`；同类同值或同名 409 `conflict`，每站 100 个 409 `limit_reached`）、删除；实现在 [`crate::goals_admin`] |
 //!
 //! | `GET /api/internal/orgs/{org_id}/members` | 会话，任一组织成员 | 成员、待处理邀请、站点访客，带 `can_manage` 与 `my_role` |
 //! | `PATCH /api/internal/orgs/{org_id}/members/{user_id}`、`DELETE` | 会话，组织 admin+ | 改角色、移除成员（移除同时吊销其在该组织的 API key）；admin 不能碰 owner，不能改自己，最后一名 owner 409 |
@@ -283,6 +289,8 @@ struct Limiters {
     /// 登录：每 `(账号, IP)` 一桶（防同一来源爆破一个账号）。**不再有单纯按账号的桶**：
     /// 否则任何人不停用受害者的邮箱登录就能让真用户一直 429（锁号）。
     login_pair: PolicyLimiter,
+    /// 改密码：每 `(用户, IP)` 一桶，参数同登录的 `(账号, IP)` 桶（防拿着被盗的会话爆破当前密码）。
+    password_change: PolicyLimiter,
     setup_ip: PolicyLimiter,
     share_view: PolicyLimiter,
     /// 邀请页（查询与接受）：每客户端 IP 一桶，参数同共享链接与公开看板。
@@ -304,6 +312,7 @@ impl Limiters {
                 l.login_window,
             ),
             login_pair: login(),
+            password_change: login(),
             setup_ip: login(),
             share_view: view(),
             invite_view: view(),
@@ -317,13 +326,13 @@ impl Limiters {
     }
 }
 
-type Clock = Arc<dyn Fn() -> Timestamp + Send + Sync>;
+pub(crate) type Clock = Arc<dyn Fn() -> Timestamp + Send + Sync>;
 
 /// 内部端点的依赖。进程里建一个并共享：限流状态在它里面。
 pub struct DashApi {
     pub(crate) pg: PgPool,
     /// `rivu_reader` 账号的客户端（已绑定库）。
-    reader: clickhouse::Client,
+    pub(crate) reader: clickhouse::Client,
     pub(crate) geo: Option<Arc<GeoDb>>,
     pub(crate) passwords: PasswordService,
     /// `RIVU_SHIELD_MAX_RULES_PER_SITE`。
@@ -334,18 +343,22 @@ pub struct DashApi {
     pub(crate) base_url: String,
     /// 公开 API 的限额（`RIVU_API_RATE_PER_HOUR`、`RIVU_API_BURST`、`RIVU_API_MAX_CONCURRENCY`），API key 列表展示。
     pub(crate) api_rate: rivu_common::config::ApiRateConfig,
+    /// `RIVU_SITE_RESTORE_DAYS`：站点软删除后的恢复窗口。
+    pub(crate) site_restore_days: u32,
+    /// 同进程运行 `ch_delete_batch` 时（`rivu all`）用来在写入日期范围删除意图后立即唤醒它。
+    pub(crate) stats_delete_kick: Option<rivu_jobs::StatsDeleteKick>,
     csrf: Csrf,
     cookies: CookieConfig,
     /// `RIVU_SETUP_TOKEN` 的 SHA-256：比较时两边都是定长摘要，常数时间。
     setup_token: Option<[u8; 32]>,
     trusted_proxies: Vec<Cidr>,
-    dashboard_timeout_secs: u64,
+    pub(crate) dashboard_timeout_secs: u64,
     public_timeout_secs: u64,
     limiters: Limiters,
     limits: DashLimits,
     login_watch: LoginWatch,
     realtime_cache: moka::sync::Cache<String, Arc<String>>,
-    clock: Clock,
+    pub(crate) clock: Clock,
 }
 
 impl DashApi {
@@ -366,6 +379,8 @@ impl DashApi {
             ingest_rate_default: config.ingest_rate_limit_per_min,
             base_url: config.base_url.clone(),
             api_rate: config.api_rate,
+            site_restore_days: config.site_restore_days,
+            stats_delete_kick: None,
             csrf,
             cookies: CookieConfig {
                 secure: config.cookie_secure,
@@ -392,6 +407,12 @@ impl DashApi {
     pub fn with_limits(mut self, limits: DashLimits) -> Self {
         self.limiters = Limiters::new(&limits);
         self.limits = limits;
+        self
+    }
+
+    /// 同进程的 `ch_delete_batch` 唤醒器（`rivu all`）；`None` 时只等它的定时周期。
+    pub fn with_stats_delete_kick(mut self, kick: Option<rivu_jobs::StatsDeleteKick>) -> Self {
+        self.stats_delete_kick = kick;
         self
     }
 
@@ -476,6 +497,8 @@ pub(crate) enum DashError {
     Conflict(&'static str, String),
     /// 400。
     Invalid(String),
+    /// 400，带稳定的错误码（页面据此把错误放到对应的字段上）。
+    BadRequest(&'static str, &'static str),
     /// 429，带建议的等待时间。
     RateLimited(Duration),
     /// 500（细节只进日志）。
@@ -548,6 +571,9 @@ impl IntoResponse for DashError {
             DashError::Conflict(code, message) => error_body(StatusCode::CONFLICT, code, &message),
             DashError::Invalid(message) => {
                 error_body(StatusCode::BAD_REQUEST, "invalid_request", &message)
+            }
+            DashError::BadRequest(code, message) => {
+                error_body(StatusCode::BAD_REQUEST, code, message)
             }
             DashError::RateLimited(wait) => {
                 let secs = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
@@ -953,6 +979,81 @@ async fn delete_session(
         api.finish(ns(StatusCode::NO_CONTENT.into_response()), &ctx)
     };
     Ok(resp)
+}
+
+// ------------------------------------------------------------------------------------------
+// POST /api/internal/me/password
+// ------------------------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct ChangePasswordBody {
+    current: String,
+    new: String,
+}
+
+/// 改密码（`platform-and-ops.md` §5）：先限流（`(用户, IP)` 桶），再校验新密码的长度，
+/// 然后**总是**对当前密码做一次哈希校验；通过后同一事务内换哈希并撤销该用户全部会话，再签发新会话。
+async fn change_password(
+    State(api): State<Arc<DashApi>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: Request,
+) -> Res<Response> {
+    let headers = req.headers().clone();
+    let ctx = api.require_session(&headers).await?;
+    let user_id = ctx.s.user_id;
+    let ip = ip_bucket(api.client_ip(peer, &headers));
+    let body: ChangePasswordBody = read_json(req, AUTH_BODY_MAX).await?;
+    api.limiters
+        .password_change
+        .check(&(user_id, ip))
+        .map_err(|w| {
+            metrics::counter!("rivu_password_change_total", "result" => "rate_limited")
+                .increment(1);
+            rate_limited("password_change", w)
+        })?;
+    validate_password(&body.new).map_err(|_| {
+        DashError::BadRequest(
+            "invalid_new_password",
+            "the new password must be 12 to 128 characters",
+        )
+    })?;
+    let stored = rivu_storage_pg::users::password_hash(&api.pg, user_id)
+        .await?
+        .ok_or(DashError::Unauthorized)?;
+    // 超长的密码不可能是真密码，直接判错（与登录一致）；其余一律走完整的哈希校验
+    let verified = body.current.chars().count() <= MAX_PASSWORD_CHARS
+        && api
+            .passwords
+            .verify(body.current.clone(), Some(&stored))
+            .await;
+    if !verified {
+        metrics::counter!("rivu_password_change_total", "result" => "wrong_password").increment(1);
+        return Err(DashError::BadRequest(
+            "wrong_password",
+            "the current password is incorrect",
+        ));
+    }
+    if body.new == body.current {
+        return Err(DashError::BadRequest(
+            "same_password",
+            "the new password must differ from the current one",
+        ));
+    }
+    let hash = api
+        .passwords
+        .hash(body.new)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if !rivu_storage_pg::users::change_password(&api.pg, user_id, &hash).await? {
+        return Err(DashError::Unauthorized);
+    }
+    let cookie = api.start_session(user_id, None, &headers).await?;
+    metrics::counter!("rivu_password_change_total", "result" => "success").increment(1);
+    tracing::info!(user_id, "修改密码，其他会话已撤销");
+    Ok(with_cookie(
+        json_response(StatusCode::OK, json!({})),
+        &cookie,
+    ))
 }
 
 // ------------------------------------------------------------------------------------------
@@ -1543,6 +1644,12 @@ pub fn router(api: Arc<DashApi>) -> Router {
         ))
         .merge(endpoint(
             a,
+            "internal.change_password",
+            "/api/internal/me/password",
+            post_only(post(change_password)),
+        ))
+        .merge(endpoint(
+            a,
             "internal.sites",
             "/api/internal/sites",
             get_only(get(list_sites)),
@@ -1578,6 +1685,8 @@ pub fn router(api: Arc<DashApi>) -> Router {
             get_only(get(public_info)),
         ))
         .merge(crate::site_admin::routes(a))
+        .merge(crate::goals_admin::routes(a))
+        .merge(crate::diagnostics::routes(a))
         .merge(crate::org_admin::routes(a))
 }
 // ------------------------------------------------------------------------------------------

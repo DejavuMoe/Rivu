@@ -694,6 +694,7 @@ async fn direct(server: &Server, site: &Site, spec: &Value) -> String {
         week_starts_on: Weekday::Monday,
         geo_attribution: server.geo.attribution(),
         geo_capability: server.geo.capability(),
+        goals: Vec::new(),
     };
     let result = execute(
         &server.reader,
@@ -2146,6 +2147,17 @@ async fn session_queries_equal_direct_execution_and_site_access_is_uniform() {
         .post(
             &query_path(site_a.id),
             &json!({"metrics": ["visitors"], "date_range": "day", "dimensions": ["event:goal"]}),
+        )
+        .cookie(&c_owner)
+        .send()
+        .await;
+    // 目标维度已支持：站点没有目标时没有行
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.json()["results"], json!([]), "{}", r.body);
+    let r = http
+        .post(
+            &query_path(site_a.id),
+            &json!({"metrics": ["visitors"], "date_range": "day", "dimensions": ["event:props:plan"]}),
         )
         .cookie(&c_owner)
         .send()
@@ -4948,4 +4960,274 @@ async fn site_admin_delete_site_and_csrf() {
             .unwrap()
             .is_none()
     );
+}
+
+// ================================================================== 目标
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn goals_crud_permissions_and_goal_queries() {
+    let Some(env) = test_env("goals") else {
+        return;
+    };
+    migrate_once(&env).await;
+    let pg = rivu_storage_pg::connect(&env.pg_url, 6).await.unwrap();
+    let server = start(&env, &pg, &config(&env, &[]), loose()).await;
+    let http = &server.http;
+    let c = cast(&pg, http).await;
+    let site = make_site(&pg, &c.org, false).await;
+    let other = make_site(&pg, &c.org, false).await;
+    let ge = guest_of(&pg, &site, "editor").await;
+    let ge_cookie = login_cookie(http, &ge.email).await;
+    let gv = guest_of(&pg, &site, "viewer").await;
+    let gv_cookie = login_cookie(http, &gv.email).await;
+    let gp = site_path(site.id, "/goals");
+
+    // ---- 添加：owner、admin、editor、站点访客 editor 都可以（site.content.write）
+    let add = |cookie: &str, body: Value| {
+        let cookie = cookie.to_owned();
+        let gp = gp.clone();
+        async move { http.post(&gp, &body).cookie(&cookie).send().await }
+    };
+    let v = expect(
+        &add(
+            &c.owner,
+            json!({"kind": "page", "page_path": " /pricing ", "display_name": " Pricing "}),
+        )
+        .await,
+        201,
+    );
+    let g = &v["goal"];
+    assert_eq!(g["kind"], "page");
+    assert_eq!(g["page_path"], "/pricing");
+    assert_eq!(g["event_name"], Value::Null);
+    assert_eq!(g["display_name"], "Pricing");
+    assert_eq!(g["label"], "Pricing");
+    assert!(g["created_at"].as_str().unwrap().ends_with('Z'));
+    let pricing_id = g["id"].as_i64().unwrap();
+    let v = expect(
+        &add(&c.admin, json!({"kind": "page", "page_path": "/**"})).await,
+        201,
+    );
+    assert_eq!(v["goal"]["page_path"], "/*", "连续的 * 合并");
+    assert_eq!(v["goal"]["label"], "/*");
+    let v = expect(
+        &add(
+            &c.editor,
+            json!({"kind": "event", "event_name": "Signup", "display_name": null}),
+        )
+        .await,
+        201,
+    );
+    let signup_id = v["goal"]["id"].as_i64().unwrap();
+    assert_eq!(v["goal"]["label"], "Signup");
+    expect(
+        &add(
+            &ge_cookie,
+            json!({"kind": "event", "event_name": "Download"}),
+        )
+        .await,
+        201,
+    );
+    // viewer、站点访客 viewer 403；外人 404；没有会话 401
+    for cookie in [&c.viewer, &gv_cookie] {
+        expect_err(
+            &add(cookie, json!({"kind": "event", "event_name": "X"})).await,
+            403,
+            "forbidden",
+        );
+        expect_err(
+            &http
+                .delete(&format!("{gp}/{signup_id}"))
+                .cookie(cookie)
+                .send()
+                .await,
+            403,
+            "forbidden",
+        );
+        expect_err(&http.get(&gp).cookie(cookie).send().await, 403, "forbidden");
+    }
+    expect_err(
+        &add(&c.outsider, json!({"kind": "event", "event_name": "X"})).await,
+        404,
+        "not_found",
+    );
+    expect_err(&http.get(&gp).send().await, 401, "unauthorized");
+    // 重复（同类同值）、同名（标签撞了）409 conflict
+    expect_err(
+        &add(
+            &c.owner,
+            json!({"kind": "event", "event_name": "Signup", "display_name": "Other"}),
+        )
+        .await,
+        409,
+        "conflict",
+    );
+    expect_err(
+        &add(&c.owner, json!({"kind": "event", "event_name": "Pricing"})).await,
+        409,
+        "conflict",
+    );
+    // 400：类型、缺字段、多字段、事件名、页面通配、显示名、滚动深度与属性条件（不在本期）
+    for bad in [
+        json!({"kind": "scroll", "page_path": "/a"}),
+        json!({"kind": "event"}),
+        json!({"kind": "page"}),
+        json!({"kind": "event", "event_name": "A", "page_path": "/a"}),
+        json!({"kind": "page", "page_path": "/a", "event_name": "A"}),
+        json!({"kind": "event", "event_name": "x".repeat(121)}),
+        json!({"kind": "event", "event_name": "a\u{1}b"}),
+        json!({"kind": "event", "event_name": "engagement"}),
+        json!({"kind": "page", "page_path": "no-slash"}),
+        json!({"kind": "page", "page_path": "/a b"}),
+        json!({"kind": "page", "page_path": format!("/{}", "a".repeat(250))}),
+        json!({"kind": "event", "event_name": "A", "display_name": "d".repeat(101)}),
+        json!({"kind": "event", "event_name": "A", "props": {"plan": "pro"}}),
+    ] {
+        let r = add(&c.owner, bad.clone()).await;
+        assert_eq!(r.status, 400, "{bad}: {}", r.body);
+    }
+
+    // ---- 列表：editor 与站点访客 editor 能读，按创建顺序
+    let list = expect(&http.get(&gp).cookie(&ge_cookie).send().await, 200);
+    assert_eq!(list["max_goals"], 100);
+    let labels: Vec<&str> = list["goals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| g["label"].as_str().unwrap())
+        .collect();
+    assert_eq!(labels, ["Pricing", "/*", "Signup", "Download"]);
+    expect(&http.get(&gp).cookie(&c.editor).send().await, 200);
+
+    // ---- 查询：目标从 PG 现读；目标维度、目标过滤与转化率（数据：6 人 × 3 天各浏览 / 与 /pricing，
+    //      3 月 12 日又有 3 人只浏览 /；每日访客之和 = 18 + 3 = 21）
+    ingest(&env, &pg, &[&site], &server.geo).await;
+    let range = json!(["2026-03-09", "2026-03-12"]);
+    let spec = json!({"metrics": ["visitors", "events", "conversion_rate"],
+                      "dimensions": ["event:goal"], "date_range": range});
+    // 能看看板的人（viewer、站点访客 viewer）都能拿到目标名字：它们随结果行返回
+    for cookie in [&c.viewer, &gv_cookie, &c.owner] {
+        let v = expect(
+            &http
+                .post(&query_path(site.id), &spec)
+                .cookie(cookie)
+                .send()
+                .await,
+            200,
+        );
+        let rows: Vec<(String, i64, i64, f64)> = v["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r["dimensions"][0].as_str().unwrap().to_owned(),
+                    r["metrics"][0].as_i64().unwrap(),
+                    r["metrics"][1].as_i64().unwrap(),
+                    r["metrics"][2].as_f64().unwrap(),
+                )
+            })
+            .collect();
+        // 没有转化的目标（Signup、Download）不出现
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0], ("/*".to_owned(), 21, 39, 1.0));
+        assert_eq!(
+            (rows[1].0.as_str(), rows[1].1, rows[1].2),
+            ("Pricing", 18, 18)
+        );
+        assert!((rows[1].3 - 18.0 / 21.0).abs() < 1e-12, "{rows:?}");
+        assert!(
+            v["meta"]["metric_semantics"]["conversion_rate"]
+                .as_str()
+                .unwrap()
+                .contains("event:goal")
+        );
+    }
+    // 目标过滤（按标签与按 id 相同）：分母去掉目标叶子
+    for value in [json!("Pricing"), json!(pricing_id), json!("pricing")] {
+        let cs = !matches!(&value, Value::String(s) if s == "pricing");
+        let spec = json!({"metrics": ["visitors", "conversion_rate"], "date_range": range,
+                          "filters": [["is", "event:goal", [value], {"case_sensitive": cs}]]});
+        let v = expect(
+            &http
+                .post(&query_path(site.id), &spec)
+                .cookie(&c.viewer)
+                .send()
+                .await,
+            200,
+        );
+        assert_eq!(v["results"][0]["metrics"][0], 18, "{spec}");
+        let cr = v["results"][0]["metrics"][1].as_f64().unwrap();
+        assert!((cr - 18.0 / 21.0).abs() < 1e-12, "{spec}: {cr}");
+    }
+    // 校验：转化率要有目标维度或过滤；目标过滤只认 is / is_not
+    let r = http
+        .post(
+            &query_path(site.id),
+            &json!({"metrics": ["conversion_rate"], "date_range": range}),
+        )
+        .cookie(&c.owner)
+        .send()
+        .await;
+    assert_eq!(r.status, 400, "{}", r.body);
+
+    // ---- 删除：软删除，立即从查询里消失；再删 404；非整数 id 404；别的站点 404
+    expect(
+        &http
+            .delete(&format!("{gp}/{pricing_id}"))
+            .cookie(&ge_cookie)
+            .send()
+            .await,
+        204,
+    );
+    expect_err(
+        &http
+            .delete(&format!("{gp}/{pricing_id}"))
+            .cookie(&c.owner)
+            .send()
+            .await,
+        404,
+        "not_found",
+    );
+    expect_err(
+        &http
+            .delete(&format!("{gp}/abc"))
+            .cookie(&c.owner)
+            .send()
+            .await,
+        404,
+        "not_found",
+    );
+    expect_err(
+        &http
+            .delete(&site_path(other.id, &format!("/goals/{signup_id}")))
+            .cookie(&c.owner)
+            .send()
+            .await,
+        404,
+        "not_found",
+    );
+    let v = expect(
+        &http
+            .post(&query_path(site.id), &spec)
+            .cookie(&c.owner)
+            .send()
+            .await,
+        200,
+    );
+    assert_eq!(v["results"].as_array().unwrap().len(), 1, "{v}");
+    assert_eq!(v["results"][0]["dimensions"][0], "/*");
+    // 同一事件名删除后可以再加
+    expect(
+        &add(&c.owner, json!({"kind": "page", "page_path": "/pricing"})).await,
+        201,
+    );
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM goals WHERE site_id = $1")
+        .bind(site.id as i64)
+        .fetch_one(&pg)
+        .await
+        .unwrap();
+    assert_eq!(n, 5, "软删除的行仍在");
+
+    cleanup(&env, &[site.id, other.id]).await;
 }

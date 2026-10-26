@@ -255,8 +255,12 @@ pub enum Action {
     SiteCreate,
     /// `site.delete`：owner、admin。
     SiteDelete,
+    /// `stats.delete`（按日期范围删除统计数据）：owner、admin。
+    StatsDelete,
     /// `shared_link.manage`：owner、admin、editor。
     SharedLinkManage,
+    /// `site.content.write`（目标的增删）：owner、admin、editor；看板按有效角色判定，站点访客 editor 也可以。
+    SiteContentWrite,
     /// `member.invite`、`member.remove`、`member.role.change`：owner、admin（admin 能碰到哪些角色见 [`can_assign`]、[`can_modify`]）。
     MemberManage,
     /// `site_membership.manage`（站点访客的邀请与移除）：owner、admin。
@@ -281,14 +285,16 @@ impl Action {
 pub fn allowed(role: OrgRole, action: Action) -> bool {
     match action {
         Action::StatsRead | Action::SitesRead | Action::ApiKeyManageOwn => true,
-        Action::ExportsRead | Action::SiteSettingsRead | Action::SharedLinkManage => {
-            role >= OrgRole::Editor
-        }
+        Action::ExportsRead
+        | Action::SiteSettingsRead
+        | Action::SharedLinkManage
+        | Action::SiteContentWrite => role >= OrgRole::Editor,
         Action::SitesWrite
         | Action::SiteSettingsWrite
         | Action::SitePublicToggle
         | Action::SiteCreate
         | Action::SiteDelete
+        | Action::StatsDelete
         | Action::MemberManage
         | Action::SiteMembershipManage => role >= OrgRole::Admin,
     }
@@ -432,7 +438,9 @@ mod tests {
             (Action::SitePublicToggle, [true, true, false, false]),
             (Action::SiteCreate, [true, true, false, false]),
             (Action::SiteDelete, [true, true, false, false]),
+            (Action::StatsDelete, [true, true, false, false]),
             (Action::SharedLinkManage, [true, true, true, false]),
+            (Action::SiteContentWrite, [true, true, true, false]),
             (Action::MemberManage, [true, true, false, false]),
             (Action::SiteMembershipManage, [true, true, false, false]),
             (Action::ApiKeyManageOwn, [true, true, true, true]),

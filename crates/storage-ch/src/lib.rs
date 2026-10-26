@@ -1,5 +1,6 @@
 //! ClickHouse 访问（官方 `clickhouse` crate，HTTP + RowBinary + LZ4）：客户端、迁移记录表与迁移执行。
 
+pub mod diagnostics;
 pub mod rows;
 
 use anyhow::{Context, Result};

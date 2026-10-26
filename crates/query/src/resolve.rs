@@ -50,10 +50,12 @@ pub struct SiteContext {
     /// 当前加载的地理库的署名与能力（`rivu_geo::GeoDb::attribution()` / `capability()`）；结果含位置维度时回显。
     pub geo_attribution: Option<Attribution>,
     pub geo_capability: Option<GeoCapability>,
+    /// 站点的目标（未删除，调用方从 PG 加载，§6.3 build 阶段「加载目标」）：`event:goal` 维度与过滤、`conversion_rate` 用。
+    pub goals: Vec<GoalDef>,
 }
 
 impl SiteContext {
-    /// UTC、周一起始、没有地理库的站点（测试与预设用）。
+    /// UTC、周一起始、没有地理库、没有目标的站点（测试与预设用）。
     pub fn new(site_id: u64, timezone: TimeZone) -> Self {
         SiteContext {
             site_id,
@@ -62,7 +64,52 @@ impl SiteContext {
             week_starts_on: Weekday::Monday,
             geo_attribution: None,
             geo_capability: None,
+            goals: Vec::new(),
         }
+    }
+}
+
+/// 一个目标（`goals` 表的一行）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GoalDef {
+    pub id: i64,
+    /// 标签：显示名，否则事件名，否则页面通配。`event:goal` 维度的取值，也是过滤里认的名字。
+    pub label: String,
+    pub kind: GoalKind,
+}
+
+/// 目标的完成条件（只看非 engagement 事件）。
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum GoalKind {
+    /// 事件名完全相等（区分大小写）。
+    Event(String),
+    /// `pageview` 事件，且 pathname 整串匹配通配模式：只有 `*` 是通配（匹配任意串，含空串与 `/`），区分大小写，
+    /// 与屏蔽规则的 `page` 模式同一语义。
+    Page(String),
+}
+
+impl GoalDef {
+    /// 由 `goals` 表的字段构造：`kind` 是 `event` 或 `page`，否则返回 `None`。
+    pub fn from_parts(
+        id: i64,
+        kind: &str,
+        event_name: Option<&str>,
+        page_path: Option<&str>,
+        display_name: Option<&str>,
+    ) -> Option<GoalDef> {
+        let kind = match (kind, event_name, page_path) {
+            ("event", Some(n), _) => GoalKind::Event(n.to_owned()),
+            ("page", _, Some(p)) => GoalKind::Page(p.to_owned()),
+            _ => return None,
+        };
+        let value = match &kind {
+            GoalKind::Event(v) | GoalKind::Page(v) => v.clone(),
+        };
+        Some(GoalDef {
+            id,
+            label: display_name.map(str::to_owned).unwrap_or(value),
+            kind,
+        })
     }
 }
 
@@ -103,6 +150,9 @@ pub(crate) enum Col {
     EventName,
     EventPage,
     EventHostname,
+    /// `event:goal`：不是表里的列。维度取值是匹配的目标标签（一个事件可以匹配多个目标），
+    /// 过滤叶子换成目标的完成条件（[`Test::Goal`]）。
+    EventGoal,
     EntryPage,
     ExitPage,
     Source,
@@ -129,6 +179,7 @@ impl Col {
             Dimension::EventName => Col::EventName,
             Dimension::EventPage => Col::EventPage,
             Dimension::EventHostname => Col::EventHostname,
+            Dimension::EventGoal => Col::EventGoal,
             Dimension::VisitEntryPage => Col::EntryPage,
             Dimension::VisitExitPage => Col::ExitPage,
             Dimension::VisitSource => Col::Source,
@@ -153,7 +204,10 @@ impl Col {
 
     /// 事件级列（`event:*`）。
     pub(crate) fn is_event_level(self) -> bool {
-        matches!(self, Col::EventName | Col::EventPage | Col::EventHostname)
+        matches!(
+            self,
+            Col::EventName | Col::EventPage | Col::EventHostname | Col::EventGoal
+        )
     }
 
     /// 空值（库里存的是空串）的展示文案（沿用 P1 与 Plausible 的习惯，见 `presets`）。
@@ -177,6 +231,7 @@ impl Col {
             Col::EventName
             | Col::EventPage
             | Col::EventHostname
+            | Col::EventGoal
             | Col::EntryPage
             | Col::ExitPage => "(none)",
         }
@@ -252,6 +307,9 @@ pub(crate) enum Test {
     },
     /// `visit:city`：geoname id。
     CityIn { ids: Vec<u32>, negated: bool },
+    /// `event:goal` 的 `is` / `is_not`：事件满足其中任一目标的完成条件（`goals` 已按标签或 id 解析、去重；
+    /// 没有对上任何目标时为空，`is` 恒假、`is_not` 恒真）。
+    Goal { goals: Vec<GoalKind>, negated: bool },
 }
 
 impl Pred {
@@ -280,6 +338,25 @@ impl Pred {
     pub(crate) fn has_page_leaf(&self) -> bool {
         self.any_leaf(&|l| matches!(l.col, Col::EventPage | Col::EventHostname))
     }
+
+    /// 去掉全部 `event:goal` 叶子（`conversion_rate` 的分母，§6.5）：`and` / `or` 去掉这些子节点，
+    /// 子节点全被去掉的分支与 `not` 也一并去掉；整棵树都是目标叶子时返回 `None`。
+    pub(crate) fn without_goal_leaves(&self) -> Option<Pred> {
+        match self {
+            Pred::Leaf(l) => (l.col != Col::EventGoal).then(|| self.clone()),
+            Pred::Not(x) => x.without_goal_leaves().map(|x| Pred::Not(Box::new(x))),
+            Pred::And(c) | Pred::Or(c) => {
+                let kept: Vec<Pred> = c.iter().filter_map(Pred::without_goal_leaves).collect();
+                if kept.is_empty() {
+                    None
+                } else if matches!(self, Pred::And(_)) {
+                    Some(Pred::And(kept))
+                } else {
+                    Some(Pred::Or(kept))
+                }
+            }
+        }
+    }
 }
 
 fn leaf_path_error(path: &str, sub: &str, msg: impl Into<String>) -> QueryError {
@@ -291,6 +368,7 @@ fn build_pred(
     path: &str,
     leaves: &mut usize,
     first_event_leaf: &mut Option<String>,
+    goals: &[GoalDef],
 ) -> Result<Pred, QueryError> {
     match f {
         Filter::Leaf(l) => {
@@ -301,7 +379,7 @@ fn build_pred(
                     format!("a query may have at most {MAX_FILTER_LEAVES} filter conditions"),
                 ));
             }
-            let leaf = build_leaf(l, path)?;
+            let leaf = build_leaf(l, path, goals)?;
             if leaf.col.is_event_level() && first_event_leaf.is_none() {
                 *first_event_leaf = Some(path.to_owned());
             }
@@ -315,6 +393,7 @@ fn build_pred(
                     &format!("{path}[1][{j}]"),
                     leaves,
                     first_event_leaf,
+                    goals,
                 )?);
             }
             Ok(if matches!(f, Filter::And(_)) {
@@ -328,6 +407,7 @@ fn build_pred(
             &format!("{path}[1]"),
             leaves,
             first_event_leaf,
+            goals,
         )?))),
         Filter::HasDone(_) | Filter::HasNotDone(_) => Err(QueryError::validation(
             format!("{path}[0]"),
@@ -336,7 +416,7 @@ fn build_pred(
     }
 }
 
-fn build_leaf(l: &FilterLeaf, path: &str) -> Result<Leaf, QueryError> {
+fn build_leaf(l: &FilterLeaf, path: &str, goals: &[GoalDef]) -> Result<Leaf, QueryError> {
     let dim = match &l.target {
         FilterTarget::Segment => {
             return Err(leaf_path_error(
@@ -417,6 +497,23 @@ fn build_leaf(l: &FilterLeaf, path: &str) -> Result<Leaf, QueryError> {
                 format!("`{}` values must not be empty", l.op.as_str()),
             ));
         }
+    }
+
+    if col == Col::EventGoal {
+        if !matches!(l.op, FilterOp::Is | FilterOp::IsNot) {
+            return Err(leaf_path_error(
+                path,
+                "[0]",
+                "`event:goal` only supports `is` and `is_not` (values are goal names or ids)",
+            ));
+        }
+        return Ok(Leaf {
+            col,
+            test: Test::Goal {
+                goals: match_goals(goals, &l.values, cs),
+                negated,
+            },
+        });
     }
 
     if col == Col::City {
@@ -521,6 +618,49 @@ fn build_leaf(l: &FilterLeaf, path: &str) -> Result<Leaf, QueryError> {
     Ok(Leaf { col, test })
 }
 
+/// 过滤取值对上的目标：取值等于目标的标签（`case_sensitive: false` 时按 ASCII 大小写折叠比较），
+/// 或等于目标 id 的十进制文本。结果按条件去重、排序（不认识的取值不报错，只是对不上任何目标）。
+pub(crate) fn match_goals(goals: &[GoalDef], values: &[String], cs: bool) -> Vec<GoalKind> {
+    let hit = |g: &GoalDef| {
+        values.iter().any(|v| {
+            let by_label = if cs {
+                *v == g.label
+            } else {
+                v.eq_ignore_ascii_case(&g.label)
+            };
+            by_label || *v == g.id.to_string()
+        })
+    };
+    let set: BTreeSet<GoalKind> = goals
+        .iter()
+        .filter(|g| hit(g))
+        .map(|g| g.kind.clone())
+        .collect();
+    set.into_iter().collect()
+}
+
+/// 页面目标的通配模式转成 ClickHouse `LIKE` 模式：`*`（连续的合并）→ `%`，`%` `_` `\` 前面加 `\` 转义。
+/// `LIKE` 整串匹配、区分大小写，与 [`wildcard_to_regex`] 的语义相同，但不走 Hyperscan，没有 256 字节的正则上限。
+pub(crate) fn wildcard_to_like(pattern: &str) -> String {
+    let mut out = String::with_capacity(pattern.len() + 4);
+    let mut prev_star = false;
+    for ch in pattern.chars() {
+        if ch == '*' {
+            if !prev_star {
+                out.push('%');
+            }
+            prev_star = true;
+            continue;
+        }
+        prev_star = false;
+        if matches!(ch, '%' | '_' | '\\') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 fn first_line(s: &str) -> String {
     let line = s
         .lines()
@@ -620,6 +760,13 @@ fn dates_interval(tz: &TimeZone, from: Date, to: Date) -> Result<Interval, Query
         end_ms: day_start_ms(tz, end_day)?,
         kind: IntervalKind::Dates { from, to },
     })
+}
+
+/// 站点本地日期 `[from, to]`（含两端）对应的 UTC 半开区间 `[start_ms, end_ms)`，与看板整日区间同一套换算
+/// （本地日起点 = 当天 00:00 的本地时刻，DST 缺口按 jiff 的 compatible 规则）。统计数据按日期删除用它。
+pub fn local_dates_utc_ms(tz: &TimeZone, from: Date, to: Date) -> Result<(i64, i64), QueryError> {
+    let iv = dates_interval(tz, from, to)?;
+    Ok((iv.start_ms, iv.end_ms))
 }
 
 fn cap(mut iv: Interval, now_ms: i64) -> Interval {
@@ -969,6 +1116,8 @@ pub struct ResolvedQuery {
     /// 结果含位置维度（回显地理署名）、或维度 / 过滤涉及位置（回显地理能力）。
     pub(crate) geo_in_dims: bool,
     pub(crate) geo_touched: bool,
+    /// 站点的目标（`event:goal` 维度用；过滤叶子里已经解析好了）。
+    pub(crate) goals: Vec<GoalDef>,
 }
 
 /// `query` 回显里由 resolve 决定的部分（日期范围与时间粒度已展开）。
@@ -1111,6 +1260,7 @@ impl ResolvedQuery {
                 &format!("filters[{i}]"),
                 &mut leaves,
                 &mut first_event_leaf,
+                &site.goals,
             )?);
         }
         let filter = match parts.len() {
@@ -1201,6 +1351,7 @@ impl ResolvedQuery {
             echo,
             geo_in_dims,
             geo_touched,
+            goals: site.goals.clone(),
         })
     }
 }
@@ -1210,6 +1361,15 @@ const SESSION_METRICS: [Metric; 4] = [
     Metric::VisitDuration,
     Metric::EngagedDuration,
     Metric::ViewsPerVisit,
+];
+
+/// 能与 `event:goal` 维度同用的指标。
+const GOAL_DIM_METRICS: [Metric; 5] = [
+    Metric::Visitors,
+    Metric::Visits,
+    Metric::Events,
+    Metric::Pageviews,
+    Metric::ConversionRate,
 ];
 
 fn validate_combinations(
@@ -1250,7 +1410,7 @@ fn validate_combinations(
         if let Some(path) = first_event_leaf {
             return Err(QueryError::validation(
                 path,
-                "event-level filters (event:page, event:hostname, event:name) cannot be combined with `exit_rate`",
+                "event-level filters (event:page, event:hostname, event:name, event:goal) cannot be combined with `exit_rate`",
             ));
         }
     }
@@ -1275,8 +1435,49 @@ fn validate_combinations(
                     ),
                 ));
             }
+            // 目标只由非 engagement 事件完成：在 engagement 事件上恒不成立
+            if let Some(j) = dim_index(Col::EventGoal) {
+                return Err(QueryError::validation(
+                    format!("dimensions[{j}]"),
+                    format!(
+                        "`event:goal` cannot be combined with `{}` (it is computed from engagement events)",
+                        m.as_str()
+                    ),
+                ));
+            }
+            if filter.is_some_and(|f| f.has_leaf_on(Col::EventGoal)) {
+                return Err(QueryError::validation(
+                    first_event_leaf.unwrap_or("filters"),
+                    format!(
+                        "`event:goal` filters cannot be combined with `{}` (it is computed from engagement events)",
+                        m.as_str()
+                    ),
+                ));
+            }
             let _ = i;
         }
+    }
+
+    // `event:goal` 维度：每行是一个目标的完成情况，只配事件形式的计数与转化率
+    if let Some(j) = dim_index(Col::EventGoal)
+        && let Some(m) = spec.metrics.iter().find(|m| !GOAL_DIM_METRICS.contains(m))
+    {
+        return Err(QueryError::validation(
+            format!("dimensions[{j}]"),
+            format!(
+                "`event:goal` can only be combined with the metrics visitors, visits, events, pageviews and conversion_rate (got `{}`)",
+                m.as_str()
+            ),
+        ));
+    }
+    if let Some(i) = metric_index(Metric::ConversionRate)
+        && dim_index(Col::EventGoal).is_none()
+        && !filter.is_some_and(|f| f.has_leaf_on(Col::EventGoal))
+    {
+        return Err(QueryError::validation(
+            format!("metrics[{i}]"),
+            "`conversion_rate` requires an `event:goal` dimension or an `event:goal` filter",
+        ));
     }
 
     if let Some(j) = dim_index(Col::EventName)

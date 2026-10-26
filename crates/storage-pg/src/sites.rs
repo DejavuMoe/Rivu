@@ -477,7 +477,8 @@ pub async fn update_site(pool: &PgPool, site_id: u64, patch: &SitePatch<'_>) -> 
     Ok(true)
 }
 
-/// 软删除站点（`deleted_at = now()`）；返回是否删除了。统计数据的清理不在这里（多阶段流程以后做）。
+/// 只软删除站点行（`deleted_at = now()`），不写删除意图；返回是否删除了。看板删除站点用
+/// [`crate::stats_deletions::soft_delete_site`]（同一事务写入站点删除意图，恢复窗口过后清除统计数据）。
 pub async fn soft_delete_site(pool: &PgPool, site_id: u64) -> Result<bool> {
     let n = sqlx::query("UPDATE sites SET deleted_at = now() WHERE id = $1 AND deleted_at IS NULL")
         .bind(i64::try_from(site_id).context("site_id 超出范围")?)

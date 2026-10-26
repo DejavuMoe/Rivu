@@ -111,6 +111,40 @@ pub async fn set_disabled(pool: &PgPool, email: &str, disabled: bool) -> Result<
     Ok(true)
 }
 
+/// 未删除用户当前的密码哈希（修改密码时校验当前密码）。
+pub async fn password_hash(pool: &PgPool, user_id: i64) -> Result<Option<String>> {
+    sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1 AND deleted_at IS NULL")
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await
+        .context("查询密码哈希失败")
+}
+
+/// 改密码：同一个事务内更新哈希并撤销该用户的全部登录会话（调用方随后签发一个新会话）。
+/// 返回是否找到了这个用户。
+pub async fn change_password(pool: &PgPool, user_id: i64, new_hash: &str) -> Result<bool> {
+    let mut tx = pool.begin().await.context("开启事务失败")?;
+    let n = sqlx::query("UPDATE users SET password_hash = $2 WHERE id = $1 AND deleted_at IS NULL")
+        .bind(user_id)
+        .bind(new_hash)
+        .execute(&mut *tx)
+        .await
+        .context("更新 users.password_hash 失败")?
+        .rows_affected();
+    if n == 0 {
+        return Ok(false);
+    }
+    sqlx::query(
+        "UPDATE auth_sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await
+    .context("撤销会话失败")?;
+    tx.commit().await.context("提交事务失败")?;
+    Ok(true)
+}
+
 /// `rivu user list` 的一行（不含密码哈希）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserListRow {

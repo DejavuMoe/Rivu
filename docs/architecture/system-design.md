@@ -698,7 +698,7 @@ TTL minute + INTERVAL 90 DAY DELETE;
 | 操作 | 实现 |
 |---|---|
 | 原始数据保留 | 表级 TTL，配合 `ttl_only_drop_parts`，过期后按 part 和月分区整块删除。月分区里最新的一行过期后整个分区才会删除，所以实际保留时间是 N 到 N+31 天（#8）；需要精确截止时，改由后台任务执行 `DROP PARTITION`。调整全局保留期属于迁移类的管理操作。站点可以设置更短的保留期（`site_settings.retention_days`），由删除任务按站点、按日期执行轻量删除 |
-| 删除站点 | 与 Plausible 相同（R02 §9）：在 PG 删除站点的同一事务里写入 `pending_stats_deletions`；后台任务每天批量处理，对 `events` 和 `sessions` 按分区执行轻量删除（`DELETE … IN PARTITION`），对 `rollup_*` 和 `ingest_counters` 也做删除 |
+| 删除站点 | 与 Plausible 相同（R02 §9）：在 PG 删除站点的同一事务里写入 `pending_stats_deletions`（`not_before` = 删除时刻 + 恢复窗口 `RIVU_SITE_RESTORE_DAYS`，窗口内恢复会取消它）；后台任务 `ch_delete_batch`（每 5 分钟，`platform-and-ops.md` §6）对 `events`、`sessions`、`ingest_counters` 按分区执行轻量删除（`DELETE … IN PARTITION`），P2 的 `rollup_*` 也要删除。按日期范围删除走同一个任务：站点本地日期按站点时区换算成 UTC 区间，`events` 按 `ts`、`ingest_counters` 按 `minute`，`sessions` 删除开始时间落在区间内的会话 |
 | 重置统计 | 真正删除数据，复用上面的删除意图机制。Plausible 只是挪了一个起始时间指针，数据永久残留（R02 §9.1） |
 | 单个访客的数据 | 系统不存在长期访客 ID，所以无法定位某个人的数据。这正是隐私设计的结果，需要写进隐私说明 |
 
@@ -737,7 +737,7 @@ v1 的 `overview`、`timeseries`、`breakdown`、`goals` 改为看板中的查�
 | 字段 | 取值 |
 |---|---|
 | `site` | `site_key`。公开 API（`POST /api/v1/query`）没有路径参数，`site` 必填，缺失返回 400；站点由它经 `authorize_site` 授权后确定，不存在或无权访问一律 404。看板内部端点由路径给出站点，`site` 可以省略，给出时只用来核对：与路径不一致返回 404，`resolve` 再核对一次，不一致按校验错误拒绝 |
-| `metrics` | 至少 1 个、至多 12 个，不得重复：`visitors` `visits` `pageviews` `events` `views_per_visit` `bounce_rate` `visit_duration` `engaged_duration` `percentage` `exit_rate` `time_on_page` `scroll_depth`；`conversion_rate` `group_conversion_rate` 与收入指标 `total_revenue` `average_revenue` 能解析，但返回 `not supported yet` |
+| `metrics` | 至少 1 个、至多 12 个，不得重复：`visitors` `visits` `pageviews` `events` `views_per_visit` `bounce_rate` `visit_duration` `engaged_duration` `percentage` `exit_rate` `time_on_page` `scroll_depth` `conversion_rate`（要求 `event:goal` 维度或过滤，§6.5）；`group_conversion_rate` 与收入指标 `total_revenue` `average_revenue` 能解析，但返回 `not supported yet` |
 | `date_range` | `day` `24h` `month` `year` `all` `realtime`、`Nd`（1–5000，含 `7d` `28d` `30d`）、`Nmo`（1–100，含 `6mo` `12mo`），或 `[from, to]`：两端同为日期（`YYYY-MM-DD`，含两端的站点本地日）或同为带 UTC 偏移的 RFC 3339 时间戳（含起点、不含终点）。`realtime` 是最近 5 分钟，QuerySpec 本身接受，是否只对看板开放由路由层决定。换算规则见 §6.7 |
 | `dimensions` | 至多 4 个，不得重复，至多一个时间维度。`event:name` `event:page` `event:hostname` `event:goal` `event:props:<k>`、`visit:entry_page` `visit:exit_page` `visit:source` `visit:channel` `visit:referrer` `visit:utm_*` `visit:country` `visit:region` `visit:city` `visit:device` `visit:browser(_version)` `visit:os(_version)`、`time`（自动粒度）`time:minute` `time:hour` `time:day` `time:week` `time:month` |
 | `filters` | 顶层数组是隐式 AND。叶子节点为 `[op, dim, [values], {case_sensitive}]`：`op` 取 `is` `is_not` `contains` `contains_not` `matches` `matches_not` `matches_wildcard` `matches_wildcard_not`；`values` 是非空的字符串或整数数组；`case_sensitive` 缺省 `true`。组合节点为 `and` `or` `not` `has_done` `has_not_done`；另有 `["is","segment",[id]]`。嵌套至多 8 层，叶子至多 100 个；时间维度不能用于过滤 |
@@ -761,9 +761,10 @@ v1 的 `overview`、`timeseries`、`breakdown`、`goals` 改为看板中的查�
 
 | 类别 | 已支持 | 返回 `not supported yet` |
 |---|---|---|
-| 指标 | `visitors` `visits` `pageviews` `events` `views_per_visit` `bounce_rate` `visit_duration` `engaged_duration` `percentage` `exit_rate` `time_on_page` `scroll_depth` | 转化率（`conversion_rate` `group_conversion_rate`）、收入（`total_revenue` `average_revenue`） |
-| 维度 | `event:name` `event:page` `event:hostname` `visit:entry_page` `visit:exit_page` `visit:source` `visit:channel` `visit:referrer` `visit:utm_*` `visit:country` `visit:region` `visit:city` `visit:device` `visit:browser(_version)` `visit:os(_version)`、`time` `time:minute` `time:hour` `time:day` `time:week` `time:month`（`time:minute` 至多 1500 个桶，约 25 小时） | 目标（`event:goal`）、属性（`event:props:<k>`） |
-| 过滤 | 上述维度（不含时间维度）上的 8 个叶子操作符，以及 `and` `or` `not`；`visit:city` 只支持 `is` `is_not`，取值是 GeoNames id | `has_done` `has_not_done`、`["is","segment",[id]]`、对目标、属性的过滤 |
+| 指标 | `visitors` `visits` `pageviews` `events` `views_per_visit` `bounce_rate` `visit_duration` `engaged_duration` `percentage` `exit_rate` `time_on_page` `scroll_depth` `conversion_rate` | 分组转化率（`group_conversion_rate`）、收入（`total_revenue` `average_revenue`） |
+| 维度 | `event:name` `event:page` `event:hostname` `event:goal` `visit:entry_page` `visit:exit_page` `visit:source` `visit:channel` `visit:referrer` `visit:utm_*` `visit:country` `visit:region` `visit:city` `visit:device` `visit:browser(_version)` `visit:os(_version)`、`time` `time:minute` `time:hour` `time:day` `time:week` `time:month`（`time:minute` 至多 1500 个桶，约 25 小时） | 属性（`event:props:<k>`） |
+| 过滤 | 上述维度（不含时间维度）上的 8 个叶子操作符，以及 `and` `or` `not`；`visit:city` 只支持 `is` `is_not`，取值是 GeoNames id；`event:goal` 只支持 `is` `is_not`，取值是目标的标签或 id | `has_done` `has_not_done`、`["is","segment",[id]]`、对属性的过滤 |
+| 目标 | 事件目标（事件名）与页面目标（pathname 通配），见 §6.6 | 滚动深度目标、目标的 props 条件（要改表结构，并依赖 `event:props`） |
 | `date_range` | `day` `24h` `month` `year` `all` `realtime` `Nd` `Nmo` `[from, to]` | — |
 | `include` | `time_labels` `total_rows` `compare` | `imports`（未实现，直接是未知字段） |
 | 数据层 | 原始层（`events` 与 `sessions`）。`meta.tiers` 恒为 `["raw"]` | 日汇总层与 §6.4「选层」规则、`range_beyond_raw_retention` 警告 |
@@ -787,7 +788,7 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 - 对比查询沿用 Plausible 的做法：先执行主查询，再用主查询结果中的维度值约束对比期，保证两边的行集一致（R03 §7.5）。时间维度不参与约束。
 - 一次请求可能发多条查询（`all` 的最早事件、`percentage` 的分母、主查询、对比期），共用同一个截止时间（调用方档位的 `max_execution_time`，§6.8）。
 - **地理元数据**：`meta.geo_capability`（`country` 或 `city`）只在维度或过滤涉及位置（`visit:country` `visit:region` `visit:city`）时给出；`meta.geo_attribution` 只在**维度**含位置时给出（§4.4 署名要求）。站点的地理库能力是 `country`，而维度或过滤用到 `visit:region` 或 `visit:city` 时，`meta.warnings` 带 `geo_capability_country_only`（地理库只提供国家级数据，地区与城市为空，§6.10）。
-- 分群（`segment`）与目标（`event:goal`）的展开、加载目前未实现：build 阶段直接返回 `not supported yet`（§6.2）。
+- **加载目标**：调用方（`query_api::load_site_context`）每次查询从 PG 读站点未删除的目标放进 `SiteContext.goals`，没有缓存，增删立即生效；build 阶段把 `event:goal` 过滤的取值解析成目标的完成条件，`event:goal` 维度用全部目标。分群（`segment`）的展开目前未实现：build 阶段直接返回 `not supported yet`（§6.2）。
 
 ### 6.4 规划器：选表与选层
 
@@ -852,7 +853,7 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 | `time_on_page` | 按行计算，只看 engagement 事件：先对每个（维度值，会话）累加 `engagement_ms`，再 `sum(engagement_ms) / 1000 / 有 engagement 的会话数` |
 | `scroll_depth` | 按行计算：先对每个（维度值，会话）取 `max(scroll_depth ≤ 100)`，再对有有效 `scroll_depth` 的会话取平均，范围 0–100 |
 | `exit_rate` | 该页的退出次数 / 该页的 pageviews。退出次数是区间内活跃、最后一个 pageview 是该页的会话数，所以退出发生在区间之后时比值可以超过 1 |
-| `conversion_rate` | 完成目标的访客数 / 同范围、去掉目标和 props 过滤后的访客数 |
+| `conversion_rate` | 完成目标的访客数 / 同范围、去掉目标过滤后的访客数（0–1）。要求 `event:goal` 维度或 `event:goal` 过滤，否则校验错误。**分子**是本行的 `visitors`（有目标过滤时只数完成目标的事件；有目标维度时只数完成本行目标的事件）。**分母**是另一个事件组件（转化分母组件）：同一区间、非 engagement 事件、过滤树去掉全部 `event:goal` 叶子（`and` / `or` 去掉这些子节点，子节点全被去掉的分支与 `not` 一并去掉，整棵树都是目标叶子时不过滤）、按本行**其余维度**（时间桶、来源等）分组的访客数；`event:goal` 维度在分母里展开成全部目标标签，所以同一组其余维度值下每个目标的分母相同。有维度时只返回有转化访客（分子 > 0）的行，没有转化的目标不出现。props 条件不在本期，没有可去掉的 props 过滤 |
 | `percentage` | 本行访客数 / 去掉维度后的访客总数（同一区间、同样的过滤，另一次查询）。要求至少一个维度，且不能带时间维度 |
 | `realtime` | `uniq(visitor_id)`，取最近 5 分钟、`name != 'engagement'` 的事件 |
 
@@ -871,7 +872,12 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 - **时间维度上的会话**：会话级指标按会话在范围内**首次活跃**的桶计入，即 `max(started_at, 范围起点)` 所在的桶，所以各桶的 `visits` 之和等于整个范围的 `visits`。事件形式的 `visits`（有 `event:*` 维度）按事件时间分桶，同一会话的事件落在多个桶时各算一次，各桶之和可以大于总数。
 - **取值规则**：`is` 的取值若等于该维度的展示文案（`Direct / None`、`(not set)`、`(none)`），按空值匹配；`contains` 不匹配空串；`case_sensitive: false` 只做 ASCII 大小写折叠；`visit:city` 只支持 `is` `is_not`，取值是 GeoNames id。数量上限与正则限制见 §6.8。
 - `has_done` / `has_not_done` 通过 `session_id IN (…)` 实现（目前返回 `not supported yet`，§6.2）。
-- 目标（goal）有三种：事件名、页面通配、滚动深度阈值，每个目标最多带 3 个 props 条件（R03 §6.4）。
+- **目标（goal）**：Plausible 有三种（事件名、页面通配、滚动深度阈值），每个目标最多带 3 个 props 条件（R03 §6.4）。Rivu 本期只做前两种，不带 props 条件：
+  - **事件目标**：非 engagement 事件的 `name` 与目标的事件名完全相等（区分大小写）；
+  - **页面目标**：`pageview` 事件，且规范化后的 pathname 整串匹配目标的通配模式：只有 `*` 是通配（匹配任意串，含空串与 `/`，连续的 `*` 合并），其余字符按字面、区分大小写，与屏蔽规则的 `page` 模式同一语义（SQL 里转成 `LIKE`，`%` `_` `\` 转义）；
+  - **标签**：显示名，否则事件名，否则页面通配；同一站点里标签唯一（添加时 409），是 `event:goal` 维度的取值；
+  - **`event:goal` 维度**：一个事件落进它完成的每个目标（按标签去重）的行，不完成任何目标的事件不出现，所以没有空值行；只能与 `visitors` `visits` `events` `pageviews` `conversion_rate` 同用（会话指标、`percentage`、`exit_rate`、`time_on_page`、`scroll_depth` 报错）；
+  - **`event:goal` 过滤**：`["is","event:goal",[…]]` 与 `is_not`，取值等于目标的标签（`case_sensitive: false` 时 ASCII 大小写折叠）或目标 id 的十进制文本；翻译成这些目标完成条件的 `OR`，不认识的取值对不上任何目标（`is` 恒假、`is_not` 恒真）。它是事件级叶子：在事件指标上逐事件判定，在会话指标上是「会话在范围内有完成目标的事件」（存在语义，同上）；不能与 `exit_rate`、`time_on_page`、`scroll_depth` 同用。
 - 未知的过滤组合直接报错，不静默放行。Plausible 的做法是返回 false 再记一条日志，只是不会泄露数据。
 
 ### 6.7 时间与时区
@@ -903,7 +909,7 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
   | 整日区间 | 向前平移 N 个本地日，N 是主区间的本地日数（终点晚于今天、起点不晚于今天时，终点先裁到今天再数） | 起点减一年（2 月 29 日取 28 日），长度 N 日不变 |
   | 时刻区间（`24h`、`realtime`、时间戳对） | 向前平移区间的时长 | 起点按站点时区减一年，长度不变 |
 
-  显式的 `[from, to]` 与 `date_range` 的写法和校验相同。`change`（只在无时间维度的对比里给出，与 `metrics` 同序）：`bounce_rate`、`percentage`、`exit_rate` 取绝对差（新 − 旧）；其余指标取相对变化 `(新 − 旧) / 旧`，旧值为 0 时新值也为 0 记 0，否则记 1。对比期里没有的行，旧值按 0 算。
+  显式的 `[from, to]` 与 `date_range` 的写法和校验相同。`change`（只在无时间维度的对比里给出，与 `metrics` 同序）：`bounce_rate`、`percentage`、`exit_rate`、`conversion_rate` 取绝对差（新 − 旧）；其余指标取相对变化 `(新 − 旧) / 旧`，旧值为 0 时新值也为 0 记 0，否则记 1。对比期里没有的行，旧值按 0 算。
 ### 6.8 安全与隔离
 
 | 风险 | 措施 |
@@ -919,7 +925,7 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 ### 6.9 结果缓存
 
 - 使用 moka。key 为以下内容的哈希：规范化后的 `ResolvedQuery`、`site.config_version`、`site.data_version`，以及时间桶。时间桶的长度按 v1 的 TTL 表：实时 3 s，当日 10 s，近 7 天 60 s，历史范围 10 min。
-- 站点配置（目标、时区）变化时，`config_version` 加一。删除数据、重建汇总层时，`data_version` 加一，并通过 NOTIFY 广播。
+- 站点配置（目标、时区）变化时，`config_version` 加一（结果缓存尚未实现：目标与时区现在每次查询现读，没有要失效的东西）。删除数据、重建汇总层时，`data_version` 加一，并通过 NOTIFY 广播。
 - Plausible 完全没有结果缓存（R03 §11），这是 Rivu 在 v1 基础上新增的优化。多节点 api 部署时，先接受各节点各自缓存；确实出现不一致问题后再引入 Valkey，与 v1 一致。
 
 ### 6.10 维度可信度

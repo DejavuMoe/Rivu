@@ -14,6 +14,10 @@
 //!   `bounce_rate` 再要求把 `event:page` / `event:hostname` 叶子换成入口页之后的树也成立。
 //! - `visits`：有 `event:*` 维度时是「含该维度值的事件所属的不同会话数」，否则是「区间内活跃的会话数」。
 //! - 所有区间的终点封顶到 `now + 1 ms`。
+//! - 目标：事件目标是事件名相等，页面目标是 `pageview` 且 pathname 整串匹配通配（手写 glob，区分大小写）。
+//!   `event:goal` 维度：一个事件落进它完成的每个目标（按标签去重）的组；过滤取值按标签或 id 对上目标，只有 `is` / `is_not`。
+//!   `conversion_rate` = 本组访客 ÷ 分母：过滤去掉目标叶子、同样的其余维度值的访客（`event:goal` 维度取每个目标标签）；
+//!   有维度时只保留有转化访客的组。
 //!
 //! 通配符用手写的 glob 匹配（不转正则）；`matches` 用 Rust 的 `regex`（线性时间，与 Hyperscan 在测试用的语法子集上一致）。
 
@@ -95,6 +99,34 @@ pub struct RefSite {
     pub tz: TimeZone,
     pub week_start: Weekday,
     pub now_ms: i64,
+    /// 站点的目标。
+    pub goals: Vec<RefGoal>,
+}
+
+/// 一个目标：标签（显示名，否则事件名，否则页面通配）与完成条件。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefGoal {
+    pub id: i64,
+    pub label: String,
+    pub kind: RefGoalKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RefGoalKind {
+    /// 事件名完全相等。
+    Event(String),
+    /// `pageview`，且 pathname 整串匹配通配（只有 `*`，区分大小写）。
+    Page(String),
+}
+
+impl RefGoal {
+    /// 非 engagement 事件 `e` 是否完成了这个目标。
+    fn completed_by(&self, e: &RefEvent) -> bool {
+        match &self.kind {
+            RefGoalKind::Event(n) => e.name == *n,
+            RefGoalKind::Page(p) => e.name == "pageview" && glob_match(p, &e.pathname),
+        }
+    }
 }
 
 /// 一行结果。`raw` 是未换成展示文案的维度值（排序用），`dimensions` 是展示文案。
@@ -152,6 +184,24 @@ enum Node {
     Or(Vec<Node>),
     Not(Box<Node>),
     Leaf(Leaf),
+}
+
+impl Node {
+    /// 去掉 `event:goal` 叶子；`and` / `or` 的子节点全去掉了就整支去掉，`not` 跟着它的子节点走。
+    fn without_goals(&self) -> Option<Node> {
+        match self {
+            Node::Leaf(l) => (l.dim != "event:goal").then(|| self.clone()),
+            Node::Not(x) => x.without_goals().map(|x| Node::Not(Box::new(x))),
+            Node::And(c) | Node::Or(c) => {
+                let kept: Vec<Node> = c.iter().filter_map(Node::without_goals).collect();
+                match (kept.is_empty(), self) {
+                    (true, _) => None,
+                    (false, Node::And(_)) => Some(Node::And(kept)),
+                    _ => Some(Node::Or(kept)),
+                }
+            }
+        }
+    }
 }
 
 fn parse_node(v: &Value) -> Result<Node, String> {
@@ -664,6 +714,7 @@ struct Model<'a> {
     /// 事件 → 会话
     owner: Vec<Option<usize>>,
     clock: Clock<'a>,
+    goals: &'a [RefGoal],
 }
 
 #[derive(Default, Clone)]
@@ -682,6 +733,8 @@ struct Acc {
     exits: u64,
     /// engagement：会话 → (时长, 有效滚动深度的最大值, 有效滚动事件数)
     eng: BTreeMap<usize, (u64, u8, u64)>,
+    /// `conversion_rate` 的分母：去掉目标过滤后的访客。
+    cr_base: HashSet<(Date, u64)>,
 }
 
 impl Model<'_> {
@@ -748,6 +801,42 @@ impl Model<'_> {
         }
     }
 
+    /// 事件 `i` 完成的目标的标签（去重、排序）。
+    fn goal_labels(&self, i: usize) -> Vec<String> {
+        let e = &self.ev[i];
+        let set: BTreeSet<String> = self
+            .goals
+            .iter()
+            .filter(|g| g.completed_by(e))
+            .map(|g| g.label.clone())
+            .collect();
+        set.into_iter().collect()
+    }
+
+    /// 事件级叶子在事件 `i` 上：`event:goal` 是「事件完成了取值对上的某个目标」（取值是标签或 id），其余比较事件的字段。
+    fn event_leaf(&self, l: &Leaf, i: usize) -> bool {
+        if l.dim != "event:goal" {
+            return leaf_test(l, &self.event_value(&l.dim, i), 0);
+        }
+        let e = &self.ev[i];
+        let named = |g: &RefGoal| {
+            l.values.iter().any(|v| {
+                let by_label = if l.case_sensitive {
+                    *v == g.label
+                } else {
+                    v.eq_ignore_ascii_case(&g.label)
+                };
+                by_label || *v == g.id.to_string()
+            })
+        };
+        let hit = self.goals.iter().any(|g| named(g) && g.completed_by(e));
+        match l.op.as_str() {
+            "is" => hit,
+            "is_not" => !hit,
+            other => panic!("event:goal 不支持 {other}"),
+        }
+    }
+
     /// 在事件行 `i` 上求过滤树。
     fn eval_event(&self, n: &Node, i: usize) -> bool {
         match n {
@@ -756,7 +845,7 @@ impl Model<'_> {
             Node::Not(x) => !self.eval_event(x, i),
             Node::Leaf(l) => {
                 if l.dim.starts_with("event:") {
-                    leaf_test(l, &self.event_value(&l.dim, i), 0)
+                    self.event_leaf(l, i)
                 } else {
                     let s = self.owner[i].expect("参与求值的事件都有会话");
                     let (v, city) = self.visit_value(&l.dim, s);
@@ -785,7 +874,7 @@ impl Model<'_> {
                         e.kind() != EventKind::Engagement
                             && e.ts_ms >= iv.start
                             && e.ts_ms < iv.end
-                            && leaf_test(l, &self.event_value(&l.dim, i), 0)
+                            && self.event_leaf(l, i)
                     })
                 } else {
                     let (v, city) = self.visit_value(&l.dim, s);
@@ -795,20 +884,45 @@ impl Model<'_> {
         }
     }
 
-    /// 事件行上的维度原始值。
-    fn event_dims(&self, dims: &[String], i: usize, gran: &str) -> Vec<String> {
+    /// 事件行上的维度原始值。`event:goal` 的取值是一组标签，所以一个事件落进零到多个组：
+    /// `all_goals` 为假时取事件完成的目标；为真时（转化率的分母）取全部目标的标签。
+    fn event_keys(
+        &self,
+        dims: &[String],
+        i: usize,
+        gran: &str,
+        all_goals: bool,
+    ) -> Vec<Vec<String>> {
         let s = self.owner[i].expect("有会话");
-        dims.iter()
-            .map(|d| {
-                if d.starts_with("time") {
-                    self.clock.bucket(gran, self.ev[i].ts_ms)
-                } else if d.starts_with("event:") {
-                    self.event_value(d, i)
+        let mut keys: Vec<Vec<String>> = vec![Vec::new()];
+        for d in dims {
+            let values: Vec<String> = if d.starts_with("time") {
+                vec![self.clock.bucket(gran, self.ev[i].ts_ms)]
+            } else if d == "event:goal" {
+                if all_goals {
+                    let set: BTreeSet<String> =
+                        self.goals.iter().map(|g| g.label.clone()).collect();
+                    set.into_iter().collect()
                 } else {
-                    self.visit_value(d, s).0
+                    self.goal_labels(i)
                 }
-            })
-            .collect()
+            } else if d.starts_with("event:") {
+                vec![self.event_value(d, i)]
+            } else {
+                vec![self.visit_value(d, s).0]
+            };
+            keys = keys
+                .into_iter()
+                .flat_map(|k| {
+                    values.iter().map(move |v| {
+                        let mut k = k.clone();
+                        k.push(v.clone());
+                        k
+                    })
+                })
+                .collect();
+        }
+        keys
     }
 
     /// 会话行上的维度原始值。`exit`：`event:page` 取退出页，否则取入口页。
@@ -858,6 +972,10 @@ impl Run<'_> {
     /// 在区间 `iv` 上计算所有组件，按维度原始值分组。
     fn groups(&self, iv: &Iv) -> BTreeMap<Vec<String>, Acc> {
         let mut groups = self.groups_raw(iv);
+        // 转化率：有维度时只保留有转化访客的组（分母会带出没有转化的组）
+        if self.needs("conversion_rate") && !self.spec.dims.is_empty() {
+            groups.retain(|_, a| !a.visitors.is_empty());
+        }
         // 没有维度的查询恒有一行（数据为空时全是 0）
         if self.spec.dims.is_empty() {
             groups.entry(Vec::new()).or_default();
@@ -877,6 +995,7 @@ impl Run<'_> {
             || self.needs("events")
             || self.needs("percentage")
             || self.needs("exit_rate")
+            || self.needs("conversion_rate")
             || (self.needs("visits") && self.has_event_dim);
         if ev_needed {
             for (i, e) in m.ev.iter().enumerate() {
@@ -886,14 +1005,35 @@ impl Run<'_> {
                 if filter.is_some_and(|f| !m.eval_event(f, i)) {
                     continue;
                 }
-                let key = m.event_dims(&spec.dims, i, self.gran);
-                let a = groups.entry(key).or_default();
-                a.visitors.insert((m.clock.date(e.ts_ms), e.person));
-                a.events += 1;
-                if e.kind() == EventKind::Pageview {
-                    a.pageviews += 1;
+                for key in m.event_keys(&spec.dims, i, self.gran, false) {
+                    let a = groups.entry(key).or_default();
+                    a.visitors.insert((m.clock.date(e.ts_ms), e.person));
+                    a.events += 1;
+                    if e.kind() == EventKind::Pageview {
+                        a.pageviews += 1;
+                    }
+                    a.ev_sessions.insert(m.owner[i].expect("有会话"));
                 }
-                a.ev_sessions.insert(m.owner[i].expect("有会话"));
+            }
+        }
+
+        // 转化率的分母：同样的事件，但过滤去掉目标叶子；`event:goal` 维度取全部目标的标签
+        if self.needs("conversion_rate") {
+            let base = filter.and_then(Node::without_goals);
+            for (i, e) in m.ev.iter().enumerate() {
+                if m.owner[i].is_none() || e.kind() == EventKind::Engagement || !in_range(e.ts_ms) {
+                    continue;
+                }
+                if base.as_ref().is_some_and(|f| !m.eval_event(f, i)) {
+                    continue;
+                }
+                for key in m.event_keys(&spec.dims, i, self.gran, true) {
+                    groups
+                        .entry(key)
+                        .or_default()
+                        .cr_base
+                        .insert((m.clock.date(e.ts_ms), e.person));
+                }
             }
         }
 
@@ -951,13 +1091,14 @@ impl Run<'_> {
                 if filter.is_some_and(|f| !m.eval_event(f, i)) {
                     continue;
                 }
-                let key = m.event_dims(&spec.dims, i, self.gran);
-                let a = groups.entry(key).or_default();
-                let slot = a.eng.entry(m.owner[i].expect("有会话")).or_default();
-                slot.0 += u64::from(e.engagement_ms);
-                if e.scroll_depth <= 100 {
-                    slot.1 = slot.1.max(e.scroll_depth);
-                    slot.2 += 1;
+                for key in m.event_keys(&spec.dims, i, self.gran, false) {
+                    let a = groups.entry(key).or_default();
+                    let slot = a.eng.entry(m.owner[i].expect("有会话")).or_default();
+                    slot.0 += u64::from(e.engagement_ms);
+                    if e.scroll_depth <= 100 {
+                        slot.1 = slot.1.max(e.scroll_depth);
+                        slot.2 += 1;
+                    }
                 }
             }
         }
@@ -1016,6 +1157,7 @@ impl Run<'_> {
                 "engaged_duration" => div(a.s_eng_ms as f64 / 1000.0, a.s_eng_n as f64),
                 "percentage" => div(a.visitors.len() as f64, total.unwrap_or(0) as f64),
                 "exit_rate" => div(a.exits as f64, a.pageviews as f64),
+                "conversion_rate" => div(a.visitors.len() as f64, a.cr_base.len() as f64),
                 "time_on_page" => {
                     let ms: u64 = a.eng.values().map(|x| x.0).sum();
                     div(ms as f64 / 1000.0, a.eng.len() as f64)
@@ -1102,7 +1244,10 @@ impl Run<'_> {
 }
 
 fn change(metric: &str, new: f64, old: f64) -> f64 {
-    if matches!(metric, "bounce_rate" | "percentage" | "exit_rate") {
+    if matches!(
+        metric,
+        "bounce_rate" | "percentage" | "exit_rate" | "conversion_rate"
+    ) {
         new - old
     } else if old == 0.0 {
         if new == 0.0 { 0.0 } else { 1.0 }
@@ -1140,6 +1285,7 @@ pub fn run(spec_json: &Value, site: &RefSite, events: &[RefEvent]) -> Result<Ref
         sess,
         owner,
         clock: Clock { site },
+        goals: &site.goals,
     };
     let time_idx = spec.dims.iter().position(|d| d.starts_with("time"));
     let gran = match time_idx.map(|i| spec.dims[i].as_str()) {
@@ -1275,6 +1421,7 @@ mod tests {
             tz: TimeZone::get(tz).unwrap(),
             week_start: Weekday::Monday,
             now_ms: now.as_millisecond(),
+            goals: Vec::new(),
         }
     }
 
@@ -1353,6 +1500,85 @@ mod tests {
         assert_eq!(r.rows.len(), 1);
         // visitors 3、pageviews 3、visits 3（浏览过 /a 的会话）；bounce：入口是 /a 的会话 1 号（不跳出）和 3 号（跳出）
         assert_eq!(r.rows[0].metrics, vec![3.0, 3.0, 3.0, 0.5]);
+    }
+
+    #[test]
+    fn goals_by_hand() {
+        // 1 号：/checkout/a/done（完成 Checkout）+ Signup；2 号：/checkout/done（不匹配 /checkout/*/done 的第二个 /）；
+        // 3 号：只有 /。共 3 个访客。
+        let tz = TimeZone::UTC;
+        let d = date(2026, 3, 10);
+        let t = |h, m| at(d, h, m, &tz);
+        let signup = RefEvent {
+            name: "Signup".into(),
+            ..pv(1, t(10, 2), "/checkout/a/done", "")
+        };
+        let evs = vec![
+            pv(1, t(10, 0), "/", "g"),
+            pv(1, t(10, 1), "/checkout/a/done", "g"),
+            signup,
+            pv(2, t(11, 0), "/checkout/done", ""),
+            pv(3, t(12, 0), "/", "g"),
+        ];
+        let mut s = site(
+            "UTC",
+            Timestamp::from_millisecond(at(date(2026, 3, 11), 0, 0, &tz)).unwrap(),
+        );
+        s.goals = vec![
+            RefGoal {
+                id: 7,
+                label: "Signup".into(),
+                kind: RefGoalKind::Event("Signup".into()),
+            },
+            RefGoal {
+                id: 8,
+                label: "Checkout".into(),
+                kind: RefGoalKind::Page("/checkout/*/done".into()),
+            },
+            RefGoal {
+                id: 9,
+                label: "Never".into(),
+                kind: RefGoalKind::Event("never".into()),
+            },
+        ];
+        let spec = json!({
+            "metrics": ["visitors", "events", "conversion_rate"],
+            "date_range": ["2026-03-10", "2026-03-10"],
+            "dimensions": ["event:goal"],
+            "order_by": [["event:goal", "asc"]]
+        });
+        let r = run(&spec, &s, &evs).unwrap();
+        let got: Vec<(String, Vec<f64>)> = r
+            .rows
+            .iter()
+            .map(|x| (x.dimensions[0].clone(), x.metrics.clone()))
+            .collect();
+        // 没有转化的目标（Never）不出现；分母是全部 3 个访客
+        assert_eq!(
+            got,
+            [
+                ("Checkout".into(), vec![1.0, 1.0, 1.0 / 3.0]),
+                ("Signup".into(), vec![1.0, 1.0, 1.0 / 3.0])
+            ]
+        );
+        // 目标过滤（按 id）+ 来源维度：分母去掉目标叶子，按来源算
+        let spec = json!({
+            "metrics": ["visitors", "conversion_rate"],
+            "date_range": ["2026-03-10", "2026-03-10"],
+            "dimensions": ["visit:source"],
+            "filters": [["is", "event:goal", ["8"]]]
+        });
+        let r = run(&spec, &s, &evs).unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0].dimensions, vec!["g".to_owned()]);
+        assert_eq!(r.rows[0].metrics, vec![1.0, 0.5]);
+        // is_not：没有完成 Checkout 的事件
+        let spec = json!({
+            "metrics": ["events"],
+            "date_range": ["2026-03-10", "2026-03-10"],
+            "filters": [["is_not", "event:goal", ["checkout"], {"case_sensitive": false}]]
+        });
+        assert_eq!(run(&spec, &s, &evs).unwrap().rows[0].metrics, vec![4.0]);
     }
 
     #[test]

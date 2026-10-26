@@ -5,7 +5,8 @@
 //!   接入管线（hostname、限流、垃圾引荐、屏蔽规则、机器人、地理、UA、来源）、
 //!   会话清扫、站点脚本分发（`GET /js/<site_key>.js`，`core.js` 启动时从 `RIVU_TRACKER_DIR` 读入）；
 //! - worker / all：后台任务 `salts_rotate`（启动时补跑一次，之后每小时一次）、`geoip_refresh`
-//!   （无本地副本时立即下载，之后按 `RIVU_GEOIP_REFRESH_INTERVAL` 条件 GET）；
+//!   （无本地副本时立即下载，之后按 `RIVU_GEOIP_REFRESH_INTERVAL` 条件 GET）、`ch_delete_batch`
+//!   （启动后一轮，之后每 `RIVU_STATS_DELETE_INTERVAL_SECS` 一轮，`rivu_maintainer` 账号）；
 //! - collector / all：持有 GeoIP 库并每小时检查文件修改时间、热加载；管线第 6 步用它查询位置；
 //! - api / all：公开查询 API（`POST /api/v1/query`、`GET /api/v1/query/schema.json`，见 [`crate::query_api`]）：
 //!   `rivu_reader` 账号的 ClickHouse 客户端、API key 鉴权与按组织限流（[`crate::api_auth::build_guard`]）；
@@ -230,6 +231,7 @@ pub async fn run(config: Config) -> Result<ExitCode> {
     rivu_geo::describe_metrics();
     query_api::describe_metrics();
     dash_api::describe_metrics();
+    rivu_jobs::stats_delete::describe_metrics();
 
     // 先绑定端口：端口被占用时不应该留下已经启动的后台任务。
     let internal_listener = TcpListener::bind(config.internal_addr)
@@ -258,6 +260,28 @@ pub async fn run(config: Config) -> Result<ExitCode> {
             false,
         ));
     }
+
+    // 后台任务 ch_delete_batch：执行到期的统计数据删除意图（`rivu_maintainer` 账号）。
+    // all 里看板写入日期范围意图后通过 `stats_delete_kick` 立即唤醒一次。
+    let stats_delete_kick = if role.runs_jobs() {
+        let account = config
+            .ch_maintainer
+            .as_ref()
+            .context("worker 需要 RIVU_CH_MAINTAINER_USER / RIVU_CH_MAINTAINER_PASSWORD")?;
+        let maintainer =
+            rivu_storage_ch::client(&config.clickhouse_url, account, Some(&config.ch_database));
+        let kick = rivu_jobs::StatsDeleteKick::default();
+        background.push(rivu_jobs::spawn_stats_delete(
+            pg.clone(),
+            maintainer,
+            config.stats_delete_interval,
+            Arc::clone(&kick),
+            bg_stop_rx.clone(),
+        ));
+        Some(kick)
+    } else {
+        None
+    };
 
     // GeoIP：collector / all 持有库并热加载（管线接入之前只是加载与报告状态）；
     // worker / all 运行 `geoip_refresh`，all 里刷新成功后直接热加载同一个库。
@@ -326,7 +350,8 @@ pub async fn run(config: Config) -> Result<ExitCode> {
         }
         let dash = Arc::new(
             DashApi::new(&config, pg.clone(), reader.clone(), geo_db.clone())
-                .context("装配内部端点失败")?,
+                .context("装配内部端点失败")?
+                .with_stats_delete_kick(stats_delete_kick.clone()),
         );
         background.push(dash_api::spawn_maintenance(pg.clone(), bg_stop_rx.clone()));
         Some(

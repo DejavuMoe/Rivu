@@ -5,6 +5,8 @@ pub mod api_auth;
 pub mod apikey_cmd;
 pub mod cli;
 pub mod dash_api;
+pub mod diagnostics;
+pub mod goals_admin;
 pub mod internal;
 pub mod migrate;
 pub mod org_admin;
