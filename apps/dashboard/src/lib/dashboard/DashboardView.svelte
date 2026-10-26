@@ -36,7 +36,6 @@
     encodeFilters,
     grans,
     METRICS,
-    partialLast,
     readRows,
     readSeries,
     readState,
@@ -272,9 +271,9 @@
         {#snippet actions()}
           {#if !shared && neverReceived}
             <Button variant="primary" href="/s/{siteId}/install">{t("dash.installGuide")}</Button>
-          {:else if !neverReceived && dash.range !== "day"}
-            <!-- Nmo 不含本月：刚接入的站点只有今天的数据 -->
-            <Button onclick={() => setQuery({ range: "day", gran: null })}>{t("dash.viewToday")}</Button>
+          {:else if !neverReceived && dash.range !== "all"}
+            <!-- 所选范围没有数据，但站点以前收到过 -->
+            <Button onclick={() => setQuery({ range: "all", gran: null })}>{t("dash.viewAll")}</Button>
           {/if}
         {/snippet}
       </EmptyState>
@@ -332,7 +331,7 @@
             {xLabels}
             tipLabels={tips}
             format={(n) => fmtAxis(metric, n, app.lang)}
-            partialLast={partialLast(dash.range)}
+            partialLast
             partialText={t("dash.partial")}
             deltaOf={delta}
             lowerIsBetter={lowerIsBetter(metric)}

@@ -14,7 +14,7 @@
 //!   所以 23 / 25 小时的日子都恰好是一个本地日。
 //! - `day`：今天；`24h`：`[now - 24h, now]`；`realtime`：`[now - 5 min, now]`；
 //!   `Nd`（含 `7d` `28d` `30d`）：截至**今天**的 N 个本地日，含今天；`month`：本月 1 日到今天；
-//!   `Nmo`（含 `6mo` `12mo`）：截至上个月月底的 N 个完整自然月；`year`：当年 1 月 1 日到今天；
+//!   `Nmo`（含 `6mo` `12mo`）：截至今天的 N 个自然月，含本月；`year`：当年 1 月 1 日到今天；
 //!   `all`：站点最早事件所在本地日到今天（最早事件由 ClickHouse 查一次，没有数据时只含今天）。
 //! - 所有区间的终点都**封顶到 `now`**（`end = min(end, now + 1 ms)`）：未来没有数据，这样 `month`、`year`、`day`
 //!   的时间标签不会出现未来的空桶，数据与标签用同一个终点。
@@ -844,12 +844,11 @@ pub(crate) fn resolve_range(
         }
         DateRange::Month => dates_interval(tz, today.first_of_month(), today)?,
         DateRange::Months(n) => {
-            let this_month = today.first_of_month();
-            let from = this_month
-                .checked_sub(Span::new().months(i64::from(*n)))
+            let from = today
+                .first_of_month()
+                .checked_sub(Span::new().months(i64::from(*n) - 1))
                 .map_err(|_| range_error("date_range", "the date is out of the supported range"))?;
-            let to = checked_days(this_month, -1, "date_range")?;
-            dates_interval(tz, from, to)?
+            dates_interval(tz, from, today)?
         }
         DateRange::Year => dates_interval(tz, today.first_of_year(), today)?,
         DateRange::All => {
@@ -1629,21 +1628,20 @@ mod tests {
     }
 
     #[test]
-    fn months_end_with_last_month() {
+    fn months_end_today_and_include_this_month() {
         let berlin = tz("Europe/Berlin");
         let now = ms(&berlin, 2026, 3, 31, 9, 0);
-        assert_eq!(
-            dates(&iv(DateRange::Months(1), &berlin, now)),
-            (date(2026, 2, 1), date(2026, 2, 28))
-        );
+        let one = iv(DateRange::Months(1), &berlin, now);
+        assert_eq!(dates(&one), (date(2026, 3, 1), date(2026, 3, 31)));
+        assert_eq!(one.end_ms, now + 1, "含本月，终点封顶到 now");
         assert_eq!(
             dates(&iv(DateRange::Months(6), &berlin, now)),
-            (date(2025, 9, 1), date(2026, 2, 28))
+            (date(2025, 10, 1), date(2026, 3, 31))
         );
         let now = ms(&berlin, 2026, 1, 15, 9, 0);
         assert_eq!(
             dates(&iv(DateRange::Months(12), &berlin, now)),
-            (date(2025, 1, 1), date(2025, 12, 31))
+            (date(2025, 2, 1), date(2026, 1, 15))
         );
     }
 
@@ -1746,7 +1744,9 @@ mod tests {
         assert_eq!(g(DateRange::Days(41)), Gran::Week);
         assert_eq!(g(DateRange::Days(364)), Gran::Week);
         assert_eq!(g(DateRange::Days(365)), Gran::Month);
-        assert_eq!(g(DateRange::Months(12)), Gran::Month);
+        // 含本月的 12 个月在 10/23 只有 357 天
+        assert_eq!(g(DateRange::Months(12)), Gran::Week);
+        assert_eq!(g(DateRange::Months(13)), Gran::Month);
         // 两个本地日跨 DST：仍是「两日」，用小时
         let berlin = tz("Europe/Berlin");
         let now = ms(&berlin, 2026, 3, 30, 12, 0);
@@ -1830,13 +1830,13 @@ mod tests {
         );
         assert_eq!(
             time_labels(&r, Gran::Month, &berlin, Weekday::Monday).unwrap(),
-            ["2026-01-01", "2026-02-01", "2026-03-01"]
+            ["2026-02-01", "2026-03-01", "2026-04-01"]
         );
         assert_eq!(
             time_labels(&r, Gran::Day, &berlin, Weekday::Monday)
                 .unwrap()
                 .len(),
-            31 + 28 + 31
+            28 + 31 + 15
         );
         // 空区间没有标签
         let empty = iv(DateRange::Year, &berlin, ms(&berlin, 2025, 12, 31, 0, 0));

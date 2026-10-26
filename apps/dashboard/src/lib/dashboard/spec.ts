@@ -4,7 +4,7 @@
 
 import type { QueryResult } from "../api.ts";
 
-export type RangeKey = "realtime" | "day" | "24h" | "7d" | "28d" | "30d" | "month" | "6mo" | "12mo" | "year" | "all";
+export type RangeKey = "realtime" | "day" | "24h" | "7d" | "30d" | "month" | "6mo" | "12mo" | "year" | "all";
 export type CompareKey = "off" | "previous_period" | "year_over_year";
 export type Gran = "minute" | "hour" | "day" | "week" | "month";
 export type MetricKey = "visitors" | "visits" | "pageviews" | "views_per_visit" | "bounce_rate" | "visit_duration";
@@ -24,7 +24,7 @@ export interface DashState {
   filters: Filter[];
 }
 
-export const RANGES: RangeKey[][] = [["realtime"], ["day", "24h"], ["7d", "28d", "30d"], ["month", "6mo", "12mo", "year"], ["all"]];
+export const RANGES: RangeKey[][] = [["realtime"], ["day", "24h"], ["7d", "30d"], ["month", "6mo", "12mo", "year"], ["all"]];
 const RANGE_SET = new Set(RANGES.flat());
 
 export const METRICS: MetricKey[] = ["visitors", "visits", "pageviews", "views_per_visit", "bounce_rate", "visit_duration"];
@@ -66,7 +66,6 @@ export function grans(range: RangeKey): Gran[] {
       return ["hour"];
     case "7d":
       return ["day", "hour"];
-    case "28d":
     case "30d":
     case "month":
       return ["day", "week"];
@@ -294,11 +293,6 @@ export function labelDate(label: string): Date {
   const m = /^(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}):(\d{2}))?/.exec(label);
   if (!m) return new Date(NaN);
   return new Date(+m[1], +m[2] - 1, +m[3], m[4] ? +m[4] : 0, m[5] ? +m[5] : 0);
-}
-
-/** 最后一个桶是否还没结束（范围包含现在）。 */
-export function partialLast(range: RangeKey): boolean {
-  return !["6mo", "12mo"].includes(range);
 }
 
 /** 分解行：维度取值与访客数。 */
