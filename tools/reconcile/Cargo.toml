@@ -1,0 +1,21 @@
+[package]
+name = "reconcile"
+description = "边缘访问日志（Caddy JSON）与 ingest_counters 的严格对账（brief-p1 验收第 1 条）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap = { workspace = true, features = ["env"] }
+clickhouse.workspace = true
+rivu-common.workspace = true
+rivu-storage-ch.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
