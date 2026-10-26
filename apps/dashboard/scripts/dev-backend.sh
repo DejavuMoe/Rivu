@@ -42,7 +42,8 @@ cp "$ROOT/crates/geo/tests/data/test-data/GeoIP2-City-Test.mmdb" "$RIVU_GEOIP_DB
 
 # 账号：不存在才建（重复运行不报错）。另有编辑者、查看者各一个，用来看按角色显示的界面，密码相同
 add_user() {
-  if ! "$RIVU" user list | grep -q "$1"; then
+  # 先取完整输出再匹配：`| grep -q` 提前关管道，pipefail 下 rivu 的 broken pipe 会让判断出错
+  if ! grep -qF -- "$1" <<<"$("$RIVU" user list)"; then
     printf '%s\n' "$DEMO_PASSWORD" | "$RIVU" user add --email "$1" --name "$2" --password-stdin
   fi
 }

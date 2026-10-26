@@ -35,4 +35,19 @@ extend({
   "setup.have": ["已经初始化过？", "Already set up?"],
   "setup.signIn": ["登录", "Sign in"],
   "setup.already": ["这个实例已经初始化过。", "This instance is already set up."],
+
+  // ---- 接受邀请 ----
+  "inv.acc.invalid": ["邀请无效或已过期", "This invitation is invalid or has expired"],
+  "inv.acc.toLogin": ["去登录", "Go to sign in"],
+  "inv.acc.title.org": ["加入 {org}", "Join {org}"],
+  "inv.acc.title.site": ["访问 {org} 的 {site}", "Access {site} in {org}"],
+  "inv.acc.by": ["{name} 邀请了你。", "Invited by {name}."],
+  "inv.acc.as": ["{email}，{role}", "{email}, {role}"],
+  "inv.acc.accept": ["接受邀请", "Accept invitation"],
+  "inv.acc.signIn": ["登录后接受邀请", "Sign in to accept"],
+  "inv.acc.other": ["当前登录的是 {current}，这个邀请发给 {email}。", "You are signed in as {current}, but this invitation is for {email}."],
+  "inv.acc.signOut": ["退出登录", "Sign out"],
+  "inv.acc.create": ["创建账号并加入", "Create account and join"],
+  "inv.acc.mismatch": ["当前登录的账号与邀请的邮箱不一致。", "The signed-in account doesn't match the invited email."],
+  "inv.acc.needSignIn": ["请先登录后再接受邀请。", "Sign in first to accept this invitation."],
 });
