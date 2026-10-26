@@ -2,7 +2,7 @@
 // 「已知答案探针」（docs/brief-p1.md 验收项）的雏形：浏览器做一组已知动作，系统里查到的数字必须与之完全一致。
 //
 // 与 test/e2e 的区别：这里**没有任何模拟的采集端**。
-//   - 脚本来自 rivu 自己：`GET <RIVU>/js/<site_key>.js`（配置前缀 + core.js，规范 §2.3）；
+//   - 脚本来自 rivu 自己：`GET <RIVU>/js/<site_key>.js`（配置前缀 + full.js：新站点默认开 engagement 与 tagged，规范 §2.3、§2.4）；
 //   - 事件发往 rivu 的 `POST /api/event`；
 //   - 断言用 `rivu stats`（reader 账号查 ClickHouse），不看浏览器侧记录的请求。
 // 页面由本文件里的小服务器提供（主机名 127.0.0.1 在站点白名单里）；tracker 默认排除 127.x，
@@ -15,6 +15,7 @@
 //   4. 点链接整页跳转到 /bfcache-b             -> pageview 4
 //   5. history.back() 回到 /spa/y              -> pageview 5（bfcache 恢复走 pageshow，没命中则是重新加载，两条路径都恰好 +1）
 // 期望：pageviews = 5，visits = 1，visitors = 1，页面榜 /spa/y 2 次、其余各 1 次。
+// full 另外发 engagement（SPA 跳转与页面隐藏时 flush），它们都必须被接受，且不改变上面的任何数字。
 
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
@@ -120,7 +121,7 @@ test('已知动作：5 个 pageview、1 个会话、1 个访客，与 rivu stats
   expect(scriptRes.headers()['etag']).toMatch(/^"[0-9a-f]{32}"$/);
   const scriptText = await scriptRes.text();
   expect(scriptText.startsWith('window.rivu=window.rivu||function(){(rivu.q=rivu.q||[]).push(arguments)};rivu.c={')).toBe(true);
-  expect(scriptText).toContain(`"site":"${siteKey}","endpoint":"${RIVU}/api/event","hash":false}`);
+  expect(scriptText).toContain(`"site":"${siteKey}","endpoint":"${RIVU}/api/event","hash":false,"engagement":true`);
   // 未知站点：404，不可缓存
   const unknown = await page.request.get(`${RIVU}/js/zzzzzzzzzzzz.js`);
   expect(unknown.status()).toBe(404);
@@ -141,13 +142,14 @@ test('已知动作：5 个 pageview、1 个会话、1 个访客，与 rivu stats
     });
     const pageErrors: string[] = [];
     page.on('pageerror', (e) => pageErrors.push(String(e)));
-    const sent = (n: number) => expect.poll(() => posts.length, { message: `等待 ${n} 个采集请求` }).toBeGreaterThanOrEqual(n);
+    const pageviews = () => posts.filter((p) => p.includes('"n":"pageview"')).length;
+    const sent = (n: number) => expect.poll(pageviews, { message: `等待 ${n} 个 pageview` }).toBeGreaterThanOrEqual(n);
 
     // 1. 首屏
     await page.goto(`${pages.origin}/bfcache-a`);
     await sent(1);
-    // 脚本是 rivu 发的 core：构建号与 dist/meta.json 一致
-    expect(await page.evaluate(() => (window as unknown as { rivu: { b: string; sv: number } }).rivu.b)).toBe('core');
+    // 脚本是 rivu 发的 full：构建号与 dist/meta.json 一致
+    expect(await page.evaluate(() => (window as unknown as { rivu: { b: string; sv: number } }).rivu.b)).toBe('full');
     expect(await page.evaluate(() => (window as unknown as { rivu: { b: string; sv: number } }).rivu.sv)).toBe(DIST_META.sv);
     // 2、3. SPA 跳转（pathname 变化才算新 pageview）
     await page.evaluate(() => history.pushState(null, '', '/spa/x'));
@@ -165,10 +167,15 @@ test('已知动作：5 个 pageview、1 个会话、1 个访客，与 rivu stats
     const restored = await page.evaluate(() => (window as unknown as { __marker?: string }).__marker === 'alive');
     console.log(`[${testInfo.project.name}] 返回时${restored ? '发生了 bfcache 恢复' : '没有命中 bfcache（重新加载）'}`);
 
-    // 让可能多余的请求有机会到达，再确认「恰好」5 个，且都被 rivu 接受（202，没有 x-rivu-dropped）
+    // 让可能多余的请求有机会到达，再确认 pageview「恰好」5 个，且所有请求（含 engagement）都被 rivu 接受
+    // （202，没有 x-rivu-dropped）。beacon 的响应不一定能被观察到，所以只要求看到的响应都合格。
     await page.waitForTimeout(500);
-    expect(posts).toHaveLength(5);
-    expect(responses).toEqual(Array.from({ length: 5 }, () => ({ status: 202, dropped: undefined })));
+    expect(pageviews()).toBe(5);
+    // Firefox 观察不到 sendBeacon 的请求体（postData 为空）：只检查看得到的
+    expect(posts.filter((p) => p).every((p) => /"n":"(pageview|engagement)"/.test(p)), JSON.stringify(posts)).toBe(true);
+    expect(responses.length).toBeGreaterThanOrEqual(5);
+    expect(responses.every((r) => r.status === 202 && r.dropped === undefined), JSON.stringify(responses)).toBe(true);
+    console.log(`[${testInfo.project.name}] 采集请求 ${posts.length} 个（pageview 5 个，其余是 engagement）`);
     expect(pageErrors).toEqual([]);
 
     // ---- 系统里查到的数字必须与已知动作完全一致 --------------------------------------------------

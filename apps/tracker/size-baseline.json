@@ -1,7 +1,12 @@
 {
   "core": {
-    "raw": 1561,
-    "gzip": 859,
-    "brotli": 747
+    "raw": 1579,
+    "gzip": 869,
+    "brotli": 760
+  },
+  "full": {
+    "raw": 5364,
+    "gzip": 2622,
+    "brotli": 2372
   }
 }

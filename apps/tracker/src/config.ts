@@ -1,6 +1,6 @@
 // 配置解析（规范 §2.2、§4.1 步 2）。纯函数，便于单元测试。
 
-/** core 用到的配置键。full 的其余开关（engagement、outbound ……）以后在这里追加。 */
+/** 配置键。core 只读前四个；其余是 full 的开关，解析在 `full/config.ts`。 */
 export interface Config {
   /** `site_key`；缺省则脚本什么也不做。 */
   site?: string;
@@ -10,6 +10,20 @@ export interface Config {
   hash?: boolean;
   /** 允许 localhost / 127.x / file: 采集。 */
   local?: boolean;
+  /** 参与度事件（默认开）。 */
+  engagement?: boolean;
+  /** 外链点击。 */
+  outbound?: boolean;
+  /** 文件下载：`true` 用默认扩展名表，或扩展名列表（替换默认表）。前缀里是数组，`data-*` 里是字符串。 */
+  downloads?: boolean | string | string[];
+  /** 表单提交。 */
+  forms?: boolean;
+  /** class 标记的事件（默认开）。 */
+  tagged?: boolean;
+  /** 关闭自动 pageview。 */
+  manual?: boolean;
+  /** 在 `console.warn` 输出忽略原因。 */
+  debug?: boolean;
 }
 
 /**
