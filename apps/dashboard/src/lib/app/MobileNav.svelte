@@ -1,6 +1,7 @@
 <!--
   窄屏（860px 以下）顶部栏 + 左侧抽屉。大屏不显示。
-  抽屉是原生 <dialog>，里面复用 Sidebar。应用外壳在窄屏用 .app :global(.sidebar){display:none} 隐藏侧栏，
+  抽屉是原生 <dialog>，里面复用 Sidebar（带关闭按钮、40px 行高）。打开时从左侧滑入、背景淡入，关闭时反向；
+  Sidebar 始终挂载，关闭动画期间内容不会消失。应用外壳在窄屏用 .app :global(.sidebar){display:none} 隐藏侧栏，
   这里用更具体的选择器（.drawer .panel .sidebar）覆盖回来。路由变化时自动关闭抽屉。
 -->
 <script lang="ts">
@@ -65,7 +66,7 @@
   }}
 >
   <div class="panel">
-    {#if open}<Sidebar onsearch={openPalette} />{/if}
+    <Sidebar onsearch={openPalette} onclose={() => (open = false)} />
   </div>
 </dialog>
 
@@ -100,20 +101,45 @@
   .drawer {
     position: fixed;
     inset: 0 auto 0 0;
-    width: var(--sidebar-w);
-    max-width: 86vw;
+    width: min(300px, 85vw);
     height: 100dvh;
+    max-width: none;
     max-height: none;
     margin: 0;
     padding: 0;
     border: 0;
-    background: var(--bg-app);
+    border-radius: 0 var(--r-lg) var(--r-lg) 0;
+    background: var(--bg-subtle);
     color: var(--text);
     box-shadow: var(--shadow-pop);
     overflow: hidden;
+    transform: translateX(-100%);
+    transition:
+      transform var(--dur) var(--ease-move),
+      overlay var(--dur) allow-discrete,
+      display var(--dur) allow-discrete;
+  }
+  .drawer[open] {
+    transform: none;
   }
   .drawer::backdrop {
     background: var(--overlay);
+    opacity: 0;
+    transition:
+      opacity var(--dur) var(--ease),
+      overlay var(--dur) allow-discrete,
+      display var(--dur) allow-discrete;
+  }
+  .drawer[open]::backdrop {
+    opacity: 1;
+  }
+  @starting-style {
+    .drawer[open] {
+      transform: translateX(-100%);
+    }
+    .drawer[open]::backdrop {
+      opacity: 0;
+    }
   }
   .panel {
     position: relative;

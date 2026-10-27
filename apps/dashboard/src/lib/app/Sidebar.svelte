@@ -1,11 +1,11 @@
 <!--
-  左侧栏：组织切换与搜索 → 全部站点 → 当前组织的站点 → 组织（成员、API 密钥）→ 用户菜单。
-  当前站点展开看板 / 站点设置二级项；owner / admin 在「站点」标题行右侧有添加站点的加号。
-  组织菜单里也有成员、API 密钥入口；只以站点访客身份可见的组织没有这两页。
-  当前项用背景色表示，不加色条。接入诊断 editor 起可见（与服务端一致）。
+  左侧栏：组织切换与搜索 → 全部站点 → 当前组织的站点 → 组织 → 用户菜单。owner / admin 在「站点」标题行右侧有添加站点的加号。
+  侧栏只负责「去哪个对象」；站点内的看板 / 接入诊断 / 安装 / 设置在页头的标签栏（SiteHeader），组织的成员 / API 密钥同理（OrgHeader）。
+  组织菜单里也有成员、API 密钥入口；只以站点访客身份可见的组织没有这两页。当前项用背景色表示，不加色条。
+  onclose 有值时是移动端抽屉：顶部多一个关闭按钮，行高加大到 40px 便于触摸。
 -->
 <script lang="ts">
-  import { Activity, ChartSpline, ChevronsUpDown, KeyRound, LayoutGrid, LogOut, Plus, Search, Settings2, ShieldCheck, Users } from "@lucide/svelte";
+  import { ChevronsUpDown, KeyRound, LayoutGrid, LogOut, Plus, Search, ShieldCheck, Users, X } from "@lucide/svelte";
   import { goto } from "$app/navigation";
   import { page } from "$app/state";
   import Popover from "../ui/Popover.svelte";
@@ -16,36 +16,22 @@
   import Kbd from "../ui/Kbd.svelte";
   import Segmented from "../ui/Segmented.svelte";
   import { t } from "../i18n";
-  import type { Role } from "../api";
   import { app, setLang, setTheme, type ThemePref, type Lang } from "../state.svelte";
-  import { visibleSections } from "../admin/sections";
-  import { canAddSite, canEdit, currentOrg, displayName, orgSites, orgs, session, setOrg } from "../session.svelte";
+  import { canAddSite, currentOrg, displayName, orgSites, orgs, session, setOrg } from "../session.svelte";
   import { signOut } from "./sign-out";
 
-  let { onsearch }: { onsearch?: () => void } = $props();
+  let { onsearch, onclose }: { onsearch?: () => void; onclose?: () => void } = $props();
 
   const org = $derived(currentOrg());
   const sites = $derived(orgSites());
   const path = $derived(page.url.pathname);
   const currentSite = $derived(page.params.id ? Number(page.params.id) : null);
-  /** 当前站点所在的子页：看板、接入诊断、设置，其余（安装页）都不高亮二级项 */
-  const tab = $derived.by(() => {
-    if (currentSite === null) return null;
-    const rest = path.slice(`/s/${currentSite}`.length);
-    if (rest === "" || rest === "/") return "dashboard";
-    if (rest.startsWith("/diagnostics")) return "diagnostics";
-    return rest.startsWith("/settings") ? "settings" : null;
-  });
-  /** 设置入口指向第一个可见分区；一个都看不到时不显示 */
-  function settingsHref(s: { id: number; role: Role | null; access: "member" | "guest" }) {
-    const first = visibleSections(s)[0];
-    return first ? `/s/${s.id}/settings/${first}` : null;
-  }
 </script>
 
-<aside class="sidebar">
+<aside class="sidebar" class:drawer={!!onclose}>
   <div class="top">
-    <Popover width={248}>
+    <div class="head">
+    <Popover width="trigger">
       {#snippet trigger({ toggle, props })}
         <button type="button" class="org" onclick={toggle} {...props}>
           <Logo wordmark={false} />
@@ -86,6 +72,10 @@
         {/if}
       {/snippet}
     </Popover>
+    {#if onclose}
+      <button type="button" class="close" aria-label={t("mn.close")} onclick={onclose}><X size={18} strokeWidth={1.75} /></button>
+    {/if}
+    </div>
 
     <button type="button" class="search" onclick={onsearch}>
       <Search size={16} strokeWidth={1.75} />
@@ -110,32 +100,10 @@
     {/if}
 
     {#each sites as s (s.id)}
-      {@const open = s.id === currentSite}
-      {@const settings = open ? settingsHref(s) : null}
-      <a class="item" href="/s/{s.id}" aria-current={open && tab === "dashboard" ? "page" : undefined} class:open>
+      <a class="item" href="/s/{s.id}" aria-current={s.id === currentSite ? "page" : undefined}>
         <Avatar name={s.name} shape="square" size={16} />
         <span class="grow">{s.name}</span>
       </a>
-      {#if open && (settings || canEdit(s))}
-        <div class="sub">
-          <a class="item" href="/s/{s.id}" aria-current={tab === "dashboard" ? "page" : undefined}>
-            <ChartSpline size={16} strokeWidth={1.75} />
-            <span class="grow">{t("nav.dashboard")}</span>
-          </a>
-          {#if canEdit(s)}
-            <a class="item" href="/s/{s.id}/diagnostics" aria-current={tab === "diagnostics" ? "page" : undefined}>
-              <Activity size={16} strokeWidth={1.75} />
-              <span class="grow">{t("nav.diagnostics")}</span>
-            </a>
-          {/if}
-          {#if settings}
-            <a class="item" href={settings} aria-current={tab === "settings" ? "page" : undefined}>
-              <Settings2 size={16} strokeWidth={1.75} />
-              <span class="grow">{t("nav.settings")}</span>
-            </a>
-          {/if}
-        </div>
-      {/if}
     {/each}
   </nav>
 
@@ -146,7 +114,7 @@
         <span class="grow">{t("nav.org")}</span>
       </a>
     {/if}
-    <Popover width={248} side="top">
+    <Popover width="trigger" side="top">
       {#snippet trigger({ toggle, props })}
         <button type="button" class="item me" onclick={toggle} {...props}>
           <Avatar name={displayName()} size={20} />
@@ -227,6 +195,30 @@
   .bottom :global(.popover) {
     display: flex;
   }
+  .head {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-1);
+  }
+  .head :global(.popover) {
+    flex: 1;
+    min-width: 0;
+  }
+  .close {
+    display: grid;
+    place-items: center;
+    flex: none;
+    width: var(--control-md);
+    height: var(--control-md);
+    border: 0;
+    border-radius: var(--r-sm);
+    background: none;
+    color: var(--text-muted);
+  }
+  .close:hover {
+    background: var(--bg-element);
+    color: var(--text);
+  }
 
   /* 所有行共用：高 32，左内边距 8，图标 16，图标与文字间距 8 —— 图标、头像、Logo 在一条竖线上 */
   .item,
@@ -243,6 +235,9 @@
     background: none;
     color: var(--text-muted);
     text-align: left;
+    transition:
+      background-color var(--dur-fast) var(--ease),
+      color var(--dur-fast) var(--ease);
   }
   .item :global(svg) {
     flex: none;
@@ -300,9 +295,6 @@
     min-height: 0;
     overflow-y: auto;
   }
-  .item.open {
-    color: var(--text);
-  }
   .group {
     display: flex;
     align-items: center;
@@ -325,21 +317,32 @@
     background: var(--bg-element);
     color: var(--text);
   }
-  /* 二级导航：图标与上一级的文字左缘对齐（8 + 16 + 8 = 32） */
-  .sub {
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-    padding-left: var(--sp-6);
-  }
-
   .bottom {
     display: flex;
     flex-direction: column;
     gap: 2px;
   }
+  /* 头像 20px 比图标宽 4px：左内边距与间距各少 2px，头像中心与图标中心、名字与其他行的文字都在同一条竖线上（6 + 20 + 6 = 8 + 16 + 8） */
   .me {
+    gap: 6px;
+    padding-left: 6px;
     color: var(--text);
+  }
+
+  /* 移动端抽屉：行高 40，内容避开刘海与底部手势条 */
+  .drawer {
+    padding-top: max(var(--sp-3), env(safe-area-inset-top));
+    padding-bottom: max(var(--sp-3), env(safe-area-inset-bottom));
+    padding-left: max(var(--sp-2), env(safe-area-inset-left));
+  }
+  .drawer .item,
+  .drawer .org,
+  .drawer .search,
+  .drawer .close {
+    height: 40px;
+  }
+  .drawer .close {
+    width: 40px;
   }
   .who {
     display: flex;

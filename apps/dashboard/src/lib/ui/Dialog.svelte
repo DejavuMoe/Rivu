@@ -69,8 +69,14 @@
     box-shadow: var(--shadow-pop);
     overflow: hidden;
   }
+  dialog[open] {
+    animation: dialog-in var(--dur) var(--ease);
+  }
   dialog::backdrop {
     background: var(--overlay);
+  }
+  dialog[open]::backdrop {
+    animation: fade-in var(--dur) var(--ease);
   }
   .sm {
     --w: 400px;

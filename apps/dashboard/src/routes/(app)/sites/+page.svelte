@@ -271,9 +271,13 @@
     background: var(--bg-app);
     border: var(--hairline) solid var(--border-subtle);
     border-radius: var(--r-md);
+    transition:
+      background-color var(--dur-fast) var(--ease),
+      border-color var(--dur-fast) var(--ease);
   }
   .site:hover {
     background: var(--bg-subtle);
+    border-color: var(--border);
   }
   .site:focus-within {
     border-color: var(--accent-focus);

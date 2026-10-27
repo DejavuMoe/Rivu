@@ -8,7 +8,7 @@
   import { ChartSpline, CircleAlert, Clock, Hourglass, Inbox, Table2 } from "@lucide/svelte";
   import { page } from "$app/state";
   import NotFound from "#lib/app/NotFound.svelte";
-  import PageHeader from "#lib/app/PageHeader.svelte";
+  import SiteHeader from "#lib/app/SiteHeader.svelte";
   import TrendChart from "#lib/charts/TrendChart.svelte";
   import { failureOf, isAbort, type Failure } from "#lib/dashboard/source.ts";
   import Button from "#lib/ui/Button.svelte";
@@ -112,7 +112,7 @@
   <NotFound />
 {:else}
   <div class="page">
-    <PageHeader title={t("diag.title")}>
+    <SiteHeader siteId={site.id} name={site.name}>
       {#snippet actions()}
         {#if !noData && status === "ready"}
           <span class="last">{lastEvent}</span>
@@ -130,7 +130,7 @@
           />
         {/if}
       {/snippet}
-    </PageHeader>
+    </SiteHeader>
 
     {#if noData}
       <Card>

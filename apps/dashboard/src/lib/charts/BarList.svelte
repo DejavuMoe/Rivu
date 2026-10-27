@@ -139,6 +139,16 @@
     min-width: 2px;
     border-radius: var(--r-xs);
     background: var(--chart-bar);
+    /* 换范围、筛选时条形从旧长度变到新长度；首次出现时从左侧长出。绝对定位、行数有限，改宽度不影响其他布局 */
+    transition:
+      width var(--dur) var(--ease-move),
+      background-color var(--dur-fast) var(--ease);
+    animation: bar-grow var(--dur) var(--ease);
+  }
+  @keyframes bar-grow {
+    from {
+      width: 0;
+    }
   }
   .row:not(:disabled):hover .bar,
   .row:focus-visible .bar {
