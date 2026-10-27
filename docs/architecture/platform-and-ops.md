@@ -428,7 +428,7 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 | ClickHouse | `rivu_migrator` | `migrate` | `CREATE, ALTER, DROP, TRUNCATE, INSERT, SELECT, SHOW ON rivu.*`（含建库） | 仅 `migrate` 持有凭据。物化视图在迁移里显式写 `DEFINER = CURRENT_USER SQL SECURITY DEFINER`，以它的身份运行，所以这个账号不能删除（25.8 已验证，核实报告 E3） |
 | ClickHouse | `rivu_writer` | collector、worker | `INSERT ON rivu.*`；`SELECT ON rivu.schema_migrations`、`SELECT ON rivu.sessions` | 只跑 collector 时 `/readyz` 用它读迁移版本；collector 启动时用它从 `sessions` 预热会话（`system-design.md` §4.6）；没有其他 `SELECT`，无 DDL。INSERT 的 settings 见 `system-design.md` |
 | ClickHouse | `rivu_reader` | api | `SELECT ON rivu.*`；profile `readonly=1` | `max_execution_time` 上限 20s、`max_memory_usage`（默认 4GiB，按机器调）、`max_rows_to_read`、`max_result_rows`、`max_concurrent_queries_for_user`；按小时限查询数的 quota |
-| ClickHouse | `rivu_maintainer`（本文新增） | worker 的 jobs | `ALTER DELETE`、`SELECT`，以及 `events`、`sessions`、`ingest_counters` 上 `ALTER UPDATE(_row_exists)`（25.8 的轻量删除改写这一隐藏列，缺它报 `ACCESS_DENIED`，见 `deploy/clickhouse/users.d/rivu-dev.xml`）；日汇总表上另有 `INSERT` 与同样的 `ALTER UPDATE(_row_exists)` | ClickHouse 没有单独的 DROP PARTITION 权限，`DROP PARTITION` 也由 `ALTER DELETE` 控制（E7）。删除批处理与 rollup 构建需要；不让 `rivu_writer` 带这些权限，也不复用 migrator |
+| ClickHouse | `rivu_maintainer`（本文新增） | worker 的 jobs | `ALTER DELETE`、`SELECT`，以及 `events`、`sessions`、`ingest_counters` 上 `ALTER UPDATE(_row_exists)`（25.8 的轻量删除改写这一隐藏列，缺它报 `ACCESS_DENIED`，见 `deploy/clickhouse/users.d/rivu-dev.xml`）；日汇总表上另有 `INSERT` 与同样的 `ALTER UPDATE(_row_exists)`；`system.parts`、`system.merges`、`system.mutations` 的 `SELECT`（`ch_monitor`） | ClickHouse 没有单独的 DROP PARTITION 权限，`DROP PARTITION` 也由 `ALTER DELETE` 控制（E7）。删除批处理与 rollup 构建需要；不让 `rivu_writer` 带这些权限，也不复用 migrator |
 | ClickHouse | `rivu_backup`（运维） | 备份脚本 | `BACKUP`、`SELECT` | 与应用凭据分离 |
 
 - ClickHouse 账号经 `users.d/*.xml` 声明，密码用 `from_env` 注入（来自 Docker secrets），profile 与 quota 同处声明。
@@ -487,6 +487,7 @@ PG 与 ClickHouse 迁移共用一个版本序列（14 位时间戳），分别�
 | 限流与认证 | `ratelimit_rejected_total`、`auth_login_failures_total`、`rivu_auth_login_alerts_total` | `scope`；`kind`（`account` / `global`，登录失败告警，只告警不阻断） |
 | 后台任务 | `jobs_total`、`job_seconds`、`jobs_queue_age_seconds`、`jobs_leader` | `kind`、`state` |
 | GeoIP | `geoip_refresh_total`；`geoip_db_age_seconds`（按库的 `build_epoch`）、`geoip_loaded`（0/1） | 只有 `geoip_refresh_total` 带标签：`source`（dbip-lite/maxmind-geolite2/custom）、`result`（updated/not_modified/failed）；另两个无标签（来源切换后旧标签的序列会残留）。后两个由持有库的进程（collector、api、all）导出，worker 不持有库，所以对应的告警应针对 collector 的抓取目标 |
+| ClickHouse 存储 | `rivu_ch_parts`、`rivu_ch_partition_parts_max`、`rivu_ch_rows`、`rivu_ch_bytes`、`rivu_ch_merges`、`rivu_ch_mutations_pending`、`rivu_ch_mutation_age_seconds`（gauge，`ch_monitor` 每 30 秒读 `system.parts` / `merges` / `mutations`，worker / all 导出）。单个分区的活跃 part 达到 300、或 mutation 等待超过 1 小时打 `warn`（越线一次只打一条）；告警建议：`rivu_ch_partition_parts_max > 300` 持续 10 分钟 | `table` |
 | 依赖与状态 | `pg_pool_connections`、`ch_http_seconds`、`build_info`、`schema_version`、`salt_days_loaded` | `account` |
 
 Plausible 自定义指标覆盖缓存命中、ingest buffer 入队与丢弃、清理阶段耗时（04§6）；Rivu 补齐阶段耗时、JetStream 与按端点查询耗时。建议告警起点：写缓冲深度 > 80% 持续 1 分钟、`write_flush_failures_total` 增长、JetStream lag > 60s、非 bot/shield 丢弃率 > 1%、`/readyz` 失败 > 2 分钟、`jobs_leader` 总和 ≠ 1、`geoip_loaded` = 0 持续 1 小时或 `geoip_db_age_seconds` 超过 45 天（DB-IP 按月发布）、最近成功备份距今 > 26 小时。
