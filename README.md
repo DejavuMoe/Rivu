@@ -1,6 +1,8 @@
 # Rivu
 
-Rivu 是开源、自托管的网站分析系统（Plausible 的替代品）：一个 Rust 二进制，单机模式一个进程搭配 ClickHouse 和 PostgreSQL 就能跑，需要不丢数据和横向扩展时再切到基于 NATS JetStream 的集群模式（P3）。
+Rivu 是开源、自托管的网站分析系统（Plausible 的替代品）：一个 Rust 二进制搭配 PostgreSQL 与 ClickHouse，单机部署就是全功能版本；需要横向扩展采集、或要求 ClickHouse 故障期间不丢数据时，可以打开基于 NATS JetStream 的集群模式。
+
+**部署**：见 [`docs/install.md`](docs/install.md)（Docker 镜像 + `deploy/compose.yml`，前面放 nginx 或 Caddy）。**进度与计划**：见 [`docs/roadmap.md`](docs/roadmap.md)。
 
 技术栈：Rust（Axum + Tokio）、ClickHouse、PostgreSQL、可选 NATS JetStream；看板 SvelteKit + Svelte 5；采集脚本 TypeScript + esbuild。许可证：[MIT](LICENSE)。
 
@@ -16,7 +18,7 @@ Rivu 是开源、自托管的网站分析系统（Plausible 的替代品）：�
 | 后台任务 | 盐轮换、GeoIP 与数据中心网段刷新、站点与日期范围的统计数据删除 |
 | 运维 | 单个二进制按角色启动（`collector \| worker \| api \| migrate \| all`）；PG 与 ClickHouse 迁移共用版本序列，带冻结校验与 schema 快照；内部端口 `/healthz` `/readyz` `/metrics` |
 
-尚未实现的部分（日汇总层与结果缓存、集群模式、导入导出、Plausible 兼容端点等）见 [`docs/architecture/system-design.md` §9](docs/architecture/system-design.md) 的路线图；P1 的验收见 [`docs/brief-p1.md`](docs/brief-p1.md)。
+尚未实现的部分（日汇总层与结果缓存、集群模式、导入导出、邮件、Plausible 兼容端点等）与进度见 [`docs/roadmap.md`](docs/roadmap.md)。
 
 ## 目录结构
 
@@ -35,7 +37,7 @@ rivu/
 ├── tools/              # loadgen、reconcile、reident、replay（压测与验收工具）
 ├── migrations/         # postgres/ 与 clickhouse/ 的初始迁移、checksums.lock
 ├── schema/             # 迁移后的 schema 快照（测试比对）
-├── deploy/             # compose.dev.yml、开发账号、Caddyfile
+├── deploy/             # 生产 compose.yml 与 .env.example、nginx / Caddy 示例、开发用 compose.dev.yml
 ├── docs/               # architecture/（设计）、research/（调研与验收报告）
 ├── fuzz/               # cargo-fuzz 目标（不在工作区内）
 └── .env.example        # 开发环境变量

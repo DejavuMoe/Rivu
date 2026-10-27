@@ -1,0 +1,39 @@
+# 发布（Forgejo Actions）：推送 v* 标签时构建生产镜像并推送到仓库所在实例的容器镜像库。
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# 需要的仓库 secrets：REGISTRY_USER、REGISTRY_TOKEN（有 package 写权限的令牌）。
+# 镜像地址：<实例域名>/<owner>/rivu:<版本>，同时更新 :latest。发布前先在 CHANGELOG.md 里把「未发布」改成版本号。
+# 尚未在真实的 Forgejo runner 上运行过。
+name: release
+on:
+  push:
+    tags: ["v*"]
+jobs:
+  image:
+    runs-on: docker
+    steps:
+      - uses: actions/checkout@v4
+      - name: 版本与镜像名
+        id: meta
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          host="${GITHUB_SERVER_URL#https://}"
+          image="${host}/${GITHUB_REPOSITORY,,}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "host=${host}" >> "$GITHUB_OUTPUT"
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+      - name: 登录镜像库
+        run: echo "${{ secrets.REGISTRY_TOKEN }}" | docker login "${{ steps.meta.outputs.host }}" -u "${{ secrets.REGISTRY_USER }}" --password-stdin
+      - name: 构建
+        run: |
+          DOCKER_BUILDKIT=1 docker build \
+            --build-arg RIVU_VERSION=${{ steps.meta.outputs.version }} \
+            --build-arg RIVU_GIT_COMMIT=${{ github.sha }} \
+            --build-arg RIVU_SV=${{ github.run_number }} \
+            -t "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}" \
+            -t "${{ steps.meta.outputs.image }}:latest" .
+      - name: 推送
+        run: |
+          docker push "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}"
+          docker push "${{ steps.meta.outputs.image }}:latest"

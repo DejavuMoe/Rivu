@@ -229,3 +229,28 @@ jobs:
           pnpm exec playwright install --with-deps chromium firefox webkit
       - name: 真实浏览器端到端
         run: RIVU_E2E_SKIP_INSTALL=1 bash apps/tracker/scripts/e2e-rivu.sh
+
+  # 依赖的已知漏洞（RustSec 公告库）。有公告就失败；确认不受影响的公告在 audit.toml 里忽略并写明理由。
+  audit:
+    runs-on: docker
+    container:
+      image: rust:1-bookworm
+    steps:
+      - uses: actions/checkout@v4
+      - name: cargo audit
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
+
+  # 生产镜像能构建（Dockerfile 与 .dockerignore 没有漏掉文件）。只构建不推送；推送在 release.yml。
+  image:
+    runs-on: docker
+    steps:
+      - uses: actions/checkout@v4
+      - name: docker build
+        run: |
+          DOCKER_BUILDKIT=1 docker build \
+            --build-arg RIVU_VERSION=0.0.0-ci \
+            --build-arg RIVU_GIT_COMMIT=${{ github.sha }} \
+            -t rivu:ci .
+          docker run --rm rivu:ci --version

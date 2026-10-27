@@ -1,0 +1,16 @@
+# 镜像构建上下文只需要源码：排除构建产物、依赖目录与本地材料
+.git
+target
+**/node_modules
+apps/tracker/dist
+apps/dashboard/build
+apps/dashboard/.svelte-kit
+designs
+examples
+docs
+fuzz/target
+fuzz/corpus
+tools/*/out
+.env
+deploy/.env
+*.log

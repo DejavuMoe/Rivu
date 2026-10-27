@@ -18,76 +18,63 @@
 
 单机的会话分配依赖单写者，只允许一个 `all`（或一个 `collector`）；多副本 `collector` 仅用于集群（会话分配在 `worker`，见 `system-design.md`）。内部端口不经 Caddy 路由。
 
-### 1.2 三种 compose 的服务清单
+### 1.2 镜像与 compose
+一个镜像（仓库根目录的 `Dockerfile`）：`rivu` 二进制，加上 tracker（`/opt/rivu/tracker`，`RIVU_TRACKER_DIR`）与看板（`/opt/rivu/dashboard`，`RIVU_DASHBOARD_DIR`）的构建产物；以非 root 用户运行，默认命令 `rivu all`，`HEALTHCHECK` 用 `rivu healthcheck`（请求内部端口的 `/readyz`，镜像里不需要 curl）。看板由 rivu 的 api / all 角色直接提供（`bin/rivu/src/dashboard.rs`），反向代理只需要把整个站点转给 rivu。
+
 | 文件 | 服务 | 说明 |
 |---|---|---|
-| `compose.dev.yml` | `clickhouse`、`postgres`、`nats`（profile `nats`） | 只起依赖，端口绑 127.0.0.1，Rust 在宿主机 `cargo run`（第 2 节） |
-| `compose.yml` | `caddy`、`rivu`（`rivu all`）、`postgres`、`clickhouse`、`migrate` | 最小自托管；仅 caddy 发布 80/443 |
-| `compose.cluster.yml` | `caddy`、`collector`（`deploy.replicas` ≥ 2）、`worker`、`api`、`nats`、`postgres`、`clickhouse`、`migrate` | 采集经 JetStream 缓冲，collector 可独立扩容 |
+| `deploy/compose.dev.yml` | `clickhouse`、`postgres`、`nats`（profile `cluster`） | 开发依赖，端口绑 127.0.0.1，rivu 在宿主机 `cargo run`（第 2 节） |
+| `deploy/compose.yml` | `postgres`、`clickhouse`、`migrate`、`rivu`（`rivu all`）、`caddy`（profile `caddy`，可选） | 单机部署（默认，全功能）。rivu 公共端口绑 `127.0.0.1:8080`，供宿主机的 nginx / Caddy 反代；或用 profile `caddy` 由 compose 自带 Caddy 发布 80/443 |
+| `deploy/compose.cluster.yml`（P3） | `collector`（多副本）、`worker`、`api`、`nats`、`postgres`、`clickhouse`、`migrate` | 集群模式：采集经 JetStream 缓冲，collector 可独立扩容 |
 
 共同规则：
-- `migrate` 是一次性服务（`restart: "no"`，`command: ["rivu","migrate"]`），依赖 `postgres`、`clickhouse` 的 `service_healthy`；所有 `rivu` 服务 `depends_on: { migrate: { condition: service_completed_successfully } }`。迁移不随服务启动自动执行（04§0#7、04§7.2）。
-- 密码走 Docker secrets（`secrets:` + `*_FILE`），不写进 `environment`。
-- 固定 compose 网络子网（如 `172.28.0.0/24`），`RIVU_TRUSTED_PROXIES` 设为该子网；`stop_grace_period: 40s`，配合进程内优雅关闭（停止接收、flush 写缓冲，最长 30s）。
-- 同一 Dockerfile 两个 target：`rivu`（二进制）与 `web`（Caddy + 构建好的 `apps/dashboard` 静态文件），使 Caddy 可托管后台而 `rivu` 子命令仍共用一个镜像。
-- 命名卷：`rivu-pg-data`（postgres）、`rivu-ch-data`（clickhouse）、`rivu-nats-data`（nats，JetStream 保留 24–72h）、`rivu-data`（`RIVU_DATA_DIR`：GeoIP 库、本地导出与会话关停快照 `sessions.snapshot`，单机共享；collector 只写会话快照）、`caddy-data`、`caddy-config`。
+- `migrate` 是一次性服务（`command: ["migrate"]`），依赖 `postgres`、`clickhouse` 的 `service_healthy`；`rivu` 依赖 `migrate` 的 `service_completed_successfully`。迁移不随服务启动自动执行（04§0#7、04§7.2），但每次 `up` 都先跑一遍。
+- 密码与密钥来自 `deploy/.env`（`deploy/.env.example` 列出全部变量），同时以 `env_file` 传给 rivu，所以可选功能的变量写进 `deploy/.env` 即可生效。ClickHouse 账号的密码由 `deploy/prod/clickhouse/rivu.xml` 的 `from_env` 读取，PostgreSQL 的 `rivu_app` 由 `deploy/prod/postgres/01-roles.sh` 在首次初始化时创建。
+- compose 网络子网固定（默认 `172.31.250.0/24`，`RIVU_SUBNET` 可改），`RIVU_TRUSTED_PROXIES` 设为该子网：宿主机反代经端口映射进来时，对端是这个网段的网关。`stop_grace_period: 30s`，配合进程内的优雅关停（停止接收、写会话快照、flush 写缓冲）。
+- 命名卷：`pg-data`、`ch-data`、`rivu-data`（`RIVU_DATA_DIR`：GeoIP 库、数据中心网段、会话关停快照）、`caddy-data`、`caddy-config`。
 
-### 1.3 Caddy 路由
-| 优先级 | 匹配 | 上游 |
-|---|---|---|
-| 1 | `/api/event`、`/js/*` | `collector:8080`（单机：`rivu:8080`），`lb_try_duration 5s` |
-| 2 | `/api/*` | `api:8080`（单机：`rivu:8080`），同样配 `lb_try_duration` |
-| 3 | 其余 | 静态文件 `/srv/dashboard`，`try_files {path} /index.html` |
-| 不路由 | `/healthz` `/readyz` `/metrics` | 仅内部端口 |
+### 1.3 反向代理
+整个站点转给 rivu：看板页面、`/js/*`、`/api/*`。示例配置：`deploy/Caddyfile`、`deploy/nginx.conf`。
 
-```caddyfile
-{$RIVU_DOMAIN} {
-    encode zstd gzip
-    log { output stdout; format filter { request>remote_ip delete; request>client_ip delete; request>headers delete } }
-    handle /api/event { reverse_proxy collector:8080 { lb_try_duration 5s; lb_try_interval 250ms } }
-    handle /js/*      { reverse_proxy collector:8080 { lb_try_duration 5s; lb_try_interval 250ms } }
-    handle /api/*     { reverse_proxy api:8080       { lb_try_duration 5s; lb_try_interval 250ms } }
-    handle { root * /srv/dashboard; try_files {path} /index.html; file_server }
-}
-```
+| 匹配 | 上游 |
+|---|---|
+| 全部 | `rivu:8080`（集群模式下 `/api/event`、`/js/*` 转 `collector:8080`，其余转 `api:8080`），`lb_try_duration 5s` 或 nginx `proxy_next_upstream` |
+| 不转发 | `/healthz` `/readyz` `/metrics` 只在内部端口 9090 |
 
-要点（指令细节以实现时的 Caddy 版本为准）：
-- `lb_try_duration` 让 collector 重启期间的连接失败请求在 Caddy 排队重试，实现近零丢失重启；超过 5s 仍无上游返回 502，该窗口事件丢失，只留在 Caddy 日志，不进 `ingest_counters`。
+要点：
+- 重试让 rivu 重启期间的采集请求排队，升级时近零丢失；超过重试窗口仍无上游返回 502，这部分事件只留在代理日志，不进 `ingest_counters`。
 - 集群多副本用 `dynamic a`（Docker DNS）发现副本，配 `health_uri /readyz` + `health_port 9090` 主动检查；单机单上游不启用主动检查，避免预热期被整体摘除。
-- 服务端只信任 `RIVU_TRUSTED_PROXIES` 内对端传来的 `X-Forwarded-For`：从右向左跳过可信 CIDR，取第一个不可信地址为客户端 IP；对端不在可信范围则忽略该头。Caddy 默认用对端地址覆盖该头，前面再有 CDN 时才在全局 `servers { trusted_proxies }` 加 CDN 的 CIDR。
-- Caddy 访问日志必须删除 IP 与请求头（如上），否则隐私承诺在代理层被破坏。HSTS、`X-Content-Type-Options: nosniff`、`Referrer-Policy: same-origin` 等安全头在静态 handle 中统一设置。
-- 页面的 CSP 由 `apps/dashboard` 的构建写进 `index.html` 的 `<meta>`（`default-src 'self'`，入口的内联启动脚本按哈希放行，`style-src` 带 `'unsafe-inline'`），Caddy 不能再给页面加一份限制脚本的 CSP：两份策略取交集，启动脚本会被挡掉。`<meta>` 表达不了的 `frame-ancestors` 由 Caddy 用只含这一项的头给出：`Content-Security-Policy: frame-ancestors 'none'`。
+- 服务端只信任 `RIVU_TRUSTED_PROXIES` 内对端传来的 `X-Forwarded-For`：从右向左跳过可信 CIDR，取第一个不可信地址为客户端 IP；对端不在可信范围则忽略该头。代理前面再有 CDN 时，代理也要信任 CDN 的网段。
+- 代理的访问日志必须删除访客 IP 与请求头，否则隐私承诺在代理层被破坏。
+- 看板的静态文件由 rivu 发送：带哈希的 `_app/immutable/*` 缓存一年，其余 `no-cache` 用 ETag 协商；构建时产出的 `.br` / `.gz` 按 `Accept-Encoding` 直接发送。页面的 CSP 由看板的构建写进 `index.html` 的 `<meta>`（`default-src 'self'`，入口的内联启动脚本按哈希放行），代理不能再加一份限制脚本的 CSP：两份策略取交集，启动脚本会被挡掉。
 
 ### 1.4 拓扑示意
 ```
-单机:      浏览器 ─443─► Caddy ─┬ /api/event,/js/* ┐
-                                ├ /api/*           ├─► rivu all :8080 ─► ClickHouse
-                                └ 其余 → 静态文件    ┘        │ :9090 内部口 └─► PostgreSQL ◄─ migrate(一次性)
-集群:  浏览器 ─443─► Caddy ─┬ /api/event,/js/* ─► collector ×N ─► NATS JetStream ─► worker ─► ClickHouse
-                                ├ /api/*           ─► api ─► ClickHouse(reader) + PostgreSQL     └─► jobs/cron(PG leader)
-                                └ 其余 → 静态文件
+单机:  浏览器 ─443─► nginx / Caddy ─► rivu all :8080（看板、/js/*、/api/*）─► ClickHouse
+                                             │ :9090 内部口           └─► PostgreSQL ◄─ migrate（一次性）
+集群:  浏览器 ─443─► 反向代理 ─┬ /api/event,/js/* ─► collector ×N ─► NATS JetStream ─► worker ─► ClickHouse
+                               └ 其余              ─► api（看板、查询）─► ClickHouse(reader) + PostgreSQL
 ```
 
 ## 2. 开发环境
-`compose.dev.yml` 只起依赖；Rust 与前端在宿主机运行。镜像固定到次版本。
+`deploy/compose.dev.yml` 只起依赖；Rust 与前端在宿主机运行。
 
 | 服务 | 镜像 | 宿主端口（仅 127.0.0.1） | 命名卷 | 健康检查 |
 |---|---|---|---|---|
-| `postgres` | `postgres:18`（Plausible CI 同版本，04§7.3） | 5432 | `rivu-pg-data` → `/var/lib/postgresql` | `pg_isready -U rivu_migrator` |
-| `clickhouse` | `clickhouse/clickhouse-server:25.11`（Plausible CI 使用 25.11，04§7.3；最终以 Rivu CI 为准） | 8123（HTTP）、9000（native） | `rivu-ch-data` → `/var/lib/clickhouse` | `wget -qO- http://127.0.0.1:8123/ping` |
-| `nats`（profile `nats`） | `nats:2`，`command: ["-js","-sd","/data","-m","8222"]` | 4222、8222 | `rivu-nats-data` → `/data` | `wget -qO- http://127.0.0.1:8222/healthz` |
+| `postgres` | `postgres:18.6-alpine` | 5432 | `rivu-pg-data` → `/var/lib/postgresql` | `pg_isready -U rivu_migrator` |
+| `clickhouse` | `clickhouse/clickhouse-server:25.8.33.6` | 8123（HTTP）、9000（native） | `rivu-ch-data` → `/var/lib/clickhouse` | `wget -qO- http://127.0.0.1:8123/ping` |
+| `nats`（profile `cluster`） | `nats:2.15.1-alpine`，`command: ["-js","-sd","/data","-m","8222"]` | 4222、8222 | `rivu-nats-data` → `/data` | 无 |
 
-其他：`clickhouse` 设 `ulimits.nofile=262144`；只读挂载 `deploy/postgres/init`（建 `rivu_app` 角色与默认权限）和 `deploy/clickhouse/users.d`（建四个 CH 账号、profile、quota）。PG 18 镜像数据目录带版本子目录，挂载点为 `/var/lib/postgresql`，换版本需核对。用命名卷而非 bind mount，避开 Windows 上的权限与 I/O 性能问题。
+其他：`clickhouse` 设 `ulimits.nofile=262144`；只读挂载 `deploy/postgres/init`（建 `rivu_app` 角色与默认权限）和 `deploy/clickhouse/users.d`（建四个 CH 账号、profile、quota，密码是公开的开发值）。PG 18 镜像数据目录带版本子目录，挂载点为 `/var/lib/postgresql`，换版本需核对。
 
 | 步骤 | 命令 | 说明 |
 |---|---|---|
-| 1 | `docker compose -f compose.dev.yml up -d`（需要 NATS 加 `--profile nats`） | 首次启动执行 init 脚本 |
-| 2 | 复制 `.env.dev.example` 为 `.env.dev` | 仅 debug 构建用 `dotenvy` 加载；生产只读真实环境变量 |
-| 3 | `cargo run -p rivu -- migrate` | 建库并交织执行 PG 与 CH 迁移 |
-| 4 | `cargo run -p rivu -- all` | 单机形态；联调集群则分别运行 `collector`/`worker`/`api` 并设 `RIVU_MODE=cluster` |
-| 5 | `pnpm --filter dashboard dev` | Vite 代理 `/api` 到 `127.0.0.1:8080` |
-| 重置 | `docker compose -f compose.dev.yml down -v` | 删除三个命名卷，数据清空 |
-
+| 1 | `docker compose -f deploy/compose.dev.yml up -d`（需要 NATS 加 `--profile cluster`） | 首次启动执行 init 脚本 |
+| 2 | 加载 `.env.example`（`set -a; . ./.env.example; set +a`） | rivu 只读环境变量，不读 `.env` 文件 |
+| 3 | `cargo run -p rivu -- migrate` | 交织执行 PG 与 CH 迁移 |
+| 4 | `cargo run -p rivu -- all` | 单机部署；联调集群模式则分别运行 `collector`/`worker`/`api` 并设 `RIVU_MODE=cluster` |
+| 5 | `apps/dashboard` 里 `pnpm dev` | Vite 把 `/api` 代理到 `127.0.0.1:8080`；或 `pnpm build` 后由 rivu 直接提供 |
+| 重置 | `docker compose -f deploy/compose.dev.yml down -v` | 删除命名卷，数据清空 |
 首个访问 `/setup` 的用户成为实例管理员（第 5 节）。
 
 ## 3. PostgreSQL 数据模型
@@ -405,7 +392,8 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 | `RIVU_SITE_RESTORE_DAYS` | `7`；`0`–`365` | 站点删除后的恢复窗口（天）：删除时写入的站点删除意图 `not_before = 删除时刻 + 该值`，窗口内可恢复，过后 `ch_delete_batch` 清除统计数据；`0` 表示下一轮就清除 |
 | `RIVU_STATS_DELETE_INTERVAL_SECS` | `300`；`10`–`86400` | `ch_delete_batch` 检查到期删除意图的周期（worker、all） |
 | `RIVU_PUBLIC_BASE_URL` | `http://<RIVU_LISTEN_ADDR>`（仅开发；未设置时启动打 warn，生产必须设置） | 站点脚本前缀里 `endpoint` 的来源（`tracker-and-protocol.md` §2.3 的 `public_base_url`），不取请求的 `Host` |
-| `RIVU_TRACKER_DIR` | `apps/tracker/dist` | CI 构建的 tracker 产物目录（`core.js`、`meta.json`），启动时读入内存；生产镜像应把 `dist/` 放进该目录 |
+| `RIVU_TRACKER_DIR` | `apps/tracker/dist`（镜像里 `/opt/rivu/tracker`） | tracker 构建产物目录（`core.js`、`full.js`、`meta.json`），collector / all 启动时读入内存 |
+| `RIVU_DASHBOARD_DIR` | `apps/dashboard/build`（镜像里 `/opt/rivu/dashboard`） | 看板构建产物目录，api / all 启动时读入内存并提供（单页应用回落到 `index.html`）；缺失时页面返回 503，`/readyz` 的 `checks.dashboard` 报告，不判就绪失败 |
 | `RIVU_SITE_CACHE_REFRESH_SECS` | `10` | 站点缓存的增量刷新周期（按 `updated_at` 水位，含软删除）；另外每 5 分钟全量重载一次，并 `LISTEN rivu_site_changed` 在配置变更后立即增量刷新（`system-design.md` §4.3） |
 | `RIVU_GEOIP_DB_PATH` | `${RIVU_DATA_DIR}/geoip/geoip.mmdb` | 当前生效的 mmdb。所有来源都落在这个文件，旁边有 `.meta.json` 记录来源、ETag、SHA-256（解压后内容）、署名。没有 meta 的文件视为手工放置：默认来源时直接使用、不自动刷新；配置了 URL 或 key 时立即下载（`system-design.md` §10 Q28） |
 | `RIVU_GEOIP_DB_URL` | 空 | 自定义 mmdb 直链（http/https，`.mmdb` 或 `.mmdb.gz`），优先级最高；支持 `_FILE`。许可由运维者负责 |
