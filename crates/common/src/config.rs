@@ -99,13 +99,16 @@ pub enum LogFormat {
     Pretty,
 }
 
+/// 部署方式（`RIVU_MODE`）。两种都是全功能的，区别只在事件怎样到达会话分配。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
-    Lite,
-    Reliable,
+    /// 单机（默认）：`rivu all` 一个进程，接入、会话分配、写入都在进程内。
+    Single,
+    /// 集群（可选）：多个 collector 把事件发到 NATS JetStream，worker 按分区消费并分配会话。
+    Cluster,
 }
 
-/// CIDR 网段（`RIVU_TRUSTED_PROXIES` 的元素）。P0 只解析和校验，P1 用于客户端 IP 判定。
+/// CIDR 网段（`RIVU_TRUSTED_PROXIES` 的元素），用于客户端 IP 判定。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cidr {
     addr: IpAddr,
@@ -290,6 +293,8 @@ pub const DEFAULT_STATS_DELETE_INTERVAL_SECS: u64 = 300;
 
 /// `RIVU_TRACKER_DIR` 的默认值：仓库里 `apps/tracker` 的构建输出（相对进程工作目录）。
 pub const DEFAULT_TRACKER_DIR: &str = "apps/tracker/dist";
+/// `RIVU_DASHBOARD_DIR` 的默认值：看板（`apps/dashboard`）`pnpm build` 的产物目录，相对进程工作目录。
+pub const DEFAULT_DASHBOARD_DIR: &str = "apps/dashboard/build";
 
 /// `RIVU_DBIP_EDITION`：DB-IP Lite 的版本。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -563,6 +568,9 @@ pub struct Config {
     /// `RIVU_TRACKER_DIR`：tracker 构建产物目录（`core.js`、`meta.json`），启动时读入并缓存。
     /// 默认 `apps/tracker/dist`（相对进程工作目录）；生产镜像把 CI 构建的 `dist/` 放进该目录。
     pub tracker_dir: PathBuf,
+    /// `RIVU_DASHBOARD_DIR`：看板的静态文件目录（api / all 角色启动时读入内存，见 `bin/rivu/src/dashboard.rs`）。
+    /// 默认 `apps/dashboard/build`；生产镜像把看板的构建产物放进该目录。
+    pub dashboard_dir: PathBuf,
     /// GeoIP 数据源、刷新与署名（`migrate` 不校验，取默认值）。
     pub geo: GeoConfig,
     /// 数据中心网段过滤（默认关闭）。
@@ -660,17 +668,17 @@ impl Config {
         }
 
         let mode = match l.optional("RIVU_MODE").as_deref() {
-            None | Some("lite") => Mode::Lite,
-            Some("reliable") => Mode::Reliable,
+            None | Some("single") => Mode::Single,
+            Some("cluster") => Mode::Cluster,
             Some(other) => {
                 l.problems
-                    .push(format!("RIVU_MODE=`{other}` 无效，可选 lite | reliable"));
-                Mode::Lite
+                    .push(format!("RIVU_MODE=`{other}` 无效，可选 single | cluster"));
+                Mode::Single
             }
         };
-        if role == Role::All && mode == Mode::Reliable {
+        if role == Role::All && mode == Mode::Cluster {
             l.problems
-                .push("`rivu all` 只允许 RIVU_MODE=lite；reliable 模式请分别运行 collector / worker / api".into());
+                .push("`rivu all` 只用于单机部署（RIVU_MODE=single）；集群模式请分别运行 collector / worker / api".into());
         }
 
         let mut trusted_proxies = Vec::new();
@@ -837,6 +845,10 @@ impl Config {
             l.optional("RIVU_TRACKER_DIR")
                 .unwrap_or_else(|| DEFAULT_TRACKER_DIR.into()),
         );
+        let dashboard_dir = PathBuf::from(
+            l.optional("RIVU_DASHBOARD_DIR")
+                .unwrap_or_else(|| DEFAULT_DASHBOARD_DIR.into()),
+        );
 
         // GeoIP 变量对 migrate 没有意义：解析但丢弃问题，避免无关变量挡住迁移。
         let problems_before_geo = l.problems.len();
@@ -914,6 +926,7 @@ impl Config {
             setup_token,
             visitor_pepper,
             tracker_dir,
+            dashboard_dir,
             geo,
             datacenter,
         })
@@ -1252,7 +1265,7 @@ mod tests {
         assert_eq!(cfg.internal_addr, "127.0.0.1:9090".parse().unwrap());
         assert_eq!(cfg.log_format, LogFormat::Json);
         assert_eq!(cfg.log_level, "info");
-        assert_eq!(cfg.mode, Mode::Lite);
+        assert_eq!(cfg.mode, Mode::Single);
         assert!(cfg.trusted_proxies.is_empty());
         // 写缓冲默认值取 system-design §4.7（§10 Q16）
         assert_eq!(cfg.buffer.flush_interval, Duration::from_millis(1000));
@@ -1285,6 +1298,7 @@ mod tests {
     fn tracker_dir_and_public_base_url_have_dev_defaults_and_are_validated() {
         let cfg = with_env(&[]).unwrap();
         assert_eq!(cfg.tracker_dir, PathBuf::from("apps/tracker/dist"));
+        assert_eq!(cfg.dashboard_dir, PathBuf::from("apps/dashboard/build"));
         assert_eq!(cfg.public_base_url, "http://127.0.0.1:8080");
         assert!(!cfg.public_base_url_explicit);
 
@@ -1677,9 +1691,9 @@ mod tests {
     }
 
     #[test]
-    fn all_with_reliable_is_rejected() {
+    fn all_with_cluster_mode_is_rejected() {
         let mut env = Env::from_pairs(base_pairs());
-        env.vars.insert("RIVU_MODE".into(), "reliable".into());
+        env.vars.insert("RIVU_MODE".into(), "cluster".into());
         assert!(Config::from_env(Role::All, &env).is_err());
         assert!(Config::from_env(Role::Collector, &env).is_ok());
     }

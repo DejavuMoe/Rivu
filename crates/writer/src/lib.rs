@@ -1,4 +1,4 @@
-//! BatchWriter（Lite）：有界 channel 缓冲事件，按「1 s / 2 万行 / 8 MB 先到先写」组批写入 ClickHouse，
+//! BatchWriter：有界 channel 缓冲事件，按「1 s / 2 万行 / 8 MB 先到先写」组批写入 ClickHouse，
 //! 失败带稳定的去重 token 退避重试；同时在进程内聚合接入计数。设计见 `system-design.md` §4.7、§5.4。
 //!
 //! - 请求热路径只做 [`WriterHandle::try_send`]（`try_send`，满了立即返回错误，由调用方回 `503`）和

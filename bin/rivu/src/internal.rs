@@ -79,6 +79,8 @@ pub struct InternalState {
     /// tracker 构建产物（`/js/<site_key>.js` 的来源），只有 collector / all 有。**只报告，不判就绪失败**：
     /// 缺失时脚本路由返回 503，但事件采集不依赖它。
     pub tracker: Option<Arc<TrackerAssets>>,
+    /// 看板静态文件，只有 api / all 有。**只报告，不判就绪失败**：缺失时页面返回 503，API 照常。
+    pub dashboard: Option<Arc<crate::dashboard::DashboardAssets>>,
     pub geo: GeoReadiness,
     /// 数据中心网段表：只在开启过滤的 collector / all 有。**只报告，不判就绪失败**：未加载时不丢弃任何事件。
     pub datacenter: Option<Arc<DcDb>>,
@@ -210,6 +212,9 @@ async fn readyz(State(state): State<Arc<InternalState>>) -> impl IntoResponse {
     }
     if let Some(t) = &state.tracker {
         checks["tracker"] = t.status();
+    }
+    if let Some(d) = &state.dashboard {
+        checks["dashboard"] = d.status();
     }
 
     let body = json!({

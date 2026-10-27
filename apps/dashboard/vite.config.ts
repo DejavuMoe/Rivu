@@ -11,13 +11,14 @@ const pkg = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), 
 const api = process.env.RIVU_DEV_API ?? "http://127.0.0.1:8080";
 
 export default defineConfig({
-  // 单页应用：所有路径由 Caddy 回落到 index.html（platform-and-ops.md §1.3 的 try_files），
+  // 单页应用：rivu（api / all 角色）提供构建产物，没有对应文件的页面路径回落到 index.html（bin/rivu/src/dashboard.rs），
   // 页面在浏览器里渲染，数据全部来自 /api/internal/*。
   // CSP 由构建写进 index.html 的 <meta>：入口页的启动脚本是内联的，按哈希放行，其余脚本只许同源。
-  // Caddy 不再给页面另加 CSP（两份策略取交集，会把启动脚本挡掉），见 platform-and-ops.md §1.3。
+  // 反向代理不要再给页面另加 CSP（两份策略取交集，会把启动脚本挡掉）。
+  // precompress：同时产出 .br 与 .gz，rivu 按 Accept-Encoding 直接发送压缩好的文件。
   plugins: [
     sveltekit({
-      adapter: adapter({ fallback: "index.html" }),
+      adapter: adapter({ fallback: "index.html", precompress: true }),
       csp: {
         mode: "hash",
         directives: {
