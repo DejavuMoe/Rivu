@@ -11,6 +11,7 @@
 //!   （与查询引擎的整日区间同一套换算，[`rivu_query::resolve::local_dates_utc_ms`]）：
 //!   `events` 按 `ts`；`ingest_counters` 按 `minute`；`sessions` 删除**开始时间**（`started_at`）落在区间内的会话——
 //!   跨过区间边界的会话按开始时间归属，与看板「会话属于开始那天」的口径一致。
+//! - 日汇总层（`rollup_*`）：同一站点的行，`date_range` 时只删这些本地日，原生与导入的行都删。
 //! - 失败：记 `last_error`，指数退避后重试，`MAX_ATTEMPTS` 次后置为 `failed`。
 //!
 //! 日志只带意图 id、站点 id 与分区，不带其他内容。
@@ -211,6 +212,22 @@ pub async fn process(pg: &PgPool, ch: &Client, intent: &ClaimedDeletion) -> Resu
         );
         deleted += 1;
     }
+    // 日汇总层：按本地日删除（汇总表很小，不分区逐个记录；删除幂等，失败时整条意图重试）
+    let days = match (intent.scope.as_str(), &intent.date_from, &intent.date_to) {
+        ("date_range", Some(f), Some(t)) => Some((
+            f.parse::<Date>().context("date_from 无效")?,
+            t.parse::<Date>().context("date_to 无效")?,
+        )),
+        _ => None,
+    };
+    rivu_query::rollup::delete(
+        ch,
+        &rivu_query::TenantScope::new(intent.site_id),
+        days,
+        false,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("删除汇总行失败：{e}"))?;
     stats_deletions::mark_done(pg, intent.id).await?;
     Ok(deleted)
 }

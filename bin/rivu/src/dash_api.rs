@@ -354,6 +354,8 @@ pub struct DashApi {
     trusted_proxies: Vec<Cidr>,
     pub(crate) dashboard_timeout_secs: u64,
     public_timeout_secs: u64,
+    /// `RIVU_ROLLUP_MIN_ROWS`（§6.4 选层）。
+    rollup_min_rows: Option<u64>,
     limiters: Limiters,
     limits: DashLimits,
     login_watch: LoginWatch,
@@ -392,6 +394,7 @@ impl DashApi {
             trusted_proxies: config.trusted_proxies.clone(),
             dashboard_timeout_secs: config.query_timeouts.dashboard_secs,
             public_timeout_secs: config.query_timeouts.public_secs,
+            rollup_min_rows: Some(config.rollup_min_rows),
             limiters: Limiters::new(&limits),
             limits,
             login_watch: LoginWatch::new(),
@@ -1349,6 +1352,7 @@ impl DashApi {
         if let Some((k, v)) = comment {
             opts = opts.with_comment(k, v);
         }
+        opts.rollup_min_rows = self.rollup_min_rows;
         let started = Instant::now();
         let result = rivu_query::execute(
             &self.reader,

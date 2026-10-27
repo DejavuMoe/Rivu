@@ -389,6 +389,7 @@ fn sql_comparison_query_is_constrained_by_main_rows() {
         &p,
         &MainSqlOptions {
             interval: q.compare.unwrap(),
+            split: None,
             constraint: Some(&cons),
             total_visitors: None,
             limit: 2,

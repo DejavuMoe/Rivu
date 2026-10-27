@@ -137,6 +137,327 @@ GROUP BY
     start_date,
     session_id;
 
+CREATE TABLE {{database}}.rollup_browsers
+(
+    `site_id` UInt64,
+    `day` Date,
+    `origin` Enum8('native' = 1, 'import' = 2),
+    `import_id` UInt64,
+    `version` UInt64,
+    `browser` String,
+    `browser_version` String,
+    `visitors` UInt64,
+    `pageviews` UInt64,
+    `events` UInt64,
+    `visits_ev` UInt64,
+    `visits_s` UInt64,
+    `s_n` UInt64,
+    `s_pv` UInt64,
+    `s_dur_ms` UInt64,
+    `s_eng_ms` UInt64,
+    `s_eng_n` UInt64,
+    `b_n` UInt64,
+    `bounces` UInt64,
+    `exits` UInt64,
+    `tp_ms` UInt64,
+    `tp_n` UInt64,
+    `sc_sum` UInt64,
+    `sc_n` UInt64
+)
+ENGINE = ReplacingMergeTree(version)
+PARTITION BY toYYYYMM(day)
+ORDER BY (site_id, day, origin, import_id, browser, browser_version)
+SETTINGS index_granularity = 8192;
+
+CREATE TABLE {{database}}.rollup_devices
+(
+    `site_id` UInt64,
+    `day` Date,
+    `origin` Enum8('native' = 1, 'import' = 2),
+    `import_id` UInt64,
+    `version` UInt64,
+    `device` String,
+    `visitors` UInt64,
+    `pageviews` UInt64,
+    `events` UInt64,
+    `visits_ev` UInt64,
+    `visits_s` UInt64,
+    `s_n` UInt64,
+    `s_pv` UInt64,
+    `s_dur_ms` UInt64,
+    `s_eng_ms` UInt64,
+    `s_eng_n` UInt64,
+    `b_n` UInt64,
+    `bounces` UInt64,
+    `exits` UInt64,
+    `tp_ms` UInt64,
+    `tp_n` UInt64,
+    `sc_sum` UInt64,
+    `sc_n` UInt64
+)
+ENGINE = ReplacingMergeTree(version)
+PARTITION BY toYYYYMM(day)
+ORDER BY (site_id, day, origin, import_id, device)
+SETTINGS index_granularity = 8192;
+
+CREATE TABLE {{database}}.rollup_entry_pages
+(
+    `site_id` UInt64,
+    `day` Date,
+    `origin` Enum8('native' = 1, 'import' = 2),
+    `import_id` UInt64,
+    `version` UInt64,
+    `entry_page` String,
+    `visitors` UInt64,
+    `pageviews` UInt64,
+    `events` UInt64,
+    `visits_ev` UInt64,
+    `visits_s` UInt64,
+    `s_n` UInt64,
+    `s_pv` UInt64,
+    `s_dur_ms` UInt64,
+    `s_eng_ms` UInt64,
+    `s_eng_n` UInt64,
+    `b_n` UInt64,
+    `bounces` UInt64,
+    `exits` UInt64,
+    `tp_ms` UInt64,
+    `tp_n` UInt64,
+    `sc_sum` UInt64,
+    `sc_n` UInt64
+)
+ENGINE = ReplacingMergeTree(version)
+PARTITION BY toYYYYMM(day)
+ORDER BY (site_id, day, origin, import_id, entry_page)
+SETTINGS index_granularity = 8192;
+
+CREATE TABLE {{database}}.rollup_events
+(
+    `site_id` UInt64,
+    `day` Date,
+    `origin` Enum8('native' = 1, 'import' = 2),
+    `import_id` UInt64,
+    `version` UInt64,
+    `name` String,
+    `visitors` UInt64,
+    `pageviews` UInt64,
+    `events` UInt64,
+    `visits_ev` UInt64,
+    `visits_s` UInt64,
+    `s_n` UInt64,
+    `s_pv` UInt64,
+    `s_dur_ms` UInt64,
+    `s_eng_ms` UInt64,
+    `s_eng_n` UInt64,
+    `b_n` UInt64,
+    `bounces` UInt64,
+    `exits` UInt64,
+    `tp_ms` UInt64,
+    `tp_n` UInt64,
+    `sc_sum` UInt64,
+    `sc_n` UInt64
+)
+ENGINE = ReplacingMergeTree(version)
+PARTITION BY toYYYYMM(day)
+ORDER BY (site_id, day, origin, import_id, name)
+SETTINGS index_granularity = 8192;
+
+CREATE TABLE {{database}}.rollup_exit_pages
+(
+    `site_id` UInt64,
+    `day` Date,
+    `origin` Enum8('native' = 1, 'import' = 2),
+    `import_id` UInt64,
+    `version` UInt64,
+    `exit_page` String,
+    `visitors` UInt64,
+    `pageviews` UInt64,
+    `events` UInt64,
+    `visits_ev` UInt64,
+    `visits_s` UInt64,
+    `s_n` UInt64,
+    `s_pv` UInt64,
+    `s_dur_ms` UInt64,
+    `s_eng_ms` UInt64,
+    `s_eng_n` UInt64,
+    `b_n` UInt64,
+    `bounces` UInt64,
+    `exits` UInt64,
+    `tp_ms` UInt64,
+    `tp_n` UInt64,
+    `sc_sum` UInt64,
+    `sc_n` UInt64
+)
+ENGINE = ReplacingMergeTree(version)
+PARTITION BY toYYYYMM(day)
+ORDER BY (site_id, day, origin, import_id, exit_page)
+SETTINGS index_granularity = 8192;
+
+CREATE TABLE {{database}}.rollup_locations
+(
+    `site_id` UInt64,
+    `day` Date,
+    `origin` Enum8('native' = 1, 'import' = 2),
+    `import_id` UInt64,
+    `version` UInt64,
+    `country` String,
+    `region` String,
+    `city` String,
+    `visitors` UInt64,
+    `pageviews` UInt64,
+    `events` UInt64,
+    `visits_ev` UInt64,
+    `visits_s` UInt64,
+    `s_n` UInt64,
+    `s_pv` UInt64,
+    `s_dur_ms` UInt64,
+    `s_eng_ms` UInt64,
+    `s_eng_n` UInt64,
+    `b_n` UInt64,
+    `bounces` UInt64,
+    `exits` UInt64,
+    `tp_ms` UInt64,
+    `tp_n` UInt64,
+    `sc_sum` UInt64,
+    `sc_n` UInt64
+)
+ENGINE = ReplacingMergeTree(version)
+PARTITION BY toYYYYMM(day)
+ORDER BY (site_id, day, origin, import_id, country, region, city)
+SETTINGS index_granularity = 8192;
+
+CREATE TABLE {{database}}.rollup_os
+(
+    `site_id` UInt64,
+    `day` Date,
+    `origin` Enum8('native' = 1, 'import' = 2),
+    `import_id` UInt64,
+    `version` UInt64,
+    `os` String,
+    `os_version` String,
+    `visitors` UInt64,
+    `pageviews` UInt64,
+    `events` UInt64,
+    `visits_ev` UInt64,
+    `visits_s` UInt64,
+    `s_n` UInt64,
+    `s_pv` UInt64,
+    `s_dur_ms` UInt64,
+    `s_eng_ms` UInt64,
+    `s_eng_n` UInt64,
+    `b_n` UInt64,
+    `bounces` UInt64,
+    `exits` UInt64,
+    `tp_ms` UInt64,
+    `tp_n` UInt64,
+    `sc_sum` UInt64,
+    `sc_n` UInt64
+)
+ENGINE = ReplacingMergeTree(version)
+PARTITION BY toYYYYMM(day)
+ORDER BY (site_id, day, origin, import_id, os, os_version)
+SETTINGS index_granularity = 8192;
+
+CREATE TABLE {{database}}.rollup_pages
+(
+    `site_id` UInt64,
+    `day` Date,
+    `origin` Enum8('native' = 1, 'import' = 2),
+    `import_id` UInt64,
+    `version` UInt64,
+    `page` String,
+    `visitors` UInt64,
+    `pageviews` UInt64,
+    `events` UInt64,
+    `visits_ev` UInt64,
+    `visits_s` UInt64,
+    `s_n` UInt64,
+    `s_pv` UInt64,
+    `s_dur_ms` UInt64,
+    `s_eng_ms` UInt64,
+    `s_eng_n` UInt64,
+    `b_n` UInt64,
+    `bounces` UInt64,
+    `exits` UInt64,
+    `tp_ms` UInt64,
+    `tp_n` UInt64,
+    `sc_sum` UInt64,
+    `sc_n` UInt64
+)
+ENGINE = ReplacingMergeTree(version)
+PARTITION BY toYYYYMM(day)
+ORDER BY (site_id, day, origin, import_id, page)
+SETTINGS index_granularity = 8192;
+
+CREATE TABLE {{database}}.rollup_site
+(
+    `site_id` UInt64,
+    `day` Date,
+    `origin` Enum8('native' = 1, 'import' = 2),
+    `import_id` UInt64,
+    `version` UInt64,
+    `tz` LowCardinality(String),
+    `visitors` UInt64,
+    `pageviews` UInt64,
+    `events` UInt64,
+    `visits_ev` UInt64,
+    `visits_s` UInt64,
+    `s_n` UInt64,
+    `s_pv` UInt64,
+    `s_dur_ms` UInt64,
+    `s_eng_ms` UInt64,
+    `s_eng_n` UInt64,
+    `b_n` UInt64,
+    `bounces` UInt64,
+    `exits` UInt64,
+    `tp_ms` UInt64,
+    `tp_n` UInt64,
+    `sc_sum` UInt64,
+    `sc_n` UInt64
+)
+ENGINE = ReplacingMergeTree(version)
+PARTITION BY toYYYYMM(day)
+ORDER BY (site_id, day, origin, import_id)
+SETTINGS index_granularity = 8192;
+
+CREATE TABLE {{database}}.rollup_sources
+(
+    `site_id` UInt64,
+    `day` Date,
+    `origin` Enum8('native' = 1, 'import' = 2),
+    `import_id` UInt64,
+    `version` UInt64,
+    `channel` String,
+    `source` String,
+    `referrer` String,
+    `utm_source` String,
+    `utm_medium` String,
+    `utm_campaign` String,
+    `utm_content` String,
+    `utm_term` String,
+    `visitors` UInt64,
+    `pageviews` UInt64,
+    `events` UInt64,
+    `visits_ev` UInt64,
+    `visits_s` UInt64,
+    `s_n` UInt64,
+    `s_pv` UInt64,
+    `s_dur_ms` UInt64,
+    `s_eng_ms` UInt64,
+    `s_eng_n` UInt64,
+    `b_n` UInt64,
+    `bounces` UInt64,
+    `exits` UInt64,
+    `tp_ms` UInt64,
+    `tp_n` UInt64,
+    `sc_sum` UInt64,
+    `sc_n` UInt64
+)
+ENGINE = ReplacingMergeTree(version)
+PARTITION BY toYYYYMM(day)
+ORDER BY (site_id, day, origin, import_id, channel, source, referrer, utm_source, utm_medium, utm_campaign, utm_content, utm_term)
+SETTINGS index_granularity = 8192;
+
 CREATE TABLE {{database}}.schema_migrations
 (
     `version` UInt64,

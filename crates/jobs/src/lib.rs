@@ -1,5 +1,5 @@
-//! 后台任务。P1 有 `salts_rotate`、`geoip_refresh` 与 `ch_delete_batch`（[`stats_delete`]），直接在进程内定时执行；PG 任务队列、cron leader、
-//! 日汇总层构建等留到以后（`platform-and-ops.md` §6）。
+//! 后台任务：`salts_rotate`、`geoip_refresh`、`ch_delete_batch`（[`stats_delete`]）与 `rollup_build`（[`rollup`]），
+//! 直接在进程内定时执行（`platform-and-ops.md` §6）。
 //!
 //! 写盐需要 PG 写权限，所以只有 `worker` 和 `all` 角色运行（`Role::runs_jobs`），collector 不运行。
 //! `geoip_refresh` 见 [`geoip`]：下载并原子替换 GeoIP 库，collector 只读共享目录、自己热加载。
@@ -7,10 +7,12 @@
 
 pub mod datacenter;
 pub mod geoip;
+pub mod rollup;
 pub mod stats_delete;
 
 pub use datacenter::spawn_datacenter_refresh;
 pub use geoip::{GeoRefreshJob, GeoRefreshSnapshot, GeoRefreshState, spawn_geoip_refresh};
+pub use rollup::spawn_rollup_build;
 pub use stats_delete::{StatsDeleteKick, spawn_stats_delete};
 
 use std::time::Duration;

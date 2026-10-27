@@ -5,9 +5,9 @@
 //! ```text
 //! JSON ─► spec::QuerySpec::parse        // 语法：deny_unknown_fields、封闭枚举，错误带字段路径
 //!      ─► resolve::ResolvedQuery        // 注入站点与时区、UTC 边界、业务校验（构造函数只在 crate 内可见）
-//!      ─► plan                          // 指标与维度 → 组件与表；层留成枚举，P1 恒为 raw
+//!      ─► plan                          // 指标与维度 → 组件与表
 //!      ─► sql                           // (String, Params)：只拼常量片段，取值一律 {name:Type} 参数，每个 FROM 带 TenantScope
-//!      ─► exec                          // log_comment、调用方档位的 max_execution_time；组装 results / meta / query
+//!      ─► exec                          // 选层（rollup：日汇总层，见 [`rollup`]）、log_comment、调用方档位的 max_execution_time；组装 results / meta / query
 //! ```
 //!
 //! 不在本 crate 里的：HTTP 路由、鉴权、限流（调用方传入 [`TenantScope`]、[`SiteContext`] 与 [`ExecOptions`]）。
@@ -23,6 +23,7 @@ pub mod exec;
 pub mod plan;
 pub mod resolve;
 pub mod result;
+pub mod rollup;
 pub mod spec;
 pub mod sql;
 

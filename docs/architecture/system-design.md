@@ -661,37 +661,39 @@ TTL minute + INTERVAL 90 DAY DELETE;
 - 查询规划器估算一次查询要扫描的行数（§6.4）；
 - 配额。
 
-### 5.5 日汇总层（Tier 1）
+### 5.5 日汇总层
 
-表结构沿用 Plausible `imported_*` 的维度族（R03 §9、R02 §8.4），一共 10 张表。
+表结构沿用 Plausible `imported_*` 的维度族（R03 §9、R02 §8.4），一共 10 张表（`migrations/clickhouse/…_init.sql`，口径见 `crates/query/src/rollup.rs`）。
 
-| 表 | 维度 | 指标列 |
+| 表 | 维度列 | 有值的度量 |
 |---|---|---|
-| `rollup_site_day` | 无 | visitors, visits, pageviews, events, bounces, duration_sum, engagement_ms_sum, engagement_sessions（供 `engaged_duration`） |
-| `rollup_pages_day` | hostname, pathname | visitors, pageviews, visits, exits, engagement_ms_sum, engagement_sessions, scroll_sum, scroll_sessions |
-| `rollup_entry_pages_day` | entry hostname, entry pathname | visitors, visits（入口次数）, bounces, duration_sum, pageviews |
-| `rollup_exit_pages_day` | exit hostname, exit pathname | visitors, visits（退出次数）, pageviews |
-| `rollup_sources_day` | channel, referrer_source, referrer, utm×5 | visitors, visits, bounces, duration_sum, pageviews |
-| `rollup_locations_day` | country, region, city | 同上 |
-| `rollup_devices_day` | device | 同上 |
-| `rollup_browsers_day` | browser, browser_version | 同上 |
-| `rollup_os_day` | os, os_version | 同上 |
-| `rollup_events_day` | name, prop_key, prop_value（只含站点声明的 props） | visitors, events |
+| `rollup_site` | 无 | 除 `exits` 外全部 |
+| `rollup_pages` | `page` | 全部；会话度量按入口页归属（与原始层 `event:page` 维度的口径相同），`visits` 是事件形式 |
+| `rollup_entry_pages` / `rollup_exit_pages` | `entry_page` / `exit_page` | 除 `exits` 外全部 |
+| `rollup_sources` | `channel` `source` `referrer` `utm_source` `utm_medium` `utm_campaign` `utm_content` `utm_term` | 同上 |
+| `rollup_locations` | `country` `region` `city` | 同上 |
+| `rollup_devices` | `device` | 同上 |
+| `rollup_browsers` | `browser` `browser_version` | 同上 |
+| `rollup_os` | `os` `os_version` | 同上 |
+| `rollup_events` | `name` | `visitors` `pageviews` `events`，事件形式的 `visits` |
 
-**公共列**：`site_id`、`day`（站点本地日期）、`origin Enum8('native'=1, 'import'=2)`、`import_id`、`version`。排序键为 `(site_id, day, origin, import_id, <维度>)`，引擎为 `ReplacingMergeTree(version)`。读取时用 `FINAL`；`day` 同时在分区键和排序键里，ClickHouse 会自动跳过跨分区合并。WHERE 条件只放键列，避免在 FINAL 选出最新版本之前就按非键列过滤（#9）。
+**度量列**（所有表相同，不适用的为 0）与查询引擎组件的度量一一对应：`visitors` `pageviews` `events` `visits_ev`（事件形式）`visits_s`（会话形式）`s_n` `s_pv` `s_dur_ms` `s_eng_ms` `s_eng_n` `b_n` `bounces` `exits` `tp_ms` `tp_n` `sc_sum` `sc_n`。比率在查询时用分子分母重算。
 
-**构建**
+**公共列**：`site_id`、`day`（站点本地日期）、`origin Enum8('native'=1, 'import'=2)`、`import_id`、`version`；`rollup_site` 另有 `tz`（构建时的站点时区）。排序键为 `(site_id, day, origin, import_id, <维度>)`，引擎为 `ReplacingMergeTree(version)`，按月分区，永久保存。读取时用 `FINAL`，`FINAL` 之内只放键列上的条件，过滤放在外层（#9）。维度列存原始层维度表达式的字符串结果（空值是空串，城市是 GeoNames id 的十进制文本）。
 
-- 后台任务在站点本地日结束 1 小时后，从 `events` 和 `sessions` 计算这一天，`version` 取构建时间。
-- 重算会覆盖旧行，所以过程是幂等的。站点改时区、删除数据、迟到积压之后都可以重建。
-- worker 发现插入的批次早于已构建的水位时，会登记这些日期需要重建。
-- 会话按开始日期计入当天。
+**构建**（`rollup_build`，`platform-and-ops.md` §6）
+
+- 某天某族的行，就是对那一天、按该族全部维度分组的原始层查询（用查询引擎自己的 SQL 构建器生成 `INSERT … SELECT`），所以单日的数字与原始层一致。
+- 每个站点从「已构建的最后一天 + 1」（首次：最早事件那天）建到「结束超过 2 小时的最后一个本地日」；各族依次写入，`rollup_site` 最后写，它的行（没有数据也有一行）就是「这一天已构建」的标记。
+- 重复构建同一天是幂等的：同键的行按 `version`（构建时间）取最新。
+- 站点改时区：`rollup_site.tz` 与当前时区不同，查询不再用汇总层；构建任务删除该站点全部原生汇总行，按新时区从头重建。
+- 删除统计数据时同时删除汇总行（§5.6）。
 
 **用途**
 
-1. 回答超出 `raw_retention` 的时间范围；
-2. 存放导入数据，例如 Plausible 导出的 CSV，它天然对应这些表，迁移路径因此很直接（P4）；
-3. 作为大站长时间范围的加速层（§6.4）。
+1. 大站长时间范围的加速层（§6.4 选层）；
+2. 存放导入数据（`origin = 'import'`），例如 Plausible 导出的 CSV，它天然对应这些表（P4）；
+3. 回答超出原始数据保留期的时间范围（P2，随可配置保留期一起做）。
 
 **访客数跨天直接求和**：访客 ID 每个本地日轮换，而事件保留自己当天的 `visitor_id`（盖章不改写，§4.6、§10 Q9），所以原始层任意范围的 `uniq(visitor_id)` 严格等于各本地日去重访客数之和（R03 §12.2 #16），与日汇总层逐日相加一致。日汇总层只存每日去重的访客数，不需要 HLL 状态。两层都排除 engagement，并用同一个 `uniq`，日汇总层存的就是按同样方法算出的每日值（§6.5、§10 Q10、Q17）。
 
@@ -700,7 +702,7 @@ TTL minute + INTERVAL 90 DAY DELETE;
 | 操作 | 实现 |
 |---|---|
 | 原始数据保留 | 表级 TTL，配合 `ttl_only_drop_parts`，过期后按 part 和月分区整块删除。月分区里最新的一行过期后整个分区才会删除，所以实际保留时间是 N 到 N+31 天（#8）；需要精确截止时，改由后台任务执行 `DROP PARTITION`。调整全局保留期属于迁移类的管理操作。站点可以设置更短的保留期（`site_settings.retention_days`），由删除任务按站点、按日期执行轻量删除 |
-| 删除站点 | 与 Plausible 相同（R02 §9）：在 PG 删除站点的同一事务里写入 `pending_stats_deletions`（`not_before` = 删除时刻 + 恢复窗口 `RIVU_SITE_RESTORE_DAYS`，窗口内恢复会取消它）；后台任务 `ch_delete_batch`（每 5 分钟，`platform-and-ops.md` §6）对 `events`、`sessions`、`ingest_counters` 按分区执行轻量删除（`DELETE … IN PARTITION`），P2 的 `rollup_*` 也要删除。按日期范围删除走同一个任务：站点本地日期按站点时区换算成 UTC 区间，`events` 按 `ts`、`ingest_counters` 按 `minute`，`sessions` 删除开始时间落在区间内的会话 |
+| 删除站点 | 与 Plausible 相同（R02 §9）：在 PG 删除站点的同一事务里写入 `pending_stats_deletions`（`not_before` = 删除时刻 + 恢复窗口 `RIVU_SITE_RESTORE_DAYS`，窗口内恢复会取消它）；后台任务 `ch_delete_batch`（每 5 分钟，`platform-and-ops.md` §6）对 `events`、`sessions`、`ingest_counters` 按分区执行轻量删除（`DELETE … IN PARTITION`），`rollup_*` 同时删除（日期范围删除只删这些本地日）。按日期范围删除走同一个任务：站点本地日期按站点时区换算成 UTC 区间，`events` 按 `ts`、`ingest_counters` 按 `minute`，`sessions` 删除开始时间落在区间内的会话 |
 | 重置统计 | 真正删除数据，复用上面的删除意图机制。Plausible 只是挪了一个起始时间指针，数据永久残留（R02 §9.1） |
 | 单个访客的数据 | 系统不存在长期访客 ID，所以无法定位某个人的数据。这正是隐私设计的结果，需要写进隐私说明 |
 
@@ -753,7 +755,7 @@ TTL minute + INTERVAL 90 DAY DELETE;
 |---|---|
 | `results[].dimensions` | 展示用的字符串：空值换成文案（来源与 referrer `Direct / None`，渠道 `Direct`，事件名、页面、入口页、退出页 `(none)`，其余 `(not set)`）；小时桶是带偏移的站点本地时间（`2026-10-23T14:00:00+08:00`），其余时间桶是桶起始日（`YYYY-MM-DD`，周桶是该周起始日，首桶可能早于范围起点） |
 | `results[].metrics` | 与请求里的 `metrics` 同序。计数类是整数；比率、时长、平均值是浮点数 |
-| `meta` | `time_labels`（`include.time_labels`：完整的桶序列，含空桶；`results` 里只有有数据的桶）、`comparison_time_labels`、`warnings`、`tiers`（现在恒为 `["raw"]`）、`metric_semantics`（每个被请求的指标在本次查询形态下的口径，随过滤与维度而变）、`geo_attribution`（结果含位置维度时必带）、`geo_capability`、`total_rows`（`include.total_rows`，不计 limit 与 offset） |
+| `meta` | `time_labels`（`include.time_labels`：完整的桶序列，含空桶；`results` 里只有有数据的桶）、`comparison_time_labels`、`warnings`、`tiers`（实际用到的层：`raw`、`rollup`，§6.4）、`metric_semantics`（每个被请求的指标在本次查询形态下的口径，随过滤与维度而变）、`geo_attribution`（结果含位置维度时必带）、`geo_capability`、`total_rows`（`include.total_rows`，不计 limit 与 offset） |
 | `query` | 规范化后的请求回显：`resolved_date_range`（站点时区的起点与终点，终点已封顶到 `now`）、`comparison_date_range`、`time_zone`、自动粒度换成具体粒度（如 `time:day`）、默认排序与分页已展开 |
 | 对比（`include.compare`） | 无时间维度：每行带 `comparison: {dimensions, metrics, change}`。有时间维度：`comparison_results` 是对比期的行（只含主结果里出现过的非时间维度取值），不带 `change`，对比期的桶序列在 `meta.comparison_time_labels`（同时给了 `include.time_labels` 才返回）。规则见 §6.7 |
 
@@ -769,7 +771,7 @@ TTL minute + INTERVAL 90 DAY DELETE;
 | 目标 | 事件目标（事件名）与页面目标（pathname 通配），见 §6.6 | 滚动深度目标、目标的 props 条件（要改表结构，并依赖 `event:props`） |
 | `date_range` | `day` `24h` `month` `year` `all` `realtime` `Nd` `Nmo` `[from, to]` | — |
 | `include` | `time_labels` `total_rows` `compare` | `imports`（未实现，直接是未知字段） |
-| 数据层 | 原始层（`events` 与 `sessions`）。`meta.tiers` 恒为 `["raw"]` | 日汇总层与 §6.4「选层」规则、`range_beyond_raw_retention` 警告 |
+| 数据层 | 原始层（`events` 与 `sessions`）与日汇总层（§5.5、§6.4 选层） | 超出原始数据保留期的范围与 `range_beyond_raw_retention` 警告（保留期尚不可配置） |
 
 ### 6.3 执行流程
 
@@ -779,7 +781,8 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
     ─► [date_range = all] first_event // build 之前先查一次站点最早事件（读排序键前缀，一条查询），没有数据时只含今天
     ─► build   ─► ResolvedQuery       // 注入 site_id 和时区，UTC 边界，展开分群，加载目标，业务校验
     ─► optimize                       // 自动时间粒度、默认排序、终点封顶到 now（都在 build 内完成；Plausible 的 hostname 过滤扩展未做）
-    ─► plan    ─► Plan{tiers, tables} // 声明式「指标/维度 → 表」映射，并选择数据层
+    ─► plan    ─► Plan                // 声明式「指标/维度 → 组件与表」映射
+    ─► tier                           // 选层：兼容且已构建的天走日汇总层（§6.4）
     ─► sql     ─► (String, Params)    // 只拼服务端常量片段，取值一律用 {name:Type} 参数
     ─► exec    ─► rows                // 带 log_comment、超时和内存配额（租户并发信号量在 API 层，§6.8）
     ─► assemble─► QueryResult
@@ -819,27 +822,29 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 
 **选层**
 
-实现状态：P1 只有原始层，`Tier` 留成枚举，`meta.tiers` 恒为 `["raw"]`；下面的规则是日汇总层上线后的目标。
+选层在执行时做（要看汇总层构建到了哪一天），每次取数（主查询、对比期）各自决定：
 
-按天把查询范围分配给不同的数据层：
-
-| 规则 | 数据层 |
+| 条件 | 数据层 |
 |---|---|
-| 超出 `raw_retention` 的天 | 必须用日汇总层；查询不兼容时，这部分天不返回，并在 `meta.warnings` 中给出 `range_beyond_raw_retention` |
-| 今天和未结束的天 | 原始层 |
-| 已结束的天，且估算扫描行数（由 `ingest_counters` 估算，参考 Plausible 用来决定采样的估算器，R03 §8.1）超过 2000 万，且查询兼容 | 日汇总层（自动加速） |
+| 查询兼容、区间里有已构建的天，且这些天的事件数（`rollup_site.events`）不少于 `RIVU_ROLLUP_MIN_ROWS`（默认 100 万） | `[起点, R]` 用日汇总层（R = 已构建的最后一天），之后的天用原始层，两部分作为组件 `UNION ALL` 后一起聚合 |
 | 其余 | 原始层 |
 
-「兼容」借鉴 Plausible imported 的规则（R03 §9.2、§9.3）：
+「兼容」借鉴 Plausible imported 的规则（R03 §9.2、§9.3），并且保证与原始层的口径相同：
 
-- 维度和过滤落在恰好一个维度族上；
-- 时间粒度不细于 day；
-- 没有 `has_done` 行为过滤；
-- 所需指标在该族里都有。
+- 区间是整本地日（`date_range` 不是 `24h`、`realtime` 或时间戳区间）；
+- 时间粒度是 `day`、`week` 或 `month`；
+- 非时间维度都在同一个族里（没有维度时用 `rollup_site`）；
+- 过滤只落在已分组的维度上，且没有事件级过滤（`event:*` 在会话指标上是「存在」语义，汇总表回答不了）；
+- 没有 `percentage`、`conversion_rate`；
+- `visits` 的口径（事件形式或会话形式）与族相同，所需度量在该族里都有。
 
-两层的结果按维度合并：计数类直接相加；比率类回到分子分母重新计算，例如 `bounce_rate = Σbounces / Σvisits`，与 Plausible imported 的合并公式一致（R03 §9.4）。`meta.tiers` 会列出每一天用的是哪一层。
+汇总层的行带着全部度量，原始层只在规划用到的组件有数据时才出行，所以汇总组件只取这些组件有数据的行（例如只查 `time_on_page` 时，没有 engagement 事件的页面不出现）。比率在外层用分子分母重算，与 Plausible imported 的合并公式一致（R03 §9.4）。`meta.tiers` 列出这次查询实际用到的层，`log_comment` 的 `tier` 是 `raw`、`rollup` 或 `rollup+raw`。
 
-已知近似：日汇总层按会话开始日期计入，原始层按「区间内活跃」计入，跨午夜的会话在两层交界处可能多算一次。
+已知近似（`bin/rivu/tests/rollup_tier.rs` 在避开它们的数据上验证两层结果完全相同）：
+
+- 跨本地午夜的会话在两天里各算一次（`visits` 与会话类指标偏多）；
+- 只按族的部分维度分组时（例如 `sources` 只按渠道），同一访客同一天有两个会话、族里的其他维度不同时，`visitors` 多算（与 Plausible 的导入数据相同）；
+- 一天构建之后才写入的事件（集群模式下积压超过 2 小时）不会补进汇总层。
 
 ### 6.5 指标定义（原始层）
 
@@ -850,7 +855,7 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 | `pageviews` / `events` | `countIf(name='pageview')` / `countIf(name != 'engagement')` |
 | `bounce_rate` | `countIf(pageviews ≤ 1 AND interactive_events = 0) / 区间内活跃的会话数`，会话不按区间边界截断；带 `event:page` 或 `event:hostname` 过滤时，只统计入口页匹配、且范围内有匹配事件的会话（§6.6） |
 | `visit_duration` | `avg(last_event_at − started_at)`，单位秒。不含 engagement 时间（§10 Q2） |
-| `engaged_duration` | `sum(engagement_ms) / 1000 / count()`，只统计 `engagement_ms > 0` 的会话，单位秒。与 `time_on_page` 同口径，避免没有开启 engagement 的 `core` 脚本把均值拉向 0。超出 `raw_retention` 时只有无维度查询能由 `rollup_site_day` 回答（§6.4 兼容规则） |
+| `engaged_duration` | `sum(engagement_ms) / 1000 / count()`，只统计 `engagement_ms > 0` 的会话，单位秒。与 `time_on_page` 同口径，避免没有开启 engagement 的 `core` 脚本把均值拉向 0 |
 | `views_per_visit` | `avg(pageviews)` |
 | `time_on_page` | 按行计算，只看 engagement 事件：先对每个（维度值，会话）累加 `engagement_ms`，再 `sum(engagement_ms) / 1000 / 有 engagement 的会话数` |
 | `scroll_depth` | 按行计算：先对每个（维度值，会话）取 `max(scroll_depth ≤ 100)`，再对有有效 `scroll_depth` 的会话取平均，范围 0–100 |
@@ -1032,7 +1037,7 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 | # | 问题 | 决定 | 影响 |
 |---|---|---|---|
 | Q1 | 原始数据默认保留期 | 默认 731 天（连续两个自然年，含一个闰年）。日均 1000 万事件的部署建议把 `RIVU_RETENTION_DAYS` 调低到 180 天 | D12；§5.1 表；§5.2、§5.3 的 TTL（`INTERVAL 731 DAY`）；§7 容量；`RIVU_RETENTION_DAYS` 默认 731 |
-| Q2 | `visit_duration` 是否计入 engagement 时间 | 不计入，与 Plausible 和导入数据一致；另设独立指标 `engaged_duration` | §5.3 派生指标；§5.5 `rollup_site_day` 增列；§6.2 指标列表；§6.4 归属；§6.5 定义 |
+| Q2 | `visit_duration` 是否计入 engagement 时间 | 不计入，与 Plausible 和导入数据一致；另设独立指标 `engaged_duration` | §5.3 派生指标；§5.5 `s_eng_ms` `s_eng_n` 列；§6.2 指标列表；§6.4 归属；§6.5 定义 |
 | Q3 | tracker 是否读取 `localStorage.rivu_ignore`（站点所有者排除自己的访问） | 只读：tracker 永不写入，也不用于标识或上报 | `tracker-and-protocol.md` §1.1、§4.7；§8 |
 | Q4 | 是否提供 Plausible 协议兼容端点 | P4 提供 `POST /api/plausible/event`，便于迁移；Plausible 的 tracker 是 MIT 许可 | §9 的 P4；`tracker-and-protocol.md` §9 |
 | Q5 | UA 库和 GeoIP 库的选型与许可 | UA 用 uap-core（Apache-2.0）。GeoIP 默认 DB-IP Lite（CC BY 4.0，必须署名）；继续支持 MaxMind GeoLite2；新增自定义 mmdb 直链 `RIVU_GEOIP_DB_URL`。优先级：自定义 URL > MaxMind key > DB-IP | §4.4（来源、更新、校验、署名）；看板必须在显示位置数据处署名，查询 API 返回当前库的署名；`platform-and-ops.md` 的 `geoip_refresh` 任务、配置变量、指标 |

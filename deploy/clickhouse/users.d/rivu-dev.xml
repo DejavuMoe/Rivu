@@ -103,6 +103,17 @@
                 <query>GRANT ALTER UPDATE(_row_exists) ON rivu.events</query>
                 <query>GRANT ALTER UPDATE(_row_exists) ON rivu.sessions</query>
                 <query>GRANT ALTER UPDATE(_row_exists) ON rivu.ingest_counters</query>
+                <!-- 日汇总层：rollup_build 写入（INSERT … SELECT），时区变更与统计删除时轻量删除 -->
+                <query>GRANT INSERT, ALTER DELETE, ALTER UPDATE(_row_exists) ON rivu.rollup_site</query>
+                <query>GRANT INSERT, ALTER DELETE, ALTER UPDATE(_row_exists) ON rivu.rollup_pages</query>
+                <query>GRANT INSERT, ALTER DELETE, ALTER UPDATE(_row_exists) ON rivu.rollup_entry_pages</query>
+                <query>GRANT INSERT, ALTER DELETE, ALTER UPDATE(_row_exists) ON rivu.rollup_exit_pages</query>
+                <query>GRANT INSERT, ALTER DELETE, ALTER UPDATE(_row_exists) ON rivu.rollup_sources</query>
+                <query>GRANT INSERT, ALTER DELETE, ALTER UPDATE(_row_exists) ON rivu.rollup_locations</query>
+                <query>GRANT INSERT, ALTER DELETE, ALTER UPDATE(_row_exists) ON rivu.rollup_devices</query>
+                <query>GRANT INSERT, ALTER DELETE, ALTER UPDATE(_row_exists) ON rivu.rollup_browsers</query>
+                <query>GRANT INSERT, ALTER DELETE, ALTER UPDATE(_row_exists) ON rivu.rollup_os</query>
+                <query>GRANT INSERT, ALTER DELETE, ALTER UPDATE(_row_exists) ON rivu.rollup_events</query>
             </grants>
         </rivu_maintainer>
     </users>

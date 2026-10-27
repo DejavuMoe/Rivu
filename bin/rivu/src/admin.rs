@@ -83,7 +83,9 @@ pub async fn query(config: &Config, args: QueryArgs) -> Result<ExitCode> {
         .await
         .map_err(|e| anyhow!("读取站点 `{site_key}` 的查询设置失败：{e:?}"))?;
     // 等同看板查询，用看板档的超时（§10 Q14）。
-    let opts = ExecOptions::new(config.query_timeouts.dashboard_secs).with_route("cli.query");
+    let opts = ExecOptions::new(config.query_timeouts.dashboard_secs)
+        .with_route("cli.query")
+        .with_rollup(config.rollup_min_rows);
     let result = rivu_query::execute(&reader, &TenantScope::new(site.id), &ctx, spec, opts)
         .await
         .map_err(|e| anyhow!("查询失败：{e}"))?;

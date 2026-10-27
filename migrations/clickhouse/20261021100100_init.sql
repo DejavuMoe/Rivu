@@ -1,4 +1,4 @@
--- ClickHouse：原始事件、会话聚合与接入计数。设计见 docs/architecture/system-design.md §5.2–§5.4。
+-- ClickHouse：原始事件、会话聚合、接入计数与日汇总层。设计见 docs/architecture/system-design.md §5.2–§5.5。
 --
 -- 约定（由 `rivu migrate` 执行）：
 --   * 文件按「行尾的 `;`」拆成多条语句，逐条执行（HTTP 接口一次只能执行一条）；
@@ -166,3 +166,326 @@ PARTITION BY toYYYYMM(minute)
 ORDER BY (site_id, minute, metric, script_version)
 TTL minute + INTERVAL 90 DAY DELETE
 SETTINGS non_replicated_deduplication_window = 1000;
+
+-- ------------------------------------------------------------- rollup_*
+-- 日汇总层（§5.5、§6.4）。每张表是一个「维度族」，一行是站点本地日 × 维度取值。
+--
+-- 行由后台任务 rollup_build 用查询引擎的 SQL 构建器生成（crates/query/src/rollup.rs）：某天某族的一行，
+-- 就是对那一天、按该族的维度分组的原始层查询结果，所以单日的数字与原始层一致；跨多天相加时，访客数因为访客 ID
+-- 每天轮换而仍然正确，唯一的近似是跨午夜的会话在两天里各算一次。
+--
+-- 度量列所有族相同（不适用的为 0），名字对应查询引擎的组件度量 c_*。维度列存的是原始层维度表达式的字符串结果
+-- （空值是空串，城市是 GeoNames id 的十进制文本）。
+-- origin：native（由原始数据构建）或 import（P4 导入）；import_id 区分不同的导入批次。
+-- ReplacingMergeTree(version)：重建同一天时新行覆盖旧行，读取时用 FINAL。rollup_site 每天都有一行（没有数据也有），
+-- 作为「这一天已构建」的标记，并记录构建时站点的时区（时区变了要整体重建）。没有 TTL：汇总层永久保存。
+CREATE TABLE IF NOT EXISTS {{database}}.rollup_site
+(
+    site_id    UInt64,
+    day        Date,
+    origin     Enum8('native' = 1, 'import' = 2),
+    import_id  UInt64,
+    version    UInt64,
+    tz LowCardinality(String),
+    visitors   UInt64,
+    pageviews  UInt64,
+    events     UInt64,
+    visits_ev  UInt64,   -- 事件形式的 visits（有 event:* 维度时）
+    visits_s   UInt64,   -- 会话形式的 visits（区间内活跃的会话数）
+    s_n        UInt64,
+    s_pv       UInt64,
+    s_dur_ms   UInt64,
+    s_eng_ms   UInt64,
+    s_eng_n    UInt64,
+    b_n        UInt64,
+    bounces    UInt64,
+    exits      UInt64,
+    tp_ms      UInt64,
+    tp_n       UInt64,
+    sc_sum     UInt64,
+    sc_n       UInt64
+)
+ENGINE = ReplacingMergeTree(version)
+PARTITION BY toYYYYMM(day)
+ORDER BY (site_id, day, origin, import_id);
+
+CREATE TABLE IF NOT EXISTS {{database}}.rollup_pages
+(
+    site_id    UInt64,
+    day        Date,
+    origin     Enum8('native' = 1, 'import' = 2),
+    import_id  UInt64,
+    version    UInt64,
+    page String,
+    visitors   UInt64,
+    pageviews  UInt64,
+    events     UInt64,
+    visits_ev  UInt64,   -- 事件形式的 visits（有 event:* 维度时）
+    visits_s   UInt64,   -- 会话形式的 visits（区间内活跃的会话数）
+    s_n        UInt64,
+    s_pv       UInt64,
+    s_dur_ms   UInt64,
+    s_eng_ms   UInt64,
+    s_eng_n    UInt64,
+    b_n        UInt64,
+    bounces    UInt64,
+    exits      UInt64,
+    tp_ms      UInt64,
+    tp_n       UInt64,
+    sc_sum     UInt64,
+    sc_n       UInt64
+)
+ENGINE = ReplacingMergeTree(version)
+PARTITION BY toYYYYMM(day)
+ORDER BY (site_id, day, origin, import_id, page);
+
+CREATE TABLE IF NOT EXISTS {{database}}.rollup_entry_pages
+(
+    site_id    UInt64,
+    day        Date,
+    origin     Enum8('native' = 1, 'import' = 2),
+    import_id  UInt64,
+    version    UInt64,
+    entry_page String,
+    visitors   UInt64,
+    pageviews  UInt64,
+    events     UInt64,
+    visits_ev  UInt64,   -- 事件形式的 visits（有 event:* 维度时）
+    visits_s   UInt64,   -- 会话形式的 visits（区间内活跃的会话数）
+    s_n        UInt64,
+    s_pv       UInt64,
+    s_dur_ms   UInt64,
+    s_eng_ms   UInt64,
+    s_eng_n    UInt64,
+    b_n        UInt64,
+    bounces    UInt64,
+    exits      UInt64,
+    tp_ms      UInt64,
+    tp_n       UInt64,
+    sc_sum     UInt64,
+    sc_n       UInt64
+)
+ENGINE = ReplacingMergeTree(version)
+PARTITION BY toYYYYMM(day)
+ORDER BY (site_id, day, origin, import_id, entry_page);
+
+CREATE TABLE IF NOT EXISTS {{database}}.rollup_exit_pages
+(
+    site_id    UInt64,
+    day        Date,
+    origin     Enum8('native' = 1, 'import' = 2),
+    import_id  UInt64,
+    version    UInt64,
+    exit_page String,
+    visitors   UInt64,
+    pageviews  UInt64,
+    events     UInt64,
+    visits_ev  UInt64,   -- 事件形式的 visits（有 event:* 维度时）
+    visits_s   UInt64,   -- 会话形式的 visits（区间内活跃的会话数）
+    s_n        UInt64,
+    s_pv       UInt64,
+    s_dur_ms   UInt64,
+    s_eng_ms   UInt64,
+    s_eng_n    UInt64,
+    b_n        UInt64,
+    bounces    UInt64,
+    exits      UInt64,
+    tp_ms      UInt64,
+    tp_n       UInt64,
+    sc_sum     UInt64,
+    sc_n       UInt64
+)
+ENGINE = ReplacingMergeTree(version)
+PARTITION BY toYYYYMM(day)
+ORDER BY (site_id, day, origin, import_id, exit_page);
+
+CREATE TABLE IF NOT EXISTS {{database}}.rollup_sources
+(
+    site_id    UInt64,
+    day        Date,
+    origin     Enum8('native' = 1, 'import' = 2),
+    import_id  UInt64,
+    version    UInt64,
+    channel String,
+    source String,
+    referrer String,
+    utm_source String,
+    utm_medium String,
+    utm_campaign String,
+    utm_content String,
+    utm_term String,
+    visitors   UInt64,
+    pageviews  UInt64,
+    events     UInt64,
+    visits_ev  UInt64,   -- 事件形式的 visits（有 event:* 维度时）
+    visits_s   UInt64,   -- 会话形式的 visits（区间内活跃的会话数）
+    s_n        UInt64,
+    s_pv       UInt64,
+    s_dur_ms   UInt64,
+    s_eng_ms   UInt64,
+    s_eng_n    UInt64,
+    b_n        UInt64,
+    bounces    UInt64,
+    exits      UInt64,
+    tp_ms      UInt64,
+    tp_n       UInt64,
+    sc_sum     UInt64,
+    sc_n       UInt64
+)
+ENGINE = ReplacingMergeTree(version)
+PARTITION BY toYYYYMM(day)
+ORDER BY (site_id, day, origin, import_id, channel, source, referrer, utm_source, utm_medium, utm_campaign, utm_content, utm_term);
+
+CREATE TABLE IF NOT EXISTS {{database}}.rollup_locations
+(
+    site_id    UInt64,
+    day        Date,
+    origin     Enum8('native' = 1, 'import' = 2),
+    import_id  UInt64,
+    version    UInt64,
+    country String,
+    region String,
+    city String,
+    visitors   UInt64,
+    pageviews  UInt64,
+    events     UInt64,
+    visits_ev  UInt64,   -- 事件形式的 visits（有 event:* 维度时）
+    visits_s   UInt64,   -- 会话形式的 visits（区间内活跃的会话数）
+    s_n        UInt64,
+    s_pv       UInt64,
+    s_dur_ms   UInt64,
+    s_eng_ms   UInt64,
+    s_eng_n    UInt64,
+    b_n        UInt64,
+    bounces    UInt64,
+    exits      UInt64,
+    tp_ms      UInt64,
+    tp_n       UInt64,
+    sc_sum     UInt64,
+    sc_n       UInt64
+)
+ENGINE = ReplacingMergeTree(version)
+PARTITION BY toYYYYMM(day)
+ORDER BY (site_id, day, origin, import_id, country, region, city);
+
+CREATE TABLE IF NOT EXISTS {{database}}.rollup_devices
+(
+    site_id    UInt64,
+    day        Date,
+    origin     Enum8('native' = 1, 'import' = 2),
+    import_id  UInt64,
+    version    UInt64,
+    device String,
+    visitors   UInt64,
+    pageviews  UInt64,
+    events     UInt64,
+    visits_ev  UInt64,   -- 事件形式的 visits（有 event:* 维度时）
+    visits_s   UInt64,   -- 会话形式的 visits（区间内活跃的会话数）
+    s_n        UInt64,
+    s_pv       UInt64,
+    s_dur_ms   UInt64,
+    s_eng_ms   UInt64,
+    s_eng_n    UInt64,
+    b_n        UInt64,
+    bounces    UInt64,
+    exits      UInt64,
+    tp_ms      UInt64,
+    tp_n       UInt64,
+    sc_sum     UInt64,
+    sc_n       UInt64
+)
+ENGINE = ReplacingMergeTree(version)
+PARTITION BY toYYYYMM(day)
+ORDER BY (site_id, day, origin, import_id, device);
+
+CREATE TABLE IF NOT EXISTS {{database}}.rollup_browsers
+(
+    site_id    UInt64,
+    day        Date,
+    origin     Enum8('native' = 1, 'import' = 2),
+    import_id  UInt64,
+    version    UInt64,
+    browser String,
+    browser_version String,
+    visitors   UInt64,
+    pageviews  UInt64,
+    events     UInt64,
+    visits_ev  UInt64,   -- 事件形式的 visits（有 event:* 维度时）
+    visits_s   UInt64,   -- 会话形式的 visits（区间内活跃的会话数）
+    s_n        UInt64,
+    s_pv       UInt64,
+    s_dur_ms   UInt64,
+    s_eng_ms   UInt64,
+    s_eng_n    UInt64,
+    b_n        UInt64,
+    bounces    UInt64,
+    exits      UInt64,
+    tp_ms      UInt64,
+    tp_n       UInt64,
+    sc_sum     UInt64,
+    sc_n       UInt64
+)
+ENGINE = ReplacingMergeTree(version)
+PARTITION BY toYYYYMM(day)
+ORDER BY (site_id, day, origin, import_id, browser, browser_version);
+
+CREATE TABLE IF NOT EXISTS {{database}}.rollup_os
+(
+    site_id    UInt64,
+    day        Date,
+    origin     Enum8('native' = 1, 'import' = 2),
+    import_id  UInt64,
+    version    UInt64,
+    os String,
+    os_version String,
+    visitors   UInt64,
+    pageviews  UInt64,
+    events     UInt64,
+    visits_ev  UInt64,   -- 事件形式的 visits（有 event:* 维度时）
+    visits_s   UInt64,   -- 会话形式的 visits（区间内活跃的会话数）
+    s_n        UInt64,
+    s_pv       UInt64,
+    s_dur_ms   UInt64,
+    s_eng_ms   UInt64,
+    s_eng_n    UInt64,
+    b_n        UInt64,
+    bounces    UInt64,
+    exits      UInt64,
+    tp_ms      UInt64,
+    tp_n       UInt64,
+    sc_sum     UInt64,
+    sc_n       UInt64
+)
+ENGINE = ReplacingMergeTree(version)
+PARTITION BY toYYYYMM(day)
+ORDER BY (site_id, day, origin, import_id, os, os_version);
+
+CREATE TABLE IF NOT EXISTS {{database}}.rollup_events
+(
+    site_id    UInt64,
+    day        Date,
+    origin     Enum8('native' = 1, 'import' = 2),
+    import_id  UInt64,
+    version    UInt64,
+    name String,
+    visitors   UInt64,
+    pageviews  UInt64,
+    events     UInt64,
+    visits_ev  UInt64,   -- 事件形式的 visits（有 event:* 维度时）
+    visits_s   UInt64,   -- 会话形式的 visits（区间内活跃的会话数）
+    s_n        UInt64,
+    s_pv       UInt64,
+    s_dur_ms   UInt64,
+    s_eng_ms   UInt64,
+    s_eng_n    UInt64,
+    b_n        UInt64,
+    bounces    UInt64,
+    exits      UInt64,
+    tp_ms      UInt64,
+    tp_n       UInt64,
+    sc_sum     UInt64,
+    sc_n       UInt64
+)
+ENGINE = ReplacingMergeTree(version)
+PARTITION BY toYYYYMM(day)
+ORDER BY (site_id, day, origin, import_id, name);
