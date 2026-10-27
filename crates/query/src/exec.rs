@@ -114,6 +114,8 @@ struct Ctx<'a> {
     deadline: Deadline,
     /// 实际用到的层（`meta.tiers`）。
     tiers: std::sync::Mutex<BTreeSet<Tier>>,
+    /// 原始数据里最早的完整本地日（保留期，见 [`SiteContext::retention_days`]）；`None` 不限。
+    raw_since: Option<jiff::civil::Date>,
 }
 
 /// 每条查询的 `log_comment`（JSON，只含 id 与固定标签）：调用方的额外字段在前，保留字段 `route`、`site`、`part`、`tier` 覆盖同名项。
@@ -478,7 +480,9 @@ async fn choose_tier(
     let Some(built) = built else {
         return raw;
     };
-    if stale > 0 || built < from || rows_in_range < min_rows {
+    // 超出原始数据保留期的天只在汇总层里：不看行数阈值
+    let beyond = cx.raw_since.is_some_and(|r| from < r);
+    if stale > 0 || built < from || (rows_in_range < min_rows && !beyond) {
         return raw;
     }
     let rollup_to = built.min(to);
@@ -539,8 +543,18 @@ pub fn explain(
     Ok(sql::main_query(scope, &q, &plan, &opts))
 }
 
-/// 执行一条 `QuerySpec`。
-///
+/// 原始数据里最早的完整本地日：今天 − (保留天数 − 1)。
+fn raw_since(site: &SiteContext, now: Timestamp) -> Result<Option<jiff::civil::Date>, QueryError> {
+    let Some(days) = site.retention_days else {
+        return Ok(None);
+    };
+    let today = crate::resolve::local_date(&site.timezone, now.as_millisecond())?;
+    Ok(today
+        .checked_sub(jiff::Span::new().days(i64::from(days.max(1)) - 1))
+        .ok())
+}
+
+/// 执行一条 `QuerySpec`。///
 /// `reader` 用 `rivu_reader` 账号构造并绑定库（`rivu_storage_ch::client`）；`scope` 与 `site.site_id` 必须一致；
 /// `spec` 来自 [`QuerySpec::parse`]。解析之外的校验（组合、时间换算、正则限制）在这里完成。
 pub async fn execute(
@@ -563,6 +577,7 @@ pub async fn execute(
         opts: &opts,
         deadline: Deadline::new(opts.timeout_secs),
         tiers: Default::default(),
+        raw_since: raw_since(site, opts.now)?,
     };
     // `all` 要先知道站点最早事件的时间
     let data_start = if matches!(spec.date_range, DateRange::All) {
@@ -718,6 +733,21 @@ pub async fn execute(
             code: "geo_capability_country_only".to_owned(),
             message: "The loaded geolocation database only provides country-level data; region and city values are empty.".to_owned(),
         });
+    }
+    // 区间伸到保留期之前、而这次没有用汇总层：那些天没有数据（§6.4）
+    if let Some(since) = cx.raw_since {
+        let since_ms = day_start_ms(&q.tz, since)?;
+        let used_rollup = cx.tiers.lock().is_ok_and(|t| t.contains(&Tier::Rollup));
+        let starts_before = q.interval.start_ms < since_ms
+            || q.compare.as_ref().is_some_and(|c| c.start_ms < since_ms);
+        if starts_before && !used_rollup {
+            warnings.push(Warning {
+                code: "range_beyond_raw_retention".to_owned(),
+                message: format!(
+                    "Raw data is kept from {since}; earlier days of this range are only available from the daily rollup, which this query cannot use (see the rollup compatibility rules)."
+                ),
+            });
+        }
     }
     let time_labels = if q.want_time_labels {
         q.time_labels_for(&q.interval)?

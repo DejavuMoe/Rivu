@@ -602,6 +602,59 @@ async fn rollup_tier_matches_the_raw_tier() {
         assert_eq!(got.meta.tiers, vec![Tier::Raw], "{s}");
     }
 
+    // ---- 保留期：原始数据删掉之后，兼容查询由汇总层给出同样的结果 ------------------------------------
+    let keep = json!({"metrics": ["visitors", "visits", "pageviews", "bounce_rate"], "date_range": ["2026-06-01", "2026-06-21"], "dimensions": ["time:day", "visit:device"]});
+    let page_filter = json!({"metrics": ["visitors"], "date_range": ["2026-06-01", "2026-06-21"], "filters": [["is", "event:page", ["/docs"]]]});
+    let before = run(&reader, &site, &keep, now, false).await;
+    rivu_storage_pg::sites::update_site(
+        &pg,
+        created.id,
+        &rivu_storage_pg::sites::SitePatch {
+            retention_days: Some(Some(30)),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    // 真实的「现在」是 2026-10 之后：这个站点 6 月的数据都过了 30 天
+    let (_, deleted) = rivu_jobs::retention::run_once(&pg, &maintainer, &ch_database(), 731)
+        .await
+        .unwrap();
+    assert!(deleted > 0, "应当有分区执行了删除");
+    let left: u64 = admin
+        .query("SELECT count() FROM events WHERE site_id = ?")
+        .bind(created.id)
+        .fetch_one()
+        .await
+        .unwrap();
+    assert_eq!(left, 0, "过期的原始事件已删除");
+    // 查询按 now = 07-10 计：保留 30 天时 06-11 之前只在汇总层里，不看行数阈值也走汇总层
+    let mut kept = site.clone();
+    kept.retention_days = Some(30);
+    let got = execute(
+        &reader,
+        &scope,
+        &kept,
+        QuerySpec::parse(&keep).unwrap(),
+        ExecOptions::new(15).with_now(now).with_rollup(u64::MAX),
+    )
+    .await
+    .unwrap();
+    assert_eq!(got.meta.tiers, vec![Tier::Rollup]);
+    assert!(got.meta.warnings.is_empty(), "{:?}", got.meta.warnings);
+    if let Some(m) = diff(&got, &before) {
+        panic!("保留期之外由汇总层回答的结果与删除前的原始层不一致：{m}");
+    }
+    // 不兼容的查询：那些天没有数据，带警告
+    let got = run(&reader, &kept, &page_filter, now, true).await;
+    assert!(
+        got.meta
+            .warnings
+            .iter()
+            .any(|w| w.code == "range_beyond_raw_retention"),
+        "{:?}",
+        got.meta.warnings
+    );
     // ---- 删除汇总行之后回到原始层 ---------------------------------------------------------------
     rollup::delete(
         &maintainer,

@@ -9,6 +9,7 @@
   import { ChartSpline, CircleAlert, Clock, Hourglass, Inbox, Share2, Table2 } from "@lucide/svelte";
   import { page } from "$app/state";
   import SiteHeader from "../app/SiteHeader.svelte";
+  import Callout from "../ui/Callout.svelte";
   import Card from "../ui/Card.svelte";
   import Button from "../ui/Button.svelte";
   import Segmented from "../ui/Segmented.svelte";
@@ -121,7 +122,10 @@
     void tick;
     const key = stateKey(s);
     // 换了范围或筛选才显示骨架；实时刷新时保留旧数据
-    if (key !== shownKey) status = "loading";
+    if (key !== shownKey) {
+      status = "loading";
+      beyondRetention = false;
+    }
     const ctl = new AbortController();
     const now = new Date();
     const metrics = s.range === "realtime" ? ["visitors", "pageviews"] : METRICS;
@@ -136,6 +140,7 @@
         }
         totals = nextTotals;
         series = readSeries(ser, metrics);
+        if (pastRetention(tot) || pastRetention(ser)) beyondRetention = true;
         neverReceived = never;
         shownKey = key;
         status = "ready";
@@ -185,7 +190,14 @@
   let geoCity = $state(false);
   let geoAttribution = $state<QueryResult["meta"]["geo_attribution"]>(null);
 
+  /** 有一部分日子早于原始数据保留期、又不能由汇总层回答：换范围或筛选时重置，主查询与分解卡片的结果都可以置位 */
+  let beyondRetention = $state(false);
+  function pastRetention(res: QueryResult): boolean {
+    return !!res.meta.warnings?.some((w) => w.code === "range_beyond_raw_retention");
+  }
+
   function noteGeo(res: QueryResult) {
+    if (pastRetention(res)) beyondRetention = true;
     if (res.meta.geo_capability) geoCity = res.meta.geo_capability === "city";
     if (res.meta.geo_attribution) geoAttribution = res.meta.geo_attribution;
   }
@@ -246,6 +258,10 @@
       onfilters={(fs: Filter[]) => setQuery({ f: fs.length ? encodeFilters(fs) : null })}
     />
   </div>
+
+  {#if beyondRetention && !empty}
+    <Callout tone="warn">{t("dash.retentionWarn")}</Callout>
+  {/if}
 
   {#if empty}
     <Card>

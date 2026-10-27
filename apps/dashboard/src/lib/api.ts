@@ -62,7 +62,7 @@ export interface QueryResult {
   meta: {
     time_labels?: string[];
     comparison_time_labels?: string[];
-    warnings?: string[];
+    warnings?: { code: string; message: string }[];
     geo_capability?: "country" | "city";
     /** 地理库的署名（结果含位置维度时必带，许可要求显示） */
     geo_attribution?: { source: string; text: string; url: string; license: string } | null;
@@ -79,6 +79,8 @@ export interface SiteSettings {
   /** null：用实例默认值 */
   ingest_rate_limit_per_min: number | null;
   geo_level: "country" | "region" | "city";
+  /** 站点的原始数据保留天数；null = 实例默认（`limits.retention_days_max`）。 */
+  retention_days: number | null;
 }
 
 export type TrackerKey = "hash" | "engagement" | "outbound" | "downloads" | "forms" | "tagged";
@@ -94,7 +96,7 @@ export interface SettingsBody {
   settings: SiteSettings;
   hostnames: Hostname[];
   /** 默认上限为 null：全局没有限流 */
-  limits: { ingest_rate_limit_default_per_min: number | null; shield_max_rules: number; ingest_rate_limit_max_per_min: number };
+  limits: { ingest_rate_limit_default_per_min: number | null; shield_max_rules: number; ingest_rate_limit_max_per_min: number; retention_days_max: number };
   /** 当前加载的地理库能力；没有库为 null */
   geo_capability: "country" | "city" | null;
 }
@@ -109,6 +111,7 @@ export interface SitePatch {
   tracker?: Partial<TrackerSwitches>;
   ingest_rate_limit_per_min?: number | null;
   geo_level?: "country" | "region" | "city";
+  retention_days?: number | null;
 }
 
 export type ShieldType = "ip" | "cidr" | "country" | "hostname" | "page";

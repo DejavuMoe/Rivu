@@ -489,7 +489,7 @@ AggregatingMergeTree 的状态本身不幂等，一旦漏掉去重，就会永�
 
 | 表 | 引擎 | 写入方 | 用途 | 保留 |
 |---|---|---|---|---|
-| `events` | MergeTree | BatchWriter | 原始事件，是事实来源 | `raw_retention`（默认 731 天，§10 Q1） |
+| `events` | MergeTree | BatchWriter | 原始事件，是事实来源 | 按站点的保留期（默认 731 天，§5.6、§10 Q1） |
 | `sessions` | AggregatingMergeTree | 物化视图 `mv_sessions`（数据来自 `events`） | 会话级聚合 | 同上 |
 | `ingest_counters` | SummingMergeTree | collector / worker | 接入计数：站点 × 指标 × 脚本版本 × 分钟 | 90 天 |
 | `rollup_*`（10 张） | ReplacingMergeTree(version) | 后台任务重算，或导入 | 日汇总层，同时存放原生和导入数据 | 永久 |
@@ -546,8 +546,7 @@ PARTITION BY toYYYYMM(ts)
 ORDER BY (site_id, toDate(ts), name, visitor_id, ts)
 PRIMARY KEY (site_id, toDate(ts), name, visitor_id)
 SAMPLE BY visitor_id
-TTL toDate(ts) + INTERVAL 731 DAY DELETE
-SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1, non_replicated_deduplication_window = 1000;
+SETTINGS index_granularity = 8192, non_replicated_deduplication_window = 1000;
 ```
 
 - 排序键沿用 Plausible 的 `(site_id, 日期, name, user_id, ts)`（R02 §8.3）：所有查询都先限定站点和日期；`name` 用于按目标过滤和排除 engagement 事件；`visitor_id` 让 `SAMPLE` 和 `uniq` 更友好。主键去掉末尾的 `ts`，稀疏索引更小。
@@ -590,8 +589,7 @@ ENGINE = AggregatingMergeTree
 PARTITION BY toYYYYMM(start_date)
 ORDER BY (site_id, start_date, session_id)
 SAMPLE BY session_id
-TTL start_date + INTERVAL 731 DAY DELETE
-SETTINGS ttl_only_drop_parts = 1, non_replicated_deduplication_window = 1000;
+SETTINGS non_replicated_deduplication_window = 1000;
 
 CREATE MATERIALIZED VIEW rivu.mv_sessions TO rivu.sessions
 DEFINER = CURRENT_USER SQL SECURITY DEFINER   -- 必须显式写，见核实报告 E3
@@ -701,7 +699,7 @@ TTL minute + INTERVAL 90 DAY DELETE;
 
 | 操作 | 实现 |
 |---|---|
-| 原始数据保留 | 表级 TTL，配合 `ttl_only_drop_parts`，过期后按 part 和月分区整块删除。月分区里最新的一行过期后整个分区才会删除，所以实际保留时间是 N 到 N+31 天（#8）；需要精确截止时，改由后台任务执行 `DROP PARTITION`。调整全局保留期属于迁移类的管理操作。站点可以设置更短的保留期（`site_settings.retention_days`），由删除任务按站点、按日期执行轻量删除 |
+| 原始数据保留 | 没有表级 TTL。每个站点保留最近 N 个本地日（含今天）：N = `site_settings.retention_days`，没有设置时取 `RIVU_RETENTION_DAYS`（默认 731，也是站点设置的上限）。后台任务 `retention_purge`（每小时，`platform-and-ops.md` §6）处理 `events`（按 `ts`）与 `sessions`（按开始时间）：整月都早于所有站点截止时刻的分区 `DROP PARTITION`；与截止时刻交叠、确实有过期行的分区执行一条轻量删除，按站点取各自的截止时刻（`transform(site_id, …)`）。日汇总层不删，超出保留期的天由它回答（§6.4） |
 | 删除站点 | 与 Plausible 相同（R02 §9）：在 PG 删除站点的同一事务里写入 `pending_stats_deletions`（`not_before` = 删除时刻 + 恢复窗口 `RIVU_SITE_RESTORE_DAYS`，窗口内恢复会取消它）；后台任务 `ch_delete_batch`（每 5 分钟，`platform-and-ops.md` §6）对 `events`、`sessions`、`ingest_counters` 按分区执行轻量删除（`DELETE … IN PARTITION`），`rollup_*` 同时删除（日期范围删除只删这些本地日）。按日期范围删除走同一个任务：站点本地日期按站点时区换算成 UTC 区间，`events` 按 `ts`、`ingest_counters` 按 `minute`，`sessions` 删除开始时间落在区间内的会话 |
 | 重置统计 | 真正删除数据，复用上面的删除意图机制。Plausible 只是挪了一个起始时间指针，数据永久残留（R02 §9.1） |
 | 单个访客的数据 | 系统不存在长期访客 ID，所以无法定位某个人的数据。这正是隐私设计的结果，需要写进隐私说明 |
@@ -771,7 +769,7 @@ TTL minute + INTERVAL 90 DAY DELETE;
 | 目标 | 事件目标（事件名）与页面目标（pathname 通配），见 §6.6 | 滚动深度目标、目标的 props 条件（要改表结构，并依赖 `event:props`） |
 | `date_range` | `day` `24h` `month` `year` `all` `realtime` `Nd` `Nmo` `[from, to]` | — |
 | `include` | `time_labels` `total_rows` `compare` | `imports`（未实现，直接是未知字段） |
-| 数据层 | 原始层（`events` 与 `sessions`）与日汇总层（§5.5、§6.4 选层） | 超出原始数据保留期的范围与 `range_beyond_raw_retention` 警告（保留期尚不可配置） |
+| 数据层 | 原始层（`events` 与 `sessions`）与日汇总层（§5.5、§6.4 选层） | — |
 
 ### 6.3 执行流程
 
@@ -827,6 +825,8 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 | 条件 | 数据层 |
 |---|---|
 | 查询兼容、区间里有已构建的天，且这些天的事件数（`rollup_site.events`）不少于 `RIVU_ROLLUP_MIN_ROWS`（默认 100 万） | `[起点, R]` 用日汇总层（R = 已构建的最后一天），之后的天用原始层，两部分作为组件 `UNION ALL` 后一起聚合 |
+| 查询兼容，区间伸到原始数据保留期之前（站点保留期，§5.6） | 同上，不看行数阈值：保留期之前的天只在汇总层里 |
+| 区间伸到保留期之前，但查询不兼容 | 原始层；那些天没有数据，`meta.warnings` 带 `range_beyond_raw_retention`（看板显示提示） |
 | 其余 | 原始层 |
 
 「兼容」借鉴 Plausible imported 的规则（R03 §9.2、§9.3），并且保证与原始层的口径相同：
@@ -976,7 +976,7 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 | GeoIP 内存 | 库读入内存，每个加载库的进程各占一份：City 约 121 MiB，Country 约 8 MiB；热加载期间新旧并存，刷新校验时再临时读一份。UA 缓存键上界约 50 MB（§4.3）。内存紧张的部署选 DB-IP country | §4.3、§10 Q25 |
 | 事件可见 | p95 < 2 s（单机），< 2.5 s（集群） | §4.7、§4.8 |
 | 会话内存 | 常态几十 MB；上限 `max_sessions` 200 万 × 约 350 B（含平均不到 1 个别名 key）≈ 700 MB。理论最坏是每个会话 8 个 key、约 650 B，合计约 1.3 GB，实际不会出现，因为多个别名需要会话跨多个午夜 | §4.6 |
-| 磁盘 | 每事件估算 60–150 B（压缩后，需实测），`sessions` 约再加 30–50%，保留 731 天。日均 1000 万事件：7.31 十亿事件，事件表约 0.44–1.1 TB，加 `sessions` 后约 0.6–1.6 TB，超出单机参考配置（§7.1）的 500 GB：这个规模应把 `RIVU_RETENTION_DAYS` 调低到 180 天（约 0.14–0.4 TB）或扩容磁盘。日均 100 万事件：约 60–165 GB。按月分区整块删除，实际占用最多再多约一个月（§5.6） | §7.1 |
+| 磁盘 | 每事件估算 60–150 B（压缩后，需实测），`sessions` 约再加 30–50%，保留 731 天。日均 1000 万事件：7.31 十亿事件，事件表约 0.44–1.1 TB，加 `sessions` 后约 0.6–1.6 TB，超出单机参考配置（§7.1）的 500 GB：这个规模应把 `RIVU_RETENTION_DAYS` 调低到 180 天（约 0.14–0.4 TB）或扩容磁盘。日均 100 万事件：约 60–165 GB。过期数据每小时删除（§5.6） | §7.1 |
 | 查询 | 中小站：原始层 30 天约几百万行，几十 ms。大站（每天 200 万事件）30 天约 6000 万行：已结束的天走日汇总层，今天走原始层，目标 p95 < 300 ms | §6.4 |
 
 压测目标：持续 1000 事件/s，峰值 5000 事件/s，同时有并发看板查询。需要观察以下指标：
@@ -1039,7 +1039,7 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 
 | # | 问题 | 决定 | 影响 |
 |---|---|---|---|
-| Q1 | 原始数据默认保留期 | 默认 731 天（连续两个自然年，含一个闰年）。日均 1000 万事件的部署建议把 `RIVU_RETENTION_DAYS` 调低到 180 天 | D12；§5.1 表；§5.2、§5.3 的 TTL（`INTERVAL 731 DAY`）；§7 容量；`RIVU_RETENTION_DAYS` 默认 731 |
+| Q1 | 原始数据默认保留期 | 默认 731 天（连续两个自然年，含一个闰年）。日均 1000 万事件的部署建议把 `RIVU_RETENTION_DAYS` 调低到 180 天 | D12；§5.1 表；§5.6 `retention_purge`；§7 容量；`RIVU_RETENTION_DAYS` 默认 731 |
 | Q2 | `visit_duration` 是否计入 engagement 时间 | 不计入，与 Plausible 和导入数据一致；另设独立指标 `engaged_duration` | §5.3 派生指标；§5.5 `s_eng_ms` `s_eng_n` 列；§6.2 指标列表；§6.4 归属；§6.5 定义 |
 | Q3 | tracker 是否读取 `localStorage.rivu_ignore`（站点所有者排除自己的访问） | 只读：tracker 永不写入，也不用于标识或上报 | `tracker-and-protocol.md` §1.1、§4.7；§8 |
 | Q4 | 是否提供 Plausible 协议兼容端点 | P4 提供 `POST /api/plausible/event`，便于迁移；Plausible 的 tracker 是 MIT 许可 | §9 的 P4；`tracker-and-protocol.md` §9 |

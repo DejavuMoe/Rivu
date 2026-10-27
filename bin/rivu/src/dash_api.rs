@@ -358,6 +358,8 @@ pub struct DashApi {
     rollup_min_rows: Option<u64>,
     /// 结果缓存（与公开 API 共用，§6.9）；`None` 不缓存。
     cache: Option<Arc<QueryCache>>,
+    /// `RIVU_RETENTION_DAYS`。
+    pub(crate) retention_days: u32,
     limiters: Limiters,
     limits: DashLimits,
     login_watch: LoginWatch,
@@ -398,6 +400,7 @@ impl DashApi {
             public_timeout_secs: config.query_timeouts.public_secs,
             rollup_min_rows: Some(config.rollup_min_rows),
             cache: None,
+            retention_days: config.retention_days,
             limiters: Limiters::new(&limits),
             limits,
             login_watch: LoginWatch::new(),
@@ -1348,6 +1351,7 @@ impl DashApi {
             self.geo.as_deref(),
             auth.site.id,
             &auth.site.site_key,
+            self.retention_days,
         )
         .await
         .map_err(|e| match e {

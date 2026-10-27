@@ -177,7 +177,7 @@ const dict = {
   "dash.timeout.title": ["查询超时", "Query timed out"],
   "dash.timeout.body": ["请缩短时间范围或减少筛选条件。", "Try a shorter range or fewer filters."],
   "dash.geoAttribution": ["地理位置数据：DB-IP", "Geolocation by DB-IP"],
-  "dash.retentionWarn": ["部分日期超出原始数据保留期，只有汇总指标。", "Part of this range is past raw-data retention; only rollup metrics are available."],
+  "dash.retentionWarn": ["所选范围有一部分早于原始数据保留期，这些日子在当前筛选或分组下没有数据。", "Part of this range is older than raw-data retention; those days have no data for the current filters or breakdown."],
   "dash.notConnected": ["未接入", "Not connected"],
   "dash.noRows": ["这个范围内没有记录", "Nothing recorded in this range"],
   "dash.exported": ["已导出", "Exported"],

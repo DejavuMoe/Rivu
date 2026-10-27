@@ -1277,6 +1277,7 @@ impl Harness {
             geo_attribution: None,
             geo_capability: None,
             goals: goal_defs(),
+            retention_days: None,
         };
         let got = execute(
             &self.reader,
