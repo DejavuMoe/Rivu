@@ -981,7 +981,7 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 
 压测目标：持续 1000 事件/s，峰值 5000 事件/s，同时有并发看板查询。需要观察以下指标：
 
-- ClickHouse 的 `parts` 数、merge 积压、插入延迟；
+- ClickHouse 的 `parts` 数、merge 与 mutation 积压（`rivu_ch_*`，`ch_monitor`）、插入延迟（`write_flush_seconds`）；
 - 查询 p95，未命中缓存和命中缓存分开统计；
 - 会话数、channel 深度；
 - JetStream 积压（集群）。
