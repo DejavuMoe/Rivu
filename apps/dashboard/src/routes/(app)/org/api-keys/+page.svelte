@@ -5,7 +5,7 @@
 <script lang="ts">
   import { Inbox, Plus, TriangleAlert, Users } from "@lucide/svelte";
   import { untrack } from "svelte";
-  import PageHeader from "#lib/app/PageHeader.svelte";
+  import OrgHeader from "#lib/app/OrgHeader.svelte";
   import Badge from "#lib/ui/Badge.svelte";
   import Button from "#lib/ui/Button.svelte";
   import Callout from "#lib/ui/Callout.svelte";
@@ -169,11 +169,11 @@
 </script>
 
 <div class="page">
-  <PageHeader title={t("ak.title")}>
+  <OrgHeader>
     {#snippet actions()}
       {#if status === "ready"}<Button variant="primary" icon={Plus} onclick={openCreate}>{t("ak.create")}</Button>{/if}
     {/snippet}
-  </PageHeader>
+  </OrgHeader>
 
   {#if status === "loading"}
     <Card flush>
@@ -308,9 +308,13 @@
     flex-direction: column;
     gap: var(--sp-4);
     width: 100%;
-    max-width: 880px;
+    max-width: var(--content-max);
     margin: 0 auto;
     padding: var(--sp-6) var(--sp-8) var(--sp-12);
+  }
+  /* 与其他页面同一左缘，整页（含页头）限宽：动作按钮挨着正文 */
+  .page > :global(*) {
+    max-width: 880px;
   }
   .kname {
     font-weight: var(--fw-medium);

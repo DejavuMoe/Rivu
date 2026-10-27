@@ -37,5 +37,6 @@
     color: var(--bg-app);
     box-shadow: var(--shadow-pop);
     font-weight: var(--fw-medium);
+    animation: pop-up var(--dur) var(--ease);
   }
 </style>

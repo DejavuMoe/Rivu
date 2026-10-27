@@ -1,5 +1,6 @@
 <!--
-  站点设置外壳：左侧分区导航 + 右侧内容，最大宽 880px；窄屏导航变成顶部 Tabs。
+  站点设置外壳：站点页头（标签栏选中「设置」）下面，左侧分区导航 + 右侧内容（最宽 720px）；窄屏分区导航变成横向 Tabs。
+  分区导航的选中底色在分区之间滑动。
   站点的 settings 每个站点加载一次（需要它的分区才加载），分区之间切换不重新请求。
   分区可见性按角色（见 lib/admin/sections.ts）；不存在或无权的分区是 404。
 -->
@@ -9,12 +10,13 @@
   import { goto } from "$app/navigation";
   import { page } from "$app/state";
   import NotFound from "#lib/app/NotFound.svelte";
-  import PageHeader from "#lib/app/PageHeader.svelte";
+  import SiteHeader from "#lib/app/SiteHeader.svelte";
   import Button from "#lib/ui/Button.svelte";
   import Card from "#lib/ui/Card.svelte";
   import EmptyState from "#lib/ui/EmptyState.svelte";
   import Skeleton from "#lib/ui/Skeleton.svelte";
   import Tabs from "#lib/ui/Tabs.svelte";
+  import { trackIndicator } from "#lib/ui/indicator.ts";
   import type { IconType } from "#lib/ui/types.ts";
   import { isSectionKey, visibleSections, type SectionKey } from "#lib/admin/sections.ts";
   import { t } from "#lib/i18n.ts";
@@ -61,6 +63,12 @@
   });
 
   const go = (key: string) => void goto(`/s/${siteId}/settings/${key}`);
+  let side: HTMLElement | undefined = $state();
+  let ind: HTMLSpanElement | undefined = $state();
+  $effect(() => {
+    if (side && ind) return trackIndicator(side, ind, '[aria-current="page"]', "fill", `settings-${siteId}`);
+  });
+
   const waiting = $derived(!!current && NEEDS_SETTINGS.has(current) && store?.status !== "ready");
 </script>
 
@@ -68,10 +76,11 @@
   <NotFound />
 {:else}
   <div class="page">
-    <PageHeader title={t("nav.settings")} />
+    <SiteHeader siteId={site.id} name={site.name} />
 
     <div class="layout">
-      <nav class="side" aria-label={t("nav.settings")}>
+      <nav class="side" aria-label={t("nav.settings")} bind:this={side}>
+        <span class="ind" bind:this={ind} aria-hidden="true"></span>
         {#each visible as key (key)}
           {@const Icon = icons[key]}
           {#if key === "danger"}<span class="rule" aria-hidden="true"></span>{/if}
@@ -117,18 +126,22 @@
     flex-direction: column;
     gap: var(--sp-6);
     width: 100%;
-    max-width: 880px;
+    max-width: var(--content-max);
     margin: 0 auto;
     padding: var(--sp-6) var(--sp-8) var(--sp-12);
   }
   .layout {
     display: grid;
-    grid-template-columns: 184px minmax(0, 1fr);
+    grid-template-columns: 184px minmax(0, 720px);
     gap: var(--sp-8);
     align-items: start;
   }
   .side {
     position: sticky;
+    isolation: isolate;
+    view-transition-name: settings-nav;
+    /* 图标与页头左缘对齐（分区项有 10px 内边距） */
+    margin-left: -10px;
     top: var(--sp-6);
     display: flex;
     flex-direction: column;
@@ -139,7 +152,26 @@
     margin: var(--sp-2) 0;
     background: var(--border-subtle);
   }
+  /* 换分区时分区导航不参与整页淡入淡出，选中底色的滑动看得见（同 PageHeader） */
+  :global(::view-transition-old(settings-nav)) {
+    display: none;
+  }
+  :global(::view-transition-new(settings-nav)) {
+    animation: none;
+  }
+  .ind {
+    position: absolute;
+    top: 0;
+    left: 0;
+    z-index: -1;
+    border-radius: var(--r-sm);
+    background: var(--bg-hover);
+    transition:
+      transform var(--dur) var(--ease-move),
+      width var(--dur) var(--ease-move);
+  }
   .item {
+    position: relative;
     display: flex;
     align-items: center;
     gap: 10px;
@@ -151,12 +183,11 @@
   .item :global(svg) {
     flex: none;
   }
-  .item:hover {
+  .item:hover:not([aria-current]) {
     background: var(--bg-element);
     color: var(--text);
   }
   .item[aria-current="page"] {
-    background: var(--bg-hover);
     color: var(--text);
     font-weight: var(--fw-medium);
   }

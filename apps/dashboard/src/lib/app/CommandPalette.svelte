@@ -236,8 +236,14 @@
     box-shadow: var(--shadow-pop);
     overflow: hidden;
   }
+  dialog[open] {
+    animation: dialog-in var(--dur-pop) var(--ease);
+  }
   dialog::backdrop {
     background: var(--overlay);
+  }
+  dialog[open]::backdrop {
+    animation: fade-in var(--dur-pop) var(--ease);
   }
   .inner {
     display: flex;

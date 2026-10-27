@@ -1,6 +1,7 @@
 <!--
   数据表：表头灰底、行间细线、数字列右对齐等宽数字。单元格内容由 cell 片段渲染。
   列宽可选；sticky 表头用于对话框里的长表。
+  fit：窄屏改用固定表格布局，按列宽分配，长内容在单元格里省略，不出现横向滚动（成员这类有固定宽度控件的表）。
 -->
 <script lang="ts" generics="R">
   import type { Snippet } from "svelte";
@@ -15,13 +16,14 @@
     sticky?: boolean;
     empty?: Snippet;
     onrowclick?: (r: R) => void;
+    fit?: boolean;
   }
 
-  let { columns, rows, cell, rowKey = (_r, i) => i, caption, sticky = false, empty, onrowclick }: Props = $props();
+  let { columns, rows, cell, rowKey = (_r, i) => i, caption, sticky = false, empty, onrowclick, fit = false }: Props = $props();
 </script>
 
 <div class="wrap">
-  <table class:sticky>
+  <table class:sticky class:fit>
     {#if caption}<caption class="sr-only">{caption}</caption>{/if}
     <thead>
       <tr>
@@ -82,6 +84,7 @@
     padding: 0 var(--sp-4);
     border-bottom: var(--hairline) solid var(--border-subtle);
     vertical-align: middle;
+    transition: background-color var(--dur-fast) var(--ease);
   }
   tbody tr:last-child td {
     border-bottom: 0;
@@ -105,6 +108,26 @@
   @media (max-width: 720px) {
     .optional {
       display: none;
+    }
+    th,
+    td {
+      padding: 0 var(--sp-2);
+    }
+    th:first-child,
+    td:first-child {
+      padding-left: var(--sp-4);
+    }
+    th:last-child,
+    td:last-child {
+      padding-right: var(--sp-4);
+    }
+    .fit {
+      table-layout: fixed;
+    }
+    .fit td {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
   }
 </style>

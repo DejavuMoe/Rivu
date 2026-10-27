@@ -121,3 +121,50 @@ kbd,
   scrollbar-width: thin;
   scrollbar-color: var(--border) transparent;
 }
+
+/* ---------- 动效 ---------- */
+
+/* 浮层与提示的出现：淡入并从触发方向移动 4px。关闭是即时的。 */
+@keyframes pop-down {
+  from {
+    opacity: 0;
+    transform: translateY(-4px) scale(0.98);
+  }
+}
+@keyframes pop-up {
+  from {
+    opacity: 0;
+    transform: translateY(4px) scale(0.98);
+  }
+}
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+}
+@keyframes dialog-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.98);
+  }
+}
+
+/* 页面切换（只在路径变化时，见 router.svelte.ts）：整页淡入淡出，侧栏不变所以看不出动 */
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation-duration: var(--dur-pop);
+  animation-timing-function: var(--ease);
+}
+
+/* 系统要求减少动效时，所有过渡与动画都变成即时的 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after,
+  ::backdrop {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+    scroll-behavior: auto !important;
+  }
+}

@@ -1,9 +1,10 @@
 <!--
   标签页（下划线式）：卡片内维度切换、设置页分区。选中项下方是 2px 品牌色「水流线」。
-  只负责切换按钮；内容由调用方按 value 渲染。
+  只负责切换按钮；内容由调用方按 value 渲染。选中的底色在选项之间滑动。
 -->
 <script lang="ts" generics="V extends string">
   import type { Option } from "./types";
+  import { trackIndicator } from "./indicator";
 
   interface Props {
     options: Option<V>[];
@@ -13,6 +14,10 @@
     size?: "sm" | "md";
   }
   let { options, value = $bindable(), onchange, label, size = "md" }: Props = $props();
+
+  let box: HTMLDivElement;
+  let ind: HTMLSpanElement;
+  $effect(() => trackIndicator(box, ind, '[aria-selected="true"]'));
 
   function onKeydown(e: KeyboardEvent) {
     if (e.key !== "ArrowRight" && e.key !== "ArrowLeft") return;
@@ -25,7 +30,8 @@
   }
 </script>
 
-<div class="tabs {size}" role="tablist" aria-label={label} tabindex="-1" onkeydown={onKeydown}>
+<div class="tabs {size}" role="tablist" aria-label={label} tabindex="-1" onkeydown={onKeydown} bind:this={box}>
+  <span class="pill" bind:this={ind} aria-hidden="true"></span>
   {#each options as o (o.value)}
     <button
       type="button"
@@ -47,13 +53,25 @@
 
 <style>
   .tabs {
+    position: relative;
     display: flex;
     gap: 2px;
     min-width: 0;
     overflow-x: auto;
     scrollbar-width: none;
   }
+  .pill {
+    position: absolute;
+    top: 0;
+    left: 0;
+    border-radius: var(--r-sm);
+    background: var(--bg-hover);
+    transition:
+      transform var(--dur) var(--ease-move),
+      width var(--dur) var(--ease-move);
+  }
   button {
+    position: relative;
     display: inline-flex;
     align-items: center;
     gap: 6px;
@@ -66,6 +84,9 @@
     font-size: var(--fs-md);
     font-weight: var(--fw-medium);
     white-space: nowrap;
+    transition:
+      background-color var(--dur-fast) var(--ease),
+      color var(--dur-fast) var(--ease);
   }
   .md button {
     height: var(--control-md);
@@ -74,8 +95,9 @@
     background: var(--bg-element);
     color: var(--text);
   }
-  button[aria-selected="true"] {
-    background: var(--bg-hover);
+  button[aria-selected="true"],
+  button[aria-selected="true"]:hover {
+    background: none;
     color: var(--text);
   }
   .count {

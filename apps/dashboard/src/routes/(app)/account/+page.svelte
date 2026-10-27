@@ -239,9 +239,13 @@
     flex-direction: column;
     gap: var(--sp-4);
     width: 100%;
-    max-width: 880px;
+    max-width: var(--content-max);
     margin: 0 auto;
     padding: var(--sp-6) var(--sp-8) var(--sp-12);
+  }
+  /* 与其他页面同一左缘，整页（含页头）限宽：动作按钮挨着正文 */
+  .page > :global(*) {
+    max-width: 880px;
   }
   .rows {
     display: flex;
