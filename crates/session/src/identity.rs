@@ -8,10 +8,31 @@ use std::net::IpAddr;
 use jiff::Timestamp;
 use jiff::civil::Date;
 use jiff::tz::TimeZone;
+use sha2::{Digest, Sha256};
 use siphasher::sip::SipHasher24;
 
 /// 16 字节的盐，同时也是 SipHash-2-4 的 key。
 pub type Salt = [u8; 16];
+
+/// 访客密钥（`RIVU_VISITOR_PEPPER`）与当天的盐派生出 `visitor_hash` 实际用的 key：
+/// `SHA-256("rivu-visitor-key-v1" ‖ u32 小端长度 ‖ pepper ‖ salt)` 的前 16 字节。
+///
+/// 密钥不进数据库，所以只拿到数据库导出（含盐）的人无法再枚举 IP 还原访客（`privacy.md`）。
+pub fn peppered_key(pepper: &[u8], salt: &Salt) -> Salt {
+    let mut h = Sha256::new();
+    h.update(b"rivu-visitor-key-v1");
+    h.update(
+        u32::try_from(pepper.len())
+            .unwrap_or(u32::MAX)
+            .to_le_bytes(),
+    );
+    h.update(pepper);
+    h.update(salt);
+    let digest = h.finalize();
+    let mut key = [0u8; 16];
+    key.copy_from_slice(&digest[..16]);
+    key
+}
 
 /// 最晚、最早可以表示的毫秒时间戳（约公元 ±9999 年），超出的值被钳到边界，避免 jiff 报错。
 const TS_LIMIT_MS: i64 = 253_402_300_799_000;
@@ -136,6 +157,28 @@ mod tests {
             routing_hash(&[9; 16], 1, v4(1, 2, 3, 4), "ua"),
             routing_hash(&[9; 16], 1, v4(1, 2, 3, 4), "ua")
         );
+    }
+
+    #[test]
+    fn peppered_key_depends_on_pepper_and_salt() {
+        let k = peppered_key(b"pepper-a", &SALT);
+        assert_eq!(k, peppered_key(b"pepper-a", &SALT));
+        assert_ne!(k, SALT);
+        assert_ne!(k, peppered_key(b"pepper-b", &SALT));
+        assert_ne!(k, peppered_key(b"pepper-a", &[2; 16]));
+        // 长度前缀：密钥与盐的边界不会歧义。
+        let mut longer = b"pepper-a".to_vec();
+        longer.push(SALT[0]);
+        let mut shifted = [0u8; 16];
+        shifted[..15].copy_from_slice(&SALT[1..]);
+        assert_ne!(k, peppered_key(&longer, &shifted));
+        // 字节布局与文档一致：改了派生方式，已有实例的访客 ID 会在当天断开，必须是有意的改动。
+        let mut h = Sha256::new();
+        h.update(b"rivu-visitor-key-v1");
+        h.update(8u32.to_le_bytes());
+        h.update(b"pepper-a");
+        h.update(SALT);
+        assert_eq!(k[..], h.finalize()[..16]);
     }
 
     #[test]

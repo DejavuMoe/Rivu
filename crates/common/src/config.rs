@@ -556,6 +556,10 @@ pub struct Config {
     pub cookie_secure: bool,
     /// `RIVU_SETUP_TOKEN`：设置后首次初始化（`POST /api/internal/setup`）必须携带；至少 16 个字符。未设置则不要求（文档如此）。
     pub setup_token: Option<Secret>,
+    /// `RIVU_VISITOR_PEPPER`：访客密钥，与每天的盐一起派生 `visitor_id` 的哈希 key；至少 32 个字符。
+    /// 只放在环境变量或文件里，不进数据库，所以数据库导出加上盐也无法枚举 IP 还原访客（`privacy.md`）。
+    /// 所有 collector 必须用同一个值；更换或丢失只会让当天的访客 ID 断开一次。未设置时直接用盐（启动时提醒）。
+    pub visitor_pepper: Option<Secret>,
     /// `RIVU_TRACKER_DIR`：tracker 构建产物目录（`core.js`、`meta.json`），启动时读入并缓存。
     /// 默认 `apps/tracker/dist`（相对进程工作目录）；生产镜像把 CI 构建的 `dist/` 放进该目录。
     pub tracker_dir: PathBuf,
@@ -816,6 +820,15 @@ impl Config {
                 .push("RIVU_SETUP_TOKEN 至少 16 个字符（它挡住的是新实例被抢注）".into());
         }
         let setup_token = setup_token.map(Secret);
+        let visitor_pepper = l.optional("RIVU_VISITOR_PEPPER");
+        if let Some(p) = &visitor_pepper
+            && p.chars().count() < 32
+        {
+            l.problems.push(
+                "RIVU_VISITOR_PEPPER 至少 32 个字符（例如 `openssl rand -hex 32` 的输出）".into(),
+            );
+        }
+        let visitor_pepper = visitor_pepper.map(Secret);
         let tracker_dir = PathBuf::from(
             l.optional("RIVU_TRACKER_DIR")
                 .unwrap_or_else(|| DEFAULT_TRACKER_DIR.into()),
@@ -895,6 +908,7 @@ impl Config {
             base_url_explicit,
             cookie_secure,
             setup_token,
+            visitor_pepper,
             tracker_dir,
             geo,
             datacenter,
@@ -1508,6 +1522,30 @@ mod tests {
         let cfg = Config::from_env(Role::Collector, &env).unwrap();
         assert_eq!(cfg.ch_writer.unwrap().password.expose(), "s3cret");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn visitor_pepper_from_value_or_file_and_validated() {
+        assert!(with_env(&[]).unwrap().visitor_pepper.is_none());
+
+        let pepper = "0123456789abcdef0123456789abcdef";
+        let cfg = with_env(&[("RIVU_VISITOR_PEPPER", pepper)]).unwrap();
+        assert_eq!(cfg.visitor_pepper.unwrap().expose(), pepper);
+
+        let path = temp_file("pepper", &format!("{pepper}\n"));
+        let mut env = Env::from_pairs(base_pairs());
+        env.vars.insert(
+            "RIVU_VISITOR_PEPPER_FILE".into(),
+            path.to_string_lossy().into_owned(),
+        );
+        let cfg = Config::from_env(Role::Collector, &env).unwrap();
+        assert_eq!(cfg.visitor_pepper.unwrap().expose(), pepper);
+        let _ = std::fs::remove_file(path);
+
+        let err = with_env(&[("RIVU_VISITOR_PEPPER", "too-short")]).unwrap_err();
+        assert_eq!(err.problems.len(), 1, "{err}");
+        assert!(err.problems[0].contains("RIVU_VISITOR_PEPPER"), "{err}");
+        assert!(!err.to_string().contains("too-short"), "不回显取值：{err}");
     }
 
     #[test]
