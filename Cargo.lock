@@ -2314,10 +2314,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rivu-bus"
-version = "0.1.0"
-
-[[package]]
 name = "rivu-common"
 version = "0.1.0"
 dependencies = [

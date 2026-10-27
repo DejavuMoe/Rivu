@@ -1,7 +1,7 @@
 # Rivu 采集脚本与采集协议规范
-> 状态：草案 v0.1 ｜ 日期：2026-10-21 ｜ 协议版本：`v=1` ｜ 第 4 阶段内容已在正文标注
+> 协议版本：`v=1` ｜ 第 4 阶段（P4）的内容已在正文标注
 > 范围：浏览器脚本（构建、嵌入、运行时行为）、`POST /api/event` 线协议与 HTTP 契约、服务端规范化规则、版本策略、Plausible 兼容层设计、测试清单。不含：UA/地理/来源分类富化、访客哈希与会话、写缓冲与 ClickHouse 表结构（只写交接要求）。
-> 出处记号：`[01 §x]` = `docs/research/plausible/01-ingestion-pipeline.md` 第 x 节；`[00 §x]` = `00-rea-analysis.md`；`[v1 §x]` = v1 架构草案「三、事件数据流架构」；`[src]` = 为核对行为只读过的 Plausible `tracker/src/*.js`。
+> 出处记号：`[01 §x]` = `docs/research/plausible/01-ingestion-pipeline.md` 第 x 节；`[00 §x]` = `00-rea-analysis.md`；`[src]` = 为核对行为只读过的 Plausible `tracker/src/*.js`。
 > 许可：Plausible tracker 为 MIT（`tracker/npm_package/LICENSE.md`），服务端为 AGPL-3.0，`extra/`(EE) 另有许可 [01 头部]。本规范只描述行为，不含 Plausible 代码；未参考 EE 实现。「必须/不得」为强制，「应」为默认遵循，「可」为可选。
 
 ## 1. 设计目标与非目标
@@ -12,7 +12,7 @@
 | 隐私 | 客户端不发送屏幕尺寸、语言、时区等指纹字段；设备与地理由服务端从 UA、IP 短暂推导，IP 不落库 | `[01 §8.2]` `[01 §9.1]` |
 | 隐私 | URL 在服务端收敛为 hostname、pathname、白名单 query 参数；其余 query 与 fragment 直接丢弃 | 决策 5 |
 | 可信 | 时间戳只由服务端在接收时生成（毫秒，UTC）；客户端不可传时间 | 决策 4；`[01 §0 #3]` |
-| 体积 | `core` gzip ≤ 1 KB；`full` gzip ≤ 2.75 KB（2026-10-27 由 2 KB 上调，见附录第 1 条）；CI 强制 | 决策 6 |
+| 体积 | `core` gzip ≤ 1 KB；`full` gzip ≤ 2.75 KB（2816 B）；CI 强制 | 决策 6 |
 | 可靠 | 不重试；engagement 与页面隐藏时的事件 beacon 优先；任何失败静默，脚本不得向宿主页面抛异常 | 决策 7 |
 | 可运维 | 被过滤一律 `202`，原因只进内部计数器；`400` 只给协议错误 | 决策 2；`[01 §3.3]` |
 | 可演进 | 协议版本 `v` 与构建号 `sv` 分离；服务端至少兼容 N−1 | 决策 4；`[01 §4.1]` |
@@ -26,7 +26,7 @@
 | 客户端重试、离线队列、本地持久化；客户端生成访客/会话 ID | 违反「不写存储」，失败事件接受丢失；访客标识由服务端按日轮换盐计算 `[01 §9]`，不在本规范范围 |
 | hostname 白名单当作鉴权 | `site_key` 公开可见，白名单只是降噪与防误报，不是安全边界 |
 | 对抗广告拦截 | 仅提供可配置 `endpoint`（可经站点第一方路径反代），不做混淆 |
-| DNT/GPC、同意管理 | v1 不读取；是否作为站点开关留待第 4 阶段评估 |
+| DNT/GPC、同意管理 | 不读取；是否作为站点开关留待第 4 阶段评估 |
 | 脚本错误上报端点（Plausible 的 `GET /api/error`） | 不收集；安装问题靠 `rivu.b`/`rivu.v` 探测与服务端 400 计数 `[01 §3.1]` |
 
 ### 1.3 浏览器基线
@@ -283,7 +283,7 @@ rivu('event', 'Video Play', { interactive: false })   // 发 i:false，不影响
 | 请求 `Content-Type` | 接受 `text/plain`（含 `;charset=UTF-8`，`sendBeacon` 字符串体即此类型）与 `application/json`；**实际忽略该头**，一律按 UTF-8 JSON 解析（容忍 `Accept: */*`，同 `[01 §11.2 #13]`） |
 | 请求头大小 | 请求行与单个头值 ≤ 8192 B（同 `[01 §3.1]`），总头部 ≤ 16 KB；超限由 HTTP 层回 `414`/`431`，不属协议错误 |
 | 请求体 | JSON 对象，≤ **8192 B**；先看 `Content-Length`，分块传输按流式累计，超限即 `413` 并断开；读体超时 5 s 直接断开 |
-| 客户端 IP | 仅当对端地址属于配置的可信代理名单时才采用 `X-Forwarded-For`/`Forwarded`/`CF-Connecting-IP` 等头；否则用连接对端 IP。解析失败回退对端 IP，不得 panic `[01 §4.4]` `[01 §11.2 #7]` `[v1 §2]` |
+| 客户端 IP | 仅当对端地址属于配置的可信代理名单时才采用 `X-Forwarded-For`/`Forwarded`/`CF-Connecting-IP` 等头；否则用连接对端 IP。解析失败回退对端 IP，不得 panic `[01 §4.4]` `[01 §11.2 #7]` |
 | Cookie | 服务端忽略请求 `Cookie`，响应不得带 `Set-Cookie`（`sendBeacon` 恒带凭证，故必须保证无副作用） |
 | 所有响应 | `Access-Control-Allow-Origin: *`、`Access-Control-Expose-Headers: x-rivu-dropped, Retry-After`、`Cache-Control: no-store`、`Cross-Origin-Resource-Policy: cross-origin`；**不带** `Allow-Credentials` |
 
@@ -308,7 +308,7 @@ rivu('event', 'Video Play', { interactive: false })   // 发 i:false，不影响
 | `application/json` 或带自定义头的跨域调用 | 先发 `OPTIONS`：`204`，`Access-Control-Allow-Origin: *`、`Access-Control-Allow-Methods: POST, OPTIONS`、`Access-Control-Allow-Headers: Content-Type`、`Access-Control-Max-Age: 86400` |
 | 凭证与 `sendBeacon` | 不带 `Access-Control-Allow-Credentials`（Plausible 在 `*` 下仍回 `true` `[00 §5.4]`，对 `*` 无效，Rivu 不沿用）；beacon 字符串体为简单请求，响应不可读，无影响 |
 
-### 6.4 Collector 处理次序与响应映射（衔接 `[v1 §2]`，其中「返回 204」以本规范 `202` 为准）
+### 6.4 Collector 处理次序与响应映射
 | # | 阶段 | 失败结果 | 内部计数 |
 |---|---|---|---|
 | 1 | 方法/路径、体积（413）、读体超时（408） | `413` / `408` | `rejected_body_size`（413，只进 Prometheus） |
@@ -374,14 +374,13 @@ rivu('event', 'Video Play', { interactive: false })   // 发 i:false，不影响
 响应：`202` + 文本体 `ok`（`[00 §5.4]` 实测）+ `x-plausible-dropped` + `x-rivu-dropped`；400 体同原生格式（Plausible 的 `{"errors":{字段:[消息]}}` `[01 §3.2]`，键名为其长键名时保持原键，如 `url`、`domain`）。不提供 `/js/plausible*.js`，也不复刻 `GET /api/error`。
 
 ## 10. 与 Plausible 的差异
-### 10.1 逐条差异
 | # | Rivu | Plausible | 原因 | 证据 |
 |---|---|---|---|---|
 | 1 | 不透明 `site_key`（`s`），一请求一站点 | 域名 `d`，可逗号分隔扇出多站点 | 域名变更与过渡期会造成缓存键/访客 ID 不一致；扇出增加复杂度 | `[01 §1.2]` `[01 §6.5]` `[01 §2.10]` |
 | 2 | 时间戳毫秒 | 秒 | 事件排序与 engagement 对齐更精细 | `[01 §4.1]` |
 | 3 | `202` 空体 + `x-rivu-dropped` | `202` + 文本 `ok` + `x-plausible-dropped` | 省字节；原因不外露 | `[00 §5.4]` `[01 §3.2]` |
 | 4 | 被过滤一律 `202`，400 仅协议错误；`i` 对系统事件忽略（均为**借鉴**，无差异） | 同 | 不泄露站点存在性，客户端不重试 | `[01 §0 #1]` `[01 §3.3]` `[01 §2.2]` |
-| 5 | 新增 `503`+`Retry-After` | 无（写缓冲交接内部） | 写路径要给代理/监控明确过载信号 | `[v1 §2]`；决策 2 |
+| 5 | 新增 `503`+`Retry-After` | 无（写缓冲交接内部） | 写路径要给代理/监控明确过载信号 | 决策 2 |
 | 6 | CORS 不带 Allow-Credentials，并 Expose 自定义头 | `*` 同时 `Allow-Credentials: true` | `*` 与凭证不可同用；beacon 响应不可读 | `[00 §5.4]` |
 | 7 | engagement/隐藏页 `sendBeacon` 优先，回退 `fetch keepalive` | 仅 `fetch keepalive`，无 beacon | 卸载时送达率；旧 Firefox 的 keepalive 支持 | `[01 §2.5]` `[00 §3.3]` |
 | 8 | 两个构建（core/full） | 约 17 个变体，旧式文件名为特性幂集 | 维护与缓存成本 | `[00 §3.6]` `[01 §2.1]` `[00 §7]` |
@@ -403,9 +402,6 @@ rivu('event', 'Video Play', { interactive: false })   // 发 i:false，不影响
 | 24 | 下载扩展名小写且按 `pathname` 匹配；`xls`、`doc` 入默认表；tagged 就近优先 | 区分大小写、含 hash 时失配；最外层优先 | 减少漏报 | `[01 §2.8]` `[src]` |
 | 25 | 无导航延迟、无 XHR | 兼容变体有 5 秒延迟与 XHR | 体积与体验 | `[01 §2.5]` |
 | 26 | 收入格式 `$`:{a,c} 公开定义（第 4 阶段） | 仅 EE 解析，CE 为空操作 | 开源版需完整功能；只参考行为契约 | `[01 §2.9]` |
-
-### 10.2 相对 v1 草案的修订
-以本规范为准：产物名 `tracker.min.js`/`tracker.ext.js` → `core`/`full`；字段 site/type/path/ref → 短键 s/n/u/r（pathname 由服务端提取）；成功返回 204 → 202 空体；「不使用 localStorage」→ 仅只读 `rivu_ignore`（`system-design.md` §10 Q3 已决定）；「不直接信任 X-Forwarded-For」沿用，落实为可信代理名单（6.1）。
 
 ## 11. 测试清单
 ### 11.1 协议契约测试（Rust，表驱动）
@@ -447,9 +443,7 @@ rivu('event', 'Video Play', { interactive: false })   // 发 i:false，不影响
 | 其他 | 最坏配置前缀 ≤ 512 B；`t.js` 与 `full.js` 逐字节相同；两次构建哈希一致；`es-check es2018` 通过 |
 
 ## 附录：待拍板问题
-1. ~~`full` 估算仅余约 18 B；超预算时是否允许把预算提到 2.5 KB，还是按 3.2 顺序削功能~~：已定（2026-10-27），实现后实测 gzip 约 2,600 B，按 3.2 的顺序削减也只省约 100 B；预算上调到 2,816 B（2.75 KB），保留全部功能。
-2. `r` 超长是截断（本稿，同 Plausible）还是按决策 2 的「超长」返回 400。
-3. ~~`u` 超 2000 B 返回 400 会丢整条 pageview~~：已定，服务端对超长 `u` 不回 400，先丢弃白名单以外的 query，再把 pathname 截断到 1024 字节（§5.1、`system-design.md` §10 Q18）；客户端不需要预先剥离。
-4. 兼容层 `d` 含逗号（多站点扇出）按 400 拒绝，是否可接受。
-5. 白名单为空 fail-closed、`*.example.com` 不含根域；`r` 仅文档首个 pageview 携带（偏离 Plausible）；DNT/GPC 是否进入后续阶段。
-6. 可选的新字段（新增可选字段不升版，§8）：在 `Macintosh` UA 上附带 `navigator.maxTouchPoints` 可把 iPadOS 桌面 UA 改判为平板；高熵 Client Hints 的 `platformVersion` 可区分 Windows 10 / 11。两者都会让 tracker 多发数据或多读一个 API，不属于 P1，P2 以后再议（`system-design.md` §10 Q22、Q23）。
+1. `r` 超长是截断（本稿，同 Plausible）还是按决策 2 的「超长」返回 400。
+2. 兼容层 `d` 含逗号（多站点扇出）按 400 拒绝，是否可接受。
+3. DNT/GPC 是否作为站点开关。
+4. 可选的新字段（新增可选字段不升版，§8）：在 `Macintosh` UA 上附带 `navigator.maxTouchPoints` 可把 iPadOS 桌面 UA 改判为平板；高熵 Client Hints 的 `platformVersion` 可区分 Windows 10 / 11。两者都会让 tracker 多发数据或多读一个 API，P2 以后再议（`system-design.md` §10 Q22、Q23）。

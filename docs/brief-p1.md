@@ -1,6 +1,6 @@
 # P1 任务书：一条可证明正确的 Lite 链路
 
-> 状态：2026-10-22 起生效。本文规定 P1 做什么、怎样算做对；设计细节仍以 [`architecture/system-design.md`](architecture/system-design.md) 为准，两者冲突时先在 system-design §10 定案再改本文。
+> 本文规定 P1 做什么、怎样算做对；设计细节仍以 [`architecture/system-design.md`](architecture/system-design.md) 为准，两者冲突时先在 system-design §10 定案再改本文。
 
 ## 目标
 
@@ -76,5 +76,5 @@ Plausible 只作对照组，不作判卷标准。判卷依据来自：
 1. **最细链路**：`POST /api/event`（pageview、engagement）→ 站点快照与 hostname 白名单 → 身份 → SessionAssigner → BatchWriter → `events`/`sessions`/`ingest_counters` → 核心指标查询；同时交付参考实现与差分测试。富化（机器人、地理、UA、来源分类）先留空值。
 2. tracker `core`，Playwright 端到端。
 3. 逐段加深：机器人、UA、地理、来源与渠道，每段都带各自的外部数据源测试。
-4. 查询 DSL 的维度与过滤；看板主视图（等待 `designs/` 原型审批）。
+4. 查询 DSL 的维度与过滤；看板主视图。
 5. 验收清单中的外部对账项。
