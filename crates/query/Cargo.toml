@@ -13,6 +13,7 @@ workspace = true
 anyhow.workspace = true
 clickhouse.workspace = true
 jiff.workspace = true
+moka.workspace = true
 regex.workspace = true
 rivu-geo.workspace = true
 schemars.workspace = true

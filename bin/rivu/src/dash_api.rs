@@ -120,7 +120,7 @@ use rivu_common::config::{
 };
 use rivu_geo::GeoDb;
 use rivu_query::spec::Filter;
-use rivu_query::{ExecOptions, QueryError, QueryResult, QuerySpec, TenantScope};
+use rivu_query::{ExecOptions, QueryCache, QueryError, QueryResult, QuerySpec};
 use rivu_ratelimit::PolicyLimiter;
 use rivu_storage_pg::access::{self, SiteRef, UserSiteRoles};
 use rivu_storage_pg::sessions::ActiveSession;
@@ -356,6 +356,8 @@ pub struct DashApi {
     public_timeout_secs: u64,
     /// `RIVU_ROLLUP_MIN_ROWS`（§6.4 选层）。
     rollup_min_rows: Option<u64>,
+    /// 结果缓存（与公开 API 共用，§6.9）；`None` 不缓存。
+    cache: Option<Arc<QueryCache>>,
     limiters: Limiters,
     limits: DashLimits,
     login_watch: LoginWatch,
@@ -395,6 +397,7 @@ impl DashApi {
             dashboard_timeout_secs: config.query_timeouts.dashboard_secs,
             public_timeout_secs: config.query_timeouts.public_secs,
             rollup_min_rows: Some(config.rollup_min_rows),
+            cache: None,
             limiters: Limiters::new(&limits),
             limits,
             login_watch: LoginWatch::new(),
@@ -410,6 +413,12 @@ impl DashApi {
     pub fn with_limits(mut self, limits: DashLimits) -> Self {
         self.limiters = Limiters::new(&limits);
         self.limits = limits;
+        self
+    }
+
+    /// 使用结果缓存（与公开 API 共用同一个）。
+    pub fn with_cache(mut self, cache: Arc<QueryCache>) -> Self {
+        self.cache = Some(cache);
         self
     }
 
@@ -1353,23 +1362,16 @@ impl DashApi {
             opts = opts.with_comment(k, v);
         }
         opts.rollup_min_rows = self.rollup_min_rows;
-        let started = Instant::now();
-        let result = rivu_query::execute(
+        query_api::execute_cached(
             &self.reader,
-            &TenantScope::new(site.site_id),
+            self.cache.as_deref(),
             &site,
             spec,
             opts,
+            route,
         )
-        .await;
-        metrics::histogram!("rivu_query_seconds", "route" => route)
-            .record(started.elapsed().as_secs_f64());
-        result.map_err(|e| {
-            metrics::counter!("rivu_query_errors_total", "route" => route,
-                "kind" => query_api::error_kind(&e))
-            .increment(1);
-            DashError::Fail(Fail::Query(e), timeout)
-        })
+        .await
+        .map_err(|e| DashError::Fail(Fail::Query(e), timeout))
     }
 }
 

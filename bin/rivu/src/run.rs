@@ -328,6 +328,12 @@ pub async fn run(config: Config) -> Result<ExitCode> {
 
     // 后台任务 ch_delete_batch：执行到期的统计数据删除意图（`rivu_maintainer` 账号）。
     // all 里看板写入日期范围意图后通过 `stats_delete_kick` 立即唤醒一次。
+    // 结果缓存（§6.9）：看板与公开 API 共用；同进程的 ch_delete_batch 删除完成后让站点的结果失效
+    let query_cache = role.serves_api().then(|| {
+        Arc::new(rivu_query::QueryCache::new(
+            rivu_query::cache::DEFAULT_CAPACITY_ROWS,
+        ))
+    });
     let stats_delete_kick = if role.runs_jobs() {
         let account = config
             .ch_maintainer
@@ -341,6 +347,7 @@ pub async fn run(config: Config) -> Result<ExitCode> {
             maintainer.clone(),
             config.stats_delete_interval,
             Arc::clone(&kick),
+            query_cache.clone(),
             bg_stop_rx.clone(),
         ));
         // 后台任务 rollup_build：日汇总层（同一个 maintainer 账号）
@@ -448,10 +455,12 @@ pub async fn run(config: Config) -> Result<ExitCode> {
             Ok(true) => {}
             Err(e) => tracing::warn!(error = %format!("{e:#}"), "检查实例是否已初始化失败"),
         }
+        let cache = query_cache.clone().context("api 角色的结果缓存")?;
         let dash = Arc::new(
             DashApi::new(&config, pg.clone(), reader.clone(), geo_db.clone())
                 .context("装配内部端点失败")?
-                .with_stats_delete_kick(stats_delete_kick.clone()),
+                .with_stats_delete_kick(stats_delete_kick.clone())
+                .with_cache(Arc::clone(&cache)),
         );
         background.push(dash_api::spawn_maintenance(pg.clone(), bg_stop_rx.clone()));
         Some(
@@ -463,7 +472,8 @@ pub async fn run(config: Config) -> Result<ExitCode> {
                     geo_db.clone(),
                     config.query_timeouts.api_secs,
                 )
-                .with_rollup(config.rollup_min_rows),
+                .with_rollup(config.rollup_min_rows)
+                .with_cache(cache),
             ))
             .merge(dash_api::router(dash)),
         )
