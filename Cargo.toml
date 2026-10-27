@@ -5,7 +5,6 @@ exclude = ["fuzz"]
 members = [
     "bin/rivu",
     "crates/auth",
-    "crates/bus",
     "crates/common",
     "crates/domain",
     "crates/geo",
