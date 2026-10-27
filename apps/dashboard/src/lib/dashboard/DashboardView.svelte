@@ -8,13 +8,11 @@
 <script lang="ts">
   import { ChartSpline, CircleAlert, Clock, Hourglass, Inbox, Share2, Table2 } from "@lucide/svelte";
   import { page } from "$app/state";
-  import PageHeader from "../app/PageHeader.svelte";
+  import SiteHeader from "../app/SiteHeader.svelte";
   import Card from "../ui/Card.svelte";
   import Button from "../ui/Button.svelte";
   import Segmented from "../ui/Segmented.svelte";
   import EmptyState from "../ui/EmptyState.svelte";
-  import Avatar from "../ui/Avatar.svelte";
-  import LiveDot from "../ui/LiveDot.svelte";
   import Skeleton from "../ui/Skeleton.svelte";
   import Table from "../ui/Table.svelte";
   import TrendChart from "../charts/TrendChart.svelte";
@@ -230,25 +228,13 @@
 {/snippet}
 
 <div class="page">
-  <PageHeader title={name}>
-    {#snippet leading()}<Avatar name={name} shape="square" size={24} />{/snippet}
-    {#snippet meta()}
-      {#if live !== null}
-        <svelte:element
-          this={shared ? "span" : "a"}
-          class="live"
-          href={shared ? undefined : `/s/${siteId}?range=realtime`}
-        >
-          <LiveDot off={live === 0} />{t("dash.live", { n: live })}
-        </svelte:element>
-      {/if}
-    {/snippet}
+  <SiteHeader {siteId} {name} {live} {shared}>
     {#snippet actions()}
       {#if !shared && canShare}
         <Button icon={Share2} href="/s/{siteId}/settings/sharing">{t("dash.share")}</Button>
       {/if}
     {/snippet}
-  </PageHeader>
+  </SiteHeader>
 
   <div class="toolbar">
     <FilterBar
@@ -412,16 +398,6 @@
     max-width: var(--content-max);
     margin: 0 auto;
     padding: var(--sp-6) var(--sp-8) var(--sp-12);
-  }
-  .live {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    color: var(--text-muted);
-    font-variant-numeric: tabular-nums;
-  }
-  a.live:hover {
-    color: var(--text);
   }
   .toolbar {
     position: sticky;

@@ -51,8 +51,11 @@
   --r-lg: 12px; /* 对话框 */
   --r-full: 999px;
 
-  /* ---------- 动效：默认没有；确实需要时只用这一档 ---------- */
-  --ease: cubic-bezier(0, 0, 0.2, 1); /* ease-out */
+  /* ---------- 动效：以 transform 与 opacity 为主（条形图的宽度例外），出现用 ease-out，位移用 ease-in-out ---------- */
+  --ease: cubic-bezier(0, 0, 0.2, 1); /* ease-out：出现、展开 */
+  --ease-move: cubic-bezier(0.4, 0, 0.2, 1); /* ease-in-out：指示条、抽屉这类从一处移到另一处 */
+  --dur-fast: 120ms; /* 悬停的颜色变化 */
+  --dur-pop: 160ms; /* 浮层、提示出现 */
   --dur: 250ms;
 
   /* ---------- 中性色（gray） ---------- */

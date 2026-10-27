@@ -5,7 +5,7 @@
 -->
 <script lang="ts">
   import NotFound from "#lib/app/NotFound.svelte";
-  import PageHeader from "#lib/app/PageHeader.svelte";
+  import SiteHeader from "#lib/app/SiteHeader.svelte";
   import Button from "#lib/ui/Button.svelte";
   import Callout from "#lib/ui/Callout.svelte";
   import Card from "#lib/ui/Card.svelte";
@@ -81,7 +81,7 @@
   <NotFound />
 {:else}
   <div class="page">
-    <PageHeader title={t("in.title", { name: site.name })} />
+    <SiteHeader siteId={site.id} name={site.name} />
 
     <Card title={t("in.copy")}>
       <div class="stack">
@@ -121,9 +121,13 @@
     flex-direction: column;
     gap: var(--sp-4);
     width: 100%;
-    max-width: 880px;
+    max-width: var(--content-max);
     margin: 0 auto;
     padding: var(--sp-6) var(--sp-8) var(--sp-12);
+  }
+  /* 页头与其他站点页同宽（切换标签时不跳），正文限宽 */
+  .page > :global(:not(.ph)) {
+    max-width: 880px;
   }
   .stack {
     display: flex;

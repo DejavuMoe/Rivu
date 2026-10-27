@@ -7,7 +7,7 @@
 <script lang="ts">
   import { Trash2, TriangleAlert, UserPlus, Users, X } from "@lucide/svelte";
   import { untrack } from "svelte";
-  import PageHeader from "#lib/app/PageHeader.svelte";
+  import OrgHeader from "#lib/app/OrgHeader.svelte";
   import Avatar from "#lib/ui/Avatar.svelte";
   import Badge from "#lib/ui/Badge.svelte";
   import Button from "#lib/ui/Button.svelte";
@@ -208,7 +208,7 @@
   // ---- 表格列 ----
   const memberCols = $derived<Column[]>([
     { key: "member", label: t("mb.col.member") },
-    { key: "role", label: t("mb.col.role"), width: "160px" },
+    { key: "role", label: t("mb.col.role"), width: "132px" },
     { key: "active", label: t("mb.col.active"), optional: true, width: "120px" },
     ...(manage ? [{ key: "act", label: "", align: "right" as const, width: "56px" }] : []),
   ]);
@@ -220,8 +220,8 @@
   ]);
   const guestCols = $derived<Column[]>([
     { key: "email", label: t("mb.col.email") },
-    { key: "site", label: t("mb.col.site"), width: "200px" },
-    { key: "role", label: t("mb.col.role"), width: "120px" },
+    { key: "site", label: t("mb.col.site"), width: "200px", optional: true },
+    { key: "role", label: t("mb.col.role"), width: "96px" },
     ...(manage ? [{ key: "act", label: "", align: "right" as const, width: "56px" }] : []),
   ]);
   const active = (m: OrgMember) => {
@@ -231,11 +231,11 @@
 </script>
 
 <div class="page">
-  <PageHeader title={t("mb.title")}>
+  <OrgHeader>
     {#snippet actions()}
       {#if manage}<Button variant="primary" icon={UserPlus} onclick={openInvite}>{t("mb.invite")}</Button>{/if}
     {/snippet}
-  </PageHeader>
+  </OrgHeader>
 
   {#if notMember}
     <Card>
@@ -260,7 +260,7 @@
   {:else}
     <Card flush>
       {#key gen}
-        <Table columns={memberCols} rows={members} rowKey={(m) => m.user_id} caption={t("mb.title")}>
+        <Table fit columns={memberCols} rows={members} rowKey={(m) => m.user_id} caption={t("mb.title")}>
           {#snippet cell(m, c)}
             {#if c.key === "member"}
               <div class="who">
@@ -299,7 +299,7 @@
 
     {#if invites.length > 0}
       <Card title={t("mb.pending")} flush>
-        <Table columns={inviteCols} rows={invites} rowKey={(i) => i.id} caption={t("mb.pending")}>
+        <Table fit columns={inviteCols} rows={invites} rowKey={(i) => i.id} caption={t("mb.pending")}>
           {#snippet cell(i, c)}
             {#if c.key === "email"}
               <div class="who-text">
@@ -321,10 +321,14 @@
 
     {#if guests.length > 0}
       <Card title={t("mb.guests")} flush>
-        <Table columns={guestCols} rows={guests} rowKey={(g) => g.id} caption={t("mb.guests")}>
+        <Table fit columns={guestCols} rows={guests} rowKey={(g) => g.id} caption={t("mb.guests")}>
           {#snippet cell(g, c)}
             {#if c.key === "email"}
-              {g.email}
+              <div class="guest">
+                <span class="guest-mail">{g.email}</span>
+                <!-- 窄屏站点列隐藏，站点名放到邮箱下面 -->
+                <span class="guest-site">{g.site.name}</span>
+              </div>
             {:else if c.key === "site"}
               {g.site.name}
             {:else if c.key === "role"}
@@ -421,9 +425,13 @@
     flex-direction: column;
     gap: var(--sp-4);
     width: 100%;
-    max-width: 880px;
+    max-width: var(--content-max);
     margin: 0 auto;
     padding: var(--sp-6) var(--sp-8) var(--sp-12);
+  }
+  /* 与其他页面同一左缘，整页（含页头）限宽：动作按钮挨着正文 */
+  .page > :global(*) {
+    max-width: 880px;
   }
   .who {
     display: flex;
@@ -472,6 +480,26 @@
   @media (max-width: 720px) {
     .page {
       padding: var(--sp-4) var(--sp-4) var(--sp-10);
+    }
+  }
+  .guest {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    line-height: 1.3;
+  }
+  .guest-mail {
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .guest-site {
+    display: none;
+    color: var(--text-muted);
+    font-size: var(--fs-sm);
+  }
+  @media (max-width: 720px) {
+    .guest-site {
+      display: block;
     }
   }
 </style>

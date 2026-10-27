@@ -63,6 +63,10 @@
 {/if}
 
 <style>
+  /* 按下时略微收缩，给点击一个触感反馈 */
+  .btn:active:not(:disabled) {
+    transform: scale(0.97);
+  }
   .btn {
     --h: var(--control-md);
     display: inline-flex;
@@ -78,6 +82,11 @@
     line-height: 1;
     white-space: nowrap;
     user-select: none;
+    transition:
+      background-color var(--dur-fast) var(--ease),
+      border-color var(--dur-fast) var(--ease),
+      color var(--dur-fast) var(--ease),
+      transform var(--dur-fast) var(--ease);
   }
   /* 带图标时左侧内边距收 2px：图标的视觉边界比文字更靠外，光学上才对齐 */
   .btn:has(> :global(svg:first-child)):not(.icon-only) {

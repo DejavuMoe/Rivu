@@ -125,9 +125,25 @@
   }
   .bottom {
     top: calc(100% + 6px);
+    transform-origin: top;
+    animation: pop-down var(--dur-pop) var(--ease);
   }
   .top {
     bottom: calc(100% + 6px);
+    transform-origin: bottom;
+    animation: pop-up var(--dur-pop) var(--ease);
+  }
+  .start.bottom {
+    transform-origin: top left;
+  }
+  .end.bottom {
+    transform-origin: top right;
+  }
+  .start.top {
+    transform-origin: bottom left;
+  }
+  .end.top {
+    transform-origin: bottom right;
   }
   .start {
     left: 0;
