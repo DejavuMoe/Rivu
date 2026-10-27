@@ -5,6 +5,7 @@
 # 做什么：release 构建 rivu 与 loadgen -> 迁移 -> 建站（SITES 个）与 API key -> 启动 `rivu all` 并等 /readyz
 # -> 场景 A（持续 SUSTAINED_RATE 事件/s，SUSTAINED_SECS 秒）-> 静置 SETTLE_SECS 秒
 # -> 场景 B（峰值 PEAK_RATE 事件/s，PEAK_SECS 秒）；两个场景里都同时以 QUERY_RATE 次/s 发 POST /api/v1/query
+# 可选 PREFILL_ROWS：场景之前往这些站点预填历史事件（大表上的查询延迟），QUERY_RANGE 改查询的范围（默认 7d）。
 # -> 每个场景结束后对账（生成器 202 数 vs ingest_counters、events 行数 vs accepted）并收集 ClickHouse 指标
 # -> 停止 rivu。全程每 SAMPLE_SECS 秒采样 rivu / loadgen 的 CPU 与 RSS、会话数、写缓冲深度、活跃 part 数、merge 数。
 #
@@ -29,6 +30,8 @@ SETTLE_SECS="${SETTLE_SECS:-60}"
 PEAK_RATE="${PEAK_RATE:-5000}"
 PEAK_SECS="${PEAK_SECS:-60}"
 QUERY_RATE="${QUERY_RATE:-5}"
+QUERY_RANGE="${QUERY_RANGE:-7d}"     # 三种查询共用的 date_range
+PREFILL_ROWS="${PREFILL_ROWS:-0}"    # 场景之前往这些站点预填的历史事件数（分布在最近 30 天），0 表示不预填
 PROBE_INTERVAL_MS="${PROBE_INTERVAL_MS:-1000}"
 SAMPLE_SECS="${SAMPLE_SECS:-5}"
 BUILD="${BUILD:-1}"
@@ -114,6 +117,52 @@ done
 IDS_CSV="$(IFS=,; echo "${SITE_IDS[*]}")"
 log "站点：${SITE_IDS[*]}"
 
+# ------------------------------------------------------------------ 预填历史数据（大表上的查询延迟）
+# 每个会话 3 个事件（第 3 个一半是 engagement），会话开始时间均匀分布在最近 30 天（至少 2 分钟之前，不产生未来的时间戳），
+# 站点按 u² 取下标，与 loadgen 的 Zipf(1) 接近（第一个站点约占 41%）。sessions 由物化视图同步生成。每批 1000 万行。
+if [[ "$PREFILL_ROWS" -gt 0 ]]; then
+  log "预填 $PREFILL_ROWS 个历史事件"
+  t0=$(date +%s)
+  done_rows=0
+  while [[ "$done_rows" -lt "$PREFILL_ROWS" ]]; do
+    n=$(( PREFILL_ROWS - done_rows < 10000000 ? PREFILL_ROWS - done_rows : 10000000 ))
+    ch "INSERT INTO rivu.events (site_id, ts, event_id, name, visitor_id, session_id, session_start, ingest_partition,
+          hostname, pathname, entry_pathname, referrer_source, channel, country_code, device, browser, browser_version,
+          os, os_version, interactive, scroll_depth, engagement_ms)
+        SELECT site_id, ts, generateUUIDv7(n0), name, visitor_id, session_id, session_start, toUInt8(session_id % 32),
+          hostname, pathname, entry_pathname, referrer_source, channel, country_code, device, browser, browser_version,
+          os, '', true, if(name = 'engagement', toUInt8(h % 101), 255), if(name = 'engagement', toUInt32(h % 120000), 0)
+        FROM (
+          SELECT number + $done_rows AS n0, intDiv(n0, 3) AS sess, n0 % 3 AS step,
+            cityHash64(n0, $RUN_ID) AS h, cityHash64(sess, $RUN_ID, 1) AS hs,
+            [$IDS_CSV][1 + toUInt64(floor(pow((hs % 1000000) / 1000000.0, 2) * $SITES))] AS site_id,
+            now64(3) - toIntervalMillisecond(120000 + hs % (30 * 86400000)) AS session_start,
+            session_start + toIntervalSecond(step * 45) AS ts,
+            if(step = 2 AND h % 2 = 0, 'engagement', 'pageview') AS name,
+            cityHash64(sess, $RUN_ID, 2) AS visitor_id, cityHash64(sess, $RUN_ID, 3) AS session_id,
+            concat('site', toString(site_id), '.prefill.test') AS hostname,
+            concat('/p/', toString(h % 2000)) AS pathname, concat('/p/', toString(hs % 2000)) AS entry_pathname,
+            ['', 'Google', 'Bing', 'Twitter', 'Hacker News'][1 + hs % 5] AS referrer_source,
+            ['Direct', 'Organic Search', 'Organic Search', 'Organic Social', 'Referral'][1 + hs % 5] AS channel,
+            ['US', 'DE', 'CN', 'GB', 'FR', 'IN', 'BR', 'JP', 'CA', 'NL'][1 + bitShiftRight(hs, 8) % 10] AS country_code,
+            ['desktop', 'mobile', 'tablet'][1 + bitShiftRight(hs, 16) % 3] AS device,
+            ['Chrome', 'Safari', 'Firefox', 'Edge'][1 + bitShiftRight(hs, 20) % 4] AS browser,
+            toString(120 + bitShiftRight(hs, 24) % 20) AS browser_version,
+            ['Windows', 'macOS', 'iOS', 'Android', 'Linux'][1 + bitShiftRight(hs, 28) % 5] AS os
+          FROM numbers($n))"
+    done_rows=$(( done_rows + n ))
+  done
+  ch "OPTIMIZE TABLE rivu.sessions FINAL" >/dev/null 2>&1 || true
+  {
+    echo "预填 $PREFILL_ROWS 行用时 $(( $(date +%s) - t0 )) s"
+    echo "  本次站点的 events / sessions 行数："
+    ch "SELECT (SELECT count() FROM rivu.events WHERE site_id IN ($IDS_CSV)), (SELECT count() FROM rivu.sessions WHERE site_id IN ($IDS_CSV))" | sed 's/^/    /'
+    echo "  按站点（events）："
+    ch "SELECT site_id, count() FROM rivu.events WHERE site_id IN ($IDS_CSV) GROUP BY site_id ORDER BY 2 DESC" | sed 's/^/    /'
+  } | tee "$OUT/prefill.txt"
+  PREV_ROWS_BASE="$(ch "SELECT count() FROM rivu.events WHERE site_id IN ($IDS_CSV)")"
+fi
+
 ORG_SLUG="$(pg "SELECT o.slug FROM sites s JOIN organizations o ON o.id = s.organization_id WHERE s.id = ${SITE_IDS[0]}")"
 LT_USER="loadtest-${RUN_ID}@example.test"
 pg "INSERT INTO users (email, password_hash) VALUES ('$LT_USER', 'x') ON CONFLICT DO NOTHING" >/dev/null
@@ -170,11 +219,11 @@ sampler &
 SAMPLER_PID=$!
 
 # ------------------------------------------------------------------ 场景与对账
-PREV_ACCEPTED=0; PREV_DROPPED=0; PREV_ROWS=0
+PREV_ACCEPTED=0; PREV_DROPPED=0; PREV_ROWS="${PREV_ROWS_BASE:-0}"
 
 reconcile() {
   local label="$1" json="$2" start_unix="$3"
-  sleep 8   # 写缓冲 flush（1 s）+ 余量
+  sleep 15  # 写缓冲 flush（1 s）与接入计数的 10 秒桶都要刷出，再留余量
   ch "SYSTEM FLUSH LOGS" >/dev/null 2>&1 || true
   local acc drp rows gen_acc gen_drp gen_503 gen_400 gen_oth gen_err gen_skip
   acc="$(ch "SELECT sumIf(value, metric = 'accepted') FROM rivu.ingest_counters WHERE site_id IN ($IDS_CSV)")"
@@ -221,7 +270,7 @@ run_scenario() {
   local start_unix; start_unix="$(date +%s)"
   log "场景 $label：$*"
   "$LOADGEN" --target "http://$PUBLIC_ADDR" "${SITE_ARGS[@]}" \
-    --query-rate "$QUERY_RATE" --ch-url http://127.0.0.1:8123 --ch-database "${RIVU_CH_DATABASE:-rivu}" \
+    --query-rate "$QUERY_RATE" --query-range "$QUERY_RANGE" --ch-url http://127.0.0.1:8123 --ch-database "${RIVU_CH_DATABASE:-rivu}" \
     --ch-user "$RIVU_CH_READER_USER" --probe-interval-ms "$PROBE_INTERVAL_MS" \
     --out "$OUT/loadgen-$label.json" "$@" 2>&1 | tee "$OUT/loadgen-$label.txt" | tee -a "$OUT/run.log"
   reconcile "$label" "$OUT/loadgen-$label.json" "$start_unix"
