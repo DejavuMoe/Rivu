@@ -23,6 +23,7 @@ members = [
     "tools/loadgen",
     "tools/reconcile",
     "tools/reident",
+    "tools/replay",
 ]
 
 [workspace.package]

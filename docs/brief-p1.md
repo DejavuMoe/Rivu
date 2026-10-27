@@ -59,13 +59,13 @@ Plausible 只作对照组，不作判卷标准。判卷依据来自：
 
 ## 验收（由系统之外的证据判定）
 
-- [ ] 边缘日志里 `/api/event` 的请求数与 `ingest_counters` 严格对账；
-- [ ] 与 Plausible CE 并行回放同一请求流，所有差异都能对应到「刻意偏离清单」；
-- [ ] 参考实现与管线结果在事先写明的容差内一致；
-- [ ] 已知答案探针（定时制造已知访问的无头浏览器）连续 7 天全部通过；
-- [ ] 用数据库导出做重识别测试，结论写进隐私说明；
-- [ ] 发布前冻结 ClickHouse schema，此后只能新增迁移；
-- [ ] pageview 5 s 内可见；固定到达率下的 p95 公开、可复现。
+- [x] 边缘日志里 `/api/event` 的请求数与 `ingest_counters` 严格对账（`research/edge-reconciliation-2026-10.md`）；
+- [x] 与 Plausible CE 并行回放同一请求流，所有差异都能对应到「刻意偏离清单」（`research/plausible-replay-2026-10.md`，清单见 `system-design.md` 附录 C）；
+- [x] 参考实现与管线结果在事先写明的容差内一致（`bin/rivu/tests/query_differential.rs`：计数严格相等，比率 1e-9）；
+- [ ] 已知答案探针（定时制造已知访问的无头浏览器）连续 7 天全部通过：探针与本地 30 轮已通过（`research/known-answer-probe.md`），7 天连续运行需要常驻实例，尚未开始；
+- [x] 用数据库导出做重识别测试，结论写进隐私说明（`research/re-identification-2026-10.md`、`privacy.md`）；
+- [x] 发布前冻结 ClickHouse schema，此后只能新增迁移（`migrations/checksums.lock` 与 `schema/` 快照）；
+- [x] pageview 5 s 内可见；固定到达率下的 p95 公开、可复现（`research/load-test-2026-10.md`：可见性 p95 约 1.1 s。3 千万行表上 30 天查询的 p95 为 0.3–2.9 s，没有达到 system-design 的 300 ms 目标，留给 P2 的汇总层与缓存）。
 
 ## 交付物
 

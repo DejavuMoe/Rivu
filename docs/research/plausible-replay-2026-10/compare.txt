@@ -1,0 +1,48 @@
+== site1-20261027082504.replay.test
+  visitors: rivu Some(2899.0) / plausible 2899
+  visits: rivu Some(2899.0) / plausible 2899
+  pageviews: rivu Some(6183.0) / plausible 6185
+  bounce_rate: rivu Some(42.53190755432908) / plausible 43
+  visit_duration: rivu Some(51.6502300793377) / plausible 52
+  event:page: 合计 rivu 5951 / plausible 5953；只在 rivu []；只在 plausible []；不同 8 个 ["/: 863/864", "/blog/post-102: 5/6", "/blog/post-120: 4/3", "/blog/post-507: 2/3", "/blog/post-792: 3/2", "/blog/post-93: 6/7", "/products/item-185: 7/6", "/products/item-98: 11/12"]
+  visit:browser: 合计 rivu 2899 / plausible 2899；只在 rivu ["AOL Desktop Gold Browser", "AVG", "Adobe CreativeCloud", "Amazon Silk", "Baidu Explorer", "BlackBerry", "BlackBerry WebKit", "CitizenFX", "Config", "Crosswalk"]；只在 plausible ["360 Phone Browser", "AOL Desktop", "AVG Secure Browser", "BlackBerry Browser", "Chromium", "Coast", "Comodo Dragon", "Fluid", "Hi Browser", "Huawei Browser Mobile"]；不同 14 个 ["(not set): 11/10", "Android Browser: 1147/1123", "Baidu Browser: 7/13", "Chrome: 890/904", "Dolphin: 3/11", "Firefox: 7/10", "Maxthon: 2/3", "NetFront: 8/11", "Nokia Browser: 11/19", "Obigo: 6/8", "Opera: 160/159", "Polaris: 3/2", "Safari: 24/27", "UC Browser: 167/181"]
+  visit:channel: 合计 rivu 2899 / plausible 2899；只在 rivu []；只在 plausible []；不同 2 个 ["Direct: 1625/1627", "Organic Search: 594/592"]
+  visit:country: 合计 rivu 2899 / plausible 2899；只在 rivu ["(not set)"]；只在 plausible []；不同 29 个 ["AU: 41/38", "BE: 6/7", "BR: 60/64", "CA: 70/67", "CH: 269/271", "CN: 236/245", "CO: 16/14", "CZ: 10/11", "DE: 103/112", "DK: 11/13", "EG: 12/13", "ES: 29/28", "FI: 9/10", "FR: 60/62", "GB: 70/73"]
+  visit:device: 合计 rivu 2899 / plausible 2899；只在 rivu ["desktop", "mobile", "tablet"]；只在 plausible ["(not set)", "Desktop", "Mobile", "Tablet"]；不同 0 个 []
+  visit:os: 合计 rivu 2899 / plausible 2899；只在 rivu ["BREW", "BSD", "Brew MP", "GoogleTV", "Kindle", "LG", "Linux", "Nokia Series 40", "Sailfish", "Symbian^3 Belle"]；只在 plausible ["Android TV", "Brew", "CyanogenMod", "Fire OS", "GNU/Linux", "Google TV", "Java ME", "Mac", "MocorDroid", "Nintendo"]；不同 7 个 ["(not set): 93/38", "Android: 2397/2341", "Symbian OS: 59/6", "Symbian^3: 4/5", "Windows: 72/25", "Windows Phone: 87/88", "webOS: 1/2"]
+  visit:source: 合计 rivu 2899 / plausible 2899；只在 rivu ["X (Twitter)"]；只在 plausible ["Twitter"]；不同 3 个 ["Baidu: 138/137", "Direct / None: 1625/1627", "Google: 221/220"]
+
+== site2-20261027082504.replay.test
+  visitors: rivu Some(1424.0) / plausible 1423
+  visits: rivu Some(1424.0) / plausible 1423
+  pageviews: rivu Some(3019.0) / plausible 3016
+  bounce_rate: rivu Some(42.34550561797753) / plausible 42
+  visit_duration: rivu Some(52.013073735955054) / plausible 52
+  event:page: 合计 rivu 2891 / plausible 2888；只在 rivu ["/docs/guide/page-694"]；只在 plausible []；不同 2 个 ["/blog/post-21: 21/20", "/blog/post-42: 12/11"]
+  visit:browser: 合计 rivu 1424 / plausible 1423；只在 rivu ["AOL Shield Browser", "Adobe CEP", "AdobeAIR", "AtContent", "Baidu Explorer", "BlackBerry WebKit", "Craving Explorer Browser", "Dolfin", "DuckDuckGo Mobile", "Edge"]；只在 plausible ["AOL Shield Pro", "BlackBerry Browser", "CM Browser", "Craving Explorer", "Dolphin", "DuckDuckGo Privacy Browser", "IE Mobile", "Internet Explorer", "Kindle Browser", "LG Browser"]；不同 9 个 ["(not set): 8/6", "Android Browser: 572/562", "Baidu Browser: 5/8", "Chrome: 419/420", "Firefox: 2/3", "NetFront: 9/13", "Nokia Browser: 8/14", "Obigo: 4/7", "UC Browser: 85/95"]
+  visit:channel: 合计 rivu 1424 / plausible 1423；只在 rivu []；只在 plausible []；不同 1 个 ["Organic Social: 180/179"]
+  visit:country: 合计 rivu 1424 / plausible 1423；只在 rivu ["(not set)", "EE", "PK"]；只在 plausible ["MG", "MY"]；不同 24 个 ["AT: 2/1", "AU: 15/17", "BR: 29/30", "CA: 23/27", "CH: 146/151", "CL: 7/6", "CN: 126/129", "DE: 55/53", "DO: 3/2", "ES: 9/10", "FR: 41/42", "HK: 8/9", "ID: 10/9", "IN: 15/16", "IT: 18/17"]
+  visit:device: 合计 rivu 1424 / plausible 1423；只在 rivu ["desktop", "mobile", "tablet"]；只在 plausible ["(not set)", "Desktop", "Mobile", "Tablet"]；不同 0 个 []
+  visit:os: 合计 rivu 1424 / plausible 1423；只在 rivu ["BREW", "Brew MP", "Chromecast Fuchsia", "Kindle", "Linux", "Nokia Series 40", "Sailfish", "macOS"]；只在 plausible ["Android TV", "Brew", "CyanogenMod", "Fuchsia", "GNU/Linux", "Java ME", "Mac", "MocorDroid", "Nintendo", "PlayStation"]；不同 4 个 ["(not set): 60/28", "Android: 1168/1143", "Symbian OS: 29/6", "Windows: 40/17"]
+  visit:source: 合计 rivu 1424 / plausible 1423；只在 rivu ["X (Twitter)"]；只在 plausible ["Twitter"]；不同 1 个 ["Reddit: 34/33"]
+
+== site3-20261027082504.replay.test
+  visitors: rivu Some(926.0) / plausible 926
+  visits: rivu Some(926.0) / plausible 926
+  pageviews: rivu Some(1963.0) / plausible 1963
+  bounce_rate: rivu Some(44.16846652267819) / plausible 44
+  visit_duration: rivu Some(50.10354859611231) / plausible 50
+  event:page: 合计 rivu 1884 / plausible 1884；只在 rivu []；只在 plausible []；不同 0 个 []
+  visit:browser: 合计 rivu 926 / plausible 926；只在 rivu ["Aloha Browser", "Baidu Explorer", "BlackBerry", "BlackBerry WebKit", "BoxNotes", "Dolfin", "DuckDuckGo", "Edge", "Espial", "Facebook"]；只在 plausible ["AdBlock Browser", "Amigo", "BlackBerry Browser", "Espial TV Browser", "IE Mobile", "Internet Explorer", "Kindle Browser", "LG Browser", "Microsoft Edge", "Microsoft Outlook"]；不同 10 个 ["(not set): 5/3", "Android Browser: 359/356", "Baidu Browser: 3/5", "Chrome: 280/282", "Dolphin: 1/5", "NetFront: 4/3", "Nokia Browser: 1/3", "Obigo: 1/5", "Safari: 11/17", "UC Browser: 64/70"]
+  visit:channel: 合计 rivu 926 / plausible 926；只在 rivu []；只在 plausible []；不同 0 个 []
+  visit:country: 合计 rivu 926 / plausible 926；只在 rivu ["(not set)", "HT", "MY"]；只在 plausible []；不同 17 个 ["AE: 3/2", "AU: 20/21", "BR: 24/22", "CA: 20/21", "CH: 73/75", "CN: 73/75", "DE: 32/34", "ES: 9/8", "FR: 18/19", "GB: 33/34", "IE: 5/7", "IN: 12/10", "NL: 22/21", "NZ: 2/3", "RO: 3/2"]
+  visit:device: 合计 rivu 926 / plausible 926；只在 rivu ["desktop", "mobile", "tablet"]；只在 plausible ["(not set)", "Desktop", "Mobile", "Tablet"]；不同 0 个 []
+  visit:os: 合计 rivu 926 / plausible 926；只在 rivu ["BREW", "Brew MP", "Kindle", "Linux", "Nokia Series 40", "Symbian OS", "macOS"]；只在 plausible ["Android TV", "Brew", "CyanogenMod", "GNU/Linux", "Java ME", "Mac", "MocorDroid", "Symbian", "Symbian OS Series 40", "Symbian OS Series 60"]；不同 4 个 ["(not set): 35/19", "Android: 762/748", "Windows: 32/15", "Windows Phone: 22/23"]
+  visit:source: 合计 rivu 926 / plausible 926；只在 rivu ["X (Twitter)"]；只在 plausible ["Twitter"]；不同 0 个 []
+
+      6 plausible 丢弃 engagement
+      7 plausible 丢弃 pageview
+      4 rivu 丢弃 engagement
+      6 rivu 丢弃 pageview
+      8 Mozilla/5.0 (Linux; U; Android 2.3.7; de-de; Flyer Build/GRI40; CyanogenMod 7.2 RC1 for HTC Flyer by XK Project) AppleWebKit/533.1 (KHTML, like Gecko) Version/4.0 Mobile Safari/533.1
+      5 Mozilla/5.0 (Linux; U; Android 2.3.3; fr-fr; X10project Build/GRI40) AppleWebKit/533.1 (KHTML, like Gecko) Version/4.0 Mobile Safari/533.1
