@@ -2,7 +2,7 @@
 
 浏览器采集脚本（TypeScript + esbuild，产出 `core.js` / `full.js`，`t.js` 是 `full.js` 的副本），零运行时依赖。
 
-**状态：`core` 与 `full` 都已实现并通过三内核测试**。体积（gzip -9）：core 约 870 B（预算 1024 B），full 约 2620 B（预算 2816 B，2026-10-27 由 2048 B 上调，见规范附录第 1 条）。
+体积（gzip -9）：core 约 870 B（预算 1024 B），full 约 2620 B（预算 2816 B）。两个构建都在 chromium / firefox / webkit 上测试。
 
 线协议、字段、体积预算和行为规范见 [`docs/architecture/tracker-and-protocol.md`](../../docs/architecture/tracker-and-protocol.md)。
 

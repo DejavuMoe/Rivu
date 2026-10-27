@@ -1,6 +1,6 @@
-# Rivu 系统设计 v2
+# Rivu 系统设计
 
-> 状态：草案（2026-10-21）；§10 的八个开放问题已于 2026-10-22 定案，决定已写入正文。2026-10-23 起，UA / 地理 / 来源三份富化研究（[`enrich-ua.md`](../research/enrich-ua.md)、[`enrich-geo.md`](../research/enrich-geo.md)、[`enrich-source.md`](../research/enrich-source.md)）的结论并入 §4.2、§4.4、§6.10、§10 Q19–Q28 与附录 C。本文与 v1《网站统计系统技术架构设计 v1.0》（存档于 [`archive/v1-architecture.md`](archive/v1-architecture.md)）冲突时，以本文为准；v1 未被本文提到的部分继续有效。
+> 本文是 Rivu 的系统设计，§10 是已定案问题的索引。UA / 地理 / 来源三份富化研究（[`enrich-ua.md`](../research/enrich-ua.md)、[`enrich-geo.md`](../research/enrich-geo.md)、[`enrich-source.md`](../research/enrich-source.md)）的结论见 §4.2、§4.4、§6.10、§10 Q19–Q28 与附录 C。
 > 依据：对 Plausible Analytics 源码的 REA 分析和源码通读。源码为 `plausible/analytics` master 分支，commit `b8cc135`，本地路径 `examples/plausible-analytics/`。Plausible 服务端是 AGPL-3.0，本文只抽象设计，不复制代码。tracker 是 MIT 许可。`extra/` 目录是 EE 代码，本文只记录其行为，不参考实现。
 > 配套文档：[`tracker-and-protocol.md`](tracker-and-protocol.md)（采集脚本与线协议）；[`platform-and-ops.md`](platform-and-ops.md)（业务库、权限、后台任务、部署与运维）。
 > 证据在 [`docs/research/plausible/`](../research/plausible/) 下，编号 00–04。下文用「R01 §5.2」表示「01 号文档第 5.2 节」，每条事实在原文中都附有 `路径:行号`。
@@ -19,22 +19,22 @@ Plausible 的系统设计可以抽象成三件东西：
 
 Rivu 保留这三个抽象，但替换 Plausible 最脆弱的一环。Plausible 用 `-1/+1` 成对写入的折叠行来维护会话表；Rivu 改为接入时只给事件分配 `session_id` 并盖上会话属性，会话指标交给 ClickHouse 物化视图聚合。这样做有两个结果：Lite 和 Reliable 两种模式共用同一套会话逻辑；JetStream 重放消息也不会把统计弄错。
 
-### 0.2 关键决策（v1 → v2）
+### 0.2 关键决策
 
-| # | 主题 | v1 | v2 决策 | 主要依据 |
-|---|---|---|---|---|
-| D1 | 会话 | 没有建模，只有 `visitor_day_id` 和日 UV | 接入侧的 `SessionAssigner` 分配 `session_id`，并把会话属性写到每个事件上（下称「盖章」）。`sessions` 表由物化视图从 `events` 聚合（AggregatingMergeTree），不写 `-1/+1` 行 | R02 §2、§5.3、§11.2 |
-| D2 | 统计 API | 7 个固定端点 | 一个查询 DSL 加一个执行器，看板、公开 API、导出、邮件共用。字段用白名单枚举，取值一律由服务端参数绑定 | R03 §0、§12.1 |
-| D3 | 预聚合 | 用 MV 增量写 `agg_site_hour/day`、`agg_page_day` 等表 | 以直接查原始层为主。另设「日汇总层」，由后台任务按站点本地日期幂等重算，表结构对齐 Plausible 的 `imported_*` 维度族，导入数据和超出保留期的数据都放这一层。查询规划器自动选层 | R02 §8.4；R03 §8、§9 |
-| D4 | 时区 | Collector 计算 `site_day`，放进排序键 | 存 UTC，查询时换算（与 Plausible 相同）。只有日汇总层按站点本地日期存储，站点改时区时重建 | R03 §7.1 |
-| D5 | 访客 ID | 每日轮换 | 盐按日期存。事件使用「站点本地日期」对应的盐，所以 ID 在站点本地午夜轮换。同时计算前一天的 ID，用于跨午夜续会话；会话最长 7 天，跨多个午夜靠会话的别名 key（§4.6） | R01 §9.2、§9.3 |
-| D6 | 写入确认 | Lite 用 `async_insert` 加 `wait_for_async_insert=1`，等 ClickHouse 确认 | 应用内批量写入（1 s、2 万行或 8 MB 先到先写）。事件进入有界缓冲就回 `202`，缓冲满时回 `503`。Reliable 在 JetStream 返回 PubAck 后回 `202` | R01 §2.5、§3.3；R02 §5、§7 |
-| D7 | 响应语义 | 成功回 `204`，失败回明确状态 | 事件被接受或被过滤都回 `202`，用响应头 `x-rivu-dropped` 给出丢弃数量，不暴露原因。`400` 只用于协议错误，`503` 只用于过载 | R01 §3.2、§3.3；R00 §5.4 |
-| D8 | 可靠模式去重 | 没有解决，v1 列为风险 | 用稳定的分区键，每个分区只有一个消费者；批次边界先写入 NATS KV，保证重放时批次不变；写入时带 `insert_deduplication_token`。会话状态尽量小，重放不改变结果 | R02 §11.2 #10 |
-| D9 | 站点标识 | `data-site` | 继续用不透明的 `site_key`，与域名解耦（Plausible 的 `pa-<id>` 脚本也已改为与域名解耦）。域名只作为 hostname 白名单 | R01 §2.10、§6.5 |
-| D10 | 客户端 IP | 只信任可信代理 | 保持不变，并改为可配置的 CIDR 列表。Plausible 无条件信任 5 种转发头，是反例 | R01 §4.4 |
-| D11 | 进程 | 3 个可执行服务 | 1 个二进制，按角色启动：`rivu collector/worker/api/migrate/all`。`all` 就是最简单的自托管形态 | 降低自托管复杂度 |
-| D12 | 原始数据保留 | 90 天 TTL | 可配置，默认 731 天（连续两个自然年，含一个闰年），以支持同比。超出保留期的时间范围由日汇总层回答 | R02 §9 |
+| # | 主题 | 决策 | 主要依据 |
+|---|---|---|---|
+| D1 | 会话 | 接入侧的 `SessionAssigner` 分配 `session_id`，并把会话属性写到每个事件上（下称「盖章」）。`sessions` 表由物化视图从 `events` 聚合（AggregatingMergeTree），不写 `-1/+1` 行 | R02 §2、§5.3、§11.2 |
+| D2 | 统计 API | 一个查询 DSL 加一个执行器，看板、公开 API、导出、邮件共用，不设按报表划分的固定端点。字段用白名单枚举，取值一律由服务端参数绑定 | R03 §0、§12.1 |
+| D3 | 预聚合 | 以直接查原始层为主，不用 MV 维护按小时、按天的聚合表。另设「日汇总层」，由后台任务按站点本地日期幂等重算，表结构对齐 Plausible 的 `imported_*` 维度族，导入数据和超出保留期的数据都放这一层。查询规划器自动选层 | R02 §8.4；R03 §8、§9 |
+| D4 | 时区 | 存 UTC，查询时换算（与 Plausible 相同），排序键里没有本地日期。只有日汇总层按站点本地日期存储，站点改时区时重建 | R03 §7.1 |
+| D5 | 访客 ID | 盐按日期存。事件使用「站点本地日期」对应的盐，所以 ID 在站点本地午夜轮换。同时计算前一天的 ID，用于跨午夜续会话；会话最长 7 天，跨多个午夜靠会话的别名 key（§4.6） | R01 §9.2、§9.3 |
+| D6 | 写入确认 | 应用内批量写入（1 s、2 万行或 8 MB 先到先写），不用 ClickHouse 的 `async_insert`。事件进入有界缓冲就回 `202`，缓冲满时回 `503`。Reliable 在 JetStream 返回 PubAck 后回 `202` | R01 §2.5、§3.3；R02 §5、§7 |
+| D7 | 响应语义 | 事件被接受或被过滤都回 `202`，用响应头 `x-rivu-dropped` 给出丢弃数量，不暴露原因。`400` 只用于协议错误，`503` 只用于过载 | R01 §3.2、§3.3；R00 §5.4 |
+| D8 | 可靠模式去重 | 用稳定的分区键，每个分区只有一个消费者；批次边界先写入 NATS KV，保证重放时批次不变；写入时带 `insert_deduplication_token`。会话状态尽量小，重放不改变结果 | R02 §11.2 #10 |
+| D9 | 站点标识 | 不透明的 `site_key`，与域名解耦（Plausible 的 `pa-<id>` 脚本也已改为与域名解耦）。域名只作为 hostname 白名单 | R01 §2.10、§6.5 |
+| D10 | 客户端 IP | 只信任可配置的可信代理 CIDR 列表给出的转发头。Plausible 无条件信任 5 种转发头，是反例 | R01 §4.4 |
+| D11 | 进程 | 1 个二进制，按角色启动：`rivu collector/worker/api/migrate/all`。`all` 就是最简单的自托管形态 | 降低自托管复杂度 |
+| D12 | 原始数据保留 | 可配置，默认 731 天（连续两个自然年，含一个闰年），以支持同比。超出保留期的时间范围由日汇总层回答 | R02 §9 |
 
 ---
 
@@ -173,7 +173,7 @@ Rivu 保留这三个抽象，但替换 Plausible 最脆弱的一环。Plausible 
 
 Lite 模式要多副本时，Caddy 用 `lb_policy client_ip_hash` 按客户端 IP 路由。访客 ID 本身包含 IP，所以同一访客的事件总会落到同一个 collector，会话仍然成立。代价是扩缩容那一刻会有少量会话断开。如果需要更大规模，或者要求故障期间不丢数据，就换成 Reliable 模式。
 
-### 3.2 Cargo workspace（修订 v1 的目录）
+### 3.2 Cargo workspace
 
 ```
 rivu/
@@ -188,7 +188,7 @@ rivu/
 │   ├── source/         # rivu-source：referrer → source、渠道规则（纯库，数据编译期嵌入）
 │   ├── session/        # SessionAssigner：Lite 时跑在 collector 内，Reliable 时跑在 worker 内
 │   ├── writer/         # ClickHouse 批量写入、重试、去重 token
-│   ├── bus/            # JetStream 发布与消费、分区租约（Reliable）
+│   ├── bus/            # （P3 新增）JetStream 发布与消费、分区租约（Reliable）
 │   ├── query/          # QuerySpec → ResolvedQuery → Plan → SQL → Result
 │   ├── reference/      # rivu-reference：QuerySpec 的独立参照执行器（内存里算），只用于差分测试（`brief-p1.md`）
 │   ├── auth/           # rivu-auth：API key 格式与鉴权、scope、角色矩阵、站点访问判定（axum 中间件）
@@ -197,7 +197,8 @@ rivu/
 │   ├── storage-ch/     # clickhouse crate 封装、CH 迁移
 │   ├── jobs/           # PG 任务队列、cron leader、汇总层构建
 │   └── common/         # 配置、遥测、错误类型
-├── bin/rivu/           # 单个二进制：collector | worker | api | migrate | all
+├── bin/rivu/           # 单个二进制：collector | worker | api | migrate | all，以及管理命令
+├── tools/              # loadgen（压测）、reconcile（边缘日志对账）、reident（重识别测试）、replay（与 Plausible 并行回放）
 ├── migrations/{postgres,clickhouse}/
 └── deploy/{compose.dev.yml,compose.lite.yml,compose.reliable.yml,Caddyfile}
 ```
@@ -432,7 +433,7 @@ partition         = SipHash-2-4(routing_secret,       site_id ‖ len‖ip ‖ l
 | 格式 | 官方 `clickhouse` crate：HTTP + RowBinary + LZ4。显式设置 `async_insert=0`，因为 26.2 起它默认开启（核实报告 #12）。库名用 `with_database` 绑定，表名只传 `events`：crate 会把 `rivu.events` 整体转义成一个标识符。开启校验时，行结构体必须包含所有没有 DEFAULT 的列（E5、E6） |
 | 去重 | 每批生成 `insert_deduplication_token = {node_id}:{batch_seq}`，重试时 token 不变。token 要逐批用 `client.insert().with_setting(…)` 传入；如果设在 `Inserter` 上，自动切出的多个批次会共用同一个 token，彼此误判为重复（#13）。`events` 和 `sessions` 都要开启 `non_replicated_deduplication_window`。一批跨两个月的事件会按月分区拆成两个 block，ClickHouse 给每个 block 派生确定的子 token，重试时拆分结果不变，所以仍然幂等；单批行数上限取 `max_insert_block_size`（默认 1048449）以下（#1） |
 | 失败 | 指数退避重试，从 0.5 s 增加到 30 s，最长持续 5 分钟，期间这一批一直留在内存。channel 满了就回 `503`，并计入 `dropped_overloaded`；这些事件已经推进了会话状态（§4.6 失败语义）。Plausible 是插入失败就让进程崩溃并丢弃这一批（R02 §5.3） |
-| 可见性 | flush 间隔不超过 1 s，加上插入约 0.1–0.5 s，事件可见时间 p95 < 2 s。v1 的目标是 < 5 s |
+| 可见性 | flush 间隔不超过 1 s，加上插入约 0.1–0.5 s，事件可见时间 p95 < 2 s |
 | 关停 | 先停止接收新请求（Caddy 用 `lb_try_duration` 把请求排队），排空 channel，flush，再写会话快照 |
 | 保证 | 至多一次，损失有上界：崩溃时丢失 channel 中的数据和正在写的那一批，约等于几秒的流量，都会计入指标 |
 
@@ -551,7 +552,6 @@ SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1, non_replicated_dedup
 
 - 排序键沿用 Plausible 的 `(site_id, 日期, name, user_id, ts)`（R02 §8.3）：所有查询都先限定站点和日期；`name` 用于按目标过滤和排除 engagement 事件；`visitor_id` 让 `SAMPLE` 和 `uniq` 更友好。主键去掉末尾的 `ts`，稀疏索引更小。
 - 暂不使用 `SAMPLE` 采样（§10 Q6），大站的长时间范围由日汇总层回答（§6.4）。`SAMPLE BY visitor_id` 仍保留在 DDL 里，将来要采样时不用改表。`sessions` 同理（它的采样键是 `session_id`）。
-- 不再把 v1 的 `site_day` 放进排序键（D4）。
 - 会话属性已经盖章到事件上，且在会话内恒定，所以 `visit:source`、`visit:channel`、`visit:referrer`、`visit:utm_*`、`visit:country`、`visit:region`、`visit:city`、`visit:device`、`visit:browser(_version)`、`visit:os(_version)` 的过滤和分组可以直接用 `events` 的盖章列，不需要 JOIN。**入口页除外**：`entry_pathname` 在会话的第一个 pageview 之前是空的（会话可以由自定义事件开启，此前盖章的行永远保持空），所以入口页的维度与过滤一律从 `sessions`（`entry_page` 聚合状态）取，不用 `events.entry_pathname`。退出页和会话聚合值（例如停留时长）同样要关联 `sessions`。Plausible 的入口页过滤也要 JOIN（R03 §3.4）。查询引擎不读 `events.entry_pathname`。
 - `props` 用 `Map(LowCardinality(String), String)`。每个事件最多 30 个键，`props['k']` 的线性查找代价可以接受；只读键或只读值时，可以用 `props.keys`、`props.values` 子列。常用属性可以提升为独立列。`JSON` 类型从 25.3 起可用于生产，但属性集合有上限时，Map 更简单（#15）。
 
@@ -693,7 +693,7 @@ TTL minute + INTERVAL 90 DAY DELETE;
 2. 存放导入数据，例如 Plausible 导出的 CSV，它天然对应这些表，迁移路径因此很直接（P4）；
 3. 作为大站长时间范围的加速层（§6.4）。
 
-**访客数跨天直接求和**：访客 ID 每个本地日轮换，而事件保留自己当天的 `visitor_id`（盖章不改写，§4.6、§10 Q9），所以原始层任意范围的 `uniq(visitor_id)` 严格等于各本地日去重访客数之和（R03 §12.2 #16、v1 第四节），与日汇总层逐日相加一致。日汇总层只存每日去重的访客数，不需要 HLL 状态。两层都排除 engagement，并用同一个 `uniq`，日汇总层存的就是按同样方法算出的每日值（§6.5、§10 Q10、Q17）。
+**访客数跨天直接求和**：访客 ID 每个本地日轮换，而事件保留自己当天的 `visitor_id`（盖章不改写，§4.6、§10 Q9），所以原始层任意范围的 `uniq(visitor_id)` 严格等于各本地日去重访客数之和（R03 §12.2 #16），与日汇总层逐日相加一致。日汇总层只存每日去重的访客数，不需要 HLL 状态。两层都排除 engagement，并用同一个 `uniq`，日汇总层存的就是按同样方法算出的每日值（§6.5、§10 Q10、Q17）。
 
 ### 5.6 删除与保留
 
@@ -730,7 +730,7 @@ TTL minute + INTERVAL 90 DAY DELETE;
 - 不开 CORS：Bearer key 不应放进浏览器。
 - `GET /api/v1/query/schema.json` 不鉴权、不限流，`Cache-Control: public, max-age=3600`，强 ETag，支持 `If-None-Match` 返回 304。
 
-v1 的 `overview`、`timeseries`、`breakdown`、`goals` 改为看板中的查询预设，不再是服务端端点。DSL 只允许白名单内的结构，并不是任意 SQL，所以 v1「不让前端生成任意 SQL」的初衷仍然成立。Plausible 自己也把内部 API 收敛到了一个 `query` 端点（R03 §1.1）。
+没有按报表划分的服务端端点（概览、趋势、分组、目标）：看板里的每个报表都是一个 QuerySpec。DSL 只允许白名单内的结构，不是任意 SQL，前端不能生成任意 SQL。Plausible 自己也把内部 API 收敛到了一个 `query` 端点（R03 §1.1）。
 
 ### 6.2 `QuerySpec`
 
@@ -926,9 +926,9 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 
 ### 6.9 结果缓存
 
-- 使用 moka。key 为以下内容的哈希：规范化后的 `ResolvedQuery`、`site.config_version`、`site.data_version`，以及时间桶。时间桶的长度按 v1 的 TTL 表：实时 3 s，当日 10 s，近 7 天 60 s，历史范围 10 min。
+- 使用 moka。key 为以下内容的哈希：规范化后的 `ResolvedQuery`、`site.config_version`、`site.data_version`，以及时间桶。时间桶的长度：实时 3 s，当日 10 s，近 7 天 60 s，历史范围 10 min。
 - 站点配置（目标、时区）变化时，`config_version` 加一（结果缓存尚未实现：目标与时区现在每次查询现读，没有要失效的东西）。删除数据、重建汇总层时，`data_version` 加一，并通过 NOTIFY 广播。
-- Plausible 完全没有结果缓存（R03 §11），这是 Rivu 在 v1 基础上新增的优化。多节点 api 部署时，先接受各节点各自缓存；确实出现不一致问题后再引入 Valkey，与 v1 一致。
+- Plausible 完全没有结果缓存（R03 §11）。多节点 api 部署时，先接受各节点各自缓存；确实出现不一致问题后再引入 Valkey。
 
 ### 6.10 维度可信度
 
@@ -966,17 +966,36 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 | 写入 | 5000 事件/s 约等于每秒 1 次 INSERT、每次 5000 行；RowBinary 约 2 MB/s | §4.7 |
 | collector CPU | 每个事件 ≤50 µs（JSON 解析约 5 µs，UA 缓存命中约 1 µs、未命中 50–200 µs，地理查询约 2 µs，SipHash ×3 可忽略），5000 事件/s 约 0.25 核。UA 的实测（Windows，release，单线程，690 条 uap-core 样本）：缓存命中均值约 150 ns，未命中均值约 22 µs（p99 约 130–180 µs），都在预算内；来源与渠道 `classify` 约 143 ns/次；`UaParser::embedded()`（解析 222 KB YAML、编译全部正则）约 130 ms，只在启动时一次 | 需压测（并发与 Linux 数字未测；`docs/research/enrich-ua.md` §9、`enrich-source.md` §7.4） |
 | GeoIP 内存 | 库读入内存，每个加载库的进程各占一份：City 约 121 MiB，Country 约 8 MiB；热加载期间新旧并存，刷新校验时再临时读一份。UA 缓存键上界约 50 MB（§4.3）。内存紧张的部署选 DB-IP country | §4.3、§10 Q25 |
-| 事件可见 | p95 < 2 s（Lite），< 2.5 s（Reliable），v1 目标 5 s | §4.7、§4.8 |
+| 事件可见 | p95 < 2 s（Lite），< 2.5 s（Reliable） | §4.7、§4.8 |
 | 会话内存 | 常态几十 MB；上限 `max_sessions` 200 万 × 约 350 B（含平均不到 1 个别名 key）≈ 700 MB。理论最坏是每个会话 8 个 key、约 650 B，合计约 1.3 GB，实际不会出现，因为多个别名需要会话跨多个午夜 | §4.6 |
-| 磁盘 | 按 v1 估算的每事件 60–150 B（需实测），`sessions` 约再加 30–50%，保留 731 天。日均 1000 万事件：7.31 十亿事件，事件表约 0.44–1.1 TB，加 `sessions` 后约 0.6–1.6 TB，超出 v1 单机 500 GB 的参考配置：这个规模应把 `RIVU_RETENTION_DAYS` 调低到 180 天（约 0.14–0.4 TB）或扩容磁盘。日均 100 万事件：约 60–165 GB。按月分区整块删除，实际占用最多再多约一个月（§5.6） | v1 第七节 |
+| 磁盘 | 每事件估算 60–150 B（压缩后，需实测），`sessions` 约再加 30–50%，保留 731 天。日均 1000 万事件：7.31 十亿事件，事件表约 0.44–1.1 TB，加 `sessions` 后约 0.6–1.6 TB，超出单机参考配置（§7.1）的 500 GB：这个规模应把 `RIVU_RETENTION_DAYS` 调低到 180 天（约 0.14–0.4 TB）或扩容磁盘。日均 100 万事件：约 60–165 GB。按月分区整块删除，实际占用最多再多约一个月（§5.6） | §7.1 |
 | 查询 | 中小站：原始层 30 天约几百万行，几十 ms。大站（每天 200 万事件）30 天约 6000 万行：已结束的天走日汇总层，今天走原始层，目标 p95 < 300 ms | §6.4 |
 
-压测目标沿用 v1：持续 1000 事件/s，峰值 5000 事件/s，同时有并发看板查询。需要观察以下指标：
+压测目标：持续 1000 事件/s，峰值 5000 事件/s，同时有并发看板查询。需要观察以下指标：
 
 - ClickHouse 的 `parts` 数、merge 积压、插入延迟；
 - 查询 p95，未命中缓存和命中缓存分开统计；
 - 会话数、channel 深度；
 - JetStream 积压（Reliable）。
+
+### 7.1 流量假设与参考部署
+
+目标规模是多站点、每天 100 万到 1000 万事件。按 20 倍峰值做容量规划（这是规划假设，不是对流量形态的预测）：
+
+| 每日事件 | 平均写入 | 20 倍峰值 |
+|---|---|---|
+| 100 万 | 12/s | 240/s |
+| 500 万 | 58/s | 1160/s |
+| 1000 万 | 116/s | 2320/s |
+
+这个规模的瓶颈不是 HTTP QPS，而是高峰写入与复杂查询争抢 CPU、内存和磁盘，所以压测同时跑写入和看板查询。
+
+| 部署 | 配置起点 | 组件 |
+|---|---|---|
+| 单机（默认） | 8 vCPU / 32 GB / 500 GB NVMe | 全部组件，`docker compose` 一条命令完成初始化、迁移、启动与健康检查 |
+| 两机（查询压力明显增长时） | 应用节点 4 vCPU / 8 GB；分析节点 8 vCPU / 32 GB / 500 GB NVMe | 应用节点：Caddy、rivu、NATS、PostgreSQL；分析节点：ClickHouse |
+
+两机部署只是资源隔离，不是高可用：要容忍整个节点宕机，还需要 PostgreSQL 故障切换、JetStream 副本和 ClickHouse 复制。配置是规划起点，不是性能保证，要用真实事件的压缩率、保留期和查询并发验证。
 
 ---
 
@@ -987,14 +1006,14 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 | 无持久标识 | 不读写 Cookie；tracker 不写任何存储，唯一的读取是站点所有者手动设置的 `localStorage.rivu_ignore`，只读，不用于标识（§10 Q3）；访客 ID 按站点本地日轮换，盐 2 天后删除，跨天无法关联同一个人（会话连续的情形见下一行） |
 | 跨天连续性 | 事件表里没有跨天可关联的 ID：每个事件只带自己本地日的 `visitor_id`，盐 2 天后删除。跨天只剩 `session_id` 能把同一会话的事件串起来，前提是活动间隔始终不超过 30 min，且最长 7 天。别名 key 只存在于内存和关停快照，不落库；`sessions.last_visitor_id` 只是会话最后一个事件的当天 ID，无法关联到前一天（§4.6、§5.3、§10 Q9） |
 | 数据最小化 | IP 和 UA 只在内存中短暂使用，不进入 ClickHouse、JetStream、日志和错误上报；query 参数只保留 UTM 和 click id 参数名；props 有长度限制，可选白名单；地理精度可按站点设为国家、地区或城市 |
-| `site_key` 不是密钥 | 它是公开的，只用来路由。真实性靠 hostname 白名单、限流和机器人过滤，只能提高门槛，不能保证每个事件都真实（与 v1 相同） |
+| `site_key` 不是密钥 | 它是公开的，只用来路由。真实性靠 hostname 白名单、限流和机器人过滤，只能提高门槛，不能保证每个事件都真实 |
 | 租户隔离 | `TenantScope`、服务端参数、只读账号、按租户的超时和并发上限（§6.8） |
 | 可信代理 | 只信任 `RIVU_TRUSTED_PROXIES` 中的地址设置的转发头（§4.2 第 2 步） |
 | 删除 | 删除站点和重置统计都会真正删除 ClickHouse 中的数据（§5.6） |
 
 ---
 
-## 9. 路线图（修订 v1 第十节）
+## 9. 路线图
 
 | 阶段 | 交付 | 验收 |
 |---|---|---|
@@ -1006,21 +1025,21 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 
 ---
 
-## 10. 已决问题（2026-10-22）
+## 10. 已决问题
 
-Q1–Q8 于 2026-10-22 定案；Q9–Q18 是 P1 动工前给指标口径写 brief 时发现的文档间冲突（见 [`../brief-p1.md`](../brief-p1.md)），同日采纳建议后定案。Q19–Q28 于 2026-10-23 定案，来自三份富化研究（[`enrich-ua.md`](../research/enrich-ua.md)、[`enrich-geo.md`](../research/enrich-geo.md)、[`enrich-source.md`](../research/enrich-source.md)）：研究把 §4.4 的规范落成代码并用外部数据实测，发现的事实与偏离在此定案。Q29 于 2026-10-24 定案（看板与登录限流口径）。决定都已写入各节正文。
+每条决定都已写入相应正文，这里只做索引。Q19–Q28 来自三份富化研究（[`enrich-ua.md`](../research/enrich-ua.md)、[`enrich-geo.md`](../research/enrich-geo.md)、[`enrich-source.md`](../research/enrich-source.md)），研究用外部数据实测了 §4.4 的规范。
 
 | # | 问题 | 决定 | 影响 |
 |---|---|---|---|
-| Q1 | 原始数据默认保留期 | 默认 731 天（连续两个自然年，含一个闰年）。日均 1000 万事件的部署建议把 `RIVU_RETENTION_DAYS` 调低到 180 天 | D12；§5.1 表；§5.2、§5.3 的 TTL 改为 `INTERVAL 731 DAY`；§7 容量重算；`RIVU_RETENTION_DAYS` 默认 731 |
+| Q1 | 原始数据默认保留期 | 默认 731 天（连续两个自然年，含一个闰年）。日均 1000 万事件的部署建议把 `RIVU_RETENTION_DAYS` 调低到 180 天 | D12；§5.1 表；§5.2、§5.3 的 TTL（`INTERVAL 731 DAY`）；§7 容量；`RIVU_RETENTION_DAYS` 默认 731 |
 | Q2 | `visit_duration` 是否计入 engagement 时间 | 不计入，与 Plausible 和导入数据一致；另设独立指标 `engaged_duration` | §5.3 派生指标；§5.5 `rollup_site_day` 增列；§6.2 指标列表；§6.4 归属；§6.5 定义 |
-| Q3 | tracker 是否读取 `localStorage.rivu_ignore`（站点所有者排除自己的访问） | 只读：tracker 永不写入，也不用于标识或上报。v1 的「不使用 localStorage」作废 | `tracker-and-protocol.md` §1.1、§4.7、§10.2；§8 |
+| Q3 | tracker 是否读取 `localStorage.rivu_ignore`（站点所有者排除自己的访问） | 只读：tracker 永不写入，也不用于标识或上报 | `tracker-and-protocol.md` §1.1、§4.7；§8 |
 | Q4 | 是否提供 Plausible 协议兼容端点 | P4 提供 `POST /api/plausible/event`，便于迁移；Plausible 的 tracker 是 MIT 许可 | §9 的 P4；`tracker-and-protocol.md` §9 |
 | Q5 | UA 库和 GeoIP 库的选型与许可 | UA 用 uap-core（Apache-2.0）。GeoIP 默认 DB-IP Lite（CC BY 4.0，必须署名）；继续支持 MaxMind GeoLite2；新增自定义 mmdb 直链 `RIVU_GEOIP_DB_URL`。优先级：自定义 URL > MaxMind key > DB-IP | §4.4（来源、更新、校验、署名）；看板必须在显示位置数据处署名，查询 API 返回当前库的署名；`platform-and-ops.md` 的 `geoip_refresh` 任务、配置变量、指标 |
 | Q6 | 是否做 `SAMPLE` 采样 | 暂不做，用日汇总层的自动分层代替；DDL 里保留 `SAMPLE BY visitor_id` | §2.6；§5.2；§6.4 |
-| Q7 | 会话最长时长 | 7 天（原为 24 小时）。续期条件：`ts − last_seen_at ≤ 30 min` 且 `ts − started_at ≤ 7 d`。跨午夜靠会话的别名 key，最多 8 个 | §4.6（规则、并发、内存、预热、失败语义）；§4.5；§6.5 `visits` 回溯 7 天；§7 内存；§8 |
+| Q7 | 会话最长时长 | 7 天。续期条件：`ts − last_seen_at ≤ 30 min` 且 `ts − started_at ≤ 7 d`。跨午夜靠会话的别名 key，最多 8 个 | §4.6（规则、并发、内存、预热、失败语义）；§4.5；§6.5 `visits` 回溯 7 天；§7 内存；§8 |
 | Q8 | Reliable 的分区数 P | P = 32，安装时固定；以后要改，必须先排空队列再迁移 | §4.8；`platform-and-ops.md` 的 `RIVU_PARTITIONS` |
-| Q9 | 盖章是否改写 `visitor_id` | 不改写：事件保留自己当天的 `visitor_id`，会话只靠 `session_id` 串联。`sessions` 排序键去掉 `visitor_id`，改为 `(site_id, start_date, session_id)`，`SAMPLE BY session_id`；新增聚合列 `last_visitor_id`（`argMax(visitor_id, ts)`，会话最后一个事件的当天 ID）取代 `visitor_id`。任意范围的 `uniq(visitor_id)` 因此严格等于各本地日访客数之和 | §4.6（盖章、预热、失败语义）；§5.2、§5.3（DDL、MV、两级聚合）；§5.5 访客数跨天求和；§6.4 `visitors` 只从 `events` 计算；§6.5；§8 跨天连续性 |
+| Q9 | 盖章是否改写 `visitor_id` | 不改写：事件保留自己当天的 `visitor_id`，会话只靠 `session_id` 串联。`sessions` 的排序键是 `(site_id, start_date, session_id)`，`SAMPLE BY session_id`，不含 `visitor_id`；聚合列 `last_visitor_id`（`argMax(visitor_id, ts)`）是会话最后一个事件的当天 ID。任意范围的 `uniq(visitor_id)` 因此严格等于各本地日访客数之和 | §4.6（盖章、预热、失败语义）；§5.2、§5.3（DDL、MV、两级聚合）；§5.5 访客数跨天求和；§6.4 `visitors` 只从 `events` 计算；§6.5；§8 跨天连续性 |
 | Q10 | 原始层近似去重、汇总层精确去重 | 两层用同一个 `uniq`，日汇总层存的就是按同样方法算出的每日值；容差写进指标口径文档，实测误差见 §6.5 | §5.5；§6.5 |
 | Q11 | `site_key` 的格式 | 12 位 base32 小写（`^[a-z2-7]{12}$`）。PG 的 CHECK、线协议、站点脚本路径与 API key 的 scope 用同一条规则（`rivu_domain::is_site_key`）；格式合法但不存在的 key 落到 `unknown_site` | `tracker-and-protocol.md` §5.1 |
 | Q12 | hostname 白名单为空时怎么处理 | fail-closed：全部丢弃（`hostname_not_allowed`）；建站时自动加入主域名 | §4.2 第 3 步；`platform-and-ops.md` §3.3；`tracker-and-protocol.md` §7 |
@@ -1040,7 +1059,7 @@ Q1–Q8 于 2026-10-22 定案；Q9–Q18 是 P1 动工前给指标口径写 brie
 | Q26 | 国家码占位值与非公网地址 | 国家码只接受两个 ASCII 字母；`ZZ`、`XX` 与 `A1` `A2` `T1` 等占位码视为未知（与 Plausible 一致）；没有国家时区域与城市也为空。区域码为 `<国家>-<第一级子区划代码>`，子区划部分 1–3 位字母数字，只取第一级。私有、回环、链路本地、CGNAT（100.64/10）、文档、基准测试、组播、保留（240/4），以及 IPv6 的 ULA、链路本地、文档、丢弃、IPv4 兼容地址，不查库，直接返回空值；IPv4-mapped IPv6 先转 IPv4 | §4.2 第 6 步；`docs/research/enrich-geo.md` §6 |
 | Q27 | MaxMind 下载接口与认证 | 只实现现行接口：`https://download.maxmind.com/geoip/databases/<edition>/download?suffix=tar.gz`，HTTP Basic（Account ID + license key），返回 `tar.gz`，要解 tar 取 `.mmdb`。旧的 `/app/geoip_download?license_key=` 接口仍在，但只认 key、官方文档已不提，不实现。`RIVU_MAXMIND_ACCOUNT_ID` 在设置 license key 时必填，配置校验报错但不回显 key。Basic 认证只发给 API 域名，跨源重定向不带 `Authorization`。带凭据的真实下载、重定向目标对条件请求的反应**没有验证**（没有账号）：实现不依赖这些，有校验头就带，服务器忽略就整文件下载，再按解压后 mmdb 的 SHA-256 与 meta 比较，相同不替换。拿到账号后验证一次；若条件 GET 不被支持或占用每日 30 次额度，改为先 `HEAD` 比较 `Last-Modified`（`HEAD` 不计额度） | §4.4 优先级表第 2 行；`platform-and-ops.md` §7 `RIVU_MAXMIND_*`；`docs/research/enrich-geo.md` §3、§7 第 3、9 条 |
 | Q28 | 没有 meta 的库文件要不要刷新 | 看配置：默认来源（DB-IP Lite）时直接使用、**不自动刷新**，否则 24 小时后会被 DB-IP 的库覆盖；配置了 `RIVU_GEOIP_DB_URL` 或 `RIVU_MAXMIND_LICENSE_KEY` 时视为没有本地副本，立即下载，新库校验通过前旧文件继续用。meta 的 `build_epoch` 与库不一致时 meta 作废，署名退回手工署名。有本地副本时，第一次条件 GET 安排在 meta 最近检查时间加一个（带抖动的）刷新周期，已过期则立即 | §4.4「文件与元数据」「生命周期」；`platform-and-ops.md` §6 `geoip_refresh`；`docs/research/enrich-geo.md` §6、§7 第 4、5 条 |
-| Q29 | 看板与登录限流口径 | 2026-10-24 定案。（1）公开看板与共享链接的限流默认改为 300 次/分钟、突发 60（`RIVU_PUBLIC_VIEW_RATE_PER_MIN`、`RIVU_PUBLIC_VIEW_BURST`，可配置）：一个看板页加载就并发约 10 个查询（概览、时间序列、各维度分解），再加实时轮询，原 30 次/分钟、突发 10 第一次打开就会 429。（2）登录不再有单纯按账号的阻断桶：任何人不停用受害者的邮箱登录就能让真用户一直 429（锁号）。改为每 IP 20 次/60 秒（防喷洒）加每 `(账号, IP)` 5 次/60 秒（防同一来源爆破），再加**只告警不阻断**的失败统计：同一账号 1 小时内失败达 50 次、全实例每分钟失败达 300 次时 `warn` 并累加 `rivu_auth_login_alerts_total{kind}`，同一窗口只告警一次。代价：分布式爆破（很多 IP 各试几次）不再被挡住，由 Argon2 成本、告警与后续的 TOTP 兜底 | `platform-and-ops.md` §4.4 限流表、§5 登录防护、§7 配置表、§10 指标；`bin/rivu/src/dash_api.rs` |
+| Q29 | 看板与登录限流口径 | （1）公开看板与共享链接默认 300 次/分钟、突发 60（`RIVU_PUBLIC_VIEW_RATE_PER_MIN`、`RIVU_PUBLIC_VIEW_BURST`，可配置）：一个看板页加载就并发约 10 个查询（概览、时间序列、各维度分解），再加实时轮询，30 次/分钟、突发 10 这一级的限额第一次打开就会 429。（2）登录没有单纯按账号的阻断桶：那样任何人不停用受害者的邮箱登录就能让真用户一直 429（锁号）。限流是每 IP 20 次/60 秒（防喷洒）加每 `(账号, IP)` 5 次/60 秒（防同一来源爆破），再加**只告警不阻断**的失败统计：同一账号 1 小时内失败达 50 次、全实例每分钟失败达 300 次时 `warn` 并累加 `rivu_auth_login_alerts_total{kind}`，同一窗口只告警一次。代价：分布式爆破（很多 IP 各试几次）不再被挡住，由 Argon2 成本、告警与后续的 TOTP 兜底 | `platform-and-ops.md` §4.4 限流表、§5 登录防护、§7 配置表、§10 指标；`bin/rivu/src/dash_api.rs` |
 
 ---
 

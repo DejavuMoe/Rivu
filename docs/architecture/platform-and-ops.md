@@ -1,6 +1,6 @@
 # Rivu 平台、业务数据与运维设计
 
-> 状态：设计稿 v0.1（2026-10-21）。范围：进程与部署、PostgreSQL 业务模型、权限与认证、后台任务、配置、数据库账号、迁移、可观测性、备份与升级。
+> 范围：进程与部署、PostgreSQL 业务模型、权限与认证、后台任务、配置、数据库账号、迁移、可观测性、备份与升级。
 > 不在本文：ClickHouse 统计表结构、采集管线、会话分配、查询引擎，统一见 `system-design.md`。
 > 引用约定：`04§1.2` 指 `docs/research/plausible/04-platform-and-ops.md` 第 1.2 节；`04§0#7` 指速览表第 7 条；`04§9.5` 指「对 Rivu 的启示」第 5 条。只借鉴设计思路，不复制 Plausible（AGPL）代码。
 
@@ -358,14 +358,14 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 
 | 任务 `kind` | 触发 | 频率 | 幂等性 |
 |---|---|---|---|
-| `salts_rotate` | 进程启动补跑 + 定时 | 启动时一次，之后每小时一次（P1 实现为进程内定时器，没有 cron；原定每日 00:05 UTC，改为每小时是因为盐只需「提前一天存在」，不必卡在固定时刻） | 确保存在 `today-1`、`today`、`today+1` 的盐（`ON CONFLICT DO NOTHING`；UTC 以西站点的本地日期可能还是 `today-1`），删除 `day < today-2`。依据：站点本地日期相对 UTC 日期在 −1 到 +1 天内，多留 1 天覆盖迟到事件 |
+| `salts_rotate` | 进程启动补跑 + 定时 | 启动时一次，之后每小时一次（进程内定时器，不经任务队列；盐只需「提前一天存在」，不必卡在固定时刻） | 确保存在 `today-1`、`today`、`today+1` 的盐（`ON CONFLICT DO NOTHING`；UTC 以西站点的本地日期可能还是 `today-1`），删除 `day < today-2`。依据：站点本地日期相对 UTC 日期在 −1 到 +1 天内，多留 1 天覆盖迟到事件 |
 | `auth_sessions_cleanup` | cron | 每小时 | 删除过期/撤销行，可重复 |
 | `invitations_expire` | cron | 每日 | 删除过期邀请（04§3.2 `CleanInvitations`） |
-| `ch_delete_batch` | 进程启动 + 定时；`rivu all` 里日期范围删除请求写入后立即唤醒 | 每 `RIVU_STATS_DELETE_INTERVAL_SECS`（默认 5 分钟） | P1 实现为 worker / all 的进程内定时器（`crates/jobs/src/stats_delete.rs`），不经任务队列。领取 `pending_stats_deletions`（`status IN ('pending','running') AND not_before <= now()`，`FOR UPDATE SKIP LOCKED`），置 `running`、`attempts+1`，并把 `not_before` 推后 1 小时作为租约（每完成一个分区续租），多进程不会同时处理同一条，崩溃后租约到期由任意进程续跑。用 `rivu_maintainer` 账号对 `events`、`sessions`、`ingest_counters` 逐分区执行 `DELETE FROM t IN PARTITION p WHERE site_id = … [AND 时间条件]`：`scope='site'` 删除该站点全部分区（分区按 `site_id` 现查）；`scope='date_range'` 的日期是站点本地日期，按站点当前时区换算成 UTC 半开区间（与查询引擎的整日区间同一套换算），`events` 按 `ts`、`ingest_counters` 按 `minute`，`sessions` 删除**开始时间**落在区间内的会话（跨边界的会话按开始时间归属）。完成的分区记入 `partitions_done`（`表:YYYYMM`），续跑时跳过；重复删除无副作用。全部完成置 `done` + `completed_at`；失败记 `last_error`，保持 `running` 并退避（5 分钟起翻倍、上限 6 小时），第 8 次失败置 `failed`。指标 `rivu_stats_deletions_total{scope,result}`、`rivu_stats_delete_partitions_total{table}`。Plausible 为每周批处理（04§3.2 `ClickhouseCleanSites`），Rivu 缩短周期以满足删除请求时效 |
+| `ch_delete_batch` | 进程启动 + 定时；`rivu all` 里日期范围删除请求写入后立即唤醒 | 每 `RIVU_STATS_DELETE_INTERVAL_SECS`（默认 5 分钟） | worker / all 的进程内定时器（`crates/jobs/src/stats_delete.rs`），不经任务队列。领取 `pending_stats_deletions`（`status IN ('pending','running') AND not_before <= now()`，`FOR UPDATE SKIP LOCKED`），置 `running`、`attempts+1`，并把 `not_before` 推后 1 小时作为租约（每完成一个分区续租），多进程不会同时处理同一条，崩溃后租约到期由任意进程续跑。用 `rivu_maintainer` 账号对 `events`、`sessions`、`ingest_counters` 逐分区执行 `DELETE FROM t IN PARTITION p WHERE site_id = … [AND 时间条件]`：`scope='site'` 删除该站点全部分区（分区按 `site_id` 现查）；`scope='date_range'` 的日期是站点本地日期，按站点当前时区换算成 UTC 半开区间（与查询引擎的整日区间同一套换算），`events` 按 `ts`、`ingest_counters` 按 `minute`，`sessions` 删除**开始时间**落在区间内的会话（跨边界的会话按开始时间归属）。完成的分区记入 `partitions_done`（`表:YYYYMM`），续跑时跳过；重复删除无副作用。全部完成置 `done` + `completed_at`；失败记 `last_error`，保持 `running` 并退避（5 分钟起翻倍、上限 6 小时），第 8 次失败置 `failed`。指标 `rivu_stats_deletions_total{scope,result}`、`rivu_stats_delete_partitions_total{table}`。Plausible 为每周批处理（04§3.2 `ClickhouseCleanSites`），Rivu 缩短周期以满足删除请求时效 |
 | `rollup_today` | cron | 每小时 | 重算「今天」的 rollup，按 `(site_id, site_day)` 整体替换 |
 | `rollup_finalize` | cron | 每小时 | 站点本地日结束且过宽限（默认 2h）后重算并定稿；删除请求会使已定稿日期重新入队。定稿状态的记录位置见 `system-design.md` |
-| `site_delete_schedule` | 不单独存在 | — | 原设计为每小时为宽限期已过的站点插入意图；实现改为删除站点的同一事务里直接插入 `scope='site'` 意图，`not_before = 删除时刻 + RIVU_SITE_RESTORE_DAYS`，到期由 `ch_delete_batch` 领取；恢复站点把意图置为 `cancelled`。部分唯一索引保证一个站点只有一条未取消的站点意图 |
-| `geoip_refresh` | 进程启动（无本地副本时立即执行）+ 定时 | 每 `RIVU_GEOIP_REFRESH_INTERVAL`（默认 24h；`0` 表示不定期刷新）。有本地副本时，第一次检查在 meta 最近检查时间加一个周期（带抖动），已过期则立即 | 来源按优先级选择：`RIVU_GEOIP_DB_URL` > `RIVU_MAXMIND_LICENSE_KEY` > DB-IP Lite（默认），所以默认配置下也会运行。条件 GET（ETag / Last-Modified）；服务器没有校验头就整文件下载，按解压后 mmdb 的 SHA-256 判断是否替换；临时文件校验后原子 rename；失败保留上一份有效副本并退避重试。没有 meta 的文件：默认来源不刷新，配置了 URL 或 key 则立即下载（`system-design.md` §10 Q28）。P1 实现为进程内定时器（同 `salts_rotate`），没有任务队列，多个 worker 同时运行时各自下载：临时文件名带进程号，不会互相破坏，替换是原子的，后到者因 SHA-256 相同跳过替换；接入 PG 任务队列后用 `unique_key = geoip:{slot}`（slot = `floor(now / 间隔)`）去重。collector 每小时检查 mtime，把库读入内存并热加载（§10 Q25）。细节见 `system-design.md` §4.4（04§4.2 `MAXMIND_*`；Plausible 在构建时下载库） |
+| `site_delete_schedule` | 无 | — | 不需要单独的任务：删除站点的同一事务里直接插入 `scope='site'` 意图，`not_before = 删除时刻 + RIVU_SITE_RESTORE_DAYS`，到期由 `ch_delete_batch` 领取；恢复站点把意图置为 `cancelled`。部分唯一索引保证一个站点只有一条未取消的站点意图 |
+| `geoip_refresh` | 进程启动（无本地副本时立即执行）+ 定时 | 每 `RIVU_GEOIP_REFRESH_INTERVAL`（默认 24h；`0` 表示不定期刷新）。有本地副本时，第一次检查在 meta 最近检查时间加一个周期（带抖动），已过期则立即 | 来源按优先级选择：`RIVU_GEOIP_DB_URL` > `RIVU_MAXMIND_LICENSE_KEY` > DB-IP Lite（默认），所以默认配置下也会运行。条件 GET（ETag / Last-Modified）；服务器没有校验头就整文件下载，按解压后 mmdb 的 SHA-256 判断是否替换；临时文件校验后原子 rename；失败保留上一份有效副本并退避重试。没有 meta 的文件：默认来源不刷新，配置了 URL 或 key 则立即下载（`system-design.md` §10 Q28）。进程内定时器（同 `salts_rotate`），不经任务队列，多个 worker 同时运行时各自下载：临时文件名带进程号，不会互相破坏，替换是原子的，后到者因 SHA-256 相同跳过替换；接入 PG 任务队列后用 `unique_key = geoip:{slot}`（slot = `floor(now / 间隔)`）去重。collector 每小时检查 mtime，把库读入内存并热加载（§10 Q25）。细节见 `system-design.md` §4.4（04§4.2 `MAXMIND_*`；Plausible 在构建时下载库） |
 | `sources_update` | cron | 每周 | 只更新垃圾 referrer 名单，原子替换。来源分类库（Matomo 数据加补充表）和 UA 规则库（uap-core）在编译期嵌入，随版本升级，不在线更新、不联网（`system-design.md` §4.4、§10 Q20） |
 | `import_run` | 用户触发 | 按需 | `unique_key = import:{id}`，`max_attempts = 3`；永久失败不重试（04§3.2 `ImportAnalytics`、04§8） |
 | `export_build` | 用户触发 | 按需 | `unique_key = export:{id}`，超时 15 分钟；ClickHouse 流式输出，S3 multipart 或本地临时文件后原子移动（04§8、04§9.10）；完成后由独立任务 `export_notify` 发邮件（`max_attempts = 5`，04§3.2） |
@@ -402,7 +402,7 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 | `RIVU_VISIT_SESSION_TIMEOUT` | `30m` | 访问会话超时（区别于登录会话）。会话最长 7 天，固定不可配置：查询回溯 7 天依赖它（`system-design.md` §4.6、§6.5） |
 | `RIVU_PARTITIONS` | `32`（仅 reliable） | JetStream 分区数 P，只在首次创建流时读取，之后以流元数据里记录的值为准，不一致则拒绝启动；安装后不可改（`system-design.md` §4.8） |
 | `RIVU_RETENTION_DAYS` | `731` | 原始数据保留上限（连续两个自然年，含一个闰年），站点可在其内调小。ClickHouse 表 TTL 同为 731 天，调高需要迁移；日均千万级事件的部署建议调低（`system-design.md` §7） |
-| `RIVU_SITE_RESTORE_DAYS` | `7`；`0`–`365` | 站点删除后的恢复窗口（天）：删除时写入的站点删除意图 `not_before = 删除时刻 + 该值`，窗口内可恢复，过后 `ch_delete_batch` 清除统计数据；`0` 表示下一轮就清除（原设计名 `RIVU_SITE_DELETE_GRACE_DAYS`） |
+| `RIVU_SITE_RESTORE_DAYS` | `7`；`0`–`365` | 站点删除后的恢复窗口（天）：删除时写入的站点删除意图 `not_before = 删除时刻 + 该值`，窗口内可恢复，过后 `ch_delete_batch` 清除统计数据；`0` 表示下一轮就清除 |
 | `RIVU_STATS_DELETE_INTERVAL_SECS` | `300`；`10`–`86400` | `ch_delete_batch` 检查到期删除意图的周期（worker、all） |
 | `RIVU_PUBLIC_BASE_URL` | `http://<RIVU_LISTEN_ADDR>`（仅开发；未设置时启动打 warn，生产必须设置） | 站点脚本前缀里 `endpoint` 的来源（`tracker-and-protocol.md` §2.3 的 `public_base_url`），不取请求的 `Host` |
 | `RIVU_TRACKER_DIR` | `apps/tracker/dist` | CI 构建的 tracker 产物目录（`core.js`、`meta.json`），启动时读入内存；生产镜像应把 `dist/` 放进该目录 |
@@ -443,7 +443,7 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 | ClickHouse | `rivu_backup`（运维） | 备份脚本 | `BACKUP`、`SELECT` | 与应用凭据分离 |
 
 - ClickHouse 账号经 `users.d/*.xml` 声明，密码用 `from_env` 注入（来自 Docker secrets），profile 与 quota 同处声明。
-- **与 `log_comment` 的冲突**：`readonly=1` 默认不允许修改任何 setting，而所有查询要带 `log_comment`（第 10 节），公开链接还要调低 `max_execution_time`。方案：在 `rivu_reader` profile 中对这两项声明 `CHANGEABLE_IN_READONLY` 约束；若所选版本验证不可行，降级为 `readonly=2` 加 `MAX` 约束锁住超时与内存。P0 已在 25.8 验证：`rivu_reader` 能带 `log_comment` 查询，INSERT 被拒绝（E8）；按查询调低 `max_execution_time` 留到 P1 接入查询时验证。
+- **与 `log_comment` 的冲突**：`readonly=1` 默认不允许修改任何 setting，而所有查询要带 `log_comment`（第 10 节），公开链接还要调低 `max_execution_time`。方案：在 `rivu_reader` profile 中对这两项声明 `CHANGEABLE_IN_READONLY` 约束；若所选版本验证不可行，降级为 `readonly=2` 加 `MAX` 约束锁住超时与内存。已在 25.8 验证：`rivu_reader` 能带 `log_comment` 查询，INSERT 被拒绝（E8）；每条查询都按档位设置 `max_execution_time`，readonly 账号的集成测试覆盖了这一点。
 - Plausible 的护栏是 `readonly=1`、查询超时 15s、`max_execution_time` 20s（04§4.2），Rivu 沿用同量级并移入账号配额，由服务端强制。
 - API 档超时（`RIVU_API_QUERY_TIMEOUT_SECS`，默认 20 s）依赖每条查询显式设置 `max_execution_time`；`rivu_reader` profile 的默认值是 15 s、约束上限 20 s（`deploy/clickhouse/users.d/rivu-dev.xml`），所以档位不得超过 20 s。
 - `all` 进程持有全部应用凭据（Lite 的取舍）；Reliable 下各进程只拿各自所需。
@@ -469,7 +469,7 @@ PG 与 ClickHouse 迁移共用一个版本序列（14 位时间戳），分别�
 2. 生成规范化文本：PG 不依赖 `pg_dump`，从系统目录读 `public` 模式的表（列、约束、非约束索引、触发器）、扩展名与函数，按名字排序（NOT NULL 只写在列上，PG 18 起它也是有名字的约束，排除以免随版本变化）；ClickHouse 取库里全部表与视图的 `SHOW CREATE`，按名字排序，库名写作 `{{database}}`。
 3. 与提交的 `schema/postgres.sql`、`schema/clickhouse.sql` 比对，不一致则失败并指出第一处不同的行；`RIVU_SCHEMA_UPDATE=1 cargo test -p rivu --test schema_snapshot` 重新生成。
 4. ~~反向校验：快照加载到空库后的结构与「迁移后的库」一致~~：快照是结构的描述而不是可执行的 SQL，这一步不做；「迁移是唯一来源」由第 5 步保证。
-5. 迁移冻结：`migrations/checksums.lock` 逐行登记版本、文件与校验和，单元测试 `embedded_migrations_match_the_freeze_lock`（不需要数据库）检查登记过的迁移没有被修改、改名或删除，新迁移的版本号大于已登记的最高版本，并提示要追加的行。2026-10-27 起全部现有迁移已登记（brief-p1「发布前冻结 schema，此后只能新增迁移」），此后改结构只能新建迁移。
+5. 迁移冻结：`migrations/checksums.lock` 逐行登记版本、文件与校验和，单元测试 `embedded_migrations_match_the_freeze_lock`（不需要数据库）检查登记过的迁移没有被修改、改名或删除，新迁移的版本号大于已登记的最高版本，并提示要追加的行。改结构只能新建迁移。
 
 ## 10. 可观测性
 | 项 | 设计 |
