@@ -58,7 +58,7 @@
 //!
 //! - `rivu_api_requests_total{route,status}`：`route` 取值 `api.query`、`api.query_schema`、`api.not_found`，
 //!   401 / 403 / 429 也计入；
-//! - `rivu_query_seconds{route="api.query"}`：`execute` 的耗时（直方图，秒）；`rivu_query_errors_total{route,kind}`；
+//! - `rivu_query_seconds{route="api.query",cache}`：查询耗时（直方图，秒；`cache` = `hit` | `miss`，§6.9 结果缓存）；`rivu_query_errors_total{route,kind}`；
 //! - ClickHouse 的 `log_comment`：`{"route":"api.query","site":<id>,"org":<id>,"api_key_id":<id>,"part":..,"tier":..}`，
 //!   只含 id，不含 key 明文、邮箱、IP、过滤值。
 
@@ -80,7 +80,7 @@ use rivu_auth::{
 };
 use rivu_geo::GeoDb;
 use rivu_query::{
-    ExecOptions, GoalDef, QueryError, QueryResult, QuerySpec, SiteContext, TenantScope,
+    ExecOptions, GoalDef, QueryCache, QueryError, QueryResult, QuerySpec, SiteContext, TenantScope,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -121,6 +121,8 @@ pub struct QueryApi<S> {
     timeout_secs: u64,
     /// `RIVU_ROLLUP_MIN_ROWS`；`None` 不用日汇总层。
     rollup_min_rows: Option<u64>,
+    /// 结果缓存（进程内共用，§6.9）；`None` 不缓存。
+    cache: Option<Arc<QueryCache>>,
     clock: Clock,
 }
 
@@ -139,6 +141,7 @@ impl<S: AuthStore> QueryApi<S> {
             geo,
             timeout_secs,
             rollup_min_rows: None,
+            cache: None,
             clock: Arc::new(Timestamp::now),
         }
     }
@@ -146,6 +149,12 @@ impl<S: AuthStore> QueryApi<S> {
     /// 打开日汇总层（`RIVU_ROLLUP_MIN_ROWS`，见 [`ExecOptions::rollup_min_rows`]）。
     pub fn with_rollup(mut self, min_rows: u64) -> Self {
         self.rollup_min_rows = Some(min_rows);
+        self
+    }
+
+    /// 使用结果缓存（与看板共用同一个）。
+    pub fn with_cache(mut self, cache: Arc<QueryCache>) -> Self {
+        self.cache = Some(cache);
         self
     }
 
@@ -398,6 +407,43 @@ pub(crate) async fn read_body(req: Request, max_bytes: usize) -> Result<axum::bo
     }
 }
 
+/// 执行一条查询：先查结果缓存（§6.9），未命中再执行并写入缓存；记录耗时（按是否命中分开）与失败指标。
+pub(crate) async fn execute_cached(
+    reader: &clickhouse::Client,
+    cache: Option<&QueryCache>,
+    site: &SiteContext,
+    spec: QuerySpec,
+    opts: ExecOptions,
+    route: &'static str,
+) -> Result<QueryResult, QueryError> {
+    let started = Instant::now();
+    let key = cache.map(|c| c.key(site, &spec, opts.now));
+    if let (Some(c), Some(k)) = (cache, key)
+        && let Some(hit) = c.get(k)
+    {
+        metrics::histogram!("rivu_query_seconds", "route" => route, "cache" => "hit")
+            .record(started.elapsed().as_secs_f64());
+        return Ok(QueryResult::clone(&hit));
+    }
+    let result =
+        rivu_query::execute(reader, &TenantScope::new(site.site_id), site, spec, opts).await;
+    metrics::histogram!("rivu_query_seconds", "route" => route, "cache" => "miss")
+        .record(started.elapsed().as_secs_f64());
+    match result {
+        Ok(r) => {
+            if let (Some(c), Some(k)) = (cache, key) {
+                c.insert(k, Arc::new(r.clone()));
+            }
+            Ok(r)
+        }
+        Err(e) => {
+            metrics::counter!("rivu_query_errors_total", "route" => route, "kind" => error_kind(&e))
+                .increment(1);
+            Err(e)
+        }
+    }
+}
+
 async fn run_query<S: AuthStore>(
     api: &QueryApi<S>,
     ctx: &AuthContext,
@@ -426,22 +472,16 @@ async fn run_query<S: AuthStore>(
         .with_comment("org", ctx.org_id)
         .with_comment("api_key_id", ctx.api_key_id);
     opts.rollup_min_rows = api.rollup_min_rows;
-    let started = Instant::now();
-    let result = rivu_query::execute(
+    execute_cached(
         &api.reader,
-        &TenantScope::new(site.site_id),
+        api.cache.as_deref(),
         &site,
         spec,
         opts,
+        ROUTE_QUERY,
     )
-    .await;
-    metrics::histogram!("rivu_query_seconds", "route" => ROUTE_QUERY)
-        .record(started.elapsed().as_secs_f64());
-    result.map_err(|e| {
-        metrics::counter!("rivu_query_errors_total", "route" => ROUTE_QUERY, "kind" => error_kind(&e))
-            .increment(1);
-        Fail::Query(e)
-    })
+    .await
+    .map_err(Fail::Query)
 }
 
 async fn query<S: AuthStore>(
@@ -610,7 +650,7 @@ pub fn describe_metrics() {
     metrics::describe_histogram!(
         "rivu_query_seconds",
         metrics::Unit::Seconds,
-        "QuerySpec 执行耗时，按路由"
+        "QuerySpec 执行耗时，按路由与是否命中结果缓存（cache = hit | miss）"
     );
     metrics::describe_counter!(
         "rivu_query_errors_total",

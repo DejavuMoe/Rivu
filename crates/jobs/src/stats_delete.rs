@@ -24,6 +24,7 @@ use clickhouse::Client;
 use jiff::civil::Date;
 use jiff::tz::TimeZone;
 use jiff::{Timestamp, ToSpan};
+use rivu_query::QueryCache;
 use rivu_storage_pg::stats_deletions::{self, ClaimedDeletion};
 use sqlx::PgPool;
 use tokio::sync::{Notify, watch};
@@ -235,6 +236,15 @@ pub async fn process(pg: &PgPool, ch: &Client, intent: &ClaimedDeletion) -> Resu
 /// 一轮 `ch_delete_batch`：反复领取到期意图并执行，直到没有到期的。返回处理的意图条数。
 /// 单条失败记 `last_error` 并退避，不影响其他意图。
 pub async fn run_batch(pg: &PgPool, ch: &Client) -> Result<usize> {
+    run_batch_with_cache(pg, ch, None).await
+}
+
+/// 同 [`run_batch`]，每条意图完成后让同进程的结果缓存里那个站点的结果失效（`rivu all`）。
+pub async fn run_batch_with_cache(
+    pg: &PgPool,
+    ch: &Client,
+    cache: Option<&QueryCache>,
+) -> Result<usize> {
     let mut handled = 0;
     loop {
         let claimed = stats_deletions::claim_due(pg, CLAIM_BATCH).await?;
@@ -246,6 +256,9 @@ pub async fn run_batch(pg: &PgPool, ch: &Client) -> Result<usize> {
             let scope = intent.scope.clone();
             match process(pg, ch, intent).await {
                 Ok(partitions) => {
+                    if let Some(c) = cache {
+                        c.invalidate_site(intent.site_id);
+                    }
                     metrics::counter!("rivu_stats_deletions_total", "scope" => scope, "result" => "done")
                         .increment(1);
                     tracing::info!(
@@ -283,11 +296,13 @@ pub async fn run_batch(pg: &PgPool, ch: &Client) -> Result<usize> {
 }
 
 /// 启动 `ch_delete_batch` 的定时任务：启动后先跑一轮，之后每 `interval` 一轮，`kick` 被通知时提前跑一轮。
+/// `cache`：同进程的结果缓存（`rivu all`），删除完成后让那个站点的缓存失效。
 pub fn spawn_stats_delete(
     pg: PgPool,
     ch: Client,
     interval: Duration,
     kick: StatsDeleteKick,
+    cache: Option<Arc<QueryCache>>,
     mut stop: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -299,7 +314,7 @@ pub fn spawn_stats_delete(
                 _ = ticker.tick() => {}
                 () = kick.notified() => {}
             }
-            match run_batch(&pg, &ch).await {
+            match run_batch_with_cache(&pg, &ch, cache.as_deref()).await {
                 Ok(0) => {}
                 Ok(n) => tracing::info!(intents = n, "ch_delete_batch 完成"),
                 Err(e) => {

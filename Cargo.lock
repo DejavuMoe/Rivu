@@ -2409,6 +2409,7 @@ dependencies = [
  "clickhouse",
  "insta",
  "jiff",
+ "moka",
  "regex",
  "rivu-geo",
  "schemars",
