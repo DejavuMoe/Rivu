@@ -1,6 +1,6 @@
 //! 站点：加载（collector 的站点快照）、按 `site_key` 查找、建站（`rivu site add`）。
 //!
-//! 表结构见 `migrations/postgres/20261021100000_core_tables.sql`。
+//! 表结构见 `migrations/postgres/20261021100000_init.sql`。
 //! `rivu_app` 账号对这些表有 `SELECT/INSERT/UPDATE/DELETE`（`deploy/postgres/init/01-roles.sql` 的默认授权）。
 
 use anyhow::{Context, Result, bail};
@@ -218,7 +218,7 @@ pub async fn db_now_us(pool: &PgPool) -> Result<i64> {
         .context("读取 PG 时间失败")
 }
 
-/// 站点配置变更通知的频道（迁移 `…_site_change_notify.sql` 的触发器发送，负载是 `site_id`）。
+/// 站点配置变更通知的频道（PG 初始迁移里的 `notify_site_changed` 触发器发送，负载是 `site_id`）。
 pub const SITE_CHANGED_CHANNEL: &str = "rivu_site_changed";
 
 /// 按 `site_key` 查一个未删除的站点。

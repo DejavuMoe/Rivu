@@ -1,6 +1,6 @@
 //! 用户、组织与成员关系（`rivu user ...`、`rivu org ...`、首次初始化、登录）。
 //!
-//! 表结构见 `migrations/postgres/20261021100000_core_tables.sql`。邮箱列是 `citext`（不区分大小写，
+//! 表结构见 `migrations/postgres/20261021100000_init.sql`。邮箱列是 `citext`（不区分大小写，
 //! 唯一约束只管未删除的行），这里一律以 `text` 传入、查询里转 `citext`。
 //! 本 crate 的 sqlx 没有启用时间类型特性：时间以 ISO 文本（UTC）读出。
 

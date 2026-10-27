@@ -1,4 +1,64 @@
--- ClickHouse：会话聚合表和物化视图。设计见 docs/architecture/system-design.md §5.3。
+-- ClickHouse：原始事件、会话聚合与接入计数。设计见 docs/architecture/system-design.md §5.2–§5.4。
+--
+-- 约定（由 `rivu migrate` 执行）：
+--   * 文件按「行尾的 `;`」拆成多条语句，逐条执行（HTTP 接口一次只能执行一条）；
+--   * `{{database}}` 会被替换为 RIVU_CH_DATABASE（默认 rivu）；
+--   * 每条语句必须幂等（IF NOT EXISTS），因为 ClickHouse 没有事务，
+--     崩溃在「语句已执行、记录未写入」之间时会重跑整个文件。
+--   * 三张表都开 non_replicated_deduplication_window：批次带 insert_deduplication_token 重试，
+--     「写入成功但响应丢失」后的重放不会重复写入（§5.4）。
+
+CREATE DATABASE IF NOT EXISTS {{database}};
+
+-- ------------------------------------------------------------------ events
+CREATE TABLE IF NOT EXISTS {{database}}.events
+(
+    site_id          UInt64,
+    ts               DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)),
+    event_id         UUID,                          -- UUIDv7，由 collector 生成
+    name             LowCardinality(String),        -- pageview / engagement / 自定义事件名
+    visitor_id       UInt64,                        -- 事件当天的 visitor_id（按站点本地日的盐算出，不跨午夜）
+    session_id       UInt64,
+    session_start    DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)),
+    ingest_partition UInt8,                         -- routing % 32（Reliable 的分区号；Lite 的分片号）
+    hostname         LowCardinality(String),
+    pathname         String CODEC(ZSTD(3)),
+    entry_pathname   String CODEC(ZSTD(3)),         -- 盖章：会话入口页
+    -- 会话属性（盖章，在会话内恒定）
+    referrer         String CODEC(ZSTD(3)),
+    referrer_source  LowCardinality(String),
+    channel          LowCardinality(String),
+    utm_source       String CODEC(ZSTD(3)),
+    utm_medium       String CODEC(ZSTD(3)),
+    utm_campaign     String CODEC(ZSTD(3)),
+    utm_content      String CODEC(ZSTD(3)),
+    utm_term         String CODEC(ZSTD(3)),
+    click_id_param   LowCardinality(String),
+    country_code     LowCardinality(FixedString(2)),
+    region_code      LowCardinality(String),        -- ISO 3166-2，例如 CN-31
+    city_geoname_id  UInt32,
+    device           LowCardinality(String),        -- desktop / mobile / tablet
+    browser          LowCardinality(String),
+    browser_version  LowCardinality(String),
+    os               LowCardinality(String),
+    os_version       LowCardinality(String),
+    -- 事件级
+    interactive      Bool DEFAULT true,
+    props            Map(LowCardinality(String), String) CODEC(ZSTD(3)),
+    scroll_depth     UInt8  DEFAULT 255,            -- 255 表示无（只有 engagement 事件带）
+    engagement_ms    UInt32 DEFAULT 0,
+    revenue_amount   Nullable(Decimal(18, 3)),
+    revenue_currency LowCardinality(String)
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(ts)
+ORDER BY (site_id, toDate(ts), name, visitor_id, ts)
+PRIMARY KEY (site_id, toDate(ts), name, visitor_id)
+SAMPLE BY visitor_id
+TTL toDate(ts) + INTERVAL 731 DAY DELETE
+SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1, non_replicated_deduplication_window = 1000;
+
+-- ---------------------------------------------------------------- sessions
 -- 会话行由 mv_sessions 在 events 的同一个 INSERT 内同步生成，应用不直接写 sessions。
 -- 聚合状态列的类型已用 toTypeName(argMinIfState(...)) 在 25.8 上核对：
 --   AggregateFunction(argMinIf, Tuple(String, String), DateTime64(3, 'UTC'), UInt8)
@@ -90,3 +150,19 @@ SELECT
     any(os_version)                                                    AS os_version
 FROM {{database}}.events
 GROUP BY site_id, start_date, session_id;
+
+-- --------------------------------------------------------- ingest_counters
+-- 接入计数（§5.4）。
+CREATE TABLE IF NOT EXISTS {{database}}.ingest_counters
+(
+    site_id        UInt64,
+    minute         DateTime('UTC'),
+    metric         LowCardinality(String),   -- accepted / dropped_<reason>
+    script_version UInt16,
+    value          UInt64
+)
+ENGINE = SummingMergeTree(value)
+PARTITION BY toYYYYMM(minute)
+ORDER BY (site_id, minute, metric, script_version)
+TTL minute + INTERVAL 90 DAY DELETE
+SETTINGS non_replicated_deduplication_window = 1000;

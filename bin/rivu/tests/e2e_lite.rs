@@ -867,7 +867,7 @@ async fn pipeline_to_clickhouse_matches_the_reference() {
     let replayed = overview(&reader, site_id, &tz, d28, d30).await;
     assert_eq!(replayed, overviews[5], "重放后整个范围的指标不变");
 
-    // 计数批次同理：同一个 token 重放不能让 ingest_counters 重复累加（迁移 20261022100000 打开了去重窗口），
+    // 计数批次同理：同一个 token 重放不能让 ingest_counters 重复累加（表上开了 non_replicated_deduplication_window），
     // 否则「写入成功但响应丢失」的重试会破坏与请求数的对账。
     let counter_batches = sink.counter_batches.lock().unwrap().clone();
     assert!(!counter_batches.is_empty(), "应当至少写过一批计数");
