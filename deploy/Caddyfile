@@ -1,13 +1,15 @@
-# Rivu 的 Caddy 配置（docs/architecture/platform-and-ops.md §1.3）。
+# Rivu 的 Caddy 反向代理配置。deploy/compose.yml 的 caddy profile 直接使用它；宿主机上的 Caddy 也可以照抄，
+# 把 RIVU_UPSTREAM 换成 127.0.0.1:8080。nginx 的等价配置见 deploy/nginx.conf。
 #
-# - /api/event 与 /js/* 交给 collector（单机是同一个 rivu all），其余 /api/* 交给 api，其他路径是看板静态文件；
-#   /healthz /readyz /metrics 只在内部端口，不经 Caddy。
-# - lb_try_duration：rivu 重启期间连接失败的请求在 Caddy 排队重试 5 秒；超过仍无上游则回 502，
-#   这些事件只留在本访问日志里，不进 ingest_counters（tools/reconcile 会单独报告它们）。
+# - 整个站点（看板页面、/js/* 采集脚本、/api/* 采集与查询）都交给 rivu；看板的静态文件由 rivu 提供。
+#   /healthz /readyz /metrics 只在 rivu 的内部端口 9090，不经反向代理，也不要对外开放。
+# - lb_try_duration：rivu 重启期间连接失败的请求排队重试 5 秒，升级时通常不丢事件。
 # - 访问日志删除客户端 IP 与全部请求头（隐私承诺不能在代理层被破坏）；保留响应头，
-#   其中的 x-rivu-dropped 是边缘对账（brief-p1 验收第 1 条）区分「接受」与「过滤」的依据。
+#   其中的 x-rivu-dropped 是边缘对账（tools/reconcile）区分「接受」与「过滤」的依据。
+# - 页面的 CSP 由看板自己写在 index.html 的 <meta> 里，这里不要再加 Content-Security-Policy
+#   （两份策略取交集，会挡掉看板的启动脚本）。
 # - 前面还有 CDN 时，在全局 servers { trusted_proxies static <CDN 网段> } 里声明，
-#   并把同样的网段写进 RIVU_TRUSTED_PROXIES；否则 Caddy 用对端地址覆盖 X-Forwarded-For。
+#   否则 Caddy 用对端地址覆盖 X-Forwarded-For，访客的国家会全部变成 CDN 节点所在地。
 #
 # 环境变量：RIVU_DOMAIN（对外域名），RIVU_UPSTREAM（默认 rivu:8080），RIVU_ACCESS_LOG（默认 stdout）。
 
@@ -29,33 +31,10 @@
 		}
 	}
 
-	handle /api/event {
-		reverse_proxy {$RIVU_UPSTREAM:rivu:8080} {
-			lb_try_duration 5s
-			lb_try_interval 250ms
-		}
-	}
-	handle /js/* {
-		reverse_proxy {$RIVU_UPSTREAM:rivu:8080} {
-			lb_try_duration 5s
-			lb_try_interval 250ms
-		}
-	}
-	handle /api/* {
-		reverse_proxy {$RIVU_UPSTREAM:rivu:8080} {
-			lb_try_duration 5s
-			lb_try_interval 250ms
-		}
-	}
-	handle {
-		header {
-			Strict-Transport-Security "max-age=31536000"
-			X-Content-Type-Options nosniff
-			Referrer-Policy same-origin
-			Content-Security-Policy "frame-ancestors 'none'"
-		}
-		root * /srv/dashboard
-		try_files {path} /index.html
-		file_server
+	header Strict-Transport-Security "max-age=31536000"
+
+	reverse_proxy {$RIVU_UPSTREAM:rivu:8080} {
+		lb_try_duration 5s
+		lb_try_interval 250ms
 	}
 }

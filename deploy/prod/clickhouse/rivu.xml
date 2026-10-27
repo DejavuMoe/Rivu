@@ -1,0 +1,103 @@
+<?xml version="1.0"?>
+<!--
+  Rivu 的四个 ClickHouse 账号（生产）。权限与开发配置 deploy/clickhouse/users.d/rivu-dev.xml 相同，
+  密码从容器的环境变量读取（from_env），不写在文件里；见 deploy/compose.yml 与 deploy/.env.example。
+
+    rivu_migrator    DDL + INSERT + SELECT，仅 `rivu migrate` 使用
+    rivu_writer      INSERT，外加 schema_migrations 与 sessions 的 SELECT（就绪检查、会话预热）
+    rivu_reader      readonly=1 的只读账号，带配额和查询限制，api 使用
+    rivu_maintainer  ALTER DELETE + SELECT，删除批处理与汇总层构建使用
+  default 账号只允许容器内访问。
+-->
+<clickhouse>
+    <profiles>
+        <rivu_reader>
+            <readonly>1</readonly>
+            <max_execution_time>15</max_execution_time>
+            <max_memory_usage>4294967296</max_memory_usage>
+            <max_result_rows>1000000</max_result_rows>
+            <result_overflow_mode>throw</result_overflow_mode>
+            <!-- 正则上限：这两个默认是 0（不限制），必须显式设置（核实报告 #11）。 -->
+            <max_hyperscan_regexp_length>256</max_hyperscan_regexp_length>
+            <max_hyperscan_regexp_total_length>2560</max_hyperscan_regexp_total_length>
+            <constraints>
+                <!-- readonly=1 下默认不能改任何 setting；这两项要放开：
+                     log_comment 给每条查询归因，max_execution_time 给公开链接调低超时。 -->
+                <log_comment>
+                    <changeable_in_readonly/>
+                </log_comment>
+                <max_execution_time>
+                    <max>20</max>
+                    <changeable_in_readonly/>
+                </max_execution_time>
+            </constraints>
+        </rivu_reader>
+    </profiles>
+
+    <quotas>
+        <rivu_reader>
+            <interval>
+                <duration>3600</duration>
+                <queries>100000</queries>
+                <errors>10000</errors>
+                <execution_time>7200</execution_time>
+            </interval>
+        </rivu_reader>
+    </quotas>
+
+    <users>
+        <default>
+            <networks replace="replace">
+                <ip>127.0.0.1</ip>
+                <ip>::1</ip>
+            </networks>
+        </default>
+
+        <rivu_migrator>
+            <password from_env="RIVU_CH_MIGRATOR_PASSWORD"/>
+            <networks><ip>::/0</ip></networks>
+            <profile>default</profile>
+            <quota>default</quota>
+            <grants>
+                <query>GRANT CREATE, ALTER, DROP, TRUNCATE, INSERT, SELECT, SHOW ON rivu.*</query>
+            </grants>
+        </rivu_migrator>
+
+        <rivu_writer>
+            <password from_env="RIVU_CH_WRITER_PASSWORD"/>
+            <networks><ip>::/0</ip></networks>
+            <profile>default</profile>
+            <quota>default</quota>
+            <grants>
+                <query>GRANT INSERT ON rivu.*</query>
+                <query>GRANT SELECT ON rivu.schema_migrations</query>
+                <query>GRANT SELECT ON rivu.sessions</query>
+            </grants>
+        </rivu_writer>
+
+        <rivu_reader>
+            <password from_env="RIVU_CH_READER_PASSWORD"/>
+            <networks><ip>::/0</ip></networks>
+            <profile>rivu_reader</profile>
+            <quota>rivu_reader</quota>
+            <grants>
+                <query>GRANT SELECT ON rivu.*</query>
+            </grants>
+        </rivu_reader>
+
+        <rivu_maintainer>
+            <password from_env="RIVU_CH_MAINTAINER_PASSWORD"/>
+            <networks><ip>::/0</ip></networks>
+            <profile>default</profile>
+            <quota>default</quota>
+            <grants>
+                <query>GRANT SELECT, ALTER DELETE ON rivu.*</query>
+                <!-- 轻量删除（DELETE FROM … WHERE）在 25.8 上实现为改写隐藏列 _row_exists，
+                     除 ALTER DELETE 外还要这一列的 ALTER UPDATE；只授予这一列、只授予 ch_delete_batch 删除的三张表。 -->
+                <query>GRANT ALTER UPDATE(_row_exists) ON rivu.events</query>
+                <query>GRANT ALTER UPDATE(_row_exists) ON rivu.sessions</query>
+                <query>GRANT ALTER UPDATE(_row_exists) ON rivu.ingest_counters</query>
+            </grants>
+        </rivu_maintainer>
+    </users>
+</clickhouse>

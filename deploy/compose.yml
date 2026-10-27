@@ -1,0 +1,133 @@
+# Rivu 单机部署（默认，全功能）：rivu + PostgreSQL + ClickHouse，可选内置 Caddy。
+#
+#   cp deploy/.env.example deploy/.env      # 填写域名，并为每个密码生成随机值
+#   docker compose -f deploy/compose.yml --env-file deploy/.env up -d
+#
+# 只想用宿主机上已有的 nginx / Caddy：rivu 的公共端口只绑在 127.0.0.1:${RIVU_HTTP_PORT}，反向代理指过来即可
+# （示例见 deploy/nginx.conf、deploy/Caddyfile）。想让 compose 自己带 Caddy（自动申请 HTTPS 证书）：
+#
+#   docker compose -f deploy/compose.yml --env-file deploy/.env --profile caddy up -d
+#
+# 完整说明见 docs/install.md。数据都在命名卷里；升级只需换镜像 tag 再 up -d，迁移由 migrate 服务先跑完。
+name: rivu
+
+x-rivu-env: &rivu-env
+  RIVU_MODE: single
+  RIVU_DATABASE_URL: postgres://rivu_app:${RIVU_PG_APP_PASSWORD:?}@postgres:5432/rivu
+  RIVU_MIGRATE_DATABASE_URL: postgres://rivu_migrator:${RIVU_PG_MIGRATOR_PASSWORD:?}@postgres:5432/rivu
+  RIVU_CLICKHOUSE_URL: http://clickhouse:8123
+  RIVU_CH_MIGRATOR_USER: rivu_migrator
+  RIVU_CH_MIGRATOR_PASSWORD: ${RIVU_CH_MIGRATOR_PASSWORD:?}
+  RIVU_CH_WRITER_USER: rivu_writer
+  RIVU_CH_WRITER_PASSWORD: ${RIVU_CH_WRITER_PASSWORD:?}
+  RIVU_CH_READER_USER: rivu_reader
+  RIVU_CH_READER_PASSWORD: ${RIVU_CH_READER_PASSWORD:?}
+  RIVU_CH_MAINTAINER_USER: rivu_maintainer
+  RIVU_CH_MAINTAINER_PASSWORD: ${RIVU_CH_MAINTAINER_PASSWORD:?}
+  RIVU_VISITOR_PEPPER: ${RIVU_VISITOR_PEPPER:?}
+  RIVU_SETUP_TOKEN: ${RIVU_SETUP_TOKEN:-}
+  RIVU_BASE_URL: https://${RIVU_DOMAIN:?}
+  RIVU_PUBLIC_BASE_URL: https://${RIVU_DOMAIN:?}
+  # 只信任本 compose 网络里的地址设置的 X-Forwarded-For：宿主机反代经端口映射进来时，对端是这个网段的网关
+  RIVU_TRUSTED_PROXIES: ${RIVU_SUBNET:-172.31.250.0/24}
+  RIVU_LOG_LEVEL: ${RIVU_LOG_LEVEL:-info}
+
+services:
+  postgres:
+    image: postgres:18.6-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: rivu_migrator
+      POSTGRES_PASSWORD: ${RIVU_PG_MIGRATOR_PASSWORD:?}
+      POSTGRES_DB: rivu
+      RIVU_PG_APP_PASSWORD: ${RIVU_PG_APP_PASSWORD:?}
+    volumes:
+      - pg-data:/var/lib/postgresql
+      - ./prod/postgres:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rivu_migrator -d rivu"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    networks: [rivu]
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.8.33.6
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
+      RIVU_CH_MIGRATOR_PASSWORD: ${RIVU_CH_MIGRATOR_PASSWORD:?}
+      RIVU_CH_WRITER_PASSWORD: ${RIVU_CH_WRITER_PASSWORD:?}
+      RIVU_CH_READER_PASSWORD: ${RIVU_CH_READER_PASSWORD:?}
+      RIVU_CH_MAINTAINER_PASSWORD: ${RIVU_CH_MAINTAINER_PASSWORD:?}
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    volumes:
+      - ch-data:/var/lib/clickhouse
+      - ./prod/clickhouse/rivu.xml:/etc/clickhouse-server/users.d/rivu.xml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8123/ping | grep -q Ok"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    networks: [rivu]
+
+  # 迁移：每次 up 都先跑一遍（已应用的版本会跳过），成功后 rivu 才启动
+  migrate:
+    image: ${RIVU_IMAGE:-rivu:latest}
+    command: ["migrate"]
+    env_file: .env
+    environment: *rivu-env
+    depends_on:
+      postgres: { condition: service_healthy }
+      clickhouse: { condition: service_healthy }
+    networks: [rivu]
+
+  rivu:
+    image: ${RIVU_IMAGE:-rivu:latest}
+    command: ["all"]
+    restart: unless-stopped
+    # deploy/.env 里的其他 RIVU_* 变量（可选功能）原样传给 rivu；上面 environment 里的值优先
+    env_file: .env
+    environment: *rivu-env
+    volumes:
+      - rivu-data:/var/lib/rivu
+    ports:
+      - "127.0.0.1:${RIVU_HTTP_PORT:-8080}:8080"
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+    stop_grace_period: 30s
+    networks: [rivu]
+
+  caddy:
+    image: caddy:2.11.7-alpine
+    profiles: ["caddy"]
+    restart: unless-stopped
+    environment:
+      RIVU_DOMAIN: ${RIVU_DOMAIN:?}
+      RIVU_UPSTREAM: rivu:8080
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on: [rivu]
+    networks: [rivu]
+
+networks:
+  rivu:
+    ipam:
+      config:
+        - subnet: ${RIVU_SUBNET:-172.31.250.0/24}
+
+volumes:
+  pg-data:
+  ch-data:
+  rivu-data:
+  caddy-data:
+  caddy-config:
