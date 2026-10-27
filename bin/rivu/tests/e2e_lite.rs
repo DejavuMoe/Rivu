@@ -1,4 +1,4 @@
-//! 端到端：`Pipeline::process` -> SessionAssigner -> BatchWriter -> ClickHouse -> `rivu_query::overview`，
+//! 端到端：`Pipeline::process` -> SessionAssigner -> BatchWriter -> ClickHouse -> `rivu_query::execute`，
 //! 与独立的参考实现（`rivu_reference`）在同一批事件上算出的真值逐项比较。
 //!
 //! 需要真实的 PostgreSQL 和 ClickHouse。缺少环境变量时跳过并打印原因：
@@ -25,7 +25,12 @@ use rivu_common::config::{BufferConfig, ChAccount, Cidr, Config, Env, Role, Secr
 use rivu_domain::{DropReason, EventKind};
 use rivu_geo::GeoDb;
 use rivu_ingest::pipeline::{Outcome, Pipeline, RequestCtx, SaltCache, SiteSnapshot};
-use rivu_query::{Dimension, Overview};
+use rivu_query::result::MetricValue;
+use rivu_query::spec::{
+    CustomRange, DateRange, Dimension as SpecDim, Direction, Filter, FilterLeaf, FilterOp,
+    FilterTarget, Include, Metric, OrderBy, Pagination, RangeBound,
+};
+use rivu_query::{ExecOptions, QuerySpec, SiteContext, TenantScope};
 use rivu_reference::{EventAttrs, Metrics, RawEvent, RefDim, metrics, sessionize};
 use rivu_storage_ch::rows::{EventRow, IngestCounterRow};
 use rivu_storage_pg::sites::NewSite;
@@ -277,6 +282,165 @@ impl Sim {
 
 fn close(a: f64, b: f64) -> bool {
     (a - b).abs() <= EPS
+}
+
+// ---- 查询：用 QuerySpec 取核心指标与分组，与参考实现对比 ------------------------------------------
+
+/// 核心指标（`system-design.md` §6.5）。
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Overview {
+    visitors: u64,
+    visits: u64,
+    pageviews: u64,
+    bounce_rate: f64,
+    visit_duration: f64,
+    engaged_duration: f64,
+}
+
+/// 与参考实现的 `RefDim` 一一对应的分组维度。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Dimension {
+    Page,
+    Source,
+    Channel,
+    Country,
+    Device,
+}
+
+impl Dimension {
+    const ALL: [Dimension; 5] = [
+        Dimension::Page,
+        Dimension::Source,
+        Dimension::Channel,
+        Dimension::Country,
+        Dimension::Device,
+    ];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Dimension::Page => "page",
+            Dimension::Source => "source",
+            Dimension::Channel => "channel",
+            Dimension::Country => "country",
+            Dimension::Device => "device",
+        }
+    }
+
+    fn spec(self) -> SpecDim {
+        match self {
+            Dimension::Page => SpecDim::EventPage,
+            Dimension::Source => SpecDim::VisitSource,
+            Dimension::Channel => SpecDim::VisitChannel,
+            Dimension::Country => SpecDim::VisitCountry,
+            Dimension::Device => SpecDim::VisitDevice,
+        }
+    }
+}
+
+fn spec(from: Date, to: Date, metrics: Vec<Metric>) -> QuerySpec {
+    QuerySpec {
+        site: None,
+        metrics,
+        date_range: DateRange::Custom(CustomRange {
+            from: RangeBound::Date(from),
+            to: RangeBound::Date(to),
+        }),
+        dimensions: Vec::new(),
+        filters: Vec::new(),
+        order_by: Vec::new(),
+        include: Include::default(),
+        pagination: Pagination::default(),
+    }
+}
+
+fn int(v: MetricValue) -> u64 {
+    match v {
+        MetricValue::Int(n) => n,
+        MetricValue::Float(f) => f as u64,
+    }
+}
+
+async fn run(
+    reader: &Client,
+    site_id: u64,
+    tz: &TimeZone,
+    spec: QuerySpec,
+) -> rivu_query::QueryResult {
+    rivu_query::execute(
+        reader,
+        &TenantScope::new(site_id),
+        &SiteContext::new(site_id, tz.clone()),
+        spec,
+        ExecOptions::new(QUERY_TIMEOUT_SECS),
+    )
+    .await
+    .expect("查询")
+}
+
+/// 站点本地日期 `[from, to]` 的核心指标。
+async fn overview(reader: &Client, site_id: u64, tz: &TimeZone, from: Date, to: Date) -> Overview {
+    let metrics = vec![
+        Metric::Visitors,
+        Metric::Visits,
+        Metric::Pageviews,
+        Metric::BounceRate,
+        Metric::VisitDuration,
+        Metric::EngagedDuration,
+    ];
+    let result = run(reader, site_id, tz, spec(from, to, metrics)).await;
+    let m = &result.results[0].metrics;
+    Overview {
+        visitors: int(m[0]),
+        visits: int(m[1]),
+        pageviews: int(m[2]),
+        bounce_rate: m[3].as_f64(),
+        visit_duration: m[4].as_f64(),
+        engaged_duration: m[5].as_f64(),
+    }
+}
+
+/// 按维度分组的 `(值, 访客, 会话, 浏览)`，按三者降序，最多 `limit` 行；页面维度只看 pageview。
+async fn breakdown(
+    reader: &Client,
+    site_id: u64,
+    tz: &TimeZone,
+    (from, to): (Date, Date),
+    dim: Dimension,
+    limit: u32,
+) -> Vec<Row4> {
+    let mut s = spec(
+        from,
+        to,
+        vec![Metric::Visitors, Metric::Visits, Metric::Pageviews],
+    );
+    s.dimensions = vec![dim.spec()];
+    if dim == Dimension::Page {
+        s.filters = vec![Filter::Leaf(FilterLeaf {
+            op: FilterOp::Is,
+            target: FilterTarget::Dimension(SpecDim::EventName),
+            values: vec!["pageview".to_owned()],
+            case_sensitive: None,
+        })];
+    }
+    let desc = |k: &str| OrderBy {
+        key: k.to_owned(),
+        direction: Direction::Desc,
+    };
+    s.order_by = vec![desc("visitors"), desc("visits"), desc("pageviews")];
+    s.pagination = Pagination { limit, offset: 0 };
+    run(reader, site_id, tz, s)
+        .await
+        .results
+        .iter()
+        .map(|r| {
+            (
+                r.dimensions[0].clone(),
+                int(r.metrics[0]),
+                int(r.metrics[1]),
+                int(r.metrics[2]),
+            )
+        })
+        .collect()
 }
 
 fn assert_same_metrics(name: &str, q: &Overview, t: &Metrics) {
@@ -616,9 +780,7 @@ async fn pipeline_to_clickhouse_matches_the_reference() {
     println!("范围 | 真值 visitors/visits/pageviews/bounce/duration/engaged | 查询值");
     for (name, from, to) in ranges {
         let truth = metrics(&raw, &ref_sessions, site_id, &tz, from, to);
-        let q = rivu_query::overview(&reader, site_id, &tz, from, to, QUERY_TIMEOUT_SECS)
-            .await
-            .expect("overview");
+        let q = overview(&reader, site_id, &tz, from, to).await;
         println!(
             "{name} | {}/{}/{}/{:.6}/{:.6}/{:.6} | {}/{}/{}/{:.6}/{:.6}/{:.6}",
             truth.visitors,
@@ -645,20 +807,9 @@ async fn pipeline_to_clickhouse_matches_the_reference() {
     assert!(overviews[5].visits == 15 && overviews[5].pageviews == 22);
 
     // 页面榜：3/28 浏览最多的页面
-    let top = rivu_query::breakdown(
-        &reader,
-        site_id,
-        &tz,
-        d28,
-        d28,
-        Dimension::Page,
-        3,
-        QUERY_TIMEOUT_SECS,
-    )
-    .await
-    .expect("breakdown(page)");
+    let top = breakdown(&reader, site_id, &tz, (d28, d28), Dimension::Page, 3).await;
     assert_eq!(top.len(), 3);
-    assert!(top.windows(2).all(|w| w[0].visitors >= w[1].visitors));
+    assert!(top.windows(2).all(|w| w[0].1 >= w[1].1));
 
     // ---- 对账：ingest_counters ----------------------------------------------------------------
     let counters = counter_sums(&reader, site_id).await;
@@ -713,9 +864,7 @@ async fn pipeline_to_clickhouse_matches_the_reference() {
         sessions_rows_before,
         "重放后 sessions 的部分聚合行数不变（MV 去重生效）"
     );
-    let replayed = rivu_query::overview(&reader, site_id, &tz, d28, d30, QUERY_TIMEOUT_SECS)
-        .await
-        .expect("overview");
+    let replayed = overview(&reader, site_id, &tz, d28, d30).await;
     assert_eq!(replayed, overviews[5], "重放后整个范围的指标不变");
 
     // 计数批次同理：同一个 token 重放不能让 ingest_counters 重复累加（迁移 20261022100000 打开了去重窗口），
@@ -1064,21 +1213,7 @@ async fn assert_breakdowns_match(
     let mut shown = BTreeMap::new();
     for dim in Dimension::ALL {
         for limit in [100u32, 2] {
-            let q: Vec<Row4> = rivu_query::breakdown(
-                reader,
-                site_id,
-                tz,
-                from,
-                to,
-                dim,
-                limit,
-                QUERY_TIMEOUT_SECS,
-            )
-            .await
-            .expect("breakdown")
-            .into_iter()
-            .map(|r| (r.value, r.visitors, r.visits, r.pageviews))
-            .collect();
+            let q = breakdown(reader, site_id, tz, (from, to), dim, limit).await;
             let t: Vec<Row4> = rivu_reference::breakdown(
                 raw,
                 sessions,
@@ -1428,7 +1563,6 @@ async fn enriched_pipeline_breakdowns_match_the_reference() {
     }
 
     // ---- 署名与能力：含国家的结果要附带 -------------------------------------------------------------
-    assert!(Dimension::Country.needs_geo_attribution());
     let attribution = geo.attribution().expect("手工署名");
     assert_eq!(attribution.text, "MaxMind test database");
     assert_eq!(geo.capability(), Some(rivu_geo::GeoCapability::City));

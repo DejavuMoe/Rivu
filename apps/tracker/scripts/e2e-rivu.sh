@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 真实浏览器 -> 真实运行的 rivu -> ClickHouse -> `rivu stats` 的端到端测试（Linux）。
+# 真实浏览器 -> 真实运行的 rivu -> ClickHouse -> `rivu query` 的端到端测试（Linux）。
 #
 # 在仓库根目录的 WSL 构建镜像里依次：构建 tracker -> 构建 rivu -> migrate -> 为每个内核建站 -> 后台启动 `rivu all`
 # -> 等 /readyz -> 跑 Playwright（apps/tracker/test/e2e-rivu）-> 停 rivu（trap 保证清理）。
@@ -73,6 +73,8 @@ export RIVU_LOG_FORMAT=pretty
 export RIVU_DATA_DIR="$WORK/data"
 export RIVU_GEOIP_DB_PATH="$WORK/data/geoip/geoip.mmdb"
 export RIVU_GEOIP_REFRESH_INTERVAL=0
+# 手工放置的库要自己给署名；含国家的查询结果必须带上它（system-design §4.4）
+export RIVU_GEOIP_ATTRIBUTION_TEXT='MaxMind test database'
 mkdir -p "$WORK/data/geoip"
 cp "$ROOT/crates/geo/tests/data/test-data/GeoIP2-City-Test.mmdb" "$RIVU_GEOIP_DB_PATH"
 

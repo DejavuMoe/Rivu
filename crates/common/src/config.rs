@@ -558,7 +558,7 @@ pub struct Config {
     pub setup_token: Option<Secret>,
     /// `RIVU_VISITOR_PEPPER`：访客密钥，与每天的盐一起派生 `visitor_id` 的哈希 key；至少 32 个字符。
     /// 只放在环境变量或文件里，不进数据库，所以数据库导出加上盐也无法枚举 IP 还原访客（`privacy.md`）。
-    /// 所有 collector 必须用同一个值；更换或丢失只会让当天的访客 ID 断开一次。未设置时直接用盐（启动时提醒）。
+    /// 所有 collector 必须用同一个值；更换或丢失只会让当天的访客 ID 断开一次。collector、all 必填，其余角色为 `None`。
     pub visitor_pepper: Option<Secret>,
     /// `RIVU_TRACKER_DIR`：tracker 构建产物目录（`core.js`、`meta.json`），启动时读入并缓存。
     /// 默认 `apps/tracker/dist`（相对进程工作目录）；生产镜像把 CI 构建的 `dist/` 放进该目录。
@@ -820,7 +820,11 @@ impl Config {
                 .push("RIVU_SETUP_TOKEN 至少 16 个字符（它挡住的是新实例被抢注）".into());
         }
         let setup_token = setup_token.map(Secret);
-        let visitor_pepper = l.optional("RIVU_VISITOR_PEPPER");
+        let visitor_pepper = if role.serves_collector() {
+            l.required("RIVU_VISITOR_PEPPER")
+        } else {
+            None
+        };
         if let Some(p) = &visitor_pepper
             && p.chars().count() < 32
         {
@@ -1227,8 +1231,11 @@ mod tests {
             ("RIVU_CH_READER_PASSWORD", "r"),
             ("RIVU_CH_MAINTAINER_USER", "rivu_maintainer"),
             ("RIVU_CH_MAINTAINER_PASSWORD", "t"),
+            ("RIVU_VISITOR_PEPPER", TEST_PEPPER),
         ]
     }
+
+    const TEST_PEPPER: &str = "0123456789abcdef0123456789abcdef";
 
     fn temp_file(name: &str, content: &str) -> PathBuf {
         let path =
@@ -1525,15 +1532,29 @@ mod tests {
     }
 
     #[test]
-    fn visitor_pepper_from_value_or_file_and_validated() {
-        assert!(with_env(&[]).unwrap().visitor_pepper.is_none());
-
-        let pepper = "0123456789abcdef0123456789abcdef";
-        let cfg = with_env(&[("RIVU_VISITOR_PEPPER", pepper)]).unwrap();
+    fn visitor_pepper_is_required_for_collectors_and_validated() {
+        let pepper = TEST_PEPPER;
+        let cfg = with_env(&[]).unwrap();
         assert_eq!(cfg.visitor_pepper.unwrap().expose(), pepper);
 
+        let mut pairs = base_pairs();
+        pairs.retain(|(k, _)| *k != "RIVU_VISITOR_PEPPER");
+        for role in [Role::Collector, Role::All] {
+            let err = Config::from_env(role, &Env::from_pairs(pairs.clone())).unwrap_err();
+            assert!(
+                err.problems
+                    .iter()
+                    .any(|p| p.contains("RIVU_VISITOR_PEPPER")),
+                "{err}"
+            );
+        }
+        for role in [Role::Api, Role::Worker, Role::Migrate] {
+            let cfg = Config::from_env(role, &Env::from_pairs(pairs.clone())).unwrap();
+            assert!(cfg.visitor_pepper.is_none());
+        }
+
         let path = temp_file("pepper", &format!("{pepper}\n"));
-        let mut env = Env::from_pairs(base_pairs());
+        let mut env = Env::from_pairs(pairs);
         env.vars.insert(
             "RIVU_VISITOR_PEPPER_FILE".into(),
             path.to_string_lossy().into_owned(),

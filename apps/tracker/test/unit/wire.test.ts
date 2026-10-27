@@ -20,8 +20,8 @@ test('v 只能是整数 1', () => {
 });
 
 test('s 的格式', () => {
-  for (const s of ['short', 'a'.repeat(33), 'has space1', 'dots.dots.x', 12345678]) assert.notDeepEqual(validateWire({ ...base(), s }), [], String(s));
-  assert.deepEqual(validateWire({ ...base(), s: 'abcdefgh' }), []);
+  for (const s of ['short', 'abcdefgh', 'ABCDEFGHIJKL', 'abcdefghij01', 'has space1', 'dots.dots.x', 12345678]) assert.notDeepEqual(validateWire({ ...base(), s }), [], String(s));
+  assert.deepEqual(validateWire({ ...base(), s: 'k7qm2xv5atbr' }), []);
 });
 
 test('u 必须是 http/https 的合法 URL', () => {

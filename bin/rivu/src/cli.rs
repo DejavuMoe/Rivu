@@ -1,10 +1,10 @@
 //! 命令行：`rivu collector | worker | api | migrate | all | site add | shield add|list|remove | apikey create|list|revoke | stats |
 //! setup | user add|disable|enable|list | org create | org member add | share create|list|revoke`。
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
-use jiff::civil::Date;
 use rivu_common::build_info;
 use rivu_common::config::{Config, Role};
 use rivu_common::telemetry;
@@ -26,9 +26,9 @@ pub struct Cli {
 pub enum Command {
     /// 采集角色：公共端口提供 `POST /api/event`
     Collector,
-    /// 后台角色：后台任务（P1 只有 salts_rotate；会话分配与批量写入在 Reliable 模式下移到这里，尚未实现）
+    /// 后台角色：后台任务（盐轮换、地理库与数据中心网段刷新、统计数据删除）
     Worker,
-    /// API 角色：公共端口提供 `/api/*`（P1 仍返回 501）
+    /// API 角色：公共端口提供公开查询 API、看板与看板的内部端点
     Api,
     /// 执行 PostgreSQL + ClickHouse 迁移后退出
     Migrate(MigrateArgs),
@@ -36,8 +36,8 @@ pub enum Command {
     All,
     /// 站点管理
     Site(SiteArgs),
-    /// 查询一个站点在日期范围内的核心指标与维度分组（打印 JSON）
-    Stats(StatsArgs),
+    /// 执行一个 QuerySpec（同 `POST /api/v1/query`，不需要 API key），打印 QueryResult JSON
+    Query(QueryArgs),
     /// 站点屏蔽规则管理（IP / CIDR / 国家 / 页面 / hostname）
     Shield(ShieldArgs),
     /// 公开 API 的 API key 管理
@@ -373,16 +373,10 @@ pub struct SiteAddArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct StatsArgs {
-    /// 站点的 site_key
-    #[arg(long)]
-    pub site: String,
-    /// 起始日期（站点本地日期，含），YYYY-MM-DD
-    #[arg(long)]
-    pub from: Date,
-    /// 结束日期（站点本地日期，含），YYYY-MM-DD
-    #[arg(long)]
-    pub to: Date,
+pub struct QueryArgs {
+    /// QuerySpec JSON 文件（`site` 必填）；省略时从 stdin 读
+    #[arg(long, value_name = "PATH")]
+    pub spec: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -410,7 +404,7 @@ impl Command {
             Command::All => Role::All,
             // 管理命令连 PG（应用账号）和 ClickHouse（reader），按 api 角色校验配置
             Command::Site(_)
-            | Command::Stats(_)
+            | Command::Query(_)
             | Command::Shield(_)
             | Command::Apikey(_)
             | Command::Setup(_)
@@ -446,7 +440,7 @@ pub async fn main() -> ExitCode {
         Command::Site(SiteArgs {
             action: SiteAction::Add(args),
         }) => admin::site_add(&config, args).await,
-        Command::Stats(args) => admin::stats(&config, args).await,
+        Command::Query(args) => admin::query(&config, args).await,
         Command::Shield(ShieldArgs { action }) => shield_cmd::run(&config, action).await,
         Command::Apikey(ApikeyArgs { action }) => apikey_cmd::run(&config, action).await,
         Command::Setup(args) => user_cmd::setup(&config, args).await,
@@ -537,53 +531,19 @@ mod tests {
     }
 
     #[test]
-    fn parses_stats_dates() {
-        let cli = Cli::try_parse_from([
-            "rivu",
-            "stats",
-            "--site",
-            "abcdefghijkl",
-            "--from",
-            "2026-03-28",
-            "--to",
-            "2026-03-30",
-        ])
-        .unwrap();
-        let Command::Stats(a) = cli.command else {
-            panic!("不是 stats");
+    fn parses_query_spec_source() {
+        let cli = Cli::try_parse_from(["rivu", "query", "--spec", "q.json"]).unwrap();
+        let Command::Query(a) = &cli.command else {
+            panic!("不是 query");
         };
-        assert_eq!(a.site, "abcdefghijkl");
-        assert_eq!(a.from.to_string(), "2026-03-28");
-        assert_eq!(a.to.to_string(), "2026-03-30");
-        assert!(
-            Cli::try_parse_from([
-                "rivu",
-                "stats",
-                "--site",
-                "x",
-                "--from",
-                "03-28",
-                "--to",
-                "2026-03-30"
-            ])
-            .is_err()
-        );
-        assert_eq!(
-            Cli::try_parse_from([
-                "rivu",
-                "stats",
-                "--site",
-                "x",
-                "--from",
-                "2026-03-28",
-                "--to",
-                "2026-03-30"
-            ])
-            .unwrap()
-            .command
-            .role(),
-            Role::Api
-        );
+        assert_eq!(a.spec.as_deref(), Some(std::path::Path::new("q.json")));
+        assert_eq!(cli.command.role(), Role::Api);
+        // 省略 --spec：从 stdin 读
+        let cli = Cli::try_parse_from(["rivu", "query"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Query(QueryArgs { spec: None })
+        ));
     }
 
     #[test]

@@ -156,16 +156,9 @@ fn parse_script_version(obj: &Map<String, Value>) -> u32 {
         .unwrap_or(0)
 }
 
-/// `^[A-Za-z0-9_-]{8,32}$`
-fn is_valid_site_key(s: &str) -> bool {
-    (8..=32).contains(&s.len())
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-}
-
 fn parse_site_key(obj: &Map<String, Value>, errs: &mut ProtocolErrors) -> Option<String> {
     let s = required_str(obj, "s", errs)?;
-    if is_valid_site_key(s) {
+    if rivu_domain::is_site_key(s) {
         Some(s.to_owned())
     } else {
         errs.add("s", INVALID_FORMAT);
@@ -429,7 +422,7 @@ mod tests {
     use proptest::prelude::*;
     use rivu_domain::Utm;
 
-    const SITE: &str = "k7Qm2xV9aTbR4cLd";
+    const SITE: &str = "k7qm2xv7atbr";
 
     /// 构造一个合法的 pageview 请求体，再让测试改动个别字段。
     fn base() -> Value {
@@ -472,7 +465,7 @@ mod tests {
 
     #[test]
     fn example_1_pageview() {
-        let body = br#"{"v":1,"sv":3,"s":"k7Qm2xV9aTbR4cLd","n":"pageview","u":"https://www.Example.com/pricing?utm_source=newsletter&utm_medium=email&token=abc123#plans","r":"https://news.example.org/post/42?id=7"}"#;
+        let body = br#"{"v":1,"sv":3,"s":"k7qm2xv7atbr","n":"pageview","u":"https://www.Example.com/pricing?utm_source=newsletter&utm_medium=email&token=abc123#plans","r":"https://news.example.org/post/42?id=7"}"#;
         let ev = parse_event(body).unwrap();
         assert_eq!(
             ev,
@@ -504,7 +497,7 @@ mod tests {
 
     #[test]
     fn example_2_custom_event_with_props_and_revenue() {
-        let body = br#"{"v":1,"sv":3,"s":"k7Qm2xV9aTbR4cLd","n":"Purchase","u":"https://example.com/checkout/done","p":{"plan":"pro","seats":"5"},"$":{"a":"29.00","c":"USD"}}"#;
+        let body = br#"{"v":1,"sv":3,"s":"k7qm2xv7atbr","n":"Purchase","u":"https://example.com/checkout/done","p":{"plan":"pro","seats":"5"},"$":{"a":"29.00","c":"USD"}}"#;
         let ev = parse_event(body).unwrap();
         assert_eq!(
             ev,
@@ -529,7 +522,7 @@ mod tests {
 
     #[test]
     fn example_3_engagement() {
-        let body = br#"{"v":1,"sv":3,"s":"k7Qm2xV9aTbR4cLd","n":"engagement","u":"https://example.com/pricing","sd":72,"e":18450}"#;
+        let body = br#"{"v":1,"sv":3,"s":"k7qm2xv7atbr","n":"engagement","u":"https://example.com/pricing","sd":72,"e":18450}"#;
         let ev = parse_event(body).unwrap();
         assert_eq!(
             ev,
@@ -699,18 +692,16 @@ mod tests {
 
     #[test]
     fn site_key_format() {
-        for good in [
-            "abcdefgh",
-            "A_b-C_d-1234",
-            &"a".repeat(32),
-            "k7Qm2xV9aTbR4cLd",
-        ] {
+        for good in ["abcdefghijkl", "k7qm2xv7atbr", "234567234567"] {
             assert_eq!(ok(&with(base(), "s", json!(good))).site_key, good);
         }
         for bad in [
             "short",
-            "abcdefg",
-            &"a".repeat(33),
+            "abcdefghijk",
+            "abcdefghijklm",
+            "ABCDEFGHIJKL",
+            "abcdefghij01",
+            "abcdef-hijkl",
             "has space1",
             "dots.dots.x",
             "ünïcödé123",
@@ -1086,7 +1077,7 @@ mod tests {
 
     #[test]
     fn props_keep_order_and_last_duplicate_wins() {
-        let body = br#"{"v":1,"s":"k7Qm2xV9aTbR4cLd","n":"x","u":"https://e.com/","p":{"z":"1","a":"2","m":"3","a ":"4","z":"5"}}"#;
+        let body = br#"{"v":1,"s":"k7qm2xv7atbr","n":"x","u":"https://e.com/","p":{"z":"1","a":"2","m":"3","a ":"4","z":"5"}}"#;
         let ev = parse_event(body).unwrap();
         assert_eq!(
             ev.props,

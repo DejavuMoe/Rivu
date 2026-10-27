@@ -76,7 +76,7 @@ pub struct Meta {
     pub tiers: Vec<Tier>,
     /// 每个被请求的指标在本次查询形态下的口径。
     pub metric_semantics: BTreeMap<String, String>,
-    /// 结果含位置维度时必带（§4.4「署名要求」）；没有署名（自定义库未配置）时为 `null`。
+    /// 结果含位置维度时必带（§4.4「署名要求」）；没有署名（自定义库未配置署名文本）时省略。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub geo_attribution: Option<Attribution>,
     /// 维度或过滤涉及位置时给出：`country` 或 `city`（§6.10）。

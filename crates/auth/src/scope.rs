@@ -100,12 +100,7 @@ impl fmt::Display for Scope {
     }
 }
 
-/// `site_key` 的格式（`sites.site_key` 的 CHECK：`^[a-z2-7]{12}$`）。
-pub fn is_site_key(s: &str) -> bool {
-    s.len() == 12
-        && s.bytes()
-            .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b))
-}
+pub use rivu_domain::is_site_key;
 
 impl Scope {
     /// 解析 `resource:action:target`。
@@ -405,24 +400,6 @@ mod tests {
         let s = Scopes::from_texts(&["bogus".into(), "stats:read:*".into()]);
         assert!(s.grants(Resource::Stats, ScopeAction::Read));
         assert_eq!(s.iter().count(), 1);
-    }
-
-    #[test]
-    fn site_key_format_matches_the_pg_check() {
-        assert!(is_site_key("abcdefghijkl"));
-        assert!(is_site_key("k7qm2xv7atbr"));
-        assert!(is_site_key("234567234567"));
-        for bad in [
-            "",
-            "abcdefghijk",
-            "abcdefghijklm",
-            "ABCDEFGHIJKL",
-            "abcdefghij01",
-            "abcdefghij1l",
-            "abcdefghij-l",
-        ] {
-            assert!(!is_site_key(bad), "{bad:?}");
-        }
     }
 
     #[test]

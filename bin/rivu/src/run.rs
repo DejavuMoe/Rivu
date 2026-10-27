@@ -10,7 +10,7 @@
 //! - collector / all：持有 GeoIP 库并每小时检查文件修改时间、热加载；管线第 6 步用它查询位置；
 //! - api / all：公开查询 API（`POST /api/v1/query`、`GET /api/v1/query/schema.json`，见 [`crate::query_api`]）：
 //!   `rivu_reader` 账号的 ClickHouse 客户端、API key 鉴权与按组织限流（[`crate::api_auth::build_guard`]）；
-//!   api 角色也持有 GeoIP 库（只用来在 `meta` 里回显署名与精度），其余 `/api/*` 返回 501，也可用命令行 `rivu stats` 查询。
+//!   看板与它的内部端点（[`crate::dash_api`]）；api 角色也持有 GeoIP 库（只用来在 `meta` 里回显署名与精度）。
 //!
 //! 关停顺序：停止接收（HTTP 服务优雅关停）→ 停止后台刷新任务 → 写会话快照 → 排空 BatchWriter 并 flush →
 //! 刷出全部接入计数（包括还没结束的 10 秒桶）。
@@ -148,13 +148,8 @@ async fn start_collector(
     let pepper = config
         .visitor_pepper
         .as_ref()
-        .map(|p| p.expose().as_bytes());
-    if pepper.is_none() {
-        tracing::warn!(
-            "没有设置 RIVU_VISITOR_PEPPER：访客 ID 只用数据库里的盐计算，数据库导出加上当天的盐就能枚举 IP 还原访客（privacy.md）"
-        );
-    }
-    let salts = Arc::new(SaltCache::new().with_pepper(pepper));
+        .context("collector 需要 RIVU_VISITOR_PEPPER")?;
+    let salts = Arc::new(SaltCache::new().with_pepper(Some(pepper.expose().as_bytes())));
     match sites.reload(pg).await {
         Ok(n) => tracing::info!(sites = n, "站点快照已加载"),
         Err(e) => tracing::warn!(error = %format!("{e:#}"), "启动时加载站点快照失败，稍后重试"),

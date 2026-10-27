@@ -1,10 +1,10 @@
-// 真实浏览器 -> 真实运行的 rivu（`rivu all`，连 dev 的 PostgreSQL / ClickHouse）-> `rivu stats`。
+// 真实浏览器 -> 真实运行的 rivu（`rivu all`，连 dev 的 PostgreSQL / ClickHouse）-> `rivu query`。
 // 「已知答案探针」（docs/brief-p1.md 验收项）的雏形：浏览器做一组已知动作，系统里查到的数字必须与之完全一致。
 //
 // 与 test/e2e 的区别：这里**没有任何模拟的采集端**。
 //   - 脚本来自 rivu 自己：`GET <RIVU>/js/<site_key>.js`（配置前缀 + full.js：新站点默认开 engagement 与 tagged，规范 §2.3、§2.4）；
 //   - 事件发往 rivu 的 `POST /api/event`；
-//   - 断言用 `rivu stats`（reader 账号查 ClickHouse），不看浏览器侧记录的请求。
+//   - 断言用 `rivu query`（reader 账号查 ClickHouse），不看浏览器侧记录的请求。
 // 页面由本文件里的小服务器提供（主机名 127.0.0.1 在站点白名单里）；tracker 默认排除 127.x，
 // 所以脚本标签上写 `data-local="true"`（规范 §2.2：`data-local` 允许本地采集；`rivu.c` 前缀里没有这个键，所以 data-* 生效）。
 //
@@ -40,25 +40,70 @@ interface Row {
   visits: number;
   pageviews: number;
 }
+type Dim = 'page' | 'source' | 'channel' | 'country' | 'device';
 interface Stats {
   visitors: number;
   visits: number;
   pageviews: number;
   bounce_rate: number;
-  breakdown: Record<'page' | 'source' | 'channel' | 'country' | 'device', Row[]>;
-  meta: { geo_attribution: unknown; geo_capability: string | null };
+  breakdown: Record<Dim, Row[]>;
+  /** 国家分组那次查询的 meta。 */
+  countryMeta: { geo_attribution?: unknown; geo_capability?: string };
+}
+interface QueryResult {
+  results: { dimensions: string[]; metrics: number[] }[];
+  meta: { geo_attribution?: unknown; geo_capability?: string };
 }
 
 /** 站点时区是 UTC，范围取今天（UTC）。跨 UTC 午夜的运行会让「今天」变化，调用方会检测。 */
 const utcToday = (): string => new Date().toISOString().slice(0, 10);
 
-function stats(siteKey: string, day: string): Stats {
-  const out = execFileSync(RIVU_BIN, ['stats', '--site', siteKey, '--from', day, '--to', day], {
+/** `rivu query`：QuerySpec 从 stdin 读入，打印与公开 API 相同的 QueryResult。 */
+function query(spec: object): QueryResult {
+  const out = execFileSync(RIVU_BIN, ['query'], {
     env: process.env,
     encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'pipe'],
+    input: JSON.stringify(spec),
+    stdio: ['pipe', 'pipe', 'pipe'],
   });
-  return JSON.parse(out) as Stats;
+  return JSON.parse(out) as QueryResult;
+}
+
+const SPEC_DIMS: Record<Dim, string> = {
+  page: 'event:page',
+  source: 'visit:source',
+  channel: 'visit:channel',
+  country: 'visit:country',
+  device: 'visit:device',
+};
+
+function stats(siteKey: string, day: string): Stats {
+  const base = { site: siteKey, date_range: [day, day] };
+  const [visitors, visits, pageviews, bounce_rate] = query({
+    ...base,
+    metrics: ['visitors', 'visits', 'pageviews', 'bounce_rate'],
+  }).results[0].metrics;
+  const breakdown = {} as Record<Dim, Row[]>;
+  let countryMeta: Stats['countryMeta'] = {};
+  for (const dim of Object.keys(SPEC_DIMS) as Dim[]) {
+    const r = query({
+      ...base,
+      metrics: ['visitors', 'visits', 'pageviews'],
+      dimensions: [SPEC_DIMS[dim]],
+      // 页面榜只看 pageview（engagement 不算浏览）
+      filters: dim === 'page' ? [['is', 'event:name', ['pageview']]] : [],
+      order_by: [['visitors', 'desc'], ['visits', 'desc'], ['pageviews', 'desc']],
+      pagination: { limit: 10 },
+    });
+    breakdown[dim] = r.results.map((row) => ({
+      value: row.dimensions[0],
+      visitors: row.metrics[0],
+      visits: row.metrics[1],
+      pageviews: row.metrics[2],
+    }));
+    if (dim === 'country') countryMeta = r.meta;
+  }
+  return { visitors, visits, pageviews, bounce_rate, breakdown, countryMeta };
 }
 
 /** 测试页面服务器：任何 /spa/* 返回同一页；/bfcache-a、/bfcache-b 是普通页。不设 no-store（它会让页面失去 bfcache 资格）。 */
@@ -103,7 +148,7 @@ function startPages(siteKey: string): Promise<{ origin: string; close: () => Pro
   });
 }
 
-test('已知动作：5 个 pageview、1 个会话、1 个访客，与 rivu stats 完全一致', async ({ page, context }, testInfo) => {
+test('已知动作：5 个 pageview、1 个会话、1 个访客，与 rivu query 完全一致', async ({ page, context }, testInfo) => {
   const siteKey = need(`RIVU_E2E_SITE_${testInfo.project.name.toUpperCase()}`);
   const day = utcToday();
 
@@ -129,7 +174,7 @@ test('已知动作：5 个 pageview、1 个会话、1 个访客，与 rivu stats
 
   const pages = await startPages(siteKey);
   try {
-    // 记录发往 rivu 的采集请求与响应（只用来交叉检查，断言以 rivu stats 为准）
+    // 记录发往 rivu 的采集请求与响应（只用来交叉检查，断言以 rivu query 为准）
     const posts: string[] = [];
     const responses: { status: number; dropped: string | undefined }[] = [];
     page.on('request', (r) => {
@@ -203,8 +248,7 @@ test('已知动作：5 个 pageview、1 个会话、1 个访客，与 rivu stats
     expect(s.breakdown.device).toEqual([{ value: 'desktop', ...one }]);
     expect(s.breakdown.country).toEqual([{ value: '(not set)', ...one }]);
     // 含国家的结果必须带署名与能力（库是手工放置的测试库：署名来自配置，能力取决于库类型）
-    expect(s.meta).toHaveProperty('geo_attribution');
-    expect(s.meta).toHaveProperty('geo_capability');
+    expect(s.countryMeta).toMatchObject({ geo_attribution: { text: 'MaxMind test database' }, geo_capability: 'city' });
   } finally {
     await pages.close();
   }

@@ -56,7 +56,7 @@
 //!
 //! # 指标与日志
 //!
-//! - `rivu_api_requests_total{route,status}`：`route` 取值 `api.query`、`api.query_schema`、`api.not_implemented`，
+//! - `rivu_api_requests_total{route,status}`：`route` 取值 `api.query`、`api.query_schema`、`api.not_found`，
 //!   401 / 403 / 429 也计入；
 //! - `rivu_query_seconds{route="api.query"}`：`execute` 的耗时（直方图，秒）；`rivu_query_errors_total{route,kind}`；
 //! - ClickHouse 的 `log_comment`：`{"route":"api.query","site":<id>,"org":<id>,"api_key_id":<id>,"part":..,"tier":..}`，
@@ -89,7 +89,7 @@ use sqlx::PgPool;
 /// `rivu_api_requests_total` 与日志里的路由名。
 pub const ROUTE_QUERY: &str = "api.query";
 pub const ROUTE_SCHEMA: &str = "api.query_schema";
-pub const ROUTE_NOT_IMPLEMENTED: &str = "api.not_implemented";
+pub const ROUTE_NOT_FOUND: &str = "api.not_found";
 
 pub const QUERY_PATH: &str = "/api/v1/query";
 pub const SCHEMA_PATH: &str = "/api/v1/query/schema.json";
@@ -103,9 +103,6 @@ const BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
 pub const RETRY_AFTER_SECS: u64 = 10;
 /// schema 的 `Cache-Control: max-age`（秒）：schema 只随版本变化，配合 `ETag` 重新验证。
 pub const SCHEMA_MAX_AGE_SECS: u64 = 3600;
-/// `site_key` 是 12 位字符；更长的值肯定不存在，不必查库（响应仍是同一个 404）。
-const MAX_SITE_KEY_LEN: usize = 64;
-
 /// 查询耗时直方图的桶（秒）：覆盖毫秒级到 API 档的 20 s 上限。
 pub const QUERY_SECONDS_BUCKETS: [f64; 13] = [
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 30.0,
@@ -405,7 +402,7 @@ async fn run_query<S: AuthStore>(
         // 公开 API 没有站点路径参数：`site` 必填（看板的内部端点才允许省略）
         return Err(QueryError::validation("site", "this field is required").into());
     };
-    if site_key.len() > MAX_SITE_KEY_LEN {
+    if !rivu_domain::is_site_key(&site_key) {
         return Err(ApiError::NotFound.into());
     }
     let owner = api
@@ -566,7 +563,7 @@ pub fn count_requests(router: Router, route: &'static str) -> Router {
 }
 
 /// 公开查询 API 的路由：`POST /api/v1/query`（鉴权、限流）与 `GET /api/v1/query/schema.json`（公开）。
-/// 其余 `/api/*` 由 [`crate::public`] 继续返回 501。
+/// 没有匹配的 `/api/*` 由 [`crate::public`] 返回 404。
 pub fn router<S: AuthStore>(api: Arc<QueryApi<S>>) -> Router {
     let guard = Arc::clone(&api.guard);
     let query_routes = Router::new()

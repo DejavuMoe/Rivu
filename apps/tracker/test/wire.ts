@@ -4,7 +4,7 @@
 // `crates/ingest/src/protocol.rs`（`parse_event`）。这里只做「客户端发出的东西必须被服务端接受」所需的检查，
 // 不做规范化（hostname 白名单、query 白名单等是服务端的事）。返回错误描述列表，空数组表示合法。
 
-const SITE_KEY = /^[A-Za-z0-9_-]{8,32}$/;
+const SITE_KEY = /^[a-z2-7]{12}$/;
 const MAX_BODY_BYTES = 8192;
 const hasControl = (s: string) => /[\u0000-\u001f\u007f-\u009f]/.test(s);
 const isInt = (v: unknown): v is number => typeof v === 'number' && Number.isInteger(v);
@@ -24,7 +24,7 @@ export function validateWire(body: unknown, rawBytes?: number): string[] {
   // sv 永不 400，但客户端应发 0–999999 的整数。
   if ('sv' in b && !(isInt(b.sv) && b.sv >= 0 && b.sv <= 999_999)) errs.push(`sv 必须是 0–999999 的整数`);
 
-  if (typeof b.s !== 'string' || !SITE_KEY.test(b.s)) errs.push('s 必须匹配 ^[A-Za-z0-9_-]{8,32}$');
+  if (typeof b.s !== 'string' || !SITE_KEY.test(b.s)) errs.push('s 必须匹配 ^[a-z2-7]{12}$');
 
   const n = b.n;
   if (typeof n !== 'string') errs.push('n 必须是字符串');

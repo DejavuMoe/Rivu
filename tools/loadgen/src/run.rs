@@ -487,7 +487,7 @@ mod tests {
                 rate,
                 secs,
             }],
-            sites: vec![Site::parse("k7Qm2xV9aTbR4cLd:1:a.test").unwrap()],
+            sites: vec![Site::parse("k7qm2xv7atbr:1:a.test").unwrap()],
             uas: vec![
                 "Mozilla/5.0 (X11; Linux x86_64; rv:126.0) Gecko/20100101 Firefox/126.0".into(),
             ],

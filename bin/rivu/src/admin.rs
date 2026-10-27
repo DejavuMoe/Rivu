@@ -1,23 +1,19 @@
-//! 命令行管理命令：`rivu site add`、`rivu stats`。
+//! 命令行管理命令：`rivu site add`、`rivu query`。
 //!
 //! 它们直接连 PostgreSQL（`RIVU_DATABASE_URL`，应用账号）和 ClickHouse（reader 账号），不经过 HTTP；
 //! 配置按 api 角色校验。结果写到 stdout，日志在 stderr。
 
 use std::process::ExitCode;
 
-use anyhow::{Context, Result, bail};
-use jiff::civil::Date;
+use anyhow::{Context, Result, anyhow, bail};
 use jiff::tz::TimeZone;
 use rivu_common::config::Config;
-use rivu_geo::{GeoCapability, GeoDb};
-use rivu_query::Dimension;
+use rivu_geo::GeoDb;
+use rivu_query::{ExecOptions, QuerySpec, TenantScope};
 use rivu_storage_pg::sites::NewSite;
-use serde_json::json;
 
-use crate::cli::{SiteAddArgs, StatsArgs};
-
-/// `stats` 里每个维度榜的行数。
-const BREAKDOWN_LIMIT: u32 = 10;
+use crate::cli::{QueryArgs, SiteAddArgs};
+use crate::query_api::load_site_context;
 
 /// 规范化一条 hostname 白名单模式（实现与屏蔽规则的 hostname 类型共用，见 `rivu_ingest::hostname::validated_pattern`）。
 pub fn normalize_pattern(raw: &str) -> Result<String> {
@@ -54,78 +50,44 @@ pub async fn site_add(config: &Config, args: SiteAddArgs) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `rivu stats`：查询一个站点在本地日期范围内的核心指标与各维度分组（页面、来源、渠道、国家、设备，每个最多 10 行），
-/// 打印 JSON。`meta` 带 `geo_attribution` 与 `geo_capability`（结果含国家时必填）。
-pub async fn stats(config: &Config, args: StatsArgs) -> Result<ExitCode> {
-    let pool = rivu_storage_pg::connect(config.database_url.expose(), 2).await?;
-    let Some(site) = rivu_storage_pg::sites::find_site_by_key(&pool, &args.site).await? else {
-        bail!("找不到站点 `{}`（或已删除）", args.site);
+/// `rivu query`：公开查询 API（`POST /api/v1/query`）的命令行版本，不经过 HTTP 与 API key。
+/// 从文件或 stdin 读一个 QuerySpec（`site` 必填），执行后把 QueryResult 打印成 JSON，与 API 的响应体相同。
+pub async fn query(config: &Config, args: QueryArgs) -> Result<ExitCode> {
+    let text = match &args.spec {
+        Some(path) => std::fs::read_to_string(path)
+            .with_context(|| format!("读取 {} 失败", path.display()))?,
+        None => std::io::read_to_string(std::io::stdin()).context("读取 stdin 失败")?,
     };
-    let tz = TimeZone::get(&site.timezone)
-        .with_context(|| format!("站点时区 `{}` 无效", site.timezone))?;
+    let spec = QuerySpec::parse_str(&text).map_err(|e| anyhow!("QuerySpec 无效：{e}"))?;
+    let Some(site_key) = spec.site.clone() else {
+        bail!("QuerySpec 的 `site` 必填");
+    };
+
+    let pool = rivu_storage_pg::connect(config.database_url.expose(), 2).await?;
+    let Some(site) = rivu_storage_pg::sites::find_site_by_key(&pool, &site_key).await? else {
+        bail!("找不到站点 `{site_key}`（或已删除）");
+    };
     let account = config
         .ch_reader
         .as_ref()
-        .context("stats 需要 RIVU_CH_READER_USER / RIVU_CH_READER_PASSWORD")?;
+        .context("query 需要 RIVU_CH_READER_USER / RIVU_CH_READER_PASSWORD")?;
     let reader =
         rivu_storage_ch::client(&config.clickhouse_url, account, Some(&config.ch_database));
 
-    let (from, to): (Date, Date) = (args.from, args.to);
-    // `rivu stats` 等同看板查询，用看板档的超时（§10 Q14）。
-    let timeout = config.query_timeouts.dashboard_secs;
-    let overview = rivu_query::overview(&reader, site.id, &tz, from, to, timeout).await?;
-    let mut breakdowns = serde_json::Map::new();
-    for dim in Dimension::ALL {
-        let rows = rivu_query::breakdown(
-            &reader,
-            site.id,
-            &tz,
-            from,
-            to,
-            dim,
-            BREAKDOWN_LIMIT,
-            timeout,
-        )
-        .await?;
-        breakdowns.insert(
-            dim.as_str().to_owned(),
-            rows.iter()
-                .map(|r| {
-                    json!({"value": r.value, "visitors": r.visitors, "visits": r.visits,
-                           "pageviews": r.pageviews})
-                })
-                .collect::<Vec<_>>()
-                .into(),
-        );
-    }
-
-    // 含国家的结果必须带署名与库的能力（system-design §4.4、§6.10）。署名与能力跟随实际加载的库：
-    // 这里读同一个库文件（collector / all 进程热加载的就是它）；文件不存在则两者都是 null。
+    // 署名与能力跟随实际加载的库（§4.4、§6.10）：读 collector / all 热加载的同一个文件；文件不存在则为 null。
     let geo = GeoDb::from_config(&config.geo);
     if let Err(e) = geo.reload_if_changed(&config.geo.db_path) {
         tracing::warn!(error = %format!("{e:#}"), "读取 GeoIP 库失败，geo_attribution 与 geo_capability 为 null");
     }
-    let geo_meta = json!({
-        "geo_attribution": geo.attribution(),
-        "geo_capability": geo.capability().map(GeoCapability::as_str),
-    });
-
-    let out = json!({
-        "site_key": site.site_key,
-        "site_id": site.id,
-        "timezone": site.timezone,
-        "from": from.to_string(),
-        "to": to.to_string(),
-        "visitors": overview.visitors,
-        "visits": overview.visits,
-        "pageviews": overview.pageviews,
-        "bounce_rate": overview.bounce_rate,
-        "visit_duration": overview.visit_duration,
-        "engaged_duration": overview.engaged_duration,
-        "breakdown": breakdowns,
-        "meta": geo_meta,
-    });
-    println!("{}", serde_json::to_string_pretty(&out)?);
+    let ctx = load_site_context(&pool, Some(&geo), site.id, &site.site_key)
+        .await
+        .map_err(|e| anyhow!("读取站点 `{site_key}` 的查询设置失败：{e:?}"))?;
+    // 等同看板查询，用看板档的超时（§10 Q14）。
+    let opts = ExecOptions::new(config.query_timeouts.dashboard_secs).with_route("cli.query");
+    let result = rivu_query::execute(&reader, &TenantScope::new(site.id), &ctx, spec, opts)
+        .await
+        .map_err(|e| anyhow!("查询失败：{e}"))?;
+    println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(ExitCode::SUCCESS)
 }
 
