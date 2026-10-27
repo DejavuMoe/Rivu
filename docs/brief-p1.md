@@ -1,10 +1,10 @@
-# P1 任务书：一条可证明正确的 Lite 链路
+# P1 任务书：一条可证明正确的链路
 
 > 本文规定 P1 做什么、怎样算做对；设计细节仍以 [`architecture/system-design.md`](architecture/system-design.md) 为准，两者冲突时先在 system-design §10 定案再改本文。
 
 ## 目标
 
-做出 Rivu Lite 的最小闭环：tracker → collector → SessionAssigner → BatchWriter → ClickHouse → 查询 → 看板。
+做出 Rivu 的最小闭环：tracker → collector → SessionAssigner → BatchWriter → ClickHouse → 查询 → 看板。
 
 不追求功能多。每个数字都要能由系统之外的证据验证。
 

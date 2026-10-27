@@ -32,7 +32,7 @@ pub enum Command {
     Api,
     /// 执行 PostgreSQL + ClickHouse 迁移后退出
     Migrate(MigrateArgs),
-    /// 单进程运行 collector + api + 后台任务（Lite 形态）
+    /// 单进程运行 collector + api + 后台任务（单机部署）
     All,
     /// 站点管理
     Site(SiteArgs),
