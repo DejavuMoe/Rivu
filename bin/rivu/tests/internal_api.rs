@@ -695,6 +695,7 @@ async fn direct(server: &Server, site: &Site, spec: &Value) -> String {
         geo_attribution: server.geo.attribution(),
         geo_capability: server.geo.capability(),
         goals: Vec::new(),
+        retention_days: None,
     };
     let result = execute(
         &server.reader,
@@ -3747,7 +3748,7 @@ async fn site_admin_create_and_settings() {
     assert_eq!(
         st["settings"],
         json!({"week_starts_on": 1, "collect_enabled": true, "tracker": {"hash": false, "engagement": true, "outbound": false, "downloads": false, "forms": false, "tagged": true},
-               "ingest_rate_limit_per_min": null, "geo_level": "city"})
+               "ingest_rate_limit_per_min": null, "geo_level": "city", "retention_days": null})
     );
     assert_eq!(
         st["limits"]["shield_max_rules"],
@@ -3876,6 +3877,12 @@ async fn site_admin_create_and_settings() {
     assert_eq!(v["settings"]["collect_enabled"], false);
     let v = expect(&patch(json!({"geo_level": "country"})).await, 200);
     assert_eq!(v["settings"]["geo_level"], "country");
+    // 保留期：不超过全局（limits.retention_days_max），null 恢复全局
+    assert_eq!(v["limits"]["retention_days_max"], 731);
+    let v = expect(&patch(json!({"retention_days": 90})).await, 200);
+    assert_eq!(v["settings"]["retention_days"], 90);
+    let v = expect(&patch(json!({"retention_days": null})).await, 200);
+    assert_eq!(v["settings"]["retention_days"], Value::Null);
     // 只改一个字段不影响别的
     assert_eq!(v["site"]["name"], "Renamed");
     assert_eq!(v["settings"]["week_starts_on"], 0);
@@ -4008,7 +4015,7 @@ async fn site_admin_create_and_settings() {
     assert_eq!(
         st["settings"],
         json!({"week_starts_on": 1, "collect_enabled": true, "tracker": {"hash": false, "engagement": true, "outbound": false, "downloads": false, "forms": false, "tagged": true},
-               "ingest_rate_limit_per_min": null, "geo_level": "city"})
+               "ingest_rate_limit_per_min": null, "geo_level": "city", "retention_days": null})
     );
     let v = expect(&patch(json!({"week_starts_on": 6})).await, 200);
     assert_eq!(v["settings"]["week_starts_on"], 6);
@@ -4034,6 +4041,8 @@ async fn site_admin_create_and_settings() {
         json!({"ingest_rate_limit_per_min": max + 1}),
         json!({"ingest_rate_limit_per_min": "many"}),
         json!({"geo_level": "planet"}),
+        json!({"retention_days": 29}),
+        json!({"retention_days": 732}),
         json!({"is_public": "yes"}),
     ] {
         expect_err(&patch(bad.clone()).await, 400, "invalid_request");

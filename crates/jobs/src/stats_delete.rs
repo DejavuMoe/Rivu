@@ -40,8 +40,8 @@ pub type StatsDeleteKick = Arc<Notify>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Table {
     pub name: &'static str,
-    partition_expr: &'static str,
-    time_column: &'static str,
+    pub(crate) partition_expr: &'static str,
+    pub(crate) time_column: &'static str,
 }
 
 /// 三张表（都是 `PARTITION BY toYYYYMM(...)`，迁移见 `migrations/clickhouse/`）。

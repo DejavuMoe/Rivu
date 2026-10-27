@@ -281,13 +281,15 @@ pub struct QuerySettings {
     pub timezone: String,
     /// 周起始日，0 = 周日，1 = 周一（默认）……6 = 周六（`site_settings.week_starts_on`）。
     pub week_starts_on: i16,
+    /// `site_settings.retention_days`：站点的原始数据保留天数，`None` = 全局 `RIVU_RETENTION_DAYS`。
+    pub retention_days: Option<i32>,
 }
 
 /// 按站点 id 读查询设置；站点不存在或已软删除返回 `None`。没有 `site_settings` 行时周起始日取列默认值 1（周一）。
 pub async fn find_query_settings(pool: &PgPool, site_id: u64) -> Result<Option<QuerySettings>> {
     let id = i64::try_from(site_id).context("site_id 超出范围")?;
     let row = sqlx::query(
-        "SELECT s.timezone, COALESCE(ss.week_starts_on, 1)::smallint AS week_starts_on
+        "SELECT s.timezone, COALESCE(ss.week_starts_on, 1)::smallint AS week_starts_on, ss.retention_days
          FROM sites s LEFT JOIN site_settings ss ON ss.site_id = s.id
          WHERE s.id = $1 AND s.deleted_at IS NULL",
     )
@@ -299,9 +301,31 @@ pub async fn find_query_settings(pool: &PgPool, site_id: u64) -> Result<Option<Q
         Ok(QuerySettings {
             timezone: r.try_get("timezone")?,
             week_starts_on: r.try_get("week_starts_on")?,
+            retention_days: r.try_get("retention_days")?,
         })
     })
     .transpose()
+}
+
+/// 原始数据清理用：全部站点（含软删除、还没清除的）的 id、时区与站点级保留天数。
+pub async fn retention_settings(pool: &PgPool) -> Result<Vec<(u64, String, Option<i32>)>> {
+    let rows = sqlx::query(
+        "SELECT s.id, s.timezone, ss.retention_days
+         FROM sites s LEFT JOIN site_settings ss ON ss.site_id = s.id ORDER BY s.id",
+    )
+    .fetch_all(pool)
+    .await
+    .context("查询站点保留期失败")?;
+    rows.iter()
+        .map(|r| {
+            let id: i64 = r.try_get("id")?;
+            Ok((
+                u64::try_from(id).context("sites.id 为负数")?,
+                r.try_get("timezone")?,
+                r.try_get("retention_days")?,
+            ))
+        })
+        .collect()
 }
 
 /// 新站点的参数。
@@ -506,6 +530,7 @@ pub struct SiteAdminView {
     pub tracker: TrackerSwitches,
     pub ingest_rate_limit_per_min: Option<i32>,
     pub geo_level: String,
+    pub retention_days: Option<i32>,
 }
 
 /// 读设置页的站点视图；站点不存在或已软删除返回 `None`。
@@ -519,7 +544,8 @@ pub async fn admin_view(pool: &PgPool, site_id: u64) -> Result<Option<SiteAdminV
                 COALESCE(ss.collect_enabled, true) AS collect_enabled,
                 COALESCE(ss.tracker, '{}'::jsonb)::text AS tracker,
                 ss.ingest_rate_limit_per_min,
-                COALESCE(ss.geo_level, 'city') AS geo_level
+                COALESCE(ss.geo_level, 'city') AS geo_level,
+                ss.retention_days
          FROM sites s LEFT JOIN site_settings ss ON ss.site_id = s.id
          WHERE s.id = $1 AND s.deleted_at IS NULL"
     ))
@@ -541,6 +567,7 @@ pub async fn admin_view(pool: &PgPool, site_id: u64) -> Result<Option<SiteAdminV
             tracker: TrackerSwitches::from_json_text(&r.try_get::<String, _>("tracker")?),
             ingest_rate_limit_per_min: r.try_get("ingest_rate_limit_per_min")?,
             geo_level: r.try_get("geo_level")?,
+            retention_days: r.try_get("retention_days")?,
         })
     })
     .transpose()
@@ -559,6 +586,8 @@ pub struct SitePatch<'a> {
     /// 外层 `Some` = 要改；内层 `None` = 恢复全局默认。
     pub ingest_rate_limit_per_min: Option<Option<i32>>,
     pub geo_level: Option<&'a str>,
+    /// 外层 `Some` = 要改；内层 `None` = 用全局 `RIVU_RETENTION_DAYS`。
+    pub retention_days: Option<Option<i32>>,
 }
 
 /// 一个事务里更新 `sites` 与 `site_settings`（没有 settings 行时先补一行）；站点不存在或已软删除返回 `false`。
@@ -593,7 +622,8 @@ pub async fn update_site(pool: &PgPool, site_id: u64, patch: &SitePatch<'_>) -> 
              geo_level = COALESCE($4::text, geo_level),
              ingest_rate_limit_per_min =
                  CASE WHEN $5::boolean THEN $6::integer ELSE ingest_rate_limit_per_min END,
-             tracker = CASE WHEN $7::text IS NULL THEN tracker ELSE tracker || $7::jsonb END
+             tracker = CASE WHEN $7::text IS NULL THEN tracker ELSE tracker || $7::jsonb END,
+             retention_days = CASE WHEN $8::boolean THEN $9::integer ELSE retention_days END
          WHERE site_id = $1",
     )
     .bind(id)
@@ -612,6 +642,8 @@ pub async fn update_site(pool: &PgPool, site_id: u64, patch: &SitePatch<'_>) -> 
         )
         .to_string()
     }))
+    .bind(patch.retention_days.is_some())
+    .bind(patch.retention_days.flatten())
     .execute(&mut *tx)
     .await
     .context("更新 site_settings 失败")?;

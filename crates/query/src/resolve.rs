@@ -52,6 +52,9 @@ pub struct SiteContext {
     pub geo_capability: Option<GeoCapability>,
     /// 站点的目标（未删除，调用方从 PG 加载，§6.3 build 阶段「加载目标」）：`event:goal` 维度与过滤、`conversion_rate` 用。
     pub goals: Vec<GoalDef>,
+    /// 原始数据保留的本地日数（站点设置与 `RIVU_RETENTION_DAYS` 取小）：早于「今天 − (N − 1)」的天只在日汇总层里。
+    /// `None`：不限（测试用）。
+    pub retention_days: Option<u32>,
 }
 
 impl SiteContext {
@@ -65,6 +68,7 @@ impl SiteContext {
             geo_attribution: None,
             geo_capability: None,
             goals: Vec::new(),
+            retention_days: None,
         }
     }
 }

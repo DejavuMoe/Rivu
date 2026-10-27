@@ -59,6 +59,7 @@ done
 | MaxMind GeoLite2 / GeoIP2（城市数据更准） | `RIVU_MAXMIND_ACCOUNT_ID`、`RIVU_MAXMIND_LICENSE_KEY`、`RIVU_MAXMIND_EDITION` |
 | 自定义地理库地址 | `RIVU_GEOIP_DB_URL`，以及署名 `RIVU_GEOIP_ATTRIBUTION_TEXT` |
 | 过滤云厂商机房流量 | `RIVU_DATACENTER_FILTER=on` |
+| 缩短原始数据保留期（默认 731 天；站点还可以在设置里单独调短，汇总数据永久保留） | `RIVU_RETENTION_DAYS` |
 
 ## 升级
 

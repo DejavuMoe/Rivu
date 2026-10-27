@@ -22,7 +22,7 @@
 | P0 基础 | workspace、单二进制、配置、迁移、CI | 完成 |
 | P1 最小闭环 | tracker、接入管线、会话、查询引擎、公开 API、看板 | 完成，只差「已知答案探针连续 7 天」 |
 | 交付 | 看板由 rivu 提供、镜像、生产 compose、反向代理示例、安装与升级文档、发布流程、开源基础文件 | 完成，只差常驻实例的 7 天探针 |
-| P2 性能 | 日汇总层与规划器选层、结果缓存、merge 监控、压测达标 | 进行中：日汇总层、选层、结果缓存、merge 监控已完成 |
+| P2 性能 | 日汇总层与规划器选层、结果缓存、merge 监控、压测达标 | 进行中：只差压测复跑 |
 | P3 可靠 | 集群模式（JetStream）、worker、分区租约、确定性批次、故障注入、备份恢复演练、积压告警 | 未开始 |
 | P4 产品 | 漏斗、收入、属性报表、分群、导入导出、邮件、TOTP、Plausible 兼容端点 | 部分已提前完成（目标、共享链接、公开 API） |
 
@@ -45,7 +45,7 @@
 - [x] 结果缓存（moka）：配置进键、按范围分时间桶，删除数据后按站点失效（`system-design.md` §6.9）
 - [ ] 每个组织的查询并发与超时上限（已有，复核）
 - [x] ClickHouse merge 与 parts 监控：`ch_monitor` 导出按表的 part、merge、mutation 指标，越线打 `warn`
-- [ ] 原始数据保留期可配置（`RIVU_RETENTION_DAYS` 与站点级 `retention_days`；现在固定 731 天）
+- [x] 原始数据保留期可配置：`RIVU_RETENTION_DAYS` 与站点设置里的保留天数，`retention_purge` 按站点删除；保留期之前的天由日汇总层回答，不兼容的查询带 `range_beyond_raw_retention` 提示
 - [ ] 压测复跑并更新报告
 
 ## P3 可靠

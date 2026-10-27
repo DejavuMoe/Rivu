@@ -270,6 +270,7 @@ async fn settings_body(api: &DashApi, site_id: u64) -> Res<Value> {
             "tracker": tracker_json(&v.tracker),
             "ingest_rate_limit_per_min": v.ingest_rate_limit_per_min,
             "geo_level": v.geo_level,
+            "retention_days": v.retention_days,
         },
         "hostnames": hostnames.iter()
             .map(|h| json!({"pattern": h.pattern, "created_at": h.created_at}))
@@ -278,6 +279,7 @@ async fn settings_body(api: &DashApi, site_id: u64) -> Res<Value> {
             "ingest_rate_limit_default_per_min": api.ingest_rate_default,
             "shield_max_rules": api.shield_max_rules,
             "ingest_rate_limit_max_per_min": max,
+            "retention_days_max": api.retention_days,
         },
         "geo_capability": api.geo.as_ref().and_then(|g| g.capability()).map(GeoCapability::as_str),
     }))
@@ -359,6 +361,9 @@ struct PatchBody {
     #[serde(default, deserialize_with = "double_option")]
     ingest_rate_limit_per_min: Option<Option<i64>>,
     geo_level: Option<String>,
+    /// 站点的原始数据保留天数；`null` = 用全局 `RIVU_RETENTION_DAYS`。
+    #[serde(default, deserialize_with = "double_option")]
+    retention_days: Option<Option<i64>>,
 }
 
 async fn patch_site(
@@ -378,7 +383,8 @@ async fn patch_site(
         && body.collect_enabled.is_none()
         && body.tracker.as_ref().is_none_or(TrackerPatch::is_empty)
         && body.ingest_rate_limit_per_min.is_none()
-        && body.geo_level.is_none();
+        && body.geo_level.is_none()
+        && body.retention_days.is_none();
     if empty {
         return Err(DashError::Invalid("no fields to update".into()));
     }
@@ -416,6 +422,18 @@ async fn patch_site(
             "the geo_level must be one of country, region, city".into(),
         ));
     }
+    // 站点只能比全局短；下限与全局的下限相同（30 天）
+    let global = api.retention_days;
+    let retention = match body.retention_days {
+        None => None,
+        Some(None) => Some(None),
+        Some(Some(n)) if (30..=i64::from(global)).contains(&n) => Some(Some(n as i32)),
+        Some(Some(_)) => {
+            return Err(DashError::Invalid(format!(
+                "the retention_days must be between 30 and {global}, or null for the instance default"
+            )));
+        }
+    };
     let patch = SitePatch {
         name: name.as_deref(),
         timezone: body.timezone.as_deref(),
@@ -429,6 +447,7 @@ async fn patch_site(
             .unwrap_or_default(),
         ingest_rate_limit_per_min: ingest,
         geo_level: body.geo_level.as_deref(),
+        retention_days: retention,
     };
     if !sites::update_site(&api.pg, c.site.id, &patch).await? {
         return Err(DashError::NotFound);

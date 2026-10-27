@@ -108,11 +108,16 @@ extend({
   "set.coll.perMin": ["条 / 分钟", "per minute"],
 
   // ---- 隐私 ----
-  "set.priv.title": ["地理", "Geo"],
+  "set.priv.title": ["地理与保留", "Geo and retention"],
   "set.priv.geo": ["地理精度", "Geo precision"],
   "set.priv.geo.country": ["国家", "Country"],
   "set.priv.geo.region": ["地区", "Region"],
   "set.priv.geo.city": ["城市", "City"],
+  "set.priv.retention": ["原始数据保留", "Raw data retention"],
+  "set.priv.retentionHint": ["留空使用实例默认值。更早的日子只保留每日汇总。", "Leave empty for the instance default. Older days keep only daily rollups."],
+  "set.priv.retentionBad": ["请输入 30 到 {d} 之间的整数，或留空", "Enter a whole number from 30 to {d}, or leave empty"],
+  "set.priv.retentionPlaceholder": ["默认 {d}", "Default {d}"],
+  "set.priv.days": ["天", "days"],
   "set.priv.noDb": ["没有加载地理库，不记录访客位置。", "No geo database is loaded, so visitor locations aren't recorded."],
 
   // ---- 屏蔽规则 ----

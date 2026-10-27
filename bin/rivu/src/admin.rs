@@ -79,9 +79,15 @@ pub async fn query(config: &Config, args: QueryArgs) -> Result<ExitCode> {
     if let Err(e) = geo.reload_if_changed(&config.geo.db_path) {
         tracing::warn!(error = %format!("{e:#}"), "读取 GeoIP 库失败，geo_attribution 与 geo_capability 为 null");
     }
-    let ctx = load_site_context(&pool, Some(&geo), site.id, &site.site_key)
-        .await
-        .map_err(|e| anyhow!("读取站点 `{site_key}` 的查询设置失败：{e:?}"))?;
+    let ctx = load_site_context(
+        &pool,
+        Some(&geo),
+        site.id,
+        &site.site_key,
+        config.retention_days,
+    )
+    .await
+    .map_err(|e| anyhow!("读取站点 `{site_key}` 的查询设置失败：{e:?}"))?;
     // 等同看板查询，用看板档的超时（§10 Q14）。
     let opts = ExecOptions::new(config.query_timeouts.dashboard_secs)
         .with_route("cli.query")

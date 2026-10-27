@@ -43,8 +43,7 @@ PARTITION BY toYYYYMM(ts)
 PRIMARY KEY (site_id, toDate(ts), name, visitor_id)
 ORDER BY (site_id, toDate(ts), name, visitor_id, ts)
 SAMPLE BY visitor_id
-TTL toDate(ts) + toIntervalDay(731)
-SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1, non_replicated_deduplication_window = 1000;
+SETTINGS index_granularity = 8192, non_replicated_deduplication_window = 1000;
 
 CREATE TABLE {{database}}.ingest_counters
 (
@@ -511,5 +510,4 @@ ENGINE = AggregatingMergeTree
 PARTITION BY toYYYYMM(start_date)
 ORDER BY (site_id, start_date, session_id)
 SAMPLE BY session_id
-TTL start_date + toIntervalDay(731)
-SETTINGS ttl_only_drop_parts = 1, non_replicated_deduplication_window = 1000, index_granularity = 8192;
+SETTINGS non_replicated_deduplication_window = 1000, index_granularity = 8192;
