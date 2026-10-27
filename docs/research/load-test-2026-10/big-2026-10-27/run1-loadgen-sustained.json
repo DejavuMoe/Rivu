@@ -1,0 +1,239 @@
+{
+  "tool": "loadgen",
+  "started_unix_ms": 1793057711464,
+  "target": "http://127.0.0.1:8080",
+  "seed": 20261023,
+  "shards": 4,
+  "query_rate_per_s": 5.0,
+  "query_range": "30d",
+  "phases": [
+    {
+      "name": "warmup",
+      "target_rate_per_s": 200.0,
+      "duration_s": 15,
+      "ingest": {
+        "planned": 3000,
+        "client_skipped": 0,
+        "completed": 3015,
+        "accepted_202": 2972,
+        "dropped_202": 43,
+        "status_503": 0,
+        "status_400": 0,
+        "other_status": 0,
+        "errors": 0,
+        "latency_all": {
+          "count": 3015,
+          "min_ms": 1.068,
+          "mean_ms": 2.5540079601990016,
+          "p50_ms": 2.459,
+          "p95_ms": 3.531,
+          "p99_ms": 6.087,
+          "p999_ms": 9.759,
+          "max_ms": 11.863
+        },
+        "latency_202": {
+          "count": 3015,
+          "min_ms": 1.068,
+          "mean_ms": 2.5540079601990016,
+          "p50_ms": 2.459,
+          "p95_ms": 3.531,
+          "p99_ms": 6.087,
+          "p999_ms": 9.759,
+          "max_ms": 11.863
+        }
+      },
+      "queries": {
+        "planned": 75,
+        "all": {
+          "count": 75,
+          "min_ms": 72.192,
+          "mean_ms": 919.6258133333336,
+          "p50_ms": 608.255,
+          "p95_ms": 1980.415,
+          "p99_ms": 2306.047,
+          "p999_ms": 2306.047,
+          "max_ms": 2306.047
+        },
+        "by_kind": {
+          "overview": {
+            "ok_200": 25,
+            "status_429": 0,
+            "status_other": 0,
+            "errors": 0,
+            "latency": {
+              "count": 25,
+              "min_ms": 128.448,
+              "mean_ms": 985.07392,
+              "p50_ms": 778.751,
+              "p95_ms": 1980.415,
+              "p99_ms": 2306.047,
+              "p999_ms": 2306.047,
+              "max_ms": 2306.047
+            }
+          },
+          "breakdown_pages": {
+            "ok_200": 25,
+            "status_429": 0,
+            "status_other": 0,
+            "errors": 0,
+            "latency": {
+              "count": 25,
+              "min_ms": 207.872,
+              "mean_ms": 955.24864,
+              "p50_ms": 491.775,
+              "p95_ms": 2081.791,
+              "p99_ms": 2215.935,
+              "p999_ms": 2215.935,
+              "max_ms": 2215.935
+            }
+          },
+          "series_7d": {
+            "ok_200": 25,
+            "status_429": 0,
+            "status_other": 0,
+            "errors": 0,
+            "latency": {
+              "count": 25,
+              "min_ms": 72.192,
+              "mean_ms": 818.5548800000001,
+              "p50_ms": 479.999,
+              "p95_ms": 1847.295,
+              "p99_ms": 1884.159,
+              "p999_ms": 1884.159,
+              "max_ms": 1884.159
+            }
+          }
+        }
+      },
+      "visibility": {
+        "probes_sent": 15,
+        "probes_failed_to_send": 0,
+        "not_visible_within_timeout": 0,
+        "latency": {
+          "count": 15,
+          "min_ms": 178.048,
+          "mean_ms": 571.7461333333333,
+          "p50_ms": 535.551,
+          "p95_ms": 947.711,
+          "p99_ms": 947.711,
+          "p999_ms": 947.711,
+          "max_ms": 947.711
+        }
+      }
+    },
+    {
+      "name": "sustained",
+      "target_rate_per_s": 1000.0,
+      "duration_s": 300,
+      "ingest": {
+        "planned": 300000,
+        "client_skipped": 0,
+        "completed": 300300,
+        "accepted_202": 297956,
+        "dropped_202": 2344,
+        "status_503": 0,
+        "status_400": 0,
+        "other_status": 0,
+        "errors": 0,
+        "latency_all": {
+          "count": 300300,
+          "min_ms": 0.046,
+          "mean_ms": 2.0113016050616097,
+          "p50_ms": 1.81,
+          "p95_ms": 3.227,
+          "p99_ms": 6.927,
+          "p999_ms": 18.687,
+          "max_ms": 81.023
+        },
+        "latency_202": {
+          "count": 300300,
+          "min_ms": 0.046,
+          "mean_ms": 2.0113016050616097,
+          "p50_ms": 1.81,
+          "p95_ms": 3.227,
+          "p99_ms": 6.927,
+          "p999_ms": 18.687,
+          "max_ms": 81.023
+        }
+      },
+      "queries": {
+        "planned": 1500,
+        "all": {
+          "count": 1500,
+          "min_ms": 51.52,
+          "mean_ms": 866.0408319999995,
+          "p50_ms": 564.735,
+          "p95_ms": 2568.191,
+          "p99_ms": 3330.047,
+          "p999_ms": 4012.031,
+          "max_ms": 4222.975
+        },
+        "by_kind": {
+          "overview": {
+            "ok_200": 490,
+            "status_429": 10,
+            "status_other": 0,
+            "errors": 0,
+            "latency": {
+              "count": 500,
+              "min_ms": 88.384,
+              "mean_ms": 967.5891839999999,
+              "p50_ms": 680.959,
+              "p95_ms": 2897.919,
+              "p99_ms": 3543.039,
+              "p999_ms": 4222.975,
+              "max_ms": 4222.975
+            }
+          },
+          "breakdown_pages": {
+            "ok_200": 489,
+            "status_429": 11,
+            "status_other": 0,
+            "errors": 0,
+            "latency": {
+              "count": 500,
+              "min_ms": 125.184,
+              "mean_ms": 901.167488,
+              "p50_ms": 580.607,
+              "p95_ms": 2568.191,
+              "p99_ms": 3366.911,
+              "p999_ms": 4012.031,
+              "max_ms": 4012.031
+            }
+          },
+          "series_7d": {
+            "ok_200": 489,
+            "status_429": 11,
+            "status_other": 0,
+            "errors": 0,
+            "latency": {
+              "count": 500,
+              "min_ms": 51.52,
+              "mean_ms": 729.3658240000002,
+              "p50_ms": 401.919,
+              "p95_ms": 2322.431,
+              "p99_ms": 2703.359,
+              "p999_ms": 3389.439,
+              "max_ms": 3389.439
+            }
+          }
+        }
+      },
+      "visibility": {
+        "probes_sent": 300,
+        "probes_failed_to_send": 3,
+        "not_visible_within_timeout": 0,
+        "latency": {
+          "count": 297,
+          "min_ms": 102.592,
+          "mean_ms": 654.6679595959596,
+          "p50_ms": 635.391,
+          "p95_ms": 1100.799,
+          "p99_ms": 1179.647,
+          "p999_ms": 1338.367,
+          "max_ms": 1338.367
+        }
+      }
+    }
+  ]
+}

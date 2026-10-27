@@ -66,6 +66,8 @@ pub struct Config {
     /// 在途请求数上限，超过则不发并计入 `client_skipped`
     pub max_inflight: usize,
     pub query_rate: f64,
+    /// 查询的 `date_range`（三种查询共用），例如 `7d`、`30d`
+    pub query_range: String,
     pub api_key: Option<String>,
     pub ch: Option<ChConfig>,
     pub probe_interval: Duration,
@@ -189,18 +191,18 @@ async fn event_shard(ctx: Arc<Ctx>, shard: usize, t0: Instant) {
     }
 }
 
-fn query_body(kind: usize, key: &str) -> String {
+fn query_body(kind: usize, key: &str, range: &str) -> String {
     match kind {
         0 => json!({
             "site": key,
             "metrics": ["visitors", "visits", "pageviews", "bounce_rate", "visit_duration"],
-            "date_range": "7d",
+            "date_range": range,
         }),
         1 => json!({
             "site": key,
             "metrics": ["visitors", "pageviews"],
             "dimensions": ["event:page"],
-            "date_range": "7d",
+            "date_range": range,
             "order_by": [["visitors", "desc"]],
             "pagination": {"limit": 10},
         }),
@@ -208,7 +210,7 @@ fn query_body(kind: usize, key: &str) -> String {
             "site": key,
             "metrics": ["visitors", "pageviews"],
             "dimensions": ["time:day"],
-            "date_range": "7d",
+            "date_range": range,
         }),
     }
     .to_string()
@@ -223,7 +225,7 @@ async fn send_query(ctx: Arc<Ctx>, kind: usize, key: String, planned: Instant, p
         .post(&ctx.query_url)
         .header("authorization", format!("Bearer {api_key}"))
         .header("content-type", "application/json")
-        .body(query_body(kind, &key))
+        .body(query_body(kind, &key, &ctx.cfg.query_range))
         .send()
         .await;
     let q = &ctx.stats[phase].queries[kind];
@@ -493,6 +495,7 @@ mod tests {
             shards: 2,
             max_inflight: 10_000,
             query_rate: 0.0,
+            query_range: "7d".into(),
             api_key: None,
             ch: None,
             probe_interval: Duration::ZERO,
@@ -516,8 +519,9 @@ mod tests {
     #[test]
     fn query_bodies_are_valid_json_for_every_kind() {
         for k in 0..QUERY_KINDS.len() {
-            let v: serde_json::Value = serde_json::from_str(&query_body(k, "abc")).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&query_body(k, "abc", "30d")).unwrap();
             assert_eq!(v["site"], "abc");
+            assert_eq!(v["date_range"], "30d");
             assert!(v["metrics"].is_array());
         }
     }
