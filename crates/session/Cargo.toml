@@ -14,6 +14,7 @@ jiff.workspace = true
 parking_lot.workspace = true
 rand.workspace = true
 rivu-domain.workspace = true
+sha2.workspace = true
 siphasher.workspace = true
 
 [dev-dependencies]

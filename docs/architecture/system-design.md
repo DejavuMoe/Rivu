@@ -366,6 +366,7 @@ partition         = SipHash-2-4(routing_secret,       site_id ‖ len‖ip ‖ l
 ```
 
 - **按站点本地日期选盐**（D5）。Plausible 在 UTC 午夜轮换全局盐，对 UTC+8 的站点来说 ID 在本地 08:00 切换。同一个人 07:30 来一次、09:00 再来一次，当天会被算成 2 个访客。
+- **访客密钥（pepper）**：可选的 `RIVU_VISITOR_PEPPER`（或 `_FILE`）只放在 collector 的环境里，不进数据库。设置后，`visitor_hash` 的 key 是 `SHA-256("rivu-visitor-key-v1" ‖ u32 长度 ‖ 密钥 ‖ 盐)` 的前 16 字节；盐缓存加载时派生，热路径的开销不变。只拿到数据库导出（含盐）的人不能遍历 IPv4 还原访客（`docs/research/re-identification-2026-10.md`）。所有 collector 必须用同一个值；更换只会让当天的访客 ID 断开一次。未设置时 key 就是盐，启动时打警告。routing 密钥不受影响：数据库里只保存它的 5 位结果。
 - **盐的数量**：全球时区横跨 UTC−12 到 +14，任意时刻需要保留 `utc_date-2 … utc_date+1` 共 4 份盐。后台任务提前生成次日的盐，删除更早的盐（见 `platform-and-ops.md`）。
 - **输入用长度前缀拼接**。Plausible 直接拼接、没有分隔符，存在边界歧义（R01 §11.2 #18）。哈希输入用 `site_id` 而不用域名：站点就是隐私边界，改域名也不会让访客 ID 断开。
 - **`partition` 用长期不变的 `routing_secret`**，不随盐轮换。所以跨午夜时，`prev_visitor_id` 对应的会话和新事件仍在同一个分区。持久化的只有分区号（5 bit），不能识别个人。密钥本身存在 PG 的 `instance_secrets`（`name = 'routing'`，16 字节），第一个启动的 collector 写入随机值，之后所有进程只读：重启前后、各副本之间分片一致，关停快照与 ClickHouse 预热（§4.6）才对得上。

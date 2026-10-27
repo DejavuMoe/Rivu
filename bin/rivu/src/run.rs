@@ -145,7 +145,16 @@ async fn start_collector(
     );
 
     let sites = Arc::new(SiteSnapshot::new());
-    let salts = Arc::new(SaltCache::new());
+    let pepper = config
+        .visitor_pepper
+        .as_ref()
+        .map(|p| p.expose().as_bytes());
+    if pepper.is_none() {
+        tracing::warn!(
+            "没有设置 RIVU_VISITOR_PEPPER：访客 ID 只用数据库里的盐计算，数据库导出加上当天的盐就能枚举 IP 还原访客（privacy.md）"
+        );
+    }
+    let salts = Arc::new(SaltCache::new().with_pepper(pepper));
     match sites.reload(pg).await {
         Ok(n) => tracing::info!(sites = n, "站点快照已加载"),
         Err(e) => tracing::warn!(error = %format!("{e:#}"), "启动时加载站点快照失败，稍后重试"),
