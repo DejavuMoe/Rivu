@@ -50,6 +50,18 @@ pub enum Command {
     Org(OrgArgs),
     /// 共享链接管理：create | list | revoke
     Share(ShareArgs),
+    /// 容器健康检查：请求内部端口的 /readyz，200 时退出码 0，否则 1（不读取其他配置）
+    Healthcheck(HealthcheckArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct HealthcheckArgs {
+    /// 内部端口地址；默认取 RIVU_INTERNAL_ADDR（0.0.0.0 换成 127.0.0.1），再没有则 127.0.0.1:9090
+    #[arg(long, value_name = "HOST:PORT")]
+    pub addr: Option<String>,
+    /// 检查的路径：/readyz（就绪）或 /healthz（存活）
+    #[arg(long, default_value = "/readyz")]
+    pub path: String,
 }
 
 /// 密码来源。**没有命令行明文密码参数**（会进 shell 历史与进程列表）。
@@ -410,13 +422,18 @@ impl Command {
             | Command::Setup(_)
             | Command::User(_)
             | Command::Org(_)
-            | Command::Share(_) => Role::Api,
+            | Command::Share(_)
+            | Command::Healthcheck(_) => Role::Api,
         }
     }
 }
 
 pub async fn main() -> ExitCode {
     let cli = Cli::parse();
+    // 健康检查在容器里频繁执行，不加载、不校验配置
+    if let Command::Healthcheck(args) = &cli.command {
+        return crate::healthcheck::run(args).await;
+    }
     let role = cli.command.role();
 
     // 1. 加载并校验配置：一次报告全部问题
