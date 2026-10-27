@@ -8,7 +8,7 @@
 //!   （无本地副本时立即下载，之后按 `RIVU_GEOIP_REFRESH_INTERVAL` 条件 GET）、`ch_delete_batch`
 //!   （启动后一轮，之后每 `RIVU_STATS_DELETE_INTERVAL_SECS` 一轮，`rivu_maintainer` 账号）；
 //! - collector / all：持有 GeoIP 库并每小时检查文件修改时间、热加载；管线第 6 步用它查询位置；
-//! - api / all：公开查询 API（`POST /api/v1/query`、`GET /api/v1/query/schema.json`，见 [`crate::query_api`]）：
+//! - api / all：看板静态文件（`RIVU_DASHBOARD_DIR`，见 [`crate::dashboard`]）；公开查询 API（`POST /api/v1/query`、`GET /api/v1/query/schema.json`，见 [`crate::query_api`]）：
 //!   `rivu_reader` 账号的 ClickHouse 客户端、API key 鉴权与按组织限流（[`crate::api_auth::build_guard`]）；
 //!   看板与它的内部端点（[`crate::dash_api`]）；api 角色也持有 GeoIP 库（只用来在 `meta` 里回显署名与精度）。
 //!
@@ -239,6 +239,21 @@ async fn start_collector(
     })
 }
 
+/// 公共路由加上看板：看板是 fallback，只接住其他路由都不匹配的路径。
+fn with_dashboard(
+    router: axum::Router,
+    dashboard: Option<Arc<crate::dashboard::DashboardAssets>>,
+) -> axum::Router {
+    match dashboard {
+        Some(d) => router.merge(
+            axum::Router::new()
+                .fallback(crate::dashboard::serve)
+                .with_state(d),
+        ),
+        None => router,
+    }
+}
+
 pub async fn run(config: Config) -> Result<ExitCode> {
     let role = config.role;
     let started = Instant::now();
@@ -444,12 +459,20 @@ pub async fn run(config: Config) -> Result<ExitCode> {
         None
     };
 
+    // 看板静态文件：api / all 角色，启动时读进内存
+    let dashboard = role.serves_api().then(|| {
+        Arc::new(crate::dashboard::DashboardAssets::load(
+            &config.dashboard_dir,
+        ))
+    });
+
     let state = Arc::new(InternalState {
         role,
         probe,
         collector: collector.as_ref().map(|c| c.readiness.clone()),
         datacenter: datacenter.filter(|_| role.serves_collector()),
         tracker: collector.as_ref().map(|c| Arc::clone(&c.tracker)),
+        dashboard: dashboard.clone(),
         geo: GeoReadiness {
             db: geo_db,
             refresh: geo_refresh,
@@ -489,7 +512,10 @@ pub async fn run(config: Config) -> Result<ExitCode> {
                 serve(
                     "公共端口",
                     l,
-                    public::router_full(role, pipeline, scripts, query_routes),
+                    with_dashboard(
+                        public::router_full(role, pipeline, scripts, query_routes),
+                        dashboard,
+                    ),
                     stop_rx.clone(),
                 )
                 .await

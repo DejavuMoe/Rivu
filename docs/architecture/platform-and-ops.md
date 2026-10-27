@@ -10,20 +10,20 @@
 
 | 子命令 | 职责 | 公共端口 | 内部端口 `:9090` | `RIVU_JOBS` 默认 |
 |---|---|---|---|---|
-| `rivu collector` | `/api/event`、`/js/*`；站点缓存；写缓冲或发布 JetStream；Reliable 下可多副本 | 8080 | `/healthz` `/readyz` `/metrics` | off |
+| `rivu collector` | `/api/event`、`/js/*`；站点缓存；写缓冲或发布 JetStream；集群下可多副本 | 8080 | `/healthz` `/readyz` `/metrics` | off |
 | `rivu worker` | JetStream 消费、会话分配、批量写 ClickHouse、后台任务与 cron | 无 | 同上 | on |
 | `rivu api` | `/api/*`：登录、业务 CRUD、统计查询、shared link | 8080 | 同上 | off |
 | `rivu migrate` | 一次性执行 PG + ClickHouse 迁移后退出 | 无 | 无 | n/a |
-| `rivu all` | 以上全部，单进程（Lite）；仅允许 `RIVU_MODE=lite` | 8080 | 同上 | on |
+| `rivu all` | 以上全部，单进程（单机）；仅允许 `RIVU_MODE=single` | 8080 | 同上 | on |
 
-Lite 的会话分配依赖单写者，只允许一个 `all`（或一个 `collector`）；多副本 `collector` 仅用于 Reliable（会话分配在 `worker`，见 `system-design.md`）。内部端口不经 Caddy 路由。
+单机的会话分配依赖单写者，只允许一个 `all`（或一个 `collector`）；多副本 `collector` 仅用于集群（会话分配在 `worker`，见 `system-design.md`）。内部端口不经 Caddy 路由。
 
 ### 1.2 三种 compose 的服务清单
 | 文件 | 服务 | 说明 |
 |---|---|---|
 | `compose.dev.yml` | `clickhouse`、`postgres`、`nats`（profile `nats`） | 只起依赖，端口绑 127.0.0.1，Rust 在宿主机 `cargo run`（第 2 节） |
-| `compose.lite.yml` | `caddy`、`rivu`（`rivu all`）、`postgres`、`clickhouse`、`migrate` | 最小自托管；仅 caddy 发布 80/443 |
-| `compose.reliable.yml` | `caddy`、`collector`（`deploy.replicas` ≥ 2）、`worker`、`api`、`nats`、`postgres`、`clickhouse`、`migrate` | 采集经 JetStream 缓冲，collector 可独立扩容 |
+| `compose.yml` | `caddy`、`rivu`（`rivu all`）、`postgres`、`clickhouse`、`migrate` | 最小自托管；仅 caddy 发布 80/443 |
+| `compose.cluster.yml` | `caddy`、`collector`（`deploy.replicas` ≥ 2）、`worker`、`api`、`nats`、`postgres`、`clickhouse`、`migrate` | 采集经 JetStream 缓冲，collector 可独立扩容 |
 
 共同规则：
 - `migrate` 是一次性服务（`restart: "no"`，`command: ["rivu","migrate"]`），依赖 `postgres`、`clickhouse` 的 `service_healthy`；所有 `rivu` 服务 `depends_on: { migrate: { condition: service_completed_successfully } }`。迁移不随服务启动自动执行（04§0#7、04§7.2）。
@@ -35,8 +35,8 @@ Lite 的会话分配依赖单写者，只允许一个 `all`（或一个 `collect
 ### 1.3 Caddy 路由
 | 优先级 | 匹配 | 上游 |
 |---|---|---|
-| 1 | `/api/event`、`/js/*` | `collector:8080`（Lite：`rivu:8080`），`lb_try_duration 5s` |
-| 2 | `/api/*` | `api:8080`（Lite：`rivu:8080`），同样配 `lb_try_duration` |
+| 1 | `/api/event`、`/js/*` | `collector:8080`（单机：`rivu:8080`），`lb_try_duration 5s` |
+| 2 | `/api/*` | `api:8080`（单机：`rivu:8080`），同样配 `lb_try_duration` |
 | 3 | 其余 | 静态文件 `/srv/dashboard`，`try_files {path} /index.html` |
 | 不路由 | `/healthz` `/readyz` `/metrics` | 仅内部端口 |
 
@@ -53,17 +53,17 @@ Lite 的会话分配依赖单写者，只允许一个 `all`（或一个 `collect
 
 要点（指令细节以实现时的 Caddy 版本为准）：
 - `lb_try_duration` 让 collector 重启期间的连接失败请求在 Caddy 排队重试，实现近零丢失重启；超过 5s 仍无上游返回 502，该窗口事件丢失，只留在 Caddy 日志，不进 `ingest_counters`。
-- Reliable 多副本用 `dynamic a`（Docker DNS）发现副本，配 `health_uri /readyz` + `health_port 9090` 主动检查；Lite 单上游不启用主动检查，避免预热期被整体摘除。
+- 集群多副本用 `dynamic a`（Docker DNS）发现副本，配 `health_uri /readyz` + `health_port 9090` 主动检查；单机单上游不启用主动检查，避免预热期被整体摘除。
 - 服务端只信任 `RIVU_TRUSTED_PROXIES` 内对端传来的 `X-Forwarded-For`：从右向左跳过可信 CIDR，取第一个不可信地址为客户端 IP；对端不在可信范围则忽略该头。Caddy 默认用对端地址覆盖该头，前面再有 CDN 时才在全局 `servers { trusted_proxies }` 加 CDN 的 CIDR。
 - Caddy 访问日志必须删除 IP 与请求头（如上），否则隐私承诺在代理层被破坏。HSTS、`X-Content-Type-Options: nosniff`、`Referrer-Policy: same-origin` 等安全头在静态 handle 中统一设置。
 - 页面的 CSP 由 `apps/dashboard` 的构建写进 `index.html` 的 `<meta>`（`default-src 'self'`，入口的内联启动脚本按哈希放行，`style-src` 带 `'unsafe-inline'`），Caddy 不能再给页面加一份限制脚本的 CSP：两份策略取交集，启动脚本会被挡掉。`<meta>` 表达不了的 `frame-ancestors` 由 Caddy 用只含这一项的头给出：`Content-Security-Policy: frame-ancestors 'none'`。
 
 ### 1.4 拓扑示意
 ```
-Lite:      浏览器 ─443─► Caddy ─┬ /api/event,/js/* ┐
+单机:      浏览器 ─443─► Caddy ─┬ /api/event,/js/* ┐
                                 ├ /api/*           ├─► rivu all :8080 ─► ClickHouse
                                 └ 其余 → 静态文件    ┘        │ :9090 内部口 └─► PostgreSQL ◄─ migrate(一次性)
-Reliable:  浏览器 ─443─► Caddy ─┬ /api/event,/js/* ─► collector ×N ─► NATS JetStream ─► worker ─► ClickHouse
+集群:  浏览器 ─443─► Caddy ─┬ /api/event,/js/* ─► collector ×N ─► NATS JetStream ─► worker ─► ClickHouse
                                 ├ /api/*           ─► api ─► ClickHouse(reader) + PostgreSQL     └─► jobs/cron(PG leader)
                                 └ 其余 → 静态文件
 ```
@@ -84,7 +84,7 @@ Reliable:  浏览器 ─443─► Caddy ─┬ /api/event,/js/* ─► collector
 | 1 | `docker compose -f compose.dev.yml up -d`（需要 NATS 加 `--profile nats`） | 首次启动执行 init 脚本 |
 | 2 | 复制 `.env.dev.example` 为 `.env.dev` | 仅 debug 构建用 `dotenvy` 加载；生产只读真实环境变量 |
 | 3 | `cargo run -p rivu -- migrate` | 建库并交织执行 PG 与 CH 迁移 |
-| 4 | `cargo run -p rivu -- all` | Lite 形态；联调 Reliable 则分别运行 `collector`/`worker`/`api` 并设 `RIVU_MODE=reliable` |
+| 4 | `cargo run -p rivu -- all` | 单机形态；联调集群则分别运行 `collector`/`worker`/`api` 并设 `RIVU_MODE=cluster` |
 | 5 | `pnpm --filter dashboard dev` | Vite 代理 `/api` 到 `127.0.0.1:8080` |
 | 重置 | `docker compose -f compose.dev.yml down -v` | 删除三个命名卷，数据清空 |
 
@@ -250,7 +250,7 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
   | 坏行 | 写入时已校验；快照编译时遇到非法行（只可能来自手工改库）跳过并记 `warn`，不影响站点其余规则 |
   | 命令行 | `rivu shield add \| list \| remove` |
 
-- **盐**：事件用**站点本地日期**对应的盐，各进程每 60 秒从 PG 刷新；缺盐则丢弃事件并计入 `dropped_salt_missing`，绝不在 collector 现场生成（避免多副本分歧）。只缺前一天的盐时，不计算 `prev_visitor_id`（这次不续会话），事件照常接收。Reliable 下访客 ID 在入队前计算，JetStream 积压不依赖盐的保留期。任务见第 6 节 `salts_rotate`。
+- **盐**：事件用**站点本地日期**对应的盐，各进程每 60 秒从 PG 刷新；缺盐则丢弃事件并计入 `dropped_salt_missing`，绝不在 collector 现场生成（避免多副本分歧）。只缺前一天的盐时，不计算 `prev_visitor_id`（这次不续会话），事件照常接收。集群下访客 ID 在入队前计算，JetStream 积压不依赖盐的保留期。任务见第 6 节 `salts_rotate`。
 
 ## 4. 权限模型
 ### 4.1 角色 × 动作矩阵
@@ -378,11 +378,11 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 ## 7. 配置
 规则：
 - 所有变量前缀 `RIVU_`，每个变量支持 `*_FILE`（文件内容去掉末尾换行作为值），用于 Docker secrets；同时设置 `X` 与 `X_FILE` 视为冲突，拒绝启动。Plausible 是「`CONFIG_DIR/<VAR>` 文件优先、环境变量兜底」（04§4.1、04§9.4），Rivu 改为显式 `*_FILE`，来源可审计。
-- 启动时集中校验，一次性报告全部错误，按子命令只校验所需变量。密钥长度不足、密码为已知弱值（如 `changeme`）、`all` 配 `reliable` 都拒绝启动（对应 04§4.2 `SECRET_KEY_BASE` ≥ 32 字节）。日志中凭据一律脱敏。
+- 启动时集中校验，一次性报告全部错误，按子命令只校验所需变量。密钥长度不足、密码为已知弱值（如 `changeme`）、`all` 配 `cluster` 都拒绝启动（对应 04§4.2 `SECRET_KEY_BASE` ≥ 32 字节）。日志中凭据一律脱敏。
 
 | 变量 | 默认 / 约束 | 说明 |
 |---|---|---|
-| `RIVU_MODE` | `lite`（默认）\| `reliable` | 写入路径：直写 ClickHouse 或经 JetStream |
+| `RIVU_MODE` | `single`（默认）\| `cluster` | 写入路径：直写 ClickHouse 或经 JetStream |
 | `RIVU_BASE_URL` | 必填，`http(s)://` | 外部地址，用于邮件链接与 `Origin` 校验 |
 | `RIVU_SECRET_KEY`、`_FALLBACK` | 必填，≥ 32 字节；后者可选 | 派生 TOTP 加密与 cookie 签名密钥；后者用于轮换 |
 | `RIVU_LISTEN_ADDR`、`RIVU_INTERNAL_ADDR` | `127.0.0.1:8080`、`127.0.0.1:9090`；容器部署时由 compose 设为 `0.0.0.0` | 内部口承载 `/healthz` `/readyz` `/metrics`，不发布端口 |
@@ -393,14 +393,14 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 | `RIVU_CH_READER_USER`、`_PASSWORD` | api、all 必填 | `rivu_reader` |
 | `RIVU_CH_MAINTAINER_USER`、`_PASSWORD` | 启用 jobs 的进程必填 | `rivu_maintainer` |
 | `RIVU_CH_MIGRATOR_USER`、`_PASSWORD` | `migrate` 必填 | `rivu_migrator` |
-| `RIVU_NATS_URL`、`RIVU_NATS_STREAM_MAX_AGE` | reliable 必填；`72h` | JetStream 地址与积压保留窗口 |
+| `RIVU_NATS_URL`、`RIVU_NATS_STREAM_MAX_AGE` | 集群模式必填；`72h` | JetStream 地址与积压保留窗口 |
 | `RIVU_TRUSTED_PROXIES` | 空（不信任任何代理） | 逗号分隔 CIDR；compose 设为网络子网 |
 | `RIVU_BUFFER_FLUSH_INTERVAL_MS` | `1000` | flush 间隔（Plausible 默认 5000，04§4.2） |
 | `RIVU_BUFFER_MAX_ROWS`、`RIVU_BUFFER_MAX_BYTES` | `20000`、`8388608` | 单批上限，取 `system-design.md` §4.7 的值，压测（P2）后再调（对应 04§4.2 `CLICKHOUSE_MAX_BUFFER_SIZE_BYTES`）；`MAX_ROWS` 范围 1–1000000 |
 | `RIVU_BUFFER_CHANNEL_CAPACITY` | `200000` | 有界 channel，满则 503 背压；不得小于 `RIVU_BUFFER_MAX_ROWS` |
 | `RIVU_CH_INGEST_POOL_SIZE` | `5` | 写入连接数（04§4.2 `CLICKHOUSE_INGEST_POOL_SIZE`） |
 | `RIVU_VISIT_SESSION_TIMEOUT` | `30m` | 访问会话超时（区别于登录会话）。会话最长 7 天，固定不可配置：查询回溯 7 天依赖它（`system-design.md` §4.6、§6.5） |
-| `RIVU_PARTITIONS` | `32`（仅 reliable） | JetStream 分区数 P，只在首次创建流时读取，之后以流元数据里记录的值为准，不一致则拒绝启动；安装后不可改（`system-design.md` §4.8） |
+| `RIVU_PARTITIONS` | `32`（仅集群模式） | JetStream 分区数 P，只在首次创建流时读取，之后以流元数据里记录的值为准，不一致则拒绝启动；安装后不可改（`system-design.md` §4.8） |
 | `RIVU_RETENTION_DAYS` | `731` | 原始数据保留上限（连续两个自然年，含一个闰年），站点可在其内调小。ClickHouse 表 TTL 同为 731 天，调高需要迁移；日均千万级事件的部署建议调低（`system-design.md` §7） |
 | `RIVU_SITE_RESTORE_DAYS` | `7`；`0`–`365` | 站点删除后的恢复窗口（天）：删除时写入的站点删除意图 `not_before = 删除时刻 + 该值`，窗口内可恢复，过后 `ch_delete_batch` 清除统计数据；`0` 表示下一轮就清除 |
 | `RIVU_STATS_DELETE_INTERVAL_SECS` | `300`；`10`–`86400` | `ch_delete_batch` 检查到期删除意图的周期（worker、all） |
@@ -446,7 +446,7 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 - **与 `log_comment` 的冲突**：`readonly=1` 默认不允许修改任何 setting，而所有查询要带 `log_comment`（第 10 节），公开链接还要调低 `max_execution_time`。方案：在 `rivu_reader` profile 中对这两项声明 `CHANGEABLE_IN_READONLY` 约束；若所选版本验证不可行，降级为 `readonly=2` 加 `MAX` 约束锁住超时与内存。已在 25.8 验证：`rivu_reader` 能带 `log_comment` 查询，INSERT 被拒绝（E8）；每条查询都按档位设置 `max_execution_time`，readonly 账号的集成测试覆盖了这一点。
 - Plausible 的护栏是 `readonly=1`、查询超时 15s、`max_execution_time` 20s（04§4.2），Rivu 沿用同量级并移入账号配额，由服务端强制。
 - API 档超时（`RIVU_API_QUERY_TIMEOUT_SECS`，默认 20 s）依赖每条查询显式设置 `max_execution_time`；`rivu_reader` profile 的默认值是 15 s、约束上限 20 s（`deploy/clickhouse/users.d/rivu-dev.xml`），所以档位不得超过 20 s。
-- `all` 进程持有全部应用凭据（Lite 的取舍）；Reliable 下各进程只拿各自所需。
+- `all` 进程持有全部应用凭据（单机的取舍）；集群下各进程只拿各自所需。
 
 ## 9. 迁移与版本升级
 PG 与 ClickHouse 迁移共用一个版本序列（14 位时间戳），分别放在 `migrations/postgres/` 与 `migrations/clickhouse/`，一个文件只针对一个存储。v0.0.1 之前每个库只有一个初始迁移（`postgres/20261021100000_init.sql`、`clickhouse/20261021100100_init.sql`），之后的结构变更一律新增迁移。
@@ -475,7 +475,7 @@ PG 与 ClickHouse 迁移共用一个版本序列（14 位时间戳），分别�
 | 项 | 设计 |
 |---|---|
 | 端点 | 内部端口 `:9090`：`/healthz`（存活）、`/readyz`（就绪）、`/metrics`（Prometheus，默认开，`RIVU_METRICS=off` 可关）；均不经 Caddy |
-| `/readyz` | 全部满足才 200，否则 503 并返回逐项 JSON：PG `SELECT 1`、ClickHouse `SELECT 1`、**站点缓存已预热**、**会话缓存已预热**、盐已加载（`today-1`、`today`、`today+1`）、schema 版本达标、Reliable 下 NATS 已连接；另报告 GeoIP 库的状态（`checks.geoip`，`ok` 恒为 `true`，不参与就绪判断；字段：`file_present`、持有库的进程另有 `loaded` `source` `database_type` `build_epoch` `age_seconds`、运行刷新任务的进程另有 `refresh.{schedule,last_attempt_at,last_result,last_error,consecutive_failures}`）：下载上百 MB 超出预热预算，缺库只让位置字段为空。借鉴 04§6 就绪检查（PG、CH、关键缓存），增加盐、schema、NATS。公共监听在预热完成后才绑定，预热预算应小于 `lb_try_duration`（预热细节见 `system-design.md`）。JSON 含 `version`、`commit`、`schema_version`（对应 04§6 的 info 端点） |
+| `/readyz` | 全部满足才 200，否则 503 并返回逐项 JSON：PG `SELECT 1`、ClickHouse `SELECT 1`、**站点缓存已预热**、**会话缓存已预热**、盐已加载（`today-1`、`today`、`today+1`）、schema 版本达标、集群下 NATS 已连接；另报告 GeoIP 库的状态（`checks.geoip`，`ok` 恒为 `true`，不参与就绪判断；字段：`file_present`、持有库的进程另有 `loaded` `source` `database_type` `build_epoch` `age_seconds`、运行刷新任务的进程另有 `refresh.{schedule,last_attempt_at,last_result,last_error,consecutive_failures}`）：下载上百 MB 超出预热预算，缺库只让位置字段为空。借鉴 04§6 就绪检查（PG、CH、关键缓存），增加盐、schema、NATS。公共监听在预热完成后才绑定，预热预算应小于 `lb_try_duration`（预热细节见 `system-design.md`）。JSON 含 `version`、`commit`、`schema_version`（对应 04§6 的 info 端点） |
 | ClickHouse 查询 | 所有查询带 `log_comment`，JSON：`route`、`site`（站点 id）、`org`（组织 id）、`api_key_id`、`part`（main / compare / total 等查询部分）、`tier`（raw）；只含 id，不含 key 明文、邮箱、IP、UA、过滤值；`user` 与 `trace_id` 待会话鉴权与 trace 接入后再补。用于 `system.query_log` 归因慢查询 |
 | 采集计数 | ClickHouse `ingest_counters`（站点 × 原因 × 脚本版本 × 分钟，accepted/dropped），结构与原因枚举见 `system-design.md`。Prometheus 指标**不带 `site` 标签**（防基数爆炸），站点维度只查该表 |
 | 日志 | 结构化 JSON；请求日志只记 `method`、路由模板、状态、耗时、`trace_id`，**不记查询串**（Plausible 请求日志含路径加查询串，04§6）；`/api/event` 不记 IP、UA、完整 URL |
@@ -510,7 +510,7 @@ Plausible 自定义指标覆盖缓存命中、ingest buffer 入队与丢弃、�
 | ClickHouse | 原生 `BACKUP DATABASE rivu TO S3(...)`（或 `Disk('backups', ...)`，需服务端配置 `allowed_disk`），账号 `rivu_backup` | 每周全量、每日增量（`base_backup`） | 必须落在独立存储（另一台机器或另一账号的桶），同机磁盘副本不算备份 |
 | NATS | 不备份 | — | JetStream 是缓冲，不是事实来源 |
 
-配置与 secrets 另存于密码管理器（`RIVU_SECRET_KEY` 丢失则 TOTP 密钥不可解）。目标（需演练验证，非承诺）：PG 与 ClickHouse 的 RPO ≤ 24h，单机 Lite 的 RTO ≤ 2h；需要更低 RPO 时再加 PG WAL 归档。
+配置与 secrets 另存于密码管理器（`RIVU_SECRET_KEY` 丢失则 TOTP 密钥不可解）。目标（需演练验证，非承诺）：PG 与 ClickHouse 的 RPO ≤ 24h，单机部署的 RTO ≤ 2h；需要更低 RPO 时再加 PG WAL 归档。
 
 **恢复演练（每周自动，compose profile `drill` 或 CI 定时）**：拉起临时 PG 与 ClickHouse → 还原最近备份 → `rivu migrate status` 无异常 → 冒烟查询（org 与站点数；ClickHouse 最近一天行数与线上差异在容差内）→ 输出结果与耗时，失败告警。耗时即 RTO 的实测来源。
 
@@ -522,7 +522,7 @@ Plausible 自定义指标覆盖缓存命中、ingest buffer 入队与丢弃、�
 | 3 | `rivu migrate`，把旧版本 schema 升到当前 |
 | 4 | **重放删除意图**：把 `completed_at` 晚于 ClickHouse 备份时间点的 `done` 记录重置为 `pending`，防止还原把用户已删除的数据找回来（`ch_delete_batch` 幂等，可重放） |
 | 5 | 先启动 `worker`/`all`，等 `salts_rotate` 补盐与 rollup 重建，再启动 collector 与 api，确认 `/readyz` |
-| 6 | 还原点之后的事件不可恢复；Reliable 下若 JetStream 仍保留则重新消费，需配合去重（见 `system-design.md`） |
+| 6 | 还原点之后的事件不可恢复；集群下若 JetStream 仍保留则重新消费，需配合去重（见 `system-design.md`） |
 
 ### 11.3 版本升级流程
 | 步骤 | 动作 | 失败时 |
@@ -531,7 +531,7 @@ Plausible 自定义指标覆盖缓存命中、ingest buffer 入队与丢弃、�
 | 1 | **备份**：触发 PG `pg_dump` 与 ClickHouse `BACKUP`，确认成功并记录备份名 | 备份失败则中止 |
 | 2 | `docker compose pull` | — |
 | 3 | **migrate**：`docker compose run --rm migrate`；其他服务依赖它 `service_completed_successfully` | 失败则停止，旧版本继续运行（迁移兼容旧二进制） |
-| 4 | **滚动重启**：Lite 用 `docker compose up -d`（`rivu` 重启期间 Caddy `lb_try_duration` 排队，通常无丢失）；Reliable 依次 `worker` → `api` → `collector`，逐副本等 `/readyz` 为 200 再动下一个 | 回滚镜像 tag 重启，仅在只做了 expand 迁移时安全；否则按 11.2 恢复 |
+| 4 | **滚动重启**：单机用 `docker compose up -d`（`rivu` 重启期间 Caddy `lb_try_duration` 排队，通常无丢失）；集群依次 `worker` → `api` → `collector`，逐副本等 `/readyz` 为 200 再动下一个 | 回滚镜像 tag 重启，仅在只做了 expand 迁移时安全；否则按 11.2 恢复 |
 | 5 | **验证**：`rivu_build_info`、`schema_version`；`accepted` 速率恢复、`dropped` 无异常、JetStream 积压回落、`jobs_leader` = 1 | — |
 
 ## 12. 对 Plausible 的取舍
