@@ -7,6 +7,7 @@
 --     崩溃在「语句已执行、记录未写入」之间时会重跑整个文件。
 --   * 三张表都开 non_replicated_deduplication_window：批次带 insert_deduplication_token 重试，
 --     「写入成功但响应丢失」后的重放不会重复写入（§5.4）。
+--   * events 与 sessions 没有表级 TTL：保留期可按站点设置，由后台任务 retention_purge 删除（§5.6）。
 
 CREATE DATABASE IF NOT EXISTS {{database}};
 
@@ -55,8 +56,7 @@ PARTITION BY toYYYYMM(ts)
 ORDER BY (site_id, toDate(ts), name, visitor_id, ts)
 PRIMARY KEY (site_id, toDate(ts), name, visitor_id)
 SAMPLE BY visitor_id
-TTL toDate(ts) + INTERVAL 731 DAY DELETE
-SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1, non_replicated_deduplication_window = 1000;
+SETTINGS index_granularity = 8192, non_replicated_deduplication_window = 1000;
 
 -- ---------------------------------------------------------------- sessions
 -- 会话行由 mv_sessions 在 events 的同一个 INSERT 内同步生成，应用不直接写 sessions。
@@ -107,8 +107,7 @@ ENGINE = AggregatingMergeTree
 PARTITION BY toYYYYMM(start_date)
 ORDER BY (site_id, start_date, session_id)
 SAMPLE BY session_id
-TTL start_date + INTERVAL 731 DAY DELETE
-SETTINGS ttl_only_drop_parts = 1, non_replicated_deduplication_window = 1000;
+SETTINGS non_replicated_deduplication_window = 1000;
 
 -- SQL SECURITY 必须显式写：服务端设置 ignore_empty_sql_security_in_create_view_query 默认为 1，
 -- 不写时不会套用默认 DEFINER，推送 MV 时按写入者鉴权，rivu_writer 就得有 events 的 SELECT。

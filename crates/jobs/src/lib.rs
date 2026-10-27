@@ -1,4 +1,5 @@
-//! 后台任务：`salts_rotate`、`geoip_refresh`、`ch_delete_batch`（[`stats_delete`]）、`rollup_build`（[`rollup`]）与 `ch_monitor`（[`ch_monitor`]），
+//! 后台任务：`salts_rotate`、`geoip_refresh`、`ch_delete_batch`（[`stats_delete`]）、`rollup_build`（[`rollup`]）、`retention_purge`（[`retention`]）
+//! 与 `ch_monitor`（[`ch_monitor`]），
 //! 直接在进程内定时执行（`platform-and-ops.md` §6）。
 //!
 //! 写盐需要 PG 写权限，所以只有 `worker` 和 `all` 角色运行（`Role::runs_jobs`），collector 不运行。
@@ -8,12 +9,14 @@
 pub mod ch_monitor;
 pub mod datacenter;
 pub mod geoip;
+pub mod retention;
 pub mod rollup;
 pub mod stats_delete;
 
 pub use ch_monitor::spawn_ch_monitor;
 pub use datacenter::spawn_datacenter_refresh;
 pub use geoip::{GeoRefreshJob, GeoRefreshSnapshot, GeoRefreshState, spawn_geoip_refresh};
+pub use retention::spawn_retention_purge;
 pub use rollup::spawn_rollup_build;
 pub use stats_delete::{StatsDeleteKick, spawn_stats_delete};
 

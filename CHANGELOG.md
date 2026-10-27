@@ -12,5 +12,7 @@
 - 采集脚本 core / full、接入管线（屏蔽规则、机器人、地理、UA、来源与渠道）、会话分配与批量写入。
 - 统一查询引擎、公开查询 API（`POST /api/v1/query`）与命令行 `rivu query`。
 - 日汇总层：后台按站点本地日构建，长时间范围的兼容查询自动改用它。
+- 查询结果缓存；ClickHouse parts / merge / mutation 监控指标。
+- 原始数据保留期可配置（实例上限 `RIVU_RETENTION_DAYS`，站点可单独调短），过期数据由后台任务删除，汇总数据永久保留。
 - 看板：站点、统计、接入诊断、安装、站点设置、目标、共享链接、成员与邀请、API key、账号。
 - 生产镜像（`Dockerfile`）、compose 部署（`deploy/compose.yml`）、nginx / Caddy 反向代理示例、安装文档（`docs/install.md`）。

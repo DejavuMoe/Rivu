@@ -123,6 +123,8 @@ pub struct QueryApi<S> {
     rollup_min_rows: Option<u64>,
     /// 结果缓存（进程内共用，§6.9）；`None` 不缓存。
     cache: Option<Arc<QueryCache>>,
+    /// `RIVU_RETENTION_DAYS`。
+    retention_days: u32,
     clock: Clock,
 }
 
@@ -142,6 +144,7 @@ impl<S: AuthStore> QueryApi<S> {
             timeout_secs,
             rollup_min_rows: None,
             cache: None,
+            retention_days: rivu_common::config::DEFAULT_RETENTION_DAYS,
             clock: Arc::new(Timestamp::now),
         }
     }
@@ -149,6 +152,12 @@ impl<S: AuthStore> QueryApi<S> {
     /// 打开日汇总层（`RIVU_ROLLUP_MIN_ROWS`，见 [`ExecOptions::rollup_min_rows`]）。
     pub fn with_rollup(mut self, min_rows: u64) -> Self {
         self.rollup_min_rows = Some(min_rows);
+        self
+    }
+
+    /// 原始数据保留期（`RIVU_RETENTION_DAYS`，默认 731）。
+    pub fn with_retention(mut self, days: u32) -> Self {
+        self.retention_days = days;
         self
     }
 
@@ -166,9 +175,15 @@ impl<S: AuthStore> QueryApi<S> {
 
     /// 站点上下文：时区与周起始日来自 PG，地理署名与能力来自进程里的库。站点此刻已不存在返回 `NotFound`。
     async fn site_context(&self, site_id: u64, site_key: &str) -> Result<SiteContext, Fail> {
-        load_site_context(&self.pg, self.geo.as_deref(), site_id, site_key)
-            .await
-            .map_err(Fail::from)
+        load_site_context(
+            &self.pg,
+            self.geo.as_deref(),
+            site_id,
+            site_key,
+            self.retention_days,
+        )
+        .await
+        .map_err(Fail::from)
     }
 }
 
@@ -179,6 +194,7 @@ pub(crate) async fn load_site_context(
     geo: Option<&GeoDb>,
     site_id: u64,
     site_key: &str,
+    retention_days: u32,
 ) -> Result<SiteContext, ApiError> {
     let settings = match rivu_storage_pg::sites::find_query_settings(pg, site_id).await {
         Ok(Some(s)) => s,
@@ -229,6 +245,13 @@ pub(crate) async fn load_site_context(
         geo_attribution: geo.and_then(|g| g.attribution()),
         geo_capability: geo.and_then(|g| g.capability()),
         goals,
+        // 站点设置只能比全局短（PATCH 时校验；全局调小后也以全局为准）
+        retention_days: Some(
+            settings
+                .retention_days
+                .and_then(|d| u32::try_from(d).ok())
+                .map_or(retention_days, |d| d.min(retention_days)),
+        ),
     })
 }
 // ------------------------------------------------------------------------------------------
