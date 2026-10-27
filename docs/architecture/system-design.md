@@ -653,7 +653,7 @@ ORDER BY (site_id, minute, metric, script_version)
 TTL minute + INTERVAL 90 DAY DELETE;
 ```
 
-计数批次与事件批次一样带 `insert_deduplication_token` 重试，所以表上也要开 `non_replicated_deduplication_window`（迁移 `20261022100000_ingest_counters_dedup`）；否则「写入成功但响应丢失」后的重试会重复累加，破坏与请求数的对账。
+计数批次与事件批次一样带 `insert_deduplication_token` 重试，所以表上也要开 `non_replicated_deduplication_window`；否则「写入成功但响应丢失」后的重试会重复累加，破坏与请求数的对账。
 
 做法沿用 Plausible（R01 §10、R02 §5.4）：进程内按 10 秒分桶累加，只刷出已结束的桶，关停时强制刷出。桶用接收请求时的墙钟，不是事件时间：计数描述的是「接收」这件事。`script_version` 是 UInt16，而协议里 `sv` 最大 999999，超出的钳到 65535。这些计数有三个用途：
 
@@ -1012,7 +1012,7 @@ Q1–Q8 于 2026-10-22 定案；Q9–Q18 是 P1 动工前给指标口径写 brie
 
 | # | 问题 | 决定 | 影响 |
 |---|---|---|---|
-| Q1 | 原始数据默认保留期 | 默认 731 天（连续两个自然年，含一个闰年）。日均 1000 万事件的部署建议把 `RIVU_RETENTION_DAYS` 调低到 180 天 | D12；§5.1 表；§5.2、§5.3 的 TTL 改为 `INTERVAL 731 DAY`；§7 容量重算；`RIVU_RETENTION_DAYS` 默认 731；迁移 `…100100_events.sql`、`…100200_sessions.sql` 就地修改（尚未发布） |
+| Q1 | 原始数据默认保留期 | 默认 731 天（连续两个自然年，含一个闰年）。日均 1000 万事件的部署建议把 `RIVU_RETENTION_DAYS` 调低到 180 天 | D12；§5.1 表；§5.2、§5.3 的 TTL 改为 `INTERVAL 731 DAY`；§7 容量重算；`RIVU_RETENTION_DAYS` 默认 731 |
 | Q2 | `visit_duration` 是否计入 engagement 时间 | 不计入，与 Plausible 和导入数据一致；另设独立指标 `engaged_duration` | §5.3 派生指标；§5.5 `rollup_site_day` 增列；§6.2 指标列表；§6.4 归属；§6.5 定义 |
 | Q3 | tracker 是否读取 `localStorage.rivu_ignore`（站点所有者排除自己的访问） | 只读：tracker 永不写入，也不用于标识或上报。v1 的「不使用 localStorage」作废 | `tracker-and-protocol.md` §1.1、§4.7、§10.2；§8 |
 | Q4 | 是否提供 Plausible 协议兼容端点 | P4 提供 `POST /api/plausible/event`，便于迁移；Plausible 的 tracker 是 MIT 许可 | §9 的 P4；`tracker-and-protocol.md` §9 |
@@ -1020,13 +1020,13 @@ Q1–Q8 于 2026-10-22 定案；Q9–Q18 是 P1 动工前给指标口径写 brie
 | Q6 | 是否做 `SAMPLE` 采样 | 暂不做，用日汇总层的自动分层代替；DDL 里保留 `SAMPLE BY visitor_id` | §2.6；§5.2；§6.4 |
 | Q7 | 会话最长时长 | 7 天（原为 24 小时）。续期条件：`ts − last_seen_at ≤ 30 min` 且 `ts − started_at ≤ 7 d`。跨午夜靠会话的别名 key，最多 8 个 | §4.6（规则、并发、内存、预热、失败语义）；§4.5；§6.5 `visits` 回溯 7 天；§7 内存；§8 |
 | Q8 | Reliable 的分区数 P | P = 32，安装时固定；以后要改，必须先排空队列再迁移 | §4.8；`platform-and-ops.md` 的 `RIVU_PARTITIONS` |
-| Q9 | 盖章是否改写 `visitor_id` | 不改写：事件保留自己当天的 `visitor_id`，会话只靠 `session_id` 串联。`sessions` 排序键去掉 `visitor_id`，改为 `(site_id, start_date, session_id)`，`SAMPLE BY session_id`；新增聚合列 `last_visitor_id`（`argMax(visitor_id, ts)`，会话最后一个事件的当天 ID）取代 `visitor_id`。任意范围的 `uniq(visitor_id)` 因此严格等于各本地日访客数之和 | §4.6（盖章、预热、失败语义）；§5.2、§5.3（DDL、MV、两级聚合）；§5.5 访客数跨天求和；§6.4 `visitors` 只从 `events` 计算；§6.5；§8 跨天连续性；迁移 `…100100_events.sql`、`…100200_sessions.sql` 就地修改（尚未发布） |
+| Q9 | 盖章是否改写 `visitor_id` | 不改写：事件保留自己当天的 `visitor_id`，会话只靠 `session_id` 串联。`sessions` 排序键去掉 `visitor_id`，改为 `(site_id, start_date, session_id)`，`SAMPLE BY session_id`；新增聚合列 `last_visitor_id`（`argMax(visitor_id, ts)`，会话最后一个事件的当天 ID）取代 `visitor_id`。任意范围的 `uniq(visitor_id)` 因此严格等于各本地日访客数之和 | §4.6（盖章、预热、失败语义）；§5.2、§5.3（DDL、MV、两级聚合）；§5.5 访客数跨天求和；§6.4 `visitors` 只从 `events` 计算；§6.5；§8 跨天连续性 |
 | Q10 | 原始层近似去重、汇总层精确去重 | 两层用同一个 `uniq`，日汇总层存的就是按同样方法算出的每日值；容差写进指标口径文档，实测误差见 §6.5 | §5.5；§6.5 |
 | Q11 | `site_key` 的格式 | 12 位 base32 小写（`^[a-z2-7]{12}$`）。PG 的 CHECK、线协议、站点脚本路径与 API key 的 scope 用同一条规则（`rivu_domain::is_site_key`）；格式合法但不存在的 key 落到 `unknown_site` | `tracker-and-protocol.md` §5.1 |
-| Q12 | hostname 白名单为空时怎么处理 | fail-closed：全部丢弃（`hostname_not_allowed`）；建站时自动加入主域名 | §4.2 第 3 步；`platform-and-ops.md` §3.3；迁移 `…100000_core_tables.sql` 的注释就地修正；`tracker-and-protocol.md` §7 |
+| Q12 | hostname 白名单为空时怎么处理 | fail-closed：全部丢弃（`hostname_not_allowed`）；建站时自动加入主域名 | §4.2 第 3 步；`platform-and-ops.md` §3.3；`tracker-and-protocol.md` §7 |
 | Q13 | 丢弃原因的标识符 | Rust 枚举 `DropReason` 为唯一来源。`ingest_counters.metric` 取 `accepted` 或 `dropped_<原因>`（含 `salt_missing`）；400 按 `rejected_<字段>` 只进 Prometheus，不进 `ingest_counters`；未知站点记 `site_id = 0`；已删除的站点从快照摘除后按 `unknown_site` 计 | §2.2；§4.1；§4.2；§5.4；`tracker-and-protocol.md` §6.4；`platform-and-ops.md` §3 站点删除 |
 | Q14 | 查询超时 | 按调用方分三档：看板 `RIVU_QUERY_TIMEOUT_SECS`（默认 10）、公开 API `RIVU_API_QUERY_TIMEOUT_SECS`（默认 20）、公开看板与共享链接 `RIVU_PUBLIC_QUERY_TIMEOUT_SECS`（默认 5）；每档不得大于 reader 配额上限 | §6.8；`platform-and-ops.md` §4.4、§7 |
-| Q15 | Lite 从 ClickHouse 预热时找不到分片 | Lite 也把 `routing % 32` 写入 `ingest_partition`，分片数固定为 32，与 Reliable 的 P 相同；预热按 `ingest_partition` 放回分片 | §4.5；§4.6（并发、预热）；§5.2 DDL 注释；迁移 `…100100_events.sql` 注释 |
+| Q15 | Lite 从 ClickHouse 预热时找不到分片 | Lite 也把 `routing % 32` 写入 `ingest_partition`，分片数固定为 32，与 Reliable 的 P 相同；预热按 `ingest_partition` 放回分片 | §4.5；§4.6（并发、预热）；§5.2 DDL 注释 |
 | Q16 | 写缓冲默认值 | 变量名取 `platform-and-ops.md` 的，默认值以 §4.7 为准：1000 ms、20000 行、8388608 字节、channel 20 万条；P2 压测后再调 | §4.7；`platform-and-ops.md` §7 |
 | Q17 | `visitors` 是否统计 engagement 事件 | 排除，与 `realtime` 同口径 | §5.5；§6.5 |
 | Q18 | 线协议的错误词表与测试清单 | 词表补一条 `has an invalid format`，用于 `s` 格式错、`n` 含控制字符、`$` 字段格式错；`u` 不限长，超长 query 被丢弃、pathname 截断到 1024 字节，不回 400 | `tracker-and-protocol.md` §6.2、§11.1 |

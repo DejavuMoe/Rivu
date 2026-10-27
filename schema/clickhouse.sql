@@ -58,7 +58,7 @@ ENGINE = SummingMergeTree(value)
 PARTITION BY toYYYYMM(minute)
 ORDER BY (site_id, minute, metric, script_version)
 TTL minute + toIntervalDay(90)
-SETTINGS index_granularity = 8192, non_replicated_deduplication_window = 1000;
+SETTINGS non_replicated_deduplication_window = 1000, index_granularity = 8192;
 
 CREATE MATERIALIZED VIEW {{database}}.mv_sessions TO {{database}}.sessions
 (

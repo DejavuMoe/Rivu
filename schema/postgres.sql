@@ -220,6 +220,7 @@ TABLE shared_links
   id bigint NOT NULL GENERATED ALWAYS AS IDENTITY
   site_id bigint NOT NULL
   slug text NOT NULL
+  name text
   password_hash text
   segment_id bigint
   expires_at timestamp with time zone
@@ -227,7 +228,6 @@ TABLE shared_links
   deleted_at timestamp with time zone
   created_at timestamp with time zone NOT NULL DEFAULT now()
   updated_at timestamp with time zone NOT NULL DEFAULT now()
-  name text
   CONSTRAINT shared_links_created_by_fkey FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL
   CONSTRAINT shared_links_name_check CHECK (((char_length(name) >= 1) AND (char_length(name) <= 100)))
   CONSTRAINT shared_links_pkey PRIMARY KEY (id)
