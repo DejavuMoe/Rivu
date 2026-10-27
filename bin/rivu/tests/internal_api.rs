@@ -1385,7 +1385,7 @@ async fn session_lifecycle() {
         "/api/internal/sites/1/members",
         "/api/internal",
     ] {
-        assert_eq!(http.get(path).send().await.status, 501, "{path}");
+        assert_eq!(http.get(path).send().await.status, 404, "{path}");
     }
 }
 

@@ -424,7 +424,7 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 | `RIVU_QUERY_TIMEOUT_SECS`、`RIVU_API_QUERY_TIMEOUT_SECS`、`RIVU_PUBLIC_QUERY_TIMEOUT_SECS` | `10`、`20`、`5` | 看板、公开 API、公开看板与共享链接各一档（取值 1–300）；须不大于 reader 配额上限（第 8 节） |
 | `RIVU_SHIELD_MAX_RULES_PER_SITE` | `500`（范围 1–100000） | 每站屏蔽规则上限，添加时在事务内锁站点行后计数（§3.3） |
 | `RIVU_REGISTRATION`、`RIVU_SETUP_TOKEN` | `invite_only`；可选 | 注册策略；首次 `/setup` 令牌 |
-| `RIVU_VISITOR_PEPPER` | 可选；生产应设置（至少 32 个字符） | 访客密钥，与每天的盐派生 `visitor_hash` 的 key，不进数据库（`system-design.md` §4.5、`docs/privacy.md`）；所有 collector 用同一个值；不要和 PG 备份放在一起；未设置时 collector 启动打 warn |
+| `RIVU_VISITOR_PEPPER` | collector / all 必填（至少 32 个字符） | 访客密钥，与每天的盐派生 `visitor_hash` 的 key，不进数据库（`system-design.md` §4.5、`docs/privacy.md`）；所有 collector 用同一个值；不要和 PG 备份放在一起 |
 | `RIVU_LOG_FORMAT`、`RIVU_LOG_LEVEL` | `json`、`info` | `json` \| `pretty` |
 | `RIVU_METRICS` | `on` | 内部口 `/metrics` 开关（Plausible 默认关，04§0#6） |
 | `RIVU_OTLP_ENDPOINT`、`RIVU_ERROR_REPORT_DSN` | 空（关闭） | OTLP 导出（同 04§4.2 `OTLP_ENDPOINT` 思路）；可选错误上报，脱敏见第 10 节 |

@@ -1,7 +1,6 @@
 //! 统一查询内核（`docs/architecture/system-design.md` §6）。
 //!
-//! 一个 [`QuerySpec`] 进，一个 [`QueryResult`] 出；看板、公开 API、`rivu stats` 与 `overview` / `breakdown` 预设
-//! 都走同一条路径：
+//! 一个 [`QuerySpec`] 进，一个 [`QueryResult`] 出；看板、公开 API 与 `rivu query` 都走同一条路径：
 //!
 //! ```text
 //! JSON ─► spec::QuerySpec::parse        // 语法：deny_unknown_fields、封闭枚举，错误带字段路径
@@ -22,7 +21,6 @@
 pub mod error;
 pub mod exec;
 pub mod plan;
-pub mod presets;
 pub mod resolve;
 pub mod result;
 pub mod spec;
@@ -33,9 +31,6 @@ mod sql_tests;
 
 pub use error::QueryError;
 pub use exec::{ExecOptions, execute, explain};
-pub use presets::{
-    BreakdownRow, Dimension, NO_CHANNEL, NO_SOURCE, NOT_SET, Overview, breakdown, overview,
-};
 pub use resolve::{GoalDef, GoalKind, ResolvedQuery, SiteContext};
 pub use result::QueryResult;
 pub use spec::QuerySpec;

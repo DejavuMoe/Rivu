@@ -407,8 +407,8 @@ mod tests {
 
     fn sites() -> Arc<Vec<Site>> {
         Arc::new(vec![
-            Site::parse("k7Qm2xV9aTbR4cLd:1:a.test,b.test").unwrap(),
-            Site::parse("Zx81mQ2pLk9TnB3w:2:c.test").unwrap(),
+            Site::parse("k7qm2xv7atbr:1:a.test,b.test").unwrap(),
+            Site::parse("zx3mq2plk4tn:2:c.test").unwrap(),
         ])
     }
 

@@ -1,9 +1,17 @@
 //! 接入链路各段共用的领域类型：协议解析的产物、会话属性、丢弃原因。
 //!
-//! 这里只放数据形状和枚举，不放逻辑；解析在 `rivu-ingest`，会话在 `rivu-session`，
+//! 这里只放数据形状、枚举和它们自身的格式规则；解析在 `rivu-ingest`，会话在 `rivu-session`，
 //! 落库行结构在 `rivu-storage-ch`。
 
 use std::fmt;
+
+/// `site_key` 的格式：12 位 base32 小写（`^[a-z2-7]{12}$`），与 `sites.site_key` 的 CHECK 相同。
+/// 线协议、站点脚本路径与 API key 的 scope 都用这一条规则。
+pub fn is_site_key(s: &str) -> bool {
+    s.len() == 12
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b))
+}
 
 /// 事件种类。`pageview` 和 `engagement` 是系统事件名，其余都是自定义事件。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -188,6 +196,24 @@ mod tests {
     fn metric_names_are_prefixed_reason_names() {
         for r in DropReason::ALL {
             assert_eq!(r.metric(), format!("dropped_{}", r.as_str()));
+        }
+    }
+
+    #[test]
+    fn site_key_format_matches_the_pg_check() {
+        assert!(is_site_key("abcdefghijkl"));
+        assert!(is_site_key("k7qm2xv7atbr"));
+        assert!(is_site_key("234567234567"));
+        for bad in [
+            "",
+            "abcdefghijk",
+            "abcdefghijklm",
+            "ABCDEFGHIJKL",
+            "abcdefghij01",
+            "abcdefghij1l",
+            "abcdefghij-l",
+        ] {
+            assert!(!is_site_key(bad), "{bad:?}");
         }
     }
 
