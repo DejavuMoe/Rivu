@@ -38,7 +38,7 @@ pub struct Migration {
     pub version: u64,
     pub name: String,
     pub store: Store,
-    /// 文件名，例如 `20261021100000_core_tables.sql`
+    /// 文件名，例如 `20261021100000_init.sql`
     pub file: String,
     pub sql: String,
     /// 内容的 SHA-256（十六进制，换行符按 LF 归一化后计算）

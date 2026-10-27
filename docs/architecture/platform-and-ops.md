@@ -449,7 +449,7 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 - `all` 进程持有全部应用凭据（Lite 的取舍）；Reliable 下各进程只拿各自所需。
 
 ## 9. 迁移与版本升级
-PG 与 ClickHouse 迁移放在同一目录、同一版本序列（14 位时间戳），一个文件只针对一个存储：`migrations/20261021100000_init_orgs.pg.sql`、`migrations/20261021100100_events_raw.ch.sql`。
+PG 与 ClickHouse 迁移共用一个版本序列（14 位时间戳），分别放在 `migrations/postgres/` 与 `migrations/clickhouse/`，一个文件只针对一个存储。v0.0.1 之前每个库只有一个初始迁移（`postgres/20261021100000_init.sql`、`clickhouse/20261021100100_init.sql`），之后的结构变更一律新增迁移。
 
 | 项 | 规则 |
 |---|---|
@@ -457,7 +457,7 @@ PG 与 ClickHouse 迁移放在同一目录、同一版本序列（14 位时间�
 | 记录 | PG：`_sqlx_migrations`；ClickHouse：`rivu.schema_migrations(version, name, checksum, applied_at)`；已应用集合 = 两者并集 |
 | 乱序 | 待执行版本小于任一已应用版本时默认报错；分支合并造成的乱序需 `--allow-out-of-order` |
 | 并发 | 持 `pg_advisory_lock('rivu:migrate')`，两个 `migrate` 不会同时跑 |
-| 原子性 | PG 迁移与记录同一事务；ClickHouse 无事务，**每个 CH 迁移必须幂等**（`IF NOT EXISTS`、可重复 `ALTER`），崩溃于「应用后、记录前」时重跑安全；CH 文件内以 `-- rivu:split` 分隔语句 |
+| 原子性 | PG 迁移与记录同一事务；ClickHouse 无事务，**每个 CH 迁移必须幂等**（`IF NOT EXISTS`、可重复 `ALTER`），崩溃于「应用后、记录前」时重跑安全；CH 文件按行尾的 `;` 拆成多条语句逐条执行 |
 | 只前进 | 无 down 迁移；回滚靠 expand/contract 或恢复备份（Plausible 有 `rollback.sh`，04§7.2；跨库 down 无法保证一致，故不提供） |
 | 启动时机 | 不自动迁移，由 compose 一次性服务执行（04§0#7）；其他进程比对 `schema_migrations` 最高版本与自身 `REQUIRED_SCHEMA_VERSION`，不足则 `/readyz` 失败并给出原因 |
 | 命令 | `rivu migrate`；`rivu migrate status`（对应 04§7.2 `pending-migrations.sh`）；`rivu migrate --plan`（仅打印）。`migrate` 先 `CREATE DATABASE IF NOT EXISTS`（CH），PG 库由容器环境变量创建（对应 `createdb.sh`） |

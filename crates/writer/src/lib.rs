@@ -6,7 +6,7 @@
 //! - 写入任务单独运行；一批正在重试时不再从 channel 取数，channel 逐渐变满，背压自然传到 `503`；
 //! - token = `{node_id}:{batch_seq}`，`node_id` 每次进程启动随机生成，所以重启后 token 不会和旧进程的撞车；
 //!   同一批重试时 token 与内容都不变；
-//! - 计数 token = `{node_id}:c{seq}`。`ingest_counters` 的去重窗口由迁移 `20261022100000_ingest_counters_dedup`
+//! - 计数 token = `{node_id}:c{seq}`。`ingest_counters` 的去重窗口由 ClickHouse 初始迁移
 //!   打开，「写入成功但响应丢失」后的重试不会让计数重复；
 //! - 批次的内容与顺序由 channel 的接收顺序决定。一批横跨两个月的事件会被拆成两个 block，
 //!   ClickHouse 给每个 block 派生确定的子 token，重试仍然幂等。
