@@ -19,6 +19,7 @@ use jiff::Timestamp;
 use jiff::civil::Date;
 use jiff::tz::TimeZone;
 use rivu_geo::GeoLevel;
+use rivu_session::identity::peppered_key;
 use rivu_storage_pg::salts::Salt;
 use rivu_storage_pg::sites::{SiteRow, TrackerSwitches};
 use sqlx::PgPool;
@@ -338,9 +339,13 @@ pub fn utc_today() -> Date {
 }
 
 /// `日期 -> 盐`。collector 只读不生成：缺盐就丢弃事件（`salt_missing`）。
+///
+/// 配置了访客密钥（`RIVU_VISITOR_PEPPER`）时，存的是用密钥派生后的 key（[`peppered_key`]），
+/// [`SaltCache::get`] 拿到的就是 `visitor_hash` 要用的 key。
 pub struct SaltCache {
     map: ArcSwap<HashMap<Date, Salt>>,
     loaded: AtomicBool,
+    pepper: Option<Vec<u8>>,
 }
 
 impl Default for SaltCache {
@@ -354,14 +359,27 @@ impl SaltCache {
         SaltCache {
             map: ArcSwap::from_pointee(HashMap::new()),
             loaded: AtomicBool::new(false),
+            pepper: None,
         }
+    }
+
+    /// 用访客密钥派生每天的 key；`None` 时直接用盐。
+    pub fn with_pepper(mut self, pepper: Option<&[u8]>) -> Self {
+        self.pepper = pepper.map(<[u8]>::to_vec);
+        self
     }
 
     pub fn get(&self, day: Date) -> Option<Salt> {
         self.map.load().get(&day).copied()
     }
 
-    pub fn replace(&self, salts: HashMap<Date, Salt>) {
+    /// 整体替换为 PG 里的盐（配置了密钥时先派生）。
+    pub fn replace(&self, mut salts: HashMap<Date, Salt>) {
+        if let Some(pepper) = &self.pepper {
+            for salt in salts.values_mut() {
+                *salt = peppered_key(pepper, salt);
+            }
+        }
         self.map.store(Arc::new(salts));
         self.loaded.store(true, Ordering::Release);
     }
@@ -576,6 +594,20 @@ mod tests {
         assert!(!c.covers(date(2026, 3, 30)), "缺 3/31");
         assert_eq!(c.get(date(2026, 3, 29)), Some([2u8; 16]));
         assert_eq!(c.get(date(2026, 3, 1)), None);
+    }
+
+    #[test]
+    fn pepper_derives_the_cached_keys() {
+        let c = SaltCache::new().with_pepper(Some(b"0123456789abcdef0123456789abcdef"));
+        let mut m = HashMap::new();
+        m.insert(date(2026, 3, 29), [2u8; 16]);
+        c.replace(m);
+        let key = c.get(date(2026, 3, 29)).unwrap();
+        assert_ne!(key, [2u8; 16], "盐不能原样作为 key");
+        assert_eq!(
+            key,
+            peppered_key(b"0123456789abcdef0123456789abcdef", &[2u8; 16])
+        );
     }
 
     #[test]
