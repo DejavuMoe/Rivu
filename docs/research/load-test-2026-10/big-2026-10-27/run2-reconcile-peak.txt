@@ -1,0 +1,11 @@
+对账 peak
+  生成器：202 = 300060（接受 297999 + 丢弃 2061），503 = 0，400 = 0，其他状态 = 0，连接错误/超时 = 0，客户端跳过 = 0
+  ingest_counters：accepted 297999 + dropped 2061 = 300060
+  events 行数：297999
+  [OK] 生成器 202 数 == accepted + dropped
+  [OK] 生成器接受数 == accepted
+  [OK] events 行数 == accepted
+  丢弃原因分布：
+    dropped_no_session	1819
+    dropped_bot	1456
+    dropped_spam_referrer	1174

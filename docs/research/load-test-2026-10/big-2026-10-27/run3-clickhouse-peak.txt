@@ -1,0 +1,13 @@
+ClickHouse peak
+  active parts（rivu 库，按表）：
+    events	22	92916879	3.09 GiB
+    ingest_counters	4	1187	8.49 KiB
+    schema_migrations	1	4	865.00 B
+    sessions	12	30473905	2.08 GiB
+  INSERT 耗时（system.query_log，本场景开始以来，毫秒）：表, 次数, p50, p95, max, 平均行数, 最大行数
+    rivu.events,rivu.sessions	57	51	94.2	155	9413	10451
+    rivu.ingest_counters	7	3	11.3	14	24	24
+  INSERT 失败次数：
+    0
+  merges（system.part_log MergeParts，本场景开始以来）：次数, 合并耗时 p95(ms)
+    22	360
