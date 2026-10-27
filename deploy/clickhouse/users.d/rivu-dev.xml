@@ -114,6 +114,10 @@
                 <query>GRANT INSERT, ALTER DELETE, ALTER UPDATE(_row_exists) ON rivu.rollup_browsers</query>
                 <query>GRANT INSERT, ALTER DELETE, ALTER UPDATE(_row_exists) ON rivu.rollup_os</query>
                 <query>GRANT INSERT, ALTER DELETE, ALTER UPDATE(_row_exists) ON rivu.rollup_events</query>
+                <!-- ch_monitor：parts、merge 与 mutation 积压（系统表只列出有权限的表，即 rivu 库） -->
+                <query>GRANT SELECT ON system.parts</query>
+                <query>GRANT SELECT ON system.merges</query>
+                <query>GRANT SELECT ON system.mutations</query>
             </grants>
         </rivu_maintainer>
     </users>

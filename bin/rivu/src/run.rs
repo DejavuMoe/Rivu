@@ -7,7 +7,7 @@
 //! - worker / all：后台任务 `salts_rotate`（启动时补跑一次，之后每小时一次）、`geoip_refresh`
 //!   （无本地副本时立即下载，之后按 `RIVU_GEOIP_REFRESH_INTERVAL` 条件 GET）、`ch_delete_batch`
 //!   （启动后一轮，之后每 `RIVU_STATS_DELETE_INTERVAL_SECS` 一轮，`rivu_maintainer` 账号）、`rollup_build`
-//!   （日汇总层，每 `RIVU_ROLLUP_INTERVAL_SECS` 一轮，同一账号）；
+//!   （日汇总层，每 `RIVU_ROLLUP_INTERVAL_SECS` 一轮，同一账号）、`ch_monitor`（ClickHouse parts / merge / mutation 积压，每 30 秒）；
 //! - collector / all：持有 GeoIP 库并每小时检查文件修改时间、热加载；管线第 6 步用它查询位置；
 //! - api / all：看板静态文件（`RIVU_DASHBOARD_DIR`，见 [`crate::dashboard`]）；公开查询 API（`POST /api/v1/query`、`GET /api/v1/query/schema.json`，见 [`crate::query_api`]）：
 //!   `rivu_reader` 账号的 ClickHouse 客户端、API key 鉴权与按组织限流（[`crate::api_auth::build_guard`]）；
@@ -297,6 +297,7 @@ pub async fn run(config: Config) -> Result<ExitCode> {
     dash_api::describe_metrics();
     rivu_jobs::stats_delete::describe_metrics();
     rivu_jobs::rollup::describe_metrics();
+    rivu_jobs::ch_monitor::describe_metrics();
 
     // 先绑定端口：端口被占用时不应该留下已经启动的后台任务。
     let internal_listener = TcpListener::bind(config.internal_addr)
@@ -351,6 +352,18 @@ pub async fn run(config: Config) -> Result<ExitCode> {
             bg_stop_rx.clone(),
         ));
         // 后台任务 rollup_build：日汇总层（同一个 maintainer 账号）
+        // 后台任务 ch_monitor：parts、merge 与 mutation 积压
+        background.push(rivu_jobs::spawn_ch_monitor(
+            maintainer.clone(),
+            config.ch_database.clone(),
+            bg_stop_rx.clone(),
+        ));
+        // 后台任务 ch_monitor：parts、merge 与 mutation 积压
+        background.push(rivu_jobs::spawn_ch_monitor(
+            maintainer.clone(),
+            config.ch_database.clone(),
+            bg_stop_rx.clone(),
+        ));
         background.push(rivu_jobs::spawn_rollup_build(
             pg.clone(),
             maintainer,

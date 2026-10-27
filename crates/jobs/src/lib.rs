@@ -1,15 +1,17 @@
-//! 后台任务：`salts_rotate`、`geoip_refresh`、`ch_delete_batch`（[`stats_delete`]）与 `rollup_build`（[`rollup`]），
+//! 后台任务：`salts_rotate`、`geoip_refresh`、`ch_delete_batch`（[`stats_delete`]）、`rollup_build`（[`rollup`]）与 `ch_monitor`（[`ch_monitor`]），
 //! 直接在进程内定时执行（`platform-and-ops.md` §6）。
 //!
 //! 写盐需要 PG 写权限，所以只有 `worker` 和 `all` 角色运行（`Role::runs_jobs`），collector 不运行。
 //! `geoip_refresh` 见 [`geoip`]：下载并原子替换 GeoIP 库，collector 只读共享目录、自己热加载。
 //! `datacenter_refresh` 见 [`datacenter`]：同样的方式维护数据中心网段清单（只在开启过滤时运行）。
 
+pub mod ch_monitor;
 pub mod datacenter;
 pub mod geoip;
 pub mod rollup;
 pub mod stats_delete;
 
+pub use ch_monitor::spawn_ch_monitor;
 pub use datacenter::spawn_datacenter_refresh;
 pub use geoip::{GeoRefreshJob, GeoRefreshSnapshot, GeoRefreshState, spawn_geoip_refresh};
 pub use rollup::spawn_rollup_build;

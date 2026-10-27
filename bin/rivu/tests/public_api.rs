@@ -908,7 +908,10 @@ async fn http_results_equal_direct_execution() {
         "{text}"
     );
     assert_eq!(
-        sample(&text, "rivu_query_seconds_count{route=\"api.query\",cache=\"miss\"}"),
+        sample(
+            &text,
+            "rivu_query_seconds_count{route=\"api.query\",cache=\"miss\"}"
+        ),
         Some(executed),
         "{text}"
     );
@@ -1227,7 +1230,10 @@ async fn errors_follow_the_documented_chain() {
     assert_eq!(count("api.not_found", 404), Some(2.0), "{text}");
     // 只有走到 execute 的请求计入耗时：3 次 200（含别的组织公开站点的那次）+ 校验错误发生在 build 阶段的 2 次
     assert_eq!(
-        sample(&text, "rivu_query_seconds_count{route=\"api.query\",cache=\"miss\"}"),
+        sample(
+            &text,
+            "rivu_query_seconds_count{route=\"api.query\",cache=\"miss\"}"
+        ),
         Some(5.0),
         "{text}"
     );
