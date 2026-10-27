@@ -291,6 +291,12 @@ pub const DEFAULT_SITE_RESTORE_DAYS: u32 = 7;
 /// `RIVU_STATS_DELETE_INTERVAL_SECS` 的默认值：`ch_delete_batch` 检查到期删除意图的周期。
 pub const DEFAULT_STATS_DELETE_INTERVAL_SECS: u64 = 300;
 
+/// `RIVU_ROLLUP_INTERVAL_SECS` 的默认值：`rollup_build`（日汇总层构建）的周期。
+pub const DEFAULT_ROLLUP_INTERVAL_SECS: u64 = 600;
+
+/// `RIVU_ROLLUP_MIN_ROWS` 的默认值：查询区间里已构建的天有这么多事件时改用日汇总层（§6.4 选层）。
+pub const DEFAULT_ROLLUP_MIN_ROWS: u64 = 1_000_000;
+
 /// `RIVU_TRACKER_DIR` 的默认值：仓库里 `apps/tracker` 的构建输出（相对进程工作目录）。
 pub const DEFAULT_TRACKER_DIR: &str = "apps/tracker/dist";
 /// `RIVU_DASHBOARD_DIR` 的默认值：看板（`apps/dashboard`）`pnpm build` 的产物目录，相对进程工作目录。
@@ -545,6 +551,10 @@ pub struct Config {
     pub site_restore_days: u32,
     /// `RIVU_STATS_DELETE_INTERVAL_SECS`：`ch_delete_batch`（统计数据删除）的检查周期，worker / all 运行。
     pub stats_delete_interval: Duration,
+    /// `RIVU_ROLLUP_INTERVAL_SECS`：`rollup_build` 的周期，worker / all 运行。
+    pub rollup_interval: Duration,
+    /// `RIVU_ROLLUP_MIN_ROWS`：查询区间里已构建的天的事件数不少于它、且查询兼容时由日汇总层回答；`0` 表示只要兼容就用。
+    pub rollup_min_rows: u64,
     /// `RIVU_PUBLIC_BASE_URL`（去掉结尾的 `/`）：站点脚本前缀里 `endpoint` 的来源（`tracker-and-protocol.md` §2.3，
     /// 不取请求的 `Host`）。未设置时取 `http://<RIVU_LISTEN_ADDR>`，只适合开发。
     pub public_base_url: String,
@@ -791,6 +801,16 @@ impl Config {
             DEFAULT_STATS_DELETE_INTERVAL_SECS,
             10..=86_400,
         );
+        let rollup_interval_secs = l.parse_in_range(
+            "RIVU_ROLLUP_INTERVAL_SECS",
+            DEFAULT_ROLLUP_INTERVAL_SECS,
+            60..=86_400,
+        );
+        let rollup_min_rows = l.parse_in_range(
+            "RIVU_ROLLUP_MIN_ROWS",
+            DEFAULT_ROLLUP_MIN_ROWS,
+            0..=u64::MAX,
+        );
 
         let public_base_url = l.optional("RIVU_PUBLIC_BASE_URL");
         if let Some(u) = &public_base_url {
@@ -918,6 +938,8 @@ impl Config {
             site_cache_refresh: Duration::from_secs(site_cache_refresh_secs),
             site_restore_days,
             stats_delete_interval: Duration::from_secs(stats_delete_interval_secs),
+            rollup_interval: Duration::from_secs(rollup_interval_secs),
+            rollup_min_rows,
             public_base_url,
             public_base_url_explicit,
             base_url,
@@ -1275,6 +1297,8 @@ mod tests {
         assert_eq!(cfg.site_cache_refresh, Duration::from_secs(10));
         assert_eq!(cfg.site_restore_days, 7);
         assert_eq!(cfg.stats_delete_interval, Duration::from_secs(300));
+        assert_eq!(cfg.rollup_interval, Duration::from_secs(600));
+        assert_eq!(cfg.rollup_min_rows, 1_000_000);
         // 查询超时按调用方分三档（§6.8、§10 Q14）
         assert_eq!(
             cfg.query_timeouts,
@@ -1373,8 +1397,12 @@ mod tests {
             ("RIVU_SITE_CACHE_REFRESH_SECS", "3"),
             ("RIVU_SITE_RESTORE_DAYS", "0"),
             ("RIVU_STATS_DELETE_INTERVAL_SECS", "60"),
+            ("RIVU_ROLLUP_INTERVAL_SECS", "120"),
+            ("RIVU_ROLLUP_MIN_ROWS", "0"),
         ])
         .unwrap();
+        assert_eq!(cfg.rollup_interval, Duration::from_secs(120));
+        assert_eq!(cfg.rollup_min_rows, 0);
         assert_eq!(cfg.site_restore_days, 0);
         assert_eq!(cfg.stats_delete_interval, Duration::from_secs(60));
         assert_eq!(cfg.buffer.flush_interval, Duration::from_millis(250));
@@ -1401,6 +1429,8 @@ mod tests {
             ("RIVU_SITE_RESTORE_DAYS", "366"),
             ("RIVU_SITE_RESTORE_DAYS", "-1"),
             ("RIVU_STATS_DELETE_INTERVAL_SECS", "9"),
+            ("RIVU_ROLLUP_INTERVAL_SECS", "59"),
+            ("RIVU_ROLLUP_MIN_ROWS", "-1"),
         ] {
             let err = with_env(&[(name, bad)]).unwrap_err();
             assert_eq!(err.problems.len(), 1, "{name}={bad}: {err}");

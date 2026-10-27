@@ -119,6 +119,8 @@ pub struct QueryApi<S> {
     geo: Option<Arc<GeoDb>>,
     /// `RIVU_API_QUERY_TIMEOUT_SECS`。
     timeout_secs: u64,
+    /// `RIVU_ROLLUP_MIN_ROWS`；`None` 不用日汇总层。
+    rollup_min_rows: Option<u64>,
     clock: Clock,
 }
 
@@ -136,8 +138,15 @@ impl<S: AuthStore> QueryApi<S> {
             reader,
             geo,
             timeout_secs,
+            rollup_min_rows: None,
             clock: Arc::new(Timestamp::now),
         }
+    }
+
+    /// 打开日汇总层（`RIVU_ROLLUP_MIN_ROWS`，见 [`ExecOptions::rollup_min_rows`]）。
+    pub fn with_rollup(mut self, min_rows: u64) -> Self {
+        self.rollup_min_rows = Some(min_rows);
+        self
     }
 
     /// 替换「现在」（测试用：相对日期范围与封顶都按它换算）。
@@ -411,11 +420,12 @@ async fn run_query<S: AuthStore>(
         .await?;
     let site = api.site_context(owner.id, &owner.site_key).await?;
 
-    let opts = ExecOptions::new(api.timeout_secs)
+    let mut opts = ExecOptions::new(api.timeout_secs)
         .with_now((api.clock)())
         .with_route(ROUTE_QUERY)
         .with_comment("org", ctx.org_id)
         .with_comment("api_key_id", ctx.api_key_id);
+    opts.rollup_min_rows = api.rollup_min_rows;
     let started = Instant::now();
     let result = rivu_query::execute(
         &api.reader,

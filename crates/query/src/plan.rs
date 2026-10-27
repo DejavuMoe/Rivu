@@ -2,8 +2,8 @@
 //!
 //! # 层
 //!
-//! P1 只有原始层（`events` + `sessions`），没有日汇总层与选层逻辑；但「层」留成枚举 [`Tier`]，
-//! `meta.tiers` 恒为 `["raw"]`，将来加层时只需要在这里扩展。
+//! 原始层（`events` + `sessions`）与日汇总层（`rollup_*`，见 [`crate::rollup`]）。选层在执行时做（要看汇总层构建到了哪一天），
+//! 规划只决定组件与度量；一次查询实际用到的层写在 `meta.tiers`。
 //!
 //! # 选表（§6.4 的表落成代码）
 //!
@@ -32,11 +32,12 @@ use serde::Serialize;
 use crate::resolve::{Col, RDim, ResolvedQuery};
 use crate::spec::Metric;
 
-/// 数据层。P1 只有原始层。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+/// 数据层。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Tier {
     Raw,
+    Rollup,
 }
 
 /// 组件输出的度量列（`c_*`）。每个度量只由一个组件产生，其余组件在该列填 0。
@@ -99,7 +100,6 @@ pub(crate) enum VisitsForm {
 
 #[derive(Clone, Debug)]
 pub(crate) struct Plan {
-    pub(crate) tiers: Vec<Tier>,
     pub(crate) measures: Vec<Measure>,
     pub(crate) visits_form: VisitsForm,
     /// 需要事件组件 / engagement 组件 / 会话组件 / 跳出组件 / 退出组件。
@@ -178,7 +178,6 @@ pub(crate) fn plan(q: &ResolvedQuery) -> Plan {
         || (visits_form == VisitsForm::Sessions && measures.contains(&Measure::Visits));
     let sessions = session_measures || (bounce && !bounce_separate);
     Plan {
-        tiers: vec![Tier::Raw],
         visits_form,
         events,
         engagement,

@@ -6,7 +6,8 @@
 //!   会话预热（关停快照或 ClickHouse，开始服务之前完成）与清扫、站点脚本分发（`GET /js/<site_key>.js`，`core.js` 启动时从 `RIVU_TRACKER_DIR` 读入）；
 //! - worker / all：后台任务 `salts_rotate`（启动时补跑一次，之后每小时一次）、`geoip_refresh`
 //!   （无本地副本时立即下载，之后按 `RIVU_GEOIP_REFRESH_INTERVAL` 条件 GET）、`ch_delete_batch`
-//!   （启动后一轮，之后每 `RIVU_STATS_DELETE_INTERVAL_SECS` 一轮，`rivu_maintainer` 账号）；
+//!   （启动后一轮，之后每 `RIVU_STATS_DELETE_INTERVAL_SECS` 一轮，`rivu_maintainer` 账号）、`rollup_build`
+//!   （日汇总层，每 `RIVU_ROLLUP_INTERVAL_SECS` 一轮，同一账号）；
 //! - collector / all：持有 GeoIP 库并每小时检查文件修改时间、热加载；管线第 6 步用它查询位置；
 //! - api / all：看板静态文件（`RIVU_DASHBOARD_DIR`，见 [`crate::dashboard`]）；公开查询 API（`POST /api/v1/query`、`GET /api/v1/query/schema.json`，见 [`crate::query_api`]）：
 //!   `rivu_reader` 账号的 ClickHouse 客户端、API key 鉴权与按组织限流（[`crate::api_auth::build_guard`]）；
@@ -295,6 +296,7 @@ pub async fn run(config: Config) -> Result<ExitCode> {
     query_api::describe_metrics();
     dash_api::describe_metrics();
     rivu_jobs::stats_delete::describe_metrics();
+    rivu_jobs::rollup::describe_metrics();
 
     // 先绑定端口：端口被占用时不应该留下已经启动的后台任务。
     let internal_listener = TcpListener::bind(config.internal_addr)
@@ -336,9 +338,16 @@ pub async fn run(config: Config) -> Result<ExitCode> {
         let kick = rivu_jobs::StatsDeleteKick::default();
         background.push(rivu_jobs::spawn_stats_delete(
             pg.clone(),
-            maintainer,
+            maintainer.clone(),
             config.stats_delete_interval,
             Arc::clone(&kick),
+            bg_stop_rx.clone(),
+        ));
+        // 后台任务 rollup_build：日汇总层（同一个 maintainer 账号）
+        background.push(rivu_jobs::spawn_rollup_build(
+            pg.clone(),
+            maintainer,
+            config.rollup_interval,
             bg_stop_rx.clone(),
         ));
         Some(kick)
@@ -446,13 +455,16 @@ pub async fn run(config: Config) -> Result<ExitCode> {
         );
         background.push(dash_api::spawn_maintenance(pg.clone(), bg_stop_rx.clone()));
         Some(
-            query_api::router(Arc::new(QueryApi::new(
-                guard,
-                pg.clone(),
-                reader,
-                geo_db.clone(),
-                config.query_timeouts.api_secs,
-            )))
+            query_api::router(Arc::new(
+                QueryApi::new(
+                    guard,
+                    pg.clone(),
+                    reader,
+                    geo_db.clone(),
+                    config.query_timeouts.api_secs,
+                )
+                .with_rollup(config.rollup_min_rows),
+            ))
             .merge(dash_api::router(dash)),
         )
     } else {

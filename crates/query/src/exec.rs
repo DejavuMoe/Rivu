@@ -15,13 +15,14 @@ use jiff::Timestamp;
 use serde_json::{Value, json};
 
 use crate::error::QueryError;
-use crate::plan::{self, Plan};
+use crate::plan::{self, Plan, Tier};
 use crate::resolve::SiteContext;
-use crate::resolve::{Gran, Interval, RDim, ResolvedQuery, fmt_local};
+use crate::resolve::{Gran, Interval, IntervalKind, RDim, ResolvedQuery, day_start_ms, fmt_local};
 use crate::result::{
     Comparison, ComparisonRow, EchoedQuery, Meta, MetricValue, QueryResult, ResolvedRange,
     ResultRow, Warning,
 };
+use crate::rollup::{self, Split};
 use crate::spec::{DateRange, Metric, QuerySpec};
 use crate::sql::{
     self, Constraint, MainSqlOptions, OrderMode, ParamValue, Params, TenantScope,
@@ -43,6 +44,9 @@ pub struct ExecOptions {
     /// 额外写进 `log_comment` 的字段（只放 id 一类的标识，如 `org`、`api_key_id`；不放邮箱、IP、过滤值）。
     /// 与保留字段（`route`、`site`、`part`、`tier`）同名时以保留字段为准。
     pub comment: BTreeMap<String, Value>,
+    /// 日汇总层（§6.4 选层）：区间里已构建的天的事件数（`rollup_site.events`，估算原始层要扫描的行数）不少于这个值、
+    /// 且查询兼容时，已构建的天由汇总层回答。`None`：不用汇总层（默认；差分测试与参考实现比较的是原始层）。
+    pub rollup_min_rows: Option<u64>,
 }
 
 impl ExecOptions {
@@ -52,7 +56,14 @@ impl ExecOptions {
             now: Timestamp::now(),
             route: "query".to_owned(),
             comment: BTreeMap::new(),
+            rollup_min_rows: None,
         }
+    }
+
+    /// 打开日汇总层（见 [`ExecOptions::rollup_min_rows`]）；`0` 表示只要兼容、有已构建的天就用。
+    pub fn with_rollup(mut self, min_rows: u64) -> Self {
+        self.rollup_min_rows = Some(min_rows);
+        self
     }
 
     /// 给 `log_comment` 加一个字段（见 [`ExecOptions::comment`]）。
@@ -101,10 +112,12 @@ struct Ctx<'a> {
     scope: &'a TenantScope,
     opts: &'a ExecOptions,
     deadline: Deadline,
+    /// 实际用到的层（`meta.tiers`）。
+    tiers: std::sync::Mutex<BTreeSet<Tier>>,
 }
 
 /// 每条查询的 `log_comment`（JSON，只含 id 与固定标签）：调用方的额外字段在前，保留字段 `route`、`site`、`part`、`tier` 覆盖同名项。
-fn log_comment(opts: &ExecOptions, site_id: u64, part: &str) -> String {
+fn log_comment(opts: &ExecOptions, site_id: u64, part: &str, tier: &str) -> String {
     let mut comment: serde_json::Map<String, Value> = opts
         .comment
         .iter()
@@ -113,7 +126,7 @@ fn log_comment(opts: &ExecOptions, site_id: u64, part: &str) -> String {
     comment.insert("route".into(), json!(opts.route));
     comment.insert("site".into(), json!(site_id));
     comment.insert("part".into(), json!(part));
-    comment.insert("tier".into(), json!("raw"));
+    comment.insert("tier".into(), json!(tier));
     Value::Object(comment).to_string()
 }
 
@@ -157,7 +170,7 @@ fn classify(err: clickhouse::error::Error, part: &str) -> QueryError {
     }
 }
 
-fn bind(mut q: clickhouse::query::Query, params: &Params) -> clickhouse::query::Query {
+pub(crate) fn bind(mut q: clickhouse::query::Query, params: &Params) -> clickhouse::query::Query {
     for (name, v) in params.iter() {
         q = match v {
             ParamValue::U8(x) => q.param(name, *x),
@@ -180,13 +193,23 @@ impl Ctx<'_> {
         sql: &str,
         params: &Params,
     ) -> Result<Vec<Vec<Value>>, QueryError> {
+        self.run_tier(part, sql, params, "raw").await
+    }
+
+    async fn run_tier(
+        &self,
+        part: &str,
+        sql: &str,
+        params: &Params,
+        tier: &str,
+    ) -> Result<Vec<Vec<Value>>, QueryError> {
         if !check_tenant_scoped(sql) {
             return Err(QueryError::internal(anyhow::anyhow!(
                 "generated SQL is not tenant-scoped ({part})"
             )));
         }
         let secs = self.deadline.remaining_secs()?;
-        let comment = log_comment(self.opts, self.scope.site_id(), part);
+        let comment = log_comment(self.opts, self.scope.site_id(), part, tier);
         let q = bind(self.reader.query(sql), params)
             .with_setting("max_execution_time", secs.to_string())
             .with_setting("log_comment", comment);
@@ -394,8 +417,10 @@ async fn fetch_rows(
     } else {
         None
     };
+    let (raw_iv, split) = choose_tier(cx, q, plan, iv, part).await?;
     let opts = MainSqlOptions {
-        interval: iv,
+        interval: raw_iv,
+        split,
         constraint,
         total_visitors,
         limit: page.0,
@@ -404,8 +429,76 @@ async fn fetch_rows(
         with_total_rows,
     };
     let (sql, params) = sql::main_query(cx.scope, q, plan, &opts);
-    let rows = cx.run(part, &sql, &params).await?;
+    let tier = match split {
+        None => "raw",
+        Some(_) if raw_iv.is_empty() => "rollup",
+        Some(_) => "rollup+raw",
+    };
+    if let Ok(mut t) = cx.tiers.lock() {
+        if split.is_some() {
+            t.insert(Tier::Rollup);
+        }
+        if split.is_none() || !raw_iv.is_empty() {
+            t.insert(Tier::Raw);
+        }
+    }
+    let rows = cx.run_tier(part, &sql, &params, tier).await?;
     parse_rows(q, rows, with_total_rows)
+}
+
+/// 选层（§6.4）：查询兼容、汇总层已构建到区间里、且这些天的事件数不少于阈值时，`[from, R]` 由汇总层回答
+/// （R = 已构建的最后一天），原始层只回答 R 之后的天。返回原始层的区间与分层。
+async fn choose_tier(
+    cx: &Ctx<'_>,
+    q: &ResolvedQuery,
+    plan: &Plan,
+    iv: Interval,
+    part: &str,
+) -> Result<(Interval, Option<Split>), QueryError> {
+    let raw = Ok((iv, None));
+    let Some(min_rows) = cx.opts.rollup_min_rows else {
+        return raw;
+    };
+    let IntervalKind::Dates { from, to } = iv.kind else {
+        return raw;
+    };
+    let Some(family) = rollup::compatible_family(q, plan) else {
+        return raw;
+    };
+    let (sql, params) =
+        sql::rollup_probe_query(cx.scope, &q.tz_name, &from.to_string(), &to.to_string());
+    let rows = cx.run(&format!("{part}.tier"), &sql, &params).await?;
+    let row = rows.first();
+    let built: Option<jiff::civil::Date> = row
+        .and_then(|r| r.first())
+        .and_then(Value::as_str)
+        .and_then(|s| s.parse().ok());
+    let stale = row.and_then(|r| r.get(1)).and_then(cell_u64).unwrap_or(0);
+    let rows_in_range = row.and_then(|r| r.get(2)).and_then(cell_u64).unwrap_or(0);
+    let Some(built) = built else {
+        return raw;
+    };
+    if stale > 0 || built < from || rows_in_range < min_rows {
+        return raw;
+    }
+    let rollup_to = built.min(to);
+    let raw_start = match rollup_to.tomorrow() {
+        Ok(d) => day_start_ms(&q.tz, d)?.min(iv.end_ms),
+        Err(_) => iv.end_ms,
+    };
+    let raw_iv = Interval {
+        start_ms: raw_start.max(iv.start_ms),
+        end_ms: iv.end_ms,
+        kind: iv.kind,
+    };
+    Ok((
+        raw_iv,
+        Some(Split {
+            family,
+            from,
+            rollup_to,
+        }),
+    ))
 }
 
 /// 站点最早事件的时间（毫秒）；没有数据为 `None`。
@@ -435,6 +528,7 @@ pub fn explain(
     let plan = plan::plan(&q);
     let opts = MainSqlOptions {
         interval: q.interval,
+        split: None,
         constraint: None,
         total_visitors: plan.needs_total.then_some(0),
         limit: u64::from(q.limit),
@@ -468,6 +562,7 @@ pub async fn execute(
         scope,
         opts: &opts,
         deadline: Deadline::new(opts.timeout_secs),
+        tiers: Default::default(),
     };
     // `all` 要先知道站点最早事件的时间
     let data_start = if matches!(spec.date_range, DateRange::All) {
@@ -633,7 +728,14 @@ pub async fn execute(
         time_labels,
         comparison_time_labels: comparison_labels,
         warnings,
-        tiers: plan.tiers.clone(),
+        tiers: {
+            let used = cx.tiers.lock().map(|t| t.clone()).unwrap_or_default();
+            if used.is_empty() {
+                vec![Tier::Raw]
+            } else {
+                used.into_iter().collect()
+            }
+        },
         metric_semantics: plan::metric_semantics(&q, &plan),
         geo_attribution: if q.geo_in_dims {
             site.geo_attribution.clone()
@@ -678,7 +780,7 @@ mod log_comment_tests {
             .with_route("api.query")
             .with_comment("org", 4)
             .with_comment("api_key_id", 9);
-        let v: Value = serde_json::from_str(&log_comment(&opts, 77, "main")).unwrap();
+        let v: Value = serde_json::from_str(&log_comment(&opts, 77, "main", "raw")).unwrap();
         assert_eq!(
             v,
             json!({"route": "api.query", "site": 77, "part": "main", "tier": "raw",
@@ -693,7 +795,7 @@ mod log_comment_tests {
             .with_comment("route", "forged")
             .with_comment("site", 1)
             .with_comment("tier", "forged");
-        let v: Value = serde_json::from_str(&log_comment(&opts, 77, "compare")).unwrap();
+        let v: Value = serde_json::from_str(&log_comment(&opts, 77, "compare", "raw")).unwrap();
         assert_eq!(v["route"], "real");
         assert_eq!(v["site"], 77);
         assert_eq!(v["part"], "compare");
