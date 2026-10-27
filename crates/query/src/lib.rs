@@ -18,6 +18,7 @@
 //! 取值与表名：表名不带库名，调用方的客户端要用 `with_database` 绑定库（`rivu_storage_ch::client`）；
 //! 用 `rivu_reader` 账号（`readonly=1`）。
 
+pub mod cache;
 pub mod error;
 pub mod exec;
 pub mod plan;
@@ -30,6 +31,7 @@ pub mod sql;
 #[cfg(test)]
 mod sql_tests;
 
+pub use cache::QueryCache;
 pub use error::QueryError;
 pub use exec::{ExecOptions, execute, explain};
 pub use resolve::{GoalDef, GoalKind, ResolvedQuery, SiteContext};

@@ -481,7 +481,7 @@ PG 与 ClickHouse 迁移共用一个版本序列（14 位时间戳），分别�
 | 写缓冲深度与 flush | `write_buffer_depth`、`write_buffer_bytes`；`write_flush_seconds`、`write_flush_rows`；`write_flush_failures_total`；`write_buffer_dropped_total` | `reason` |
 | JetStream 积压 | `jetstream_pending_messages`、`jetstream_ack_pending`、`jetstream_consumer_lag_seconds`、`jetstream_publish_seconds`、`jetstream_redeliveries_total` | `consumer` |
 | 公开 API 请求 | `rivu_api_requests_total` | `route`（`api.query` 等）、`status`（含 401 / 403 / 429） |
-| 查询耗时 | `rivu_query_seconds`（固定桶直方图） | `route` |
+| 查询耗时 | `rivu_query_seconds`（固定桶直方图） | `route`、`cache`（`hit` / `miss`，结果缓存） |
 | 查询失败 | `rivu_query_errors_total` | `route`、`kind`（`validation` / `timeout` / `resource_limit` / `internal`） |
 | 缓存命中率 | `cache_hits_total`、`cache_misses_total`、`cache_entries`、`cache_refresh_seconds` | `cache`（site/session/query/salt） |
 | 限流与认证 | `ratelimit_rejected_total`、`auth_login_failures_total`、`rivu_auth_login_alerts_total` | `scope`；`kind`（`account` / `global`，登录失败告警，只告警不阻断） |

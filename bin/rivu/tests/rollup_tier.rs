@@ -63,8 +63,20 @@ const UAS: [&str; 4] = [
     "Mozilla/5.0 (X11; Linux x86_64; rv:126.0) Gecko/20100101 Firefox/126.0",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
 ];
-const IPS: [&str; 4] = ["89.160.20.128", "81.2.69.142", "175.16.199.1", "203.0.113.50"];
-const PAGES: [&str; 6] = ["/", "/pricing", "/docs", "/docs/intro", "/blog/a", "/contact"];
+const IPS: [&str; 4] = [
+    "89.160.20.128",
+    "81.2.69.142",
+    "175.16.199.1",
+    "203.0.113.50",
+];
+const PAGES: [&str; 6] = [
+    "/",
+    "/pricing",
+    "/docs",
+    "/docs/intro",
+    "/blog/a",
+    "/contact",
+];
 const CUSTOM: [&str; 2] = ["Signup", "Download"];
 const REFERRERS: [Option<&str>; 5] = [
     None,
@@ -205,18 +217,37 @@ fn families() -> Vec<(&'static [&'static str], &'static [&'static str])> {
     ];
     vec![
         (&[], SESSION),
-        (&["event:page"], &["visitors", "visits", "pageviews", "events", "time_on_page", "scroll_depth"]),
+        (
+            &["event:page"],
+            &[
+                "visitors",
+                "visits",
+                "pageviews",
+                "events",
+                "time_on_page",
+                "scroll_depth",
+            ],
+        ),
         (&["visit:entry_page"], SESSION),
         (&["visit:exit_page"], SESSION),
         (
-            &["visit:channel", "visit:source", "visit:referrer", "visit:utm_source", "visit:utm_campaign"],
+            &[
+                "visit:channel",
+                "visit:source",
+                "visit:referrer",
+                "visit:utm_source",
+                "visit:utm_campaign",
+            ],
             NO_VISITORS,
         ),
         (&["visit:country", "visit:region", "visit:city"], SESSION),
         (&["visit:device"], SESSION),
         (&["visit:browser", "visit:browser_version"], SESSION),
         (&["visit:os", "visit:os_version"], SESSION),
-        (&["event:name"], &["visitors", "visits", "pageviews", "events"]),
+        (
+            &["event:name"],
+            &["visitors", "visits", "pageviews", "events"],
+        ),
     ]
 }
 
@@ -318,7 +349,10 @@ fn diff(got: &QueryResult, want: &QueryResult) -> Option<String> {
     }
     for (i, (g, w)) in got.results.iter().zip(&want.results).enumerate() {
         if g.dimensions != w.dimensions {
-            return Some(format!("第 {i} 行维度 {:?} ≠ {:?}", g.dimensions, w.dimensions));
+            return Some(format!(
+                "第 {i} 行维度 {:?} ≠ {:?}",
+                g.dimensions, w.dimensions
+            ));
         }
         if !g.metrics.iter().zip(&w.metrics).all(|(a, b)| same(a, b)) {
             return Some(format!(
@@ -386,7 +420,9 @@ async fn rollup_tier_matches_the_raw_tier() {
         var("RIVU_TEST_DATABASE_URL"),
         var("RIVU_TEST_CLICKHOUSE_URL"),
     ) else {
-        println!("跳过 rollup_tier_matches_the_raw_tier：需要设置 RIVU_TEST_DATABASE_URL 和 RIVU_TEST_CLICKHOUSE_URL");
+        println!(
+            "跳过 rollup_tier_matches_the_raw_tier：需要设置 RIVU_TEST_DATABASE_URL 和 RIVU_TEST_CLICKHOUSE_URL"
+        );
         return;
     };
     let migrator = account("migrator");
@@ -482,8 +518,7 @@ async fn rollup_tier_matches_the_raw_tier() {
     writer.shutdown().await.expect("关停写入器");
 
     let reader = rivu_storage_ch::client(&ch_url, &account("reader"), Some(&ch_database()));
-    let maintainer =
-        rivu_storage_ch::client(&ch_url, &account("maintainer"), Some(&ch_database()));
+    let maintainer = rivu_storage_ch::client(&ch_url, &account("maintainer"), Some(&ch_database()));
     let admin = rivu_storage_ch::client(&ch_url, &migrator, Some(&ch_database()));
     let scope = TenantScope::new(created.id);
     let site = SiteContext::new(created.id, tz.clone());
@@ -547,7 +582,12 @@ async fn rollup_tier_matches_the_raw_tier() {
         failures.is_empty(),
         "{} 个请求不一致：\n{}",
         failures.len(),
-        failures.iter().take(10).cloned().collect::<Vec<_>>().join("\n")
+        failures
+            .iter()
+            .take(10)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
     );
     assert!(used_rollup > CASES * 9 / 10, "大多数请求应当走汇总层");
 
@@ -563,16 +603,26 @@ async fn rollup_tier_matches_the_raw_tier() {
     }
 
     // ---- 删除汇总行之后回到原始层 ---------------------------------------------------------------
-    rollup::delete(&maintainer, &scope, Some((date(2026, 6, 1), date(2026, 6, 30))), false)
+    rollup::delete(
+        &maintainer,
+        &scope,
+        Some((date(2026, 6, 1), date(2026, 6, 30))),
+        false,
+    )
+    .await
+    .unwrap();
+    let state = rollup::build_state(&maintainer, &scope, &tz).await.unwrap();
+    assert_eq!(state.built_to, Some(date(2026, 7, 1)));
+    rollup::delete(&maintainer, &scope, None, true)
         .await
         .unwrap();
     let state = rollup::build_state(&maintainer, &scope, &tz).await.unwrap();
-    assert_eq!(state.built_to, Some(date(2026, 7, 1)));
-    rollup::delete(&maintainer, &scope, None, true).await.unwrap();
-    let state = rollup::build_state(&maintainer, &scope, &tz).await.unwrap();
     assert_eq!(state.built_to, None);
     let s = json!({"metrics": ["visitors"], "date_range": ["2026-06-01", "2026-06-21"]});
-    assert_eq!(run(&reader, &site, &s, now, true).await.meta.tiers, vec![Tier::Raw]);
+    assert_eq!(
+        run(&reader, &site, &s, now, true).await.meta.tiers,
+        vec![Tier::Raw]
+    );
 
     cleanup(&admin, created.id).await;
 }

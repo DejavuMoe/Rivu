@@ -931,8 +931,11 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 
 ### 6.9 结果缓存
 
-- 使用 moka。key 为以下内容的哈希：规范化后的 `ResolvedQuery`、`site.config_version`、`site.data_version`，以及时间桶。时间桶的长度：实时 3 s，当日 10 s，近 7 天 60 s，历史范围 10 min。
-- 站点配置（目标、时区）变化时，`config_version` 加一（结果缓存尚未实现：目标与时区现在每次查询现读，没有要失效的东西）。删除数据、重建汇总层时，`data_version` 加一，并通过 NOTIFY 广播。
+- 进程内的 moka（`crates/query/src/cache.rs`），看板与公开 API 共用，按结果行数限容（50 万行），只缓存成功的结果。
+- key 是以下内容的哈希：站点 id、规范化的 `QuerySpec`（共享链接叠加的过滤已经并入）、影响结果的站点配置（时区、周起始日、目标、地理库的署名与能力）、站点的数据代数、「现在」所在的时间桶。配置直接进键，改目标或时区立即生效。
+- 时间桶的长度：`realtime` 3 s，`day` 与 `24h` 10 s，含今天的范围 60 s，已结束的历史范围 10 min。同一个桶里的请求拿到同一份结果。
+- 删除统计数据完成后，同进程（`rivu all`）的 `ch_delete_batch` 让该站点的数据代数加一；api 与 worker 分开部署时，旧结果最多再存活一个桶长。汇总层构建不改变结果（两层口径一致，§6.4），不需要失效。
+- `rivu_query_seconds` 带 `cache` 标签（`hit` / `miss`），命中与未命中分开统计。
 - Plausible 完全没有结果缓存（R03 §11）。多节点 api 部署时，先接受各节点各自缓存；确实出现不一致问题后再引入 Valkey。
 
 ### 6.10 维度可信度
