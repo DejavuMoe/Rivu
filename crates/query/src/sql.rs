@@ -29,6 +29,7 @@ use crate::resolve::{
     Col, GoalKind, Gran, Interval, Leaf, OrderKey, Pred, RDim, ResolvedQuery, Test,
     wildcard_to_like,
 };
+use crate::rollup::{Family, MEASURE_COLUMNS, Split, measure_column};
 use crate::spec::{Direction, Metric};
 
 /// 租户范围：每个 `FROM` 都必须带它。构造它的是鉴权之后的调用方。
@@ -98,7 +99,7 @@ impl Params {
         self.0.is_empty()
     }
 
-    fn push(&mut self, name: &str, v: ParamValue) {
+    pub(crate) fn push(&mut self, name: &str, v: ParamValue) {
         self.0.push((name.to_owned(), v));
     }
 }
@@ -121,7 +122,10 @@ pub(crate) enum OrderMode {
 }
 
 pub(crate) struct MainSqlOptions<'a> {
+    /// 原始层组件的区间。有 `split` 时只含汇总层之后的天（可能为空：整个范围都由汇总层回答）。
     pub(crate) interval: Interval,
+    /// 汇总层负责的天与族（§6.4 选层）。
+    pub(crate) split: Option<Split>,
     pub(crate) constraint: Option<&'a Constraint>,
     /// `percentage` 的分母。
     pub(crate) total_visitors: Option<u64>,
@@ -150,12 +154,20 @@ pub(crate) fn check_tenant_scoped(sql: &str) -> bool {
     if sql.contains('?') {
         return false;
     }
-    for table in ["events", "sessions"] {
+    let mut tables: Vec<&str> = vec!["events", "sessions", "ingest_counters"];
+    tables.extend(Family::ALL.iter().map(|f| f.table()));
+    for table in tables {
         let needle = format!("FROM {table}");
         let mut rest = sql;
         while let Some(i) = rest.find(&needle) {
-            let after = &rest[i + needle.len()..];
-            // 表名后必须是空白（排除 `FROM events_x`），然后是租户条件
+            let mut after = &rest[i + needle.len()..];
+            // 命中的是更长表名的前缀（`FROM events_x`）：不是这张表
+            if after.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
+                rest = after;
+                continue;
+            }
+            after = after.strip_prefix(" FINAL").unwrap_or(after);
+            // 租户条件紧跟在表名（与 FINAL）之后
             if !after.starts_with(" WHERE site_id = {site:UInt64}") {
                 return false;
             }
@@ -261,6 +273,8 @@ enum Ctx {
     /// 会话行（合并后的 `sessions`）。`entry`：`event:page` / `event:hostname` 叶子按入口页判定（`bounce_rate`，§6.6）；
     /// 否则它们是「会话在范围内有匹配的事件」。
     Sess { entry: bool },
+    /// 汇总表的行：叶子直接作用在族的维度列上（兼容判断保证叶子都在族里）。
+    Rollup(Family),
 }
 
 /// 组件里一个维度的取值方式。
@@ -430,6 +444,16 @@ impl<'a> Builder<'a> {
                 }
                 col => self.cond(ev_expr(col), l),
             },
+            Ctx::Rollup(f) => {
+                let column = f.column(l.col).expect("兼容判断保证过滤只落在族的维度上");
+                // 城市存的是 GeoNames id 的十进制文本；过滤取值是 id
+                let e = if l.col == Col::City {
+                    "toUInt32OrZero(city)".to_owned()
+                } else {
+                    column.to_owned()
+                };
+                self.cond(&e, l)
+            }
             Ctx::Sess { entry } => match l.col {
                 Col::EventName | Col::EventPage | Col::EventHostname | Col::EventGoal => {
                     if entry && l.col == Col::EventPage {
@@ -880,6 +904,158 @@ impl<'a> Builder<'a> {
         )
     }
 
+    // ---- 汇总层 ----
+
+    /// 汇总层组件：`[from, rollup_to]` 这些本地日的行，按查询的维度再相加。输出与原始层组件相同的列。
+    /// `FINAL` 之内只放键列上的条件（#9），过滤与对比约束放在外面。
+    fn comp_rollup(&mut self, split: &Split) -> String {
+        let f = split.family;
+        let r_from = self.p(ParamValue::Date(split.from.to_string()));
+        let r_to = self.p(ParamValue::Date(split.rollup_to.to_string()));
+        let scan = format!(
+            "SELECT * FROM {} FINAL WHERE site_id = {{site:UInt64}} AND day >= {r_from} AND day <= {r_to}",
+            f.table()
+        );
+        let q = self.q;
+        let dims = q
+            .dims
+            .iter()
+            .enumerate()
+            .map(|(i, d)| {
+                let e = match d {
+                    RDim::Time(g) => Self::rollup_time_expr(*g),
+                    RDim::Col(c) => f.column(*c).expect("兼容判断保证维度都在族里").to_owned(),
+                };
+                format!("{e} AS d{i}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let form = self.plan.visits_form;
+        let own: Vec<(Measure, String)> = self
+            .plan
+            .measures
+            .iter()
+            .map(|m| (*m, format!("sum({})", measure_column(*m, form))))
+            .collect();
+        let own_ref: Vec<(Measure, &str)> = own.iter().map(|(m, e)| (*m, e.as_str())).collect();
+        let measures = self.measure_cols(&own_ref);
+        // 汇总行带着全部度量；原始层只在规划用到的组件有数据时才出行（例如只要 time_on_page 时，
+        // 没有 engagement 事件的页面不出现），所以只取这些组件有数据的行
+        let mut present = Vec::new();
+        if self.plan.events {
+            present.push("events > 0");
+        }
+        if self.plan.sessions {
+            present.push("s_n > 0");
+        }
+        if self.plan.exits {
+            present.push("exits > 0");
+        }
+        if self.plan.engagement {
+            present.push("tp_n > 0");
+        }
+        let mut conds = vec![format!("({})", present.join(" OR "))];
+        if let Some(t) = self.q.filter.clone() {
+            let mut needs = Needs::new();
+            conds.push(self.pred(&t, Ctx::Rollup(f), &mut needs));
+        }
+        if let Some(c) = self.constraint_sql() {
+            conds.push(c);
+        }
+        let where_ = Self::where_clause(conds);
+        format!(
+            "SELECT {dims}{measures} FROM ({scan}) AS r{where_}{}",
+            self.group_by()
+        )
+    }
+
+    /// 汇总层的时间桶（只有天、周、月）：与 [`Self::time_expr`] 的文本格式相同。
+    fn rollup_time_expr(g: Gran) -> String {
+        match g {
+            Gran::Day => "toString(day)".to_owned(),
+            Gran::Week => {
+                "toString(subtractDays(day, modulo(toDayOfWeek(day) - {wk:UInt8} + 7, 7)))"
+                    .to_owned()
+            }
+            Gran::Month => "toString(toStartOfMonth(day))".to_owned(),
+            Gran::Minute | Gran::Hour => unreachable!("兼容判断已排除比天更细的粒度"),
+        }
+    }
+
+    /// 原始层的组件（规划里要的那些）。
+    fn raw_components(&mut self) -> Vec<String> {
+        let mut comps: Vec<String> = Vec::new();
+        if self.plan.events {
+            comps.push(self.comp_events());
+        }
+        if self.plan.sessions {
+            comps.push(self.comp_sessions(SessKind::Main));
+        }
+        if self.plan.bounce_separate {
+            comps.push(self.comp_sessions(SessKind::BounceSeparate));
+        }
+        if self.plan.exits {
+            comps.push(self.comp_sessions(SessKind::Exits));
+        }
+        if self.plan.engagement {
+            comps.push(self.comp_engagement());
+        }
+        if self.plan.conv_base {
+            comps.push(self.comp_conv_base());
+        }
+        comps
+    }
+
+    /// 构建一天一族的汇总行：`INSERT INTO rollup_x … SELECT` 原始层组件按族的维度聚合后的度量和。
+    fn rollup_build_sql(&mut self, family: Family, day: &str, version: u64) -> String {
+        let comps = self.raw_components().join(" UNION ALL ");
+        let day_ph = self.p(ParamValue::Date(day.to_owned()));
+        let version_ph = self.p(ParamValue::U64(version));
+        let mut cols: Vec<String> = ["site_id", "day", "origin", "import_id", "version"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        let mut vals: Vec<String> = vec![
+            "{site:UInt64}".to_owned(),
+            day_ph,
+            "'native'".to_owned(),
+            "0".to_owned(),
+            version_ph,
+        ];
+        if family == Family::Site {
+            cols.push("tz".to_owned());
+            vals.push("{tz:String}".to_owned());
+        }
+        for (i, (_, name)) in family.dims().iter().enumerate() {
+            cols.push((*name).to_owned());
+            vals.push(format!("d{i}"));
+        }
+        let form = self.plan.visits_form;
+        let produced = |m: Measure| self.plan.measures.contains(&m);
+        for (name, m) in MEASURE_COLUMNS {
+            cols.push(name.to_owned());
+            // visits 按口径分两列：只填与这一族口径相同的那一列
+            let fill = produced(m) && (m != Measure::Visits || form == VisitsForm::Sessions);
+            vals.push(if fill {
+                format!("sum({})", m.col())
+            } else {
+                "toUInt64(0)".to_owned()
+            });
+        }
+        cols.push("visits_ev".to_owned());
+        vals.push(if produced(Measure::Visits) && form == VisitsForm::Events {
+            format!("sum({})", Measure::Visits.col())
+        } else {
+            "toUInt64(0)".to_owned()
+        });
+        format!(
+            "INSERT INTO {} ({}) SELECT {} FROM ({comps}){}",
+            family.table(),
+            cols.join(", "),
+            vals.join(", "),
+            self.group_by()
+        )
+    }
     // ---- 外层 ----
 
     fn metric_expr(&self, m: Metric) -> String {
@@ -981,24 +1157,14 @@ impl<'a> Builder<'a> {
     }
 
     fn main_sql(&mut self, o: &MainSqlOptions<'_>) -> String {
-        let mut comps: Vec<String> = Vec::new();
-        if self.plan.events {
-            comps.push(self.comp_events());
-        }
-        if self.plan.sessions {
-            comps.push(self.comp_sessions(SessKind::Main));
-        }
-        if self.plan.bounce_separate {
-            comps.push(self.comp_sessions(SessKind::BounceSeparate));
-        }
-        if self.plan.exits {
-            comps.push(self.comp_sessions(SessKind::Exits));
-        }
-        if self.plan.engagement {
-            comps.push(self.comp_engagement());
-        }
-        if self.plan.conv_base {
-            comps.push(self.comp_conv_base());
+        // 有汇总层时，原始层只回答汇总层之后的天；整个范围都在汇总层里时没有原始层组件
+        let mut comps: Vec<String> = if o.split.is_some() && o.interval.is_empty() {
+            Vec::new()
+        } else {
+            self.raw_components()
+        };
+        if let Some(split) = &o.split {
+            comps.push(self.comp_rollup(split));
         }
         // 转化率：分母组件会给出没有转化的维度值（例如每个目标），有维度时只保留有转化访客的行
         let having = if self.plan.conv_base && !self.q.dims.is_empty() {
@@ -1050,6 +1216,40 @@ pub(crate) fn main_query(
     }
     let sql = b.main_sql(o);
     (sql, b.params)
+}
+
+/// 一天一族的汇总行的构建语句（`INSERT … SELECT`）。`q` 是那一天的整日查询，维度是族的维度；`plan` 是构建用的规划。
+pub(crate) fn rollup_build_query(
+    scope: &TenantScope,
+    q: &ResolvedQuery,
+    plan: &Plan,
+    family: Family,
+    day: &str,
+    version: u64,
+) -> (String, Params) {
+    let mut b = Builder::new(scope, q, plan, q.interval, None);
+    let sql = b.rollup_build_sql(family, day, version);
+    (sql, b.params)
+}
+
+/// 选层的探测（§6.4）：已构建到的最后一天、时区不同的行数（站点改过时区，重建之前不用汇总层）、
+/// `[from, to]` 内已构建的天里的事件数（估算原始层要扫描的行数）。
+pub(crate) fn rollup_probe_query(
+    scope: &TenantScope,
+    tz: &str,
+    from: &str,
+    to: &str,
+) -> (String, Params) {
+    let mut params = Params::default();
+    params.push("site", ParamValue::U64(scope.site_id()));
+    params.push("tz", ParamValue::Str(tz.to_owned()));
+    params.push("from_day", ParamValue::Date(from.to_owned()));
+    params.push("to_day", ParamValue::Date(to.to_owned()));
+    let sql = "SELECT toString(maxOrNull(day)), countIf(tz != {tz:String}), \
+               sumIf(events, day >= {from_day:Date} AND day <= {to_day:Date}) \
+               FROM rollup_site FINAL WHERE site_id = {site:UInt64} AND origin = 'native'"
+        .to_owned();
+    (sql, params)
 }
 
 /// `percentage` 的分母：同样的区间与过滤、无维度的访客总数。
