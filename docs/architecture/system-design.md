@@ -1101,5 +1101,10 @@ Source 研究自己的编号 D1–D12 与 §0.2 的 D1–D12 不是一套，下�
 | UA-3 | iOS Safari 26+ 的 OS 版本 | 取 `Version/` 里的版本，不取冻结的 18_6（Q22） | 同上 |
 | UA-4 | WebView | 单列为 `WebView`，不并入 Mobile App | `enrich-ua.md` §8 |
 | UA-5 | 车机浏览器 | 不单列，归 desktop（Plausible 归 tablet）；`enrich-ua.md` §5 提到，其 §10 的清单未列 | `enrich-ua.md` §5 |
+| UA-6 | UA 解析库 | 用 uap-core，不用 UAInspector（device-detector 数据）。浏览器名和系统名按 uap-core 的家族名再归一化，所以命名（`Edge` 对 `Microsoft Edge`、`macOS` 对 `Mac`）和粒度（不拆出 CyanogenMod、Fire OS 等 Android 分支）都与 Plausible 不同；uap-core 认不出的老功能机，系统记为空 | `enrich-ua.md` §3、§8；`plausible-replay-2026-10.md` §5.1 |
+| UA-7 | 机器人名单 | 判定方法是 uap-core 的 `Spider` 加上自维护规则，不用 UAInspector 的名单。两边对少数 UA 判定不同：rivu 丢弃 HeadlessChrome（UAInspector 把它解析为 Chromium，漏掉了）和 ZyBorg 等老爬虫；UAInspector 会误判部分 Android 2.3 定制 ROM 的 UA | `enrich-ua.md` §4.2；`plausible-replay-2026-10.md` §4 |
+| UA-8 | 设备类别的依据 | 只看 UA，不看屏幕宽度（tracker 不发宽度）。未知机型兜底为 Mobile，不出现 `(not set)`；取值是小写的 `desktop/mobile/tablet` | `enrich-ua.md` §5；`tracker-and-protocol.md`；`plausible-replay-2026-10.md` §5.2 |
+| Source-R1 | 来源展示名 | 补充表重命名 Matomo 的条目，如 `Twitter` → `X (Twitter)`，Google 各子产品合并为 `Google` | `enrich-source.md` §4.2、§4.6 |
+| Geo-1 | 地理库版本 | 规则与 Plausible 相同，但两边用的 DB-IP 库是不同期的，网段归属变化会造成国家计数的小差异。这是数据版本的差异，不是规则的差异 | `enrich-geo.md`；`plausible-replay-2026-10.md` §5.4 |
 
-另有两处不属于渠道规则：路径条目（Matomo 的 `x.com/i/grok` 等 14 条）因接口只有 host 而不使用；内部引荐按站点 hostname 白名单判定，Plausible 要求 host 全等（`enrich-source.md` §6 末尾）。`enrich-geo.md` 没有与 Plausible 行为不同的刻意偏离：国家码规则与 Plausible 一致。
+另有两处不属于渠道规则：路径条目（Matomo 的 `x.com/i/grok` 等 14 条）因接口只有 host 而不使用；内部引荐按站点 hostname 白名单判定，Plausible 要求 host 全等（`enrich-source.md` §6 末尾）。`enrich-geo.md` 没有与 Plausible 行为不同的刻意偏离：国家码规则与 Plausible 一致，Geo-1 只登记数据版本带来的差异。UA-6 至 Geo-1 是 2026-10 的并行回放（`plausible-replay-2026-10.md`）发现后补登的。

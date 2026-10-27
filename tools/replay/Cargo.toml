@@ -1,0 +1,21 @@
+[package]
+name = "replay"
+description = "把同一个事件流同时回放给 rivu 与 Plausible CE，并对比两边的统计（brief-p1 验收：与 Plausible CE 并行回放）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap = { workspace = true, features = ["env"] }
+reqwest = { workspace = true, features = ["json"] }
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+url.workspace = true
