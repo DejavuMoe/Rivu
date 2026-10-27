@@ -9,6 +9,8 @@
 html {
   -webkit-text-size-adjust: 100%;
   text-size-adjust: 100%;
+  /* 始终为滚动条留位置：长页面与短页面之间切换时内容宽度不变，页头不会左右跳 */
+  scrollbar-gutter: stable;
 }
 
 body {
@@ -149,7 +151,13 @@ kbd,
   }
 }
 
-/* 页面切换（只在路径变化时，见 router.svelte.ts）：整页淡入淡出，侧栏不变所以看不出动 */
+/* 页面切换（只在路径变化时）：整页淡入淡出，侧栏不变所以看不出动。
+   页头、设置分区导航单独成组（view-transition-name），这里让它们的组不做位置与尺寸动画：
+   它们在新旧页面里位置相同，任何插值都只会表现为抖动 */
+::view-transition-group(page-header),
+::view-transition-group(settings-nav) {
+  animation: none;
+}
 ::view-transition-old(root),
 ::view-transition-new(root) {
   animation-duration: var(--dur-pop);
