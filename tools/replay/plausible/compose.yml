@@ -1,0 +1,59 @@
+# Plausible CE（对照组），只用于 tools/replay 的并行回放。仅限本机：端口只绑 127.0.0.1，密钥是公开的测试值。
+# 结构参照 plausible/community-edition 仓库的 compose.yml。
+#
+#   docker compose -f tools/replay/plausible/compose.yml up -d
+#   docker compose -f tools/replay/plausible/compose.yml down -v    # 用完连数据一起删
+name: rivu-replay-plausible
+
+services:
+  plausible_db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      retries: 30
+
+  plausible_events_db:
+    image: clickhouse/clickhouse-server:24.12-alpine
+    restart: unless-stopped
+    environment:
+      # 与 community-edition 的 compose 相同：default 用户免密、只在内部网络可达
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
+    volumes:
+      - event-data:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8123/ping | grep -q Ok"]
+      interval: 3s
+      retries: 30
+
+  plausible:
+    image: ghcr.io/plausible/community-edition:v3.0.1
+    restart: unless-stopped
+    command: sh -c "/entrypoint.sh db createdb && /entrypoint.sh db migrate && /entrypoint.sh run"
+    depends_on:
+      plausible_db:
+        condition: service_healthy
+      plausible_events_db:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:18000:8000"
+    environment:
+      BASE_URL: http://127.0.0.1:18000
+      SECRET_KEY_BASE: rivu-replay-test-only-secret-key-base-not-for-production-use-0123456789abcdef
+      TOTP_VAULT_KEY: cml2dS1yZXBsYXktdGVzdC1vbmx5LTMyLWJ5dGVzISE=
+      DATABASE_URL: postgres://postgres:postgres@plausible_db:5432/plausible_db
+      CLICKHOUSE_DATABASE_URL: http://plausible_events_db:8123/plausible_events_db
+      DISABLE_REGISTRATION: invite_only
+
+volumes:
+  db-data:
+  event-data:

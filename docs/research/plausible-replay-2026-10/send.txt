@@ -1,0 +1,19 @@
+{
+  "events": 20000,
+  "rivu": {
+    "by_status": {
+      "202": 20000
+    },
+    "dropped": 196,
+    "errors": 0
+  },
+  "plausible": {
+    "by_status": {
+      "202": 20000
+    },
+    "dropped": 199,
+    "errors": 0
+  },
+  "elapsed_secs": 249.996093698,
+  "mismatches": 23
+}
