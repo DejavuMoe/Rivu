@@ -16,7 +16,7 @@
 //! 所有响应都带 `Access-Control-Allow-Origin: *`、`Access-Control-Expose-Headers`、`Cache-Control: no-store`、
 //! `Cross-Origin-Resource-Policy: cross-origin`；不带 `Allow-Credentials`，也不设 cookie（请求里的 `Cookie` 被忽略）。
 //! api / all 角色另有公开查询 API（`POST /api/v1/query`、`GET /api/v1/query/schema.json`，实现在 [`crate::query_api`]，
-//! 不带 CORS）；其余 `/api/*`（内部看板端点需要登录会话）仍返回 `501`。
+//! 不带 CORS）与看板的内部端点（[`crate::dash_api`]）；没有匹配的 `/api/*` 返回 `404`。
 //!
 //! collector / all 角色另有 `GET /js/<site_key>.js`（站点专属脚本，实现在 [`crate::script`]）。
 
@@ -58,8 +58,8 @@ pub fn router_with_scripts(
     router_full(role, pipeline, scripts, None)
 }
 
-/// 公共端口的完整路由。`query_api` 是公开查询 API 的路由（[`crate::query_api::router`]），只在 api / all 角色有值；
-/// 没有时 `/api/v1/query*` 与其他 `/api/*` 一样返回 501。
+/// 公共端口的完整路由。`query_api` 是公开查询 API 与看板端点的路由（[`crate::query_api::router`]），
+/// 只在 api / all 角色有值；没有匹配的 `/api/*` 返回 JSON 的 404（计入 `rivu_api_requests_total`）。
 pub fn router_full(
     role: Role,
     pipeline: Option<Arc<Pipeline>>,
@@ -86,11 +86,8 @@ pub fn router_full(
             // 具体路径优先于下面的 `/api/{*rest}` 通配
             router = router.merge(query_api);
         }
-        let rest = Router::new().route("/api/{*rest}", any(api_not_implemented));
-        router = router.merge(query_api::count_requests(
-            rest,
-            query_api::ROUTE_NOT_IMPLEMENTED,
-        ));
+        let rest = Router::new().route("/api/{*rest}", any(api_not_found));
+        router = router.merge(query_api::count_requests(rest, query_api::ROUTE_NOT_FOUND));
     }
     router
 }
@@ -245,14 +242,10 @@ async fn method_not_allowed() -> Response {
     resp
 }
 
-async fn api_not_implemented() -> (StatusCode, Json<Value>) {
+async fn api_not_found() -> (StatusCode, Json<Value>) {
     (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({
-            "error": "not_implemented",
-            "message": "/api/* 尚未实现，计划在 P2 实现；P1 用 `rivu stats` 命令行查询",
-            "phase": "P2",
-        })),
+        StatusCode::NOT_FOUND,
+        Json(json!({"error": "not_found", "message": "no such endpoint"})),
     )
 }
 
@@ -542,16 +535,16 @@ mod tests {
     #[tokio::test]
     async fn api_serves_api_prefix_only() {
         let r = request(router(Role::Api, None), "GET", "/api/stats/overview").await;
-        assert_eq!(r.status, 501);
-        assert!(r.body.contains("\"phase\":\"P2\""), "{}", r.body);
+        assert_eq!(r.status, 404);
+        assert!(r.body.contains("\"error\":\"not_found\""), "{}", r.body);
         let r = request(router(Role::Api, None), "POST", "/api/event").await;
         // api 角色没有 /api/event 的专用路由，会落到 /api/* 的通配上
-        assert_eq!(r.status, 501);
+        assert_eq!(r.status, 404);
         let r = request(router(Role::Api, None), "GET", "/other").await;
         assert_eq!(r.status, 404);
     }
 
-    /// 一个占位的查询 API 路由：只验证它与 501 通配的优先关系，真实实现的测试在 `query_api.rs`。
+    /// 一个占位的查询 API 路由：只验证它与 404 通配的优先关系，真实实现的测试在 `query_api.rs`。
     fn stub_query_api() -> Router {
         Router::new()
             .route("/api/v1/query", axum::routing::post(|| async { "query" }))
@@ -562,7 +555,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn query_api_routes_take_precedence_over_the_501_wildcard() {
+    async fn query_api_routes_take_precedence_over_the_404_wildcard() {
         for role in [Role::Api, Role::All] {
             let (p, _w, _rx) = collector(1);
             let pipeline = (role == Role::All).then_some(p);
@@ -571,21 +564,14 @@ mod tests {
             assert_eq!((r.status, r.body.as_str()), (200, "query"), "{role:?}");
             let r = request(app(), "GET", "/api/v1/query/schema.json").await;
             assert_eq!((r.status, r.body.as_str()), (200, "schema"), "{role:?}");
-            // 其余 /api/* 仍是 501，包括内部看板端点与 v1 下的其他路径
-            for path in [
-                "/api/v1/other",
-                "/api/v1/query/",
-                "/api/internal/sites/1/query",
-                "/api/stats",
-            ] {
+            // 其余 /api/* 是 JSON 的 404，包括 v1 下的其他路径
+            for path in ["/api/v1/other", "/api/v1/query/", "/api/stats"] {
                 let r = request(app(), "POST", path).await;
-                assert_eq!(r.status, 501, "{role:?} {path}");
+                assert_eq!(r.status, 404, "{role:?} {path}");
+                assert!(r.body.contains("not_found"), "{role:?} {path}");
             }
             assert_eq!(request(app(), "GET", "/other").await.status, 404);
         }
-        // 没有挂载查询 API（装配缺失）：`/api/v1/query` 也是 501，不会 404 或 500
-        let r = request(router(Role::Api, None), "POST", "/api/v1/query").await;
-        assert_eq!(r.status, 501);
         // collector 角色不提供查询 API，即使传了也不挂载
         let (p, _w, _rx) = collector(1);
         let r = request(
@@ -608,8 +594,8 @@ mod tests {
             "/api/anything",
         )
         .await;
-        assert_eq!(r.status, 501);
-        // all 角色的 /api/event 走 collector 的专用路由，不是 501
+        assert_eq!(r.status, 404);
+        // all 角色的 /api/event 走 collector 的专用路由，不是通配
         let r = request(router(Role::All, Some(p)), "OPTIONS", "/api/event").await;
         assert_eq!(r.status, 204);
     }

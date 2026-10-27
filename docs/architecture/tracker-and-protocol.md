@@ -243,7 +243,7 @@ rivu('event', 'Video Play', { interactive: false })   // 发 i:false，不影响
 |---|---|---|---|---|---|---|
 | `v` | integer | 是 | 全部 | 当前仅 `1`（N−1 见第 8 节） | 不支持 → 400 `v` | 决策 4 |
 | `sv` | integer | 否 | 全部 | 0–999999 | 非法/缺失按 0，**永不 400**；只作计数标签，不影响行为 | `[01 §4.1]` |
-| `s` | string | 是 | 全部 | `^[A-Za-z0-9_-]{8,32}$` | 格式错 → 400 `s: has an invalid format`；格式合法但不存在 → 202+计数（`unknown_site`）。实际生成的 key 是 12 位 base32 小写（`^[a-z2-7]{12}$`，PG 迁移与 `platform-and-ops.md` §3.3），线协议的正则故意更宽松：它只是向前兼容的语法检查，将来调整 key 的生成格式时，已发布的脚本和协议都不用改 | 决策 3；`system-design.md` §10 Q11 |
+| `s` | string | 是 | 全部 | `^[a-z2-7]{12}$` | 格式错 → 400 `s: has an invalid format`；格式合法但不存在 → 202+计数（`unknown_site`）。与 `sites.site_key` 的 CHECK 是同一条规则（`rivu_domain::is_site_key`，`platform-and-ops.md` §3.3） | 决策 3；`system-design.md` §10 Q11 |
 | `n` | string | 是 | 全部 | trim 后非空，≤120 **字符**，不含控制字符 | `pageview`、`engagement` 为系统事件名，其余为自定义 | `[01 §2.2]` |
 | `u` | string | 是 | 全部 | 只受请求体 8 KB 上限约束；scheme 仅 `http`/`https` | 规范化见第 7 节。超长不回 400：先丢弃白名单以外的 query 参数，再把 pathname 截断到 1024 字节。Plausible 对超过 2000 字节的 URL 回 400，会丢掉整条 pageview，而长 URL 多数是广告和跟踪参数造成的。无法解析或 scheme 不合法时仍回 400 | `[01 §4.1]` |
 | `r` | string 或 null | 否 | 主要 pageview | ≤2000 **字符** | null/空串视为缺失；超长**截断**不报错；其余类型 → 400 | `[01 §2.2]` |

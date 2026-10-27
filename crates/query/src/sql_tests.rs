@@ -163,7 +163,7 @@ fn sql_top_pages_with_event_dimension() {
             "pagination": {"limit": 100, "offset": 20}
         }),
     );
-    // 只看 pageview 的页面榜（P1 的 `breakdown(Page)` 预设）
+    // 只看 pageview 的页面榜
     snap(
         "top_pages_pageviews_only",
         json!({

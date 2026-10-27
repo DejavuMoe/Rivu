@@ -17,7 +17,7 @@
 | `test/unit/` | 纯函数单元测试（`node:test`） |
 | `test/fixture/server.ts` | 浏览器测试夹具：站点服务器 + 模拟 Rivu 的采集端（记录方法、Content-Type、Cookie 头、请求体） |
 | `test/e2e/` | Playwright（chromium / firefox / webkit）行为测试：`core.spec.ts`、`full.spec.ts`（夹具按 `?v=full` 发 full） |
-| `test/e2e-rivu/` | 真实浏览器 → 真实运行的 rivu → ClickHouse → `rivu stats`：脚本从 rivu 的 `/js/<site_key>.js` 加载，断言系统里的数字与已知动作完全一致（「已知答案探针」雏形）。由 `scripts/e2e-rivu.sh` 编排，配置 `playwright.rivu.config.ts`，不在 `pnpm test` 里 |
+| `test/e2e-rivu/` | 真实浏览器 → 真实运行的 rivu → ClickHouse → `rivu query`：脚本从 rivu 的 `/js/<site_key>.js` 加载，断言系统里的数字与已知动作完全一致（「已知答案探针」雏形）。由 `scripts/e2e-rivu.sh` 编排，配置 `playwright.rivu.config.ts`，不在 `pnpm test` 里 |
 | `test/wire.ts` | 线协议 `v=1` 请求体校验器，对照规范 §5.1 与 `crates/ingest/src/protocol.rs` |
 | `probe/` | 已知答案探针：`probe.mjs` 定时用无头浏览器制造已知访问并经公开 API 核对数字，`summary.mjs` 判定「连续 N 天全部通过」，`run-local.sh` 本机演练；说明见 `docs/research/known-answer-probe.md` |
 | `size-baseline.json` | 体积基线，`pnpm size` 与之对照 |

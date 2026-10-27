@@ -176,19 +176,12 @@ fn js_string(s: &str) -> String {
     out
 }
 
-/// `site_key` 只含 `[A-Za-z0-9_-]`（§2.3）。
-fn valid_site_key(s: &str) -> bool {
-    !s.is_empty()
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-}
-
 /// 站点脚本的配置前缀：**唯一**的「站点配置 → 脚本配置」映射（§2.3）。
 /// 键序固定：`site`、`endpoint`、`hash`，`full` 再接 `engagement`、`outbound`、`downloads`、`forms`、`tagged`
 /// （`downloads` 是布尔：`true` 用 tracker 的默认扩展名表）。是否 `full` 由 [`TrackerSwitches::needs_full`] 决定。
 /// `site_key` 含非法字符时返回 `None`（调用方已按路径校验过，这里再守一次，因为它会进入 JS 源码）。
 pub fn tracker_prefix(site_key: &str, endpoint: &str, t: &TrackerSwitches) -> Option<String> {
-    if !valid_site_key(site_key) {
+    if !rivu_domain::is_site_key(site_key) {
         return None;
     }
     let mut cfg = format!(
@@ -326,7 +319,10 @@ async fn serve(
         return script_response(&headers, loaded.sv, "", &loaded.full, cache);
     }
     // 站点脚本：路径必须是 `<site_key>.js`
-    let Some(key) = file.strip_suffix(".js").filter(|k| valid_site_key(k)) else {
+    let Some(key) = file
+        .strip_suffix(".js")
+        .filter(|k| rivu_domain::is_site_key(k))
+    else {
         return no_store(StatusCode::NOT_FOUND);
     };
     let Some(site) = svc.sites.get(key).filter(|s| s.collect_enabled) else {
@@ -504,14 +500,24 @@ mod tests {
     #[test]
     fn prefix_refuses_site_keys_outside_the_allowed_alphabet() {
         let t = TrackerSwitches::default();
-        for bad in ["", "a b", "a\"b", "a;b", "a/b", "a.b", "</script>", "密钥"] {
+        for bad in [
+            "",
+            "a b",
+            "a\"b",
+            "a;b",
+            "a/b",
+            "a.b",
+            "</script>",
+            "密钥",
+            "A-z_09",
+        ] {
             assert_eq!(
                 tracker_prefix(bad, "https://s/api/event", &t),
                 None,
                 "{bad:?}"
             );
         }
-        assert!(tracker_prefix("A-z_09", "https://s/api/event", &t).is_some());
+        assert!(tracker_prefix("k7qm2xv7atbr", "https://s/api/event", &t).is_some());
     }
 
     #[test]

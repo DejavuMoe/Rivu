@@ -40,7 +40,7 @@
 //! 站点管理端点的实现在 [`crate::site_admin`]：站点对调用者不可见一律 404，可见但角色不够 403 `forbidden`；
 //! 成员、邀请与 API key 端点的实现在 [`crate::org_admin`]（组织不存在或调用者不是成员 404，角色不够 403）。
 //!
-//! 其余 `/api/internal/*` 仍是 501（`public.rs` 的通配）。`{site}` 是站点的数字 id（`sites.id`，文档里的 `{site_id}`）
+//! 没有匹配的 `/api/internal/*` 是 404（`public.rs` 的通配）。`{site}` 是站点的数字 id（`sites.id`，文档里的 `{site_id}`）
 //! 或 12 位的 `site_key`；匿名的公开看板只知道 `site_key`，所以两种都收。
 //!
 //! # 站点访问判定（`platform-and-ops.md` §4.2）

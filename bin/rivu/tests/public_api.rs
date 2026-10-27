@@ -10,7 +10,7 @@
 //! 1. `http_results_equal_direct_execution`：经管线写入一组已知事件（固定的历史时间，两个站点：UTC 与
 //!    Asia/Kathmandu + 周日起始），若干 QuerySpec 的 HTTP 响应与直接调用 `rivu_query::execute` 的结果
 //!    **逐字节**相等（同一个「现在」、同一份站点上下文），并核对 `log_comment` 带 route / site / org / api_key_id；
-//! 2. `errors_follow_the_documented_chain`：400 / 401 / 403 / 404 / 501 与 schema.json；
+//! 2. `errors_follow_the_documented_chain`：400 / 401 / 403 / 404 与 schema.json；
 //! 3. `hourly_quota_exhaustion_is_429_with_headers`：组织小时配额用尽后 429 + `Retry-After` + `X-RateLimit-*`。
 
 use std::net::SocketAddr;
@@ -1174,11 +1174,11 @@ async fn errors_follow_the_documented_chain() {
     let r = http
         .request("GET", "/api/stats/overview", Some(&key.key), &[], b"")
         .await;
-    assert_eq!(r.status, 501, "其余 /api/* 仍是 501");
+    assert_eq!(r.status, 404, "没有匹配的 /api/* 是 404");
     let r = http
         .request("POST", "/api/internal/sites/1/query", None, &[], b"{}")
         .await;
-    assert_eq!(r.status, 501);
+    assert_eq!(r.status, 404);
 
     // ---- schema.json ---------------------------------------------------------------------
     let r = http
@@ -1208,7 +1208,7 @@ async fn errors_follow_the_documented_chain() {
     assert_eq!(r.status, 304);
     assert_eq!(r.body, "");
 
-    // ---- rivu_api_requests_total{route,status}：401 / 403 / 404 / 400 / 501 都被计数 ------------------
+    // ---- rivu_api_requests_total{route,status}：401 / 403 / 404 / 400 都被计数 ------------------
     let text = metrics.render();
     let count = |route: &str, status: u16| {
         sample(
@@ -1224,7 +1224,7 @@ async fn errors_follow_the_documented_chain() {
     assert_eq!(count("api.query", 405), Some(2.0), "{text}");
     assert_eq!(count("api.query_schema", 200), Some(1.0), "{text}");
     assert_eq!(count("api.query_schema", 304), Some(1.0), "{text}");
-    assert_eq!(count("api.not_implemented", 501), Some(2.0), "{text}");
+    assert_eq!(count("api.not_found", 404), Some(2.0), "{text}");
     // 只有走到 execute 的请求计入耗时：3 次 200（含别的组织公开站点的那次）+ 校验错误发生在 build 阶段的 2 次
     assert_eq!(
         sample(&text, "rivu_query_seconds_count{route=\"api.query\"}"),

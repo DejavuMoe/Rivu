@@ -55,7 +55,7 @@ pub struct SiteContext {
 }
 
 impl SiteContext {
-    /// UTC、周一起始、没有地理库、没有目标的站点（测试与预设用）。
+    /// UTC、周一起始、没有地理库、没有目标的站点（测试用）。
     pub fn new(site_id: u64, timezone: TimeZone) -> Self {
         SiteContext {
             site_id,
@@ -210,7 +210,8 @@ impl Col {
         )
     }
 
-    /// 空值（库里存的是空串）的展示文案（沿用 P1 与 Plausible 的习惯，见 `presets`）。
+    /// 空值（库里存的是空串）的展示文案，沿用 Plausible 的习惯（`docs/research/plausible/03-stats-query-engine.md` §5.1）：
+    /// 来源 `Direct / None`、渠道 `Direct`，其余 `(not set)`（Plausible 对国家没有兜底文案，直接丢掉未知行）。
     pub(crate) fn empty_label(self) -> &'static str {
         match self {
             Col::Source | Col::Referrer => "Direct / None",

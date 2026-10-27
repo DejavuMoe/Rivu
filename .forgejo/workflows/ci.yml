@@ -173,7 +173,7 @@ jobs:
           name: tracker-playwright-report
           path: apps/tracker/playwright-report
 
-  # 真实浏览器 -> 真实运行的 rivu -> ClickHouse -> rivu stats（apps/tracker/scripts/e2e-rivu.sh）。
+  # 真实浏览器 -> 真实运行的 rivu -> ClickHouse -> rivu query（apps/tracker/scripts/e2e-rivu.sh）。
   # 依赖 Rust 构建与 tracker 构建（脚本自己重新构建两者，所以这里只声明 needs，保证前两个 job 先通过）。
   # 尚未在真实的 Forgejo runner 上运行过：Playwright 的 --with-deps 要 root/apt；CI 里 ClickHouse 只有一个全权限账号
   # （见上面的 migrate-and-integration），所以四个角色账号变量都指向它。
@@ -212,6 +212,7 @@ jobs:
       RIVU_CH_READER_PASSWORD: rivu_ci
       RIVU_CH_MAINTAINER_USER: rivu_ci
       RIVU_CH_MAINTAINER_PASSWORD: rivu_ci
+      RIVU_VISITOR_PEPPER: rivu-ci-visitor-pepper-not-for-production-use
     steps:
       - uses: actions/checkout@v4
       - name: Rust 工具链
