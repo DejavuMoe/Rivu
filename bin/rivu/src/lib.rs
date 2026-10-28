@@ -9,6 +9,7 @@ pub mod dashboard;
 pub mod diagnostics;
 pub mod goals_admin;
 pub mod healthcheck;
+pub mod imports_admin;
 pub mod internal;
 pub mod migrate;
 pub mod org_admin;

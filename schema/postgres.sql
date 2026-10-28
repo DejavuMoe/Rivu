@@ -285,16 +285,19 @@ TABLE site_imports
   start_date date
   end_date date
   rows_imported bigint NOT NULL DEFAULT 0
+  error_code text
   error text
   imported_by bigint
   created_at timestamp with time zone NOT NULL DEFAULT now()
   completed_at timestamp with time zone
-  CONSTRAINT site_imports_check CHECK ((end_date >= start_date))
-  CONSTRAINT site_imports_imported_by_fkey FOREIGN KEY (imported_by) REFERENCES users(id) ON DELETE SET NULL
+  CONSTRAINT site_imports_check1 CHECK ((end_date >= start_date))
+  CONSTRAINT site_imports_error_code_check CHECK ((error_code = ANY (ARRAY['invalid_zip'::text, 'not_plausible'::text, 'invalid_csv'::text, 'no_days'::text, 'overlap'::text, 'interrupted'::text, 'internal'::text])))
+  CONSTRAINT site_imports_imported_by_fkey1 FOREIGN KEY (imported_by) REFERENCES users(id) ON DELETE SET NULL
   CONSTRAINT site_imports_pkey PRIMARY KEY (id)
-  CONSTRAINT site_imports_site_id_fkey FOREIGN KEY (site_id) REFERENCES sites(id) ON DELETE CASCADE
-  CONSTRAINT site_imports_source_check CHECK ((source = 'plausible_csv'::text))
-  CONSTRAINT site_imports_status_check CHECK ((status = ANY (ARRAY['importing'::text, 'completed'::text, 'failed'::text])))
+  CONSTRAINT site_imports_site_id_fkey1 FOREIGN KEY (site_id) REFERENCES sites(id) ON DELETE CASCADE
+  CONSTRAINT site_imports_source_check1 CHECK ((source = 'plausible_csv'::text))
+  CONSTRAINT site_imports_status_check1 CHECK ((status = ANY (ARRAY['importing'::text, 'completed'::text, 'failed'::text])))
+  CREATE UNIQUE INDEX site_imports_running ON public.site_imports USING btree (site_id) WHERE (status = 'importing'::text)
   CREATE INDEX site_imports_site ON public.site_imports USING btree (site_id)
 
 TABLE site_memberships

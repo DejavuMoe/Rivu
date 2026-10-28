@@ -99,7 +99,7 @@ test("设置分区可见性", () => {
   const editor = { role: "editor", access: "member" } as const;
   const viewer = { role: "viewer", access: "member" } as const;
   const guestEditor = { role: "editor", access: "guest" } as const;
-  assert.deepEqual(visibleSections(owner), ["general", "hostnames", "collection", "privacy", "shield", "goals", "sharing", "danger"]);
+  assert.deepEqual(visibleSections(owner), ["general", "hostnames", "collection", "privacy", "shield", "goals", "sharing", "imports", "danger"]);
   assert.deepEqual(visibleSections(editor), ["shield", "goals", "sharing"]);
   assert.deepEqual(visibleSections(viewer), []);
   assert.deepEqual(visibleSections(guestEditor), ["shield", "goals"]);

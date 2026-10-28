@@ -17,10 +17,10 @@
 //! 时长从秒换成毫秒。只写站点自己的数据开始之前的天（同一天两边都有会重复计数）；与已完成的导入重叠时拒绝。
 
 use std::collections::BTreeMap;
-use std::io::Read;
-use std::path::Path;
+use std::fmt;
+use std::io::{Cursor, Read};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clickhouse::Client;
 use jiff::civil::Date;
 use jiff::tz::TimeZone;
@@ -37,6 +37,35 @@ pub struct Summary {
     pub rows: u64,
     /// 因为站点自己的数据已经开始而跳过的天（`None`：没有跳过）。
     pub clipped_from: Option<Date>,
+}
+
+/// 看板能翻译的失败原因（`site_imports.error_code`）；不是它的错误记为 `internal`。
+#[derive(Debug)]
+pub struct Failure {
+    /// `invalid_zip` | `not_plausible` | `invalid_csv` | `no_days` | `overlap`
+    pub code: &'static str,
+    message: String,
+}
+
+impl fmt::Display for Failure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Failure {}
+
+fn failure(code: &'static str, message: impl Into<String>) -> anyhow::Error {
+    Failure {
+        code,
+        message: message.into(),
+    }
+    .into()
+}
+
+/// 失败原因的代码：[`Failure`] 的代码，其余为 `internal`。
+pub fn error_code(e: &anyhow::Error) -> &'static str {
+    e.downcast_ref::<Failure>().map_or("internal", |f| f.code)
 }
 
 /// 一个文件的内容：表头 → 列号，加上各行。
@@ -81,13 +110,20 @@ impl Csv {
 }
 
 /// 读出 zip 里的 `imported_<族>_*.csv`，按族名索引。
-fn read_zip(path: &Path) -> Result<BTreeMap<String, Csv>> {
-    let file = std::fs::File::open(path).with_context(|| format!("打不开 {}", path.display()))?;
-    let mut zip = zip::ZipArchive::new(file).context("不是有效的 zip 文件")?;
+fn read_zip(bytes: &[u8]) -> Result<BTreeMap<String, Csv>> {
+    let bad_zip =
+        |e: zip::result::ZipError| failure("invalid_zip", format!("不是有效的 zip 文件：{e}"));
+    let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).map_err(bad_zip)?;
     let mut out = BTreeMap::new();
     for i in 0..zip.len() {
-        let mut entry = zip.by_index(i)?;
-        let name = entry.name()?.rsplit('/').next().unwrap_or("").to_owned();
+        let mut entry = zip.by_index(i).map_err(bad_zip)?;
+        let name = entry
+            .name()
+            .map_err(bad_zip)?
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .to_owned();
         let Some(rest) = name.strip_prefix("imported_") else {
             continue;
         };
@@ -104,13 +140,13 @@ fn read_zip(path: &Path) -> Result<BTreeMap<String, Csv>> {
         let mut bytes = Vec::new();
         entry
             .read_to_end(&mut bytes)
-            .with_context(|| format!("读取 {name} 失败"))?;
+            .map_err(|e| failure("invalid_zip", format!("读取 {name} 失败：{e}")))?;
         let mut reader = csv::ReaderBuilder::new()
             .has_headers(true)
             .from_reader(bytes.as_slice());
         let index = reader
             .byte_headers()
-            .with_context(|| format!("{name} 没有表头"))?
+            .map_err(|e| failure("invalid_csv", format!("{name} 没有表头：{e}")))?
             .iter()
             .enumerate()
             .map(|(i, h)| (String::from_utf8_lossy(h).trim().to_owned(), i))
@@ -118,11 +154,14 @@ fn read_zip(path: &Path) -> Result<BTreeMap<String, Csv>> {
         let rows = reader
             .byte_records()
             .collect::<Result<Vec<_>, _>>()
-            .with_context(|| format!("解析 {name} 失败"))?;
+            .map_err(|e| failure("invalid_csv", format!("解析 {name} 失败：{e}")))?;
         out.insert(family, Csv { name, index, rows });
     }
     if !out.contains_key("visitors") {
-        bail!("zip 里没有 imported_visitors_*.csv：这不是 Plausible 的数据导出");
+        return Err(failure(
+            "not_plausible",
+            "zip 里没有 imported_visitors_*.csv：这不是 Plausible 的数据导出",
+        ));
     }
     Ok(out)
 }
@@ -465,10 +504,9 @@ pub async fn run(
     site_id: u64,
     tz_name: &str,
     import_id: u64,
-    zip_path: &Path,
+    zip: Vec<u8>,
 ) -> Result<Summary> {
-    let path = zip_path.to_owned();
-    let files = tokio::task::spawn_blocking(move || read_zip(&path))
+    let files = tokio::task::spawn_blocking(move || read_zip(&zip))
         .await
         .context("读取 zip 的任务异常退出")??;
 
@@ -478,26 +516,33 @@ pub async fn run(
     let state = rollup::build_state(ch, &scope, &tz)
         .await
         .map_err(|e| anyhow::anyhow!("读取站点数据范围失败：{e}"))?;
-    let native_from = state.first_day;
+    let native_from = state.native_from;
     let keep = |d: Date| native_from.is_none_or(|n| d < n);
 
-    let tables = transform(&files, &keep)?;
+    let tables = transform(&files, &keep).map_err(|e| failure("invalid_csv", format!("{e:#}")))?;
     let site_days: Vec<Date> = tables
         .get("rollup_site")
         .map(|a| a.keys().map(|(d, _)| *d).collect())
         .unwrap_or_default();
     let (Some(start), Some(end)) = (site_days.first().copied(), site_days.last().copied()) else {
-        bail!(match native_from {
-            Some(d) =>
-                format!("导出里没有 {d}（站点自己的数据开始的那天）之前的数据，没有可以导入的天"),
-            None => "导出里没有数据".to_owned(),
-        });
+        return Err(failure(
+            "no_days",
+            match native_from {
+                Some(d) => format!(
+                    "导出里没有 {d}（站点自己的数据开始的那天）之前的数据，没有可以导入的天"
+                ),
+                None => "导出里没有数据".to_owned(),
+            },
+        ));
     };
     if let Some(other) =
         rivu_storage_pg::imports::overlapping(pg, site_id, &start.to_string(), &end.to_string())
             .await?
     {
-        bail!("与已有的导入 #{other} 的日期重叠（{start} – {end}），先删除那次导入");
+        return Err(failure(
+            "overlap",
+            format!("与已有的导入 #{other} 的日期重叠（{start} – {end}），先删除那次导入"),
+        ));
     }
     let clipped_from = native_from.filter(|n| {
         files["visitors"]
@@ -536,20 +581,35 @@ pub async fn run(
     })
 }
 
-/// 建记录、导入、记结果；失败时删除已写入的汇总行并把记录置为失败。返回记录 id 与结果。
+/// 建记录并导入（见 [`execute`]）。返回记录 id 与结果。
 pub async fn import_file(
     pg: &PgPool,
     ch: &Client,
     site_id: u64,
     tz_name: &str,
-    zip_path: &Path,
+    zip: Vec<u8>,
     file_name: &str,
     imported_by: Option<i64>,
 ) -> Result<(i64, Summary)> {
     let id = rivu_storage_pg::imports::create(pg, site_id, "plausible_csv", file_name, imported_by)
-        .await?;
+        .await?
+        .context("这个站点已有进行中的导入")?;
+    execute(pg, ch, id, site_id, tz_name, zip)
+        .await
+        .map(|s| (id, s))
+}
+
+/// 对已建好的记录（`importing`）执行导入并记结果；失败时删除已写入的汇总行并把记录置为失败。
+pub async fn execute(
+    pg: &PgPool,
+    ch: &Client,
+    id: i64,
+    site_id: u64,
+    tz_name: &str,
+    zip: Vec<u8>,
+) -> Result<Summary> {
     let import_id = u64::try_from(id).context("导入 id 为负数")?;
-    match run(pg, ch, site_id, tz_name, import_id, zip_path).await {
+    match run(pg, ch, site_id, tz_name, import_id, zip).await {
         Ok(s) => {
             rivu_storage_pg::imports::complete(
                 pg,
@@ -560,20 +620,43 @@ pub async fn import_file(
             )
             .await?;
             tracing::info!(site_id, import_id = id, rows = s.rows, start = %s.start, end = %s.end, "导入完成");
-            Ok((id, s))
+            Ok(s)
         }
         Err(e) => {
             let msg = format!("{e:#}");
             if let Err(d) = rollup::delete_import(ch, &TenantScope::new(site_id), import_id).await {
                 tracing::error!(site_id, import_id = id, error = %d, "清理失败导入的汇总行失败");
             }
-            rivu_storage_pg::imports::fail(pg, id, &msg).await?;
+            rivu_storage_pg::imports::fail(pg, id, error_code(&e), &msg).await?;
             tracing::warn!(site_id, import_id = id, error = %msg, "导入失败");
             Err(e)
         }
     }
 }
 
+/// 启动时调用：上次进程退出时还在 `importing` 的导入写到一半，删除它们的汇总行并置为失败（`interrupted`）。
+pub async fn recover_interrupted(pg: &PgPool, ch: &Client) -> Result<usize> {
+    let stale = rivu_storage_pg::imports::interrupted(pg).await?;
+    for (id, site_id) in &stale {
+        let import_id = u64::try_from(*id).context("导入 id 为负数")?;
+        rollup::delete_import(ch, &TenantScope::new(*site_id), import_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("清理中断导入 #{id} 的汇总行失败：{e}"))?;
+        rivu_storage_pg::imports::fail(
+            pg,
+            *id,
+            "interrupted",
+            "服务在导入过程中重启，导入没有完成",
+        )
+        .await?;
+        tracing::warn!(
+            site_id,
+            import_id = id,
+            "上次进程退出时导入没有完成，已清理并置为失败"
+        );
+    }
+    Ok(stale.len())
+}
 #[cfg(test)]
 mod tests {
     use super::*;

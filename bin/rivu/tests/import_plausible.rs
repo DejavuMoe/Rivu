@@ -117,9 +117,8 @@ const FILES: [(&str, &str); 11] = [
     ),
 ];
 
-fn write_zip(path: &std::path::Path) {
-    let file = std::fs::File::create(path).unwrap();
-    let mut zip = zip::ZipWriter::new(file);
+fn export_zip() -> Vec<u8> {
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     let opts = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
     for (family, body) in FILES {
@@ -127,7 +126,7 @@ fn write_zip(path: &std::path::Path) {
             .unwrap();
         zip.write_all(body.as_bytes()).unwrap();
     }
-    zip.finish().unwrap();
+    zip.finish().unwrap().into_inner()
 }
 
 async fn run(reader: &clickhouse::Client, site: &SiteContext, spec: Value) -> QueryResult {
@@ -194,10 +193,6 @@ async fn plausible_export_is_imported_into_the_rollup_tier() {
     .expect("建站");
     let maintainer = rivu_storage_ch::client(&ch_url, &account("maintainer"), Some(&ch_database()));
     let reader = rivu_storage_ch::client(&ch_url, &account("reader"), Some(&ch_database()));
-    let dir = std::env::temp_dir().join(format!("rivu-import-{}", created.id));
-    std::fs::create_dir_all(&dir).unwrap();
-    let zip_path = dir.join("export.zip");
-    write_zip(&zip_path);
 
     // ---- 导入 -------------------------------------------------------------------------------
     let (id, summary) = rivu_jobs::import_plausible::import_file(
@@ -205,7 +200,7 @@ async fn plausible_export_is_imported_into_the_rollup_tier() {
         &maintainer,
         created.id,
         "UTC",
-        &zip_path,
+        export_zip(),
         "export.zip",
         None,
     )
@@ -340,13 +335,13 @@ async fn plausible_export_is_imported_into_the_rollup_tier() {
         &maintainer,
         created.id,
         "UTC",
-        &zip_path,
+        export_zip(),
         "export.zip",
         None,
     )
     .await;
     assert!(
-        again.is_err_and(|e| e.to_string().contains("重叠")),
+        again.is_err_and(|e| rivu_jobs::import_plausible::error_code(&e) == "overlap"),
         "同一段日期不能导入两次"
     );
     let imports = rivu_storage_pg::imports::list(&pg, created.id)
@@ -354,6 +349,7 @@ async fn plausible_export_is_imported_into_the_rollup_tier() {
         .unwrap();
     assert_eq!(imports.len(), 2);
     assert_eq!(imports[0].status, "failed");
+    assert_eq!(imports[0].error_code.as_deref(), Some("overlap"));
     assert_eq!(imports[1].status, "completed");
 
     rivu_query::rollup::delete_import(
@@ -380,5 +376,31 @@ async fn plausible_export_is_imported_into_the_rollup_tier() {
     )
     .await;
     assert_eq!(rows(&gone)[0].1, vec![0.0]);
-    let _ = std::fs::remove_dir_all(&dir);
+
+    // ---- 不是 Plausible 导出、不是 zip：带代码的失败 -------------------------------------------
+    for (bytes, code) in [
+        (b"not a zip".to_vec(), "invalid_zip"),
+        (empty_zip(), "not_plausible"),
+    ] {
+        let e = rivu_jobs::import_plausible::import_file(
+            &pg,
+            &maintainer,
+            created.id,
+            "UTC",
+            bytes,
+            "x.zip",
+            None,
+        )
+        .await
+        .expect_err(code);
+        assert_eq!(rivu_jobs::import_plausible::error_code(&e), code);
+    }
+}
+
+fn empty_zip() -> Vec<u8> {
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    zip.start_file("readme.txt", zip::write::SimpleFileOptions::default())
+        .unwrap();
+    zip.write_all(b"hi").unwrap();
+    zip.finish().unwrap().into_inner()
 }
