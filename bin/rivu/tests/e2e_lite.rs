@@ -1021,14 +1021,58 @@ async fn http_endpoint_end_to_end() {
     assert_eq!(r.header("cache-control"), Some("public, max-age=300"));
     assert_eq!(http_get(addr, "/js/zzzzzzzzzzzz.js").await.status, 404);
 
+    // 自定义属性：三个带 plan 的事件（两个 pro）、一个不带
+    for p in [
+        json!({"plan": "pro", "seats": 5}),
+        json!({"plan": "pro"}),
+        json!({"plan": "free"}),
+        json!({}),
+    ] {
+        let body = json!({"v": 1, "s": created.site_key, "n": "Signup", "u": format!("https://{HOST}/signup"), "p": p});
+        assert_eq!(http_post(addr, &body.to_string()).await.status, 202);
+    }
+
     writer.shutdown().await.expect("关停");
     let reader = reader_client(&env.ch_url);
-    assert_eq!(count(&reader, "events", created.id).await, 1);
+    assert_eq!(count(&reader, "events", created.id).await, 5);
     let counters = counter_sums(&reader, created.id).await;
     assert_eq!(
         counters,
-        BTreeMap::from([("accepted".to_owned(), 1), ("dropped_bot".to_owned(), 1)])
+        BTreeMap::from([("accepted".to_owned(), 5), ("dropped_bot".to_owned(), 1)])
     );
+    // 按属性分组：没有这个键的事件（含 pageview）是 (none)；数字属性存成字符串
+    let by_plan = run(
+        &reader,
+        created.id,
+        &TimeZone::UTC,
+        QuerySpec::parse(&json!({"metrics": ["events"], "date_range": "day",
+            "dimensions": ["event:props:plan"], "filters": [["is", "event:name", ["Signup", "pageview"]]]}))
+        .unwrap(),
+    )
+    .await;
+    let rows: Vec<(String, f64)> = by_plan
+        .results
+        .iter()
+        .map(|r| (r.dimensions[0].clone(), r.metrics[0].as_f64()))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            ("(none)".to_owned(), 2.0),
+            ("pro".to_owned(), 2.0),
+            ("free".to_owned(), 1.0)
+        ]
+    );
+    let seats = run(
+        &reader,
+        created.id,
+        &TimeZone::UTC,
+        QuerySpec::parse(&json!({"metrics": ["events"], "date_range": "day",
+            "filters": [["is", "event:props:seats", ["5"]]]}))
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(seats.results[0].metrics[0].as_f64(), 1.0);
     cleanup(&admin_client(&env.ch_url), created.id).await;
 }
 
