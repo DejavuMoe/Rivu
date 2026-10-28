@@ -13,7 +13,7 @@
   import Field from "../ui/Field.svelte";
   import { t } from "../i18n";
   import { app } from "../state.svelte";
-  import { opsFor, type Filter, type Op } from "./spec";
+  import { PROP_PREFIX, isPropDim, opsFor, type Filter, type Op } from "./spec";
   import { isAbort } from "./source";
   import { displayValue } from "./values";
 
@@ -95,7 +95,7 @@
             picked = [];
             if (!opsFor(v).includes(op)) op = "is";
           }}
-          options={dims.map((d) => ({ value: d, label: t(`fdim.${d}`) }))}
+          options={dims.map((d) => ({ value: d, label: isPropDim(d) ? d.slice(PROP_PREFIX.length) : t(`fdim.${d}`) }))}
         />
       </Field>
       <Field label={t("filter.operator")}>
