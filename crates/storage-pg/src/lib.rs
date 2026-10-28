@@ -24,6 +24,7 @@ macro_rules! ts_sec {
 
 pub mod access;
 pub mod api_keys;
+pub mod auth_tokens;
 pub mod goals;
 pub mod imports;
 pub mod members;
@@ -33,6 +34,7 @@ pub mod shared_links;
 pub mod shield;
 pub mod sites;
 pub mod stats_deletions;
+pub mod totp;
 pub mod users;
 
 use std::time::Duration;

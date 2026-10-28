@@ -183,5 +183,10 @@ pub async fn cleanup(pool: &PgPool) -> Result<(u64, u64)> {
         .await
         .context("清理 shared_link_grants 失败")?
         .rows_affected();
+    // 找回密码的令牌：过期或用过的行（只是记录，不再有用）
+    sqlx::query("DELETE FROM auth_tokens WHERE expires_at < now() OR used_at IS NOT NULL")
+        .execute(pool)
+        .await
+        .context("清理 auth_tokens 失败")?;
     Ok((sessions, grants))
 }

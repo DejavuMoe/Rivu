@@ -133,6 +133,17 @@ pub async fn user(config: &Config, args: UserArgs) -> Result<ExitCode> {
         }
         UserAction::Disable(a) => set_disabled(&pool, &a.email, true).await?,
         UserAction::Enable(a) => set_disabled(&pool, &a.email, false).await?,
+        UserAction::Reset2fa(a) => {
+            let email = normalize_email(&a.email).map_err(anyhow::Error::msg)?;
+            let Some(user) = rivu_storage_pg::users::find_by_email(&pool, &email).await? else {
+                bail!("找不到用户 `{email}`（或已删除）");
+            };
+            if rivu_storage_pg::totp::disable(&pool, user.id).await? {
+                println!("已关闭 {email} 的两步验证，下次登录只需要密码");
+            } else {
+                println!("{email} 没有开启两步验证");
+            }
+        }
         UserAction::List => {
             let rows = rivu_storage_pg::users::list_users(&pool).await?;
             if rows.is_empty() {
@@ -172,7 +183,7 @@ async fn set_disabled(pool: &PgPool, email: &str, disabled: bool) -> Result<()> 
         "用户 {email} 已{}{}",
         if disabled { "禁用" } else { "启用" },
         if disabled {
-            "，他的全部登录会话已撤销"
+            "，该用户的全部登录会话已撤销"
         } else {
             ""
         }

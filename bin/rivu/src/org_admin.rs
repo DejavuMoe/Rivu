@@ -380,11 +380,28 @@ async fn create_invitation(
         api.base_url.trim_end_matches('/'),
         token.plaintext()
     );
+    // 配置了 SMTP 时同时发邀请邮件（后台发送）；链接照样返回，邀请人也可以自己转发
+    let email_sent = if api.mailer.is_some() {
+        let target = match &row.site {
+            Some((_, name)) => name.clone(),
+            None => rivu_storage_pg::users::list_user_orgs(&api.pg, c.session.s.user_id)
+                .await?
+                .into_iter()
+                .find(|o| o.id == c.org_id)
+                .map(|o| o.name)
+                .unwrap_or_default(),
+        };
+        let inviter = c.session.s.name.as_deref().unwrap_or(&c.session.s.email);
+        let days = (INVITATION_TTL_SECS / 86_400) as u32;
+        crate::account::send_invitation(&api, &headers, &email, inviter, &target, &url, days)
+    } else {
+        false
+    };
     Ok(done(
         &api,
         &c,
         StatusCode::CREATED,
-        json!({"invitation": invitation_json(&row), "url": url}),
+        json!({"invitation": invitation_json(&row), "url": url, "email_sent": email_sent}),
     ))
 }
 

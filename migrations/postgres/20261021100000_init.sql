@@ -272,6 +272,34 @@ CREATE UNIQUE INDEX auth_sessions_token ON auth_sessions (token_hash);
 CREATE INDEX auth_sessions_expires ON auth_sessions (expires_at);
 CREATE INDEX auth_sessions_user ON auth_sessions (user_id);          -- 「退出所有设备」
 
+-- ---------------------------------------------------------------- auth_tokens
+-- 一次性令牌（目前只有找回密码）：只存 token 的 SHA-256；用过置 used_at，auth_sessions_cleanup 清理过期的行。
+CREATE TABLE auth_tokens (
+    id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    user_id    bigint NOT NULL REFERENCES users (id),
+    kind       text NOT NULL CHECK (kind IN ('password_reset')),
+    token_hash bytea NOT NULL CHECK (octet_length(token_hash) = 32),
+    expires_at timestamptz NOT NULL,
+    used_at    timestamptz,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX auth_tokens_token ON auth_tokens (token_hash);
+CREATE INDEX auth_tokens_user ON auth_tokens (user_id);
+CREATE INDEX auth_tokens_expires ON auth_tokens (expires_at);
+
+-- ------------------------------------------------------------------ user_totp
+-- 两步验证（TOTP，RFC 6238：SHA-1、6 位、30 秒）。secret_enc 是 12 字节 nonce 加 AES-256-GCM 密文，
+-- 密钥由 RIVU_SECRET_KEY 经 HKDF 派生，数据库里没有能解开它的东西。enabled_at 为空表示设置中（还没用验证码确认）。
+-- last_step 是最后一次用过的时间步：同一个验证码不能用两次。恢复码只存 SHA-256，用掉一个删一个。
+CREATE TABLE user_totp (
+    user_id         bigint PRIMARY KEY REFERENCES users (id),
+    secret_enc      bytea NOT NULL CHECK (octet_length(secret_enc) = 48),
+    enabled_at      timestamptz,
+    last_step       bigint NOT NULL DEFAULT 0,
+    recovery_hashes bytea[] NOT NULL DEFAULT '{}',
+    created_at      timestamptz NOT NULL DEFAULT now()
+);
+
 -- ---------------------------------------------------------------------- salts
 -- 访客 ID 盐：不可变，所以没有 updated_at。备份时排除本表的数据（platform-and-ops §11.1）。
 CREATE TABLE salts (

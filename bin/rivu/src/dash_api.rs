@@ -32,6 +32,7 @@
 //! | `GET /api/internal/sites/{site}/shared-links`、`POST`、`DELETE …/shared-links/{id}` | 会话，组织 editor+ | 共享链接的列表、创建、吊销 |
 //! | `GET /api/internal/sites/{site}/goals`、`POST`、`DELETE …/goals/{id}` | 会话，有效角色 editor+（含站点访客 editor，`site.content.write`） | 目标的列表、添加（`{"kind":"event","event_name"}` 或 `{"kind":"page","page_path"}`，可带 `display_name`；同类同值或同名 409 `conflict`，每站 100 个 409 `limit_reached`）、删除；实现在 [`crate::goals_admin`] |
 //! | `GET /api/internal/sites/{site}/imports`、`POST …/imports?file_name=`、`DELETE …/imports/{id}` | 会话，组织 admin+ | Plausible 导出的导入：列表（带 `native_from`，站点自己的数据开始的那天）、上传 zip（请求体是原样字节，最大 128 MiB；202，后台导入；进行中时 409 `import_running`）、删除（进行中 409）；实现在 [`crate::imports_admin`] |
+//! | `/api/internal/auth-options`、`/password-reset`、`/login/totp`、`/me/totp/*` | 见 [`crate::account`] | 找回密码、登录的第二步、账户的两步验证 |
 //!
 //! | `GET /api/internal/orgs/{org_id}/members` | 会话，任一组织成员 | 成员、待处理邀请、站点访客，带 `can_manage` 与 `my_role` |
 //! | `PATCH /api/internal/orgs/{org_id}/members/{user_id}`、`DELETE` | 会话，组织 admin+ | 改角色、移除成员（移除同时吊销其在该组织的 API key）；admin 不能碰 owner，不能改自己，最后一名 owner 409 |
@@ -288,20 +289,23 @@ impl LoginWatch {
     }
 }
 
-struct Limiters {
+pub(crate) struct Limiters {
     /// 登录：每 IP 一桶（防喷洒）。
-    login_ip: PolicyLimiter,
+    pub(crate) login_ip: PolicyLimiter,
     /// 登录：每 `(账号, IP)` 一桶（防同一来源爆破一个账号）。**不再有单纯按账号的桶**：
     /// 否则任何人不停用受害者的邮箱登录就能让真用户一直 429（锁号）。
     login_pair: PolicyLimiter,
     /// 改密码：每 `(用户, IP)` 一桶，参数同登录的 `(账号, IP)` 桶（防拿着被盗的会话爆破当前密码）。
-    password_change: PolicyLimiter,
+    pub(crate) password_change: PolicyLimiter,
     setup_ip: PolicyLimiter,
     share_view: PolicyLimiter,
     /// 邀请页（查询与接受）：每客户端 IP 一桶，参数同共享链接与公开看板。
-    invite_view: PolicyLimiter,
+    pub(crate) invite_view: PolicyLimiter,
     share_password: PolicyLimiter,
     public_view: PolicyLimiter,
+    /// 找回密码的请求：每 IP 一桶、每邮箱一桶，参数同登录（发信有成本，也不能拿来轰炸别人的邮箱）。
+    pub(crate) reset_ip: PolicyLimiter,
+    pub(crate) reset_email: PolicyLimiter,
 }
 
 impl Limiters {
@@ -327,6 +331,8 @@ impl Limiters {
                 Duration::from_secs(60),
             ),
             public_view: view(),
+            reset_ip: login(),
+            reset_email: login(),
         }
     }
 }
@@ -354,6 +360,12 @@ pub struct DashApi {
     pub(crate) stats_delete_kick: Option<rivu_jobs::StatsDeleteKick>,
     /// `rivu_maintainer` 账号的客户端：导入写汇总层、删除导入；`None` 时导入端点返回 503。
     pub(crate) maintainer: Option<clickhouse::Client>,
+    /// 发信（`RIVU_SMTP_URL`）；`None` 时邀请只给链接，找回密码不可用。
+    pub(crate) mailer: Option<Arc<rivu_mail::Mailer>>,
+    /// 两步验证密钥的加解密（`RIVU_SECRET_KEY`）；`None` 时两步验证不可用。
+    pub(crate) vault: Option<Arc<rivu_auth::totp::Vault>>,
+    /// 密码正确、还差两步验证的登录：challenge 的 SHA-256 → 用户（5 分钟，最多试 5 次）。
+    pub(crate) login_challenges: moka::sync::Cache<[u8; 32], crate::account::Challenge>,
     csrf: Csrf,
     cookies: CookieConfig,
     /// `RIVU_SETUP_TOKEN` 的 SHA-256：比较时两边都是定长摘要，常数时间。
@@ -367,7 +379,7 @@ pub struct DashApi {
     pub(crate) cache: Option<Arc<QueryCache>>,
     /// `RIVU_RETENTION_DAYS`。
     pub(crate) retention_days: u32,
-    limiters: Limiters,
+    pub(crate) limiters: Limiters,
     limits: DashLimits,
     login_watch: LoginWatch,
     realtime_cache: moka::sync::Cache<String, Arc<String>>,
@@ -395,6 +407,20 @@ impl DashApi {
             site_restore_days: config.site_restore_days,
             stats_delete_kick: None,
             maintainer: None,
+            mailer: match &config.smtp {
+                Some(s) => Some(Arc::new(rivu_mail::Mailer::smtp(s.url.expose(), &s.from)?)),
+                None => None,
+            },
+            vault: config.secret_key.as_ref().map(|k| {
+                Arc::new(rivu_auth::totp::Vault::new(
+                    k.expose(),
+                    config.secret_key_fallback.as_ref().map(|f| f.expose()),
+                ))
+            }),
+            login_challenges: moka::sync::Cache::builder()
+                .max_capacity(100_000)
+                .time_to_live(crate::account::CHALLENGE_TTL)
+                .build(),
             csrf,
             cookies: CookieConfig {
                 secure: config.cookie_secure,
@@ -436,6 +462,12 @@ impl DashApi {
     /// 同进程的 `ch_delete_batch` 唤醒器；`None` 时只等它的定时周期（测试）。
     pub fn with_stats_delete_kick(mut self, kick: Option<rivu_jobs::StatsDeleteKick>) -> Self {
         self.stats_delete_kick = kick;
+        self
+    }
+
+    /// 换发信器（测试用 `Mailer::memory`）。
+    pub fn with_mailer(mut self, mailer: rivu_mail::Mailer) -> Self {
+        self.mailer = Some(Arc::new(mailer));
         self
     }
 
@@ -653,12 +685,12 @@ pub(crate) fn with_cookie(mut resp: Response, cookie: &str) -> Response {
 
 /// 限流键里的客户端：IPv4 按地址，IPv6 按 /64（一个终端用户通常拥有整个 /64，按单个地址限流形同虚设）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum IpBucket {
+pub(crate) enum IpBucket {
     V4([u8; 4]),
     V6Prefix([u8; 8]),
 }
 
-fn ip_bucket(ip: IpAddr) -> IpBucket {
+pub(crate) fn ip_bucket(ip: IpAddr) -> IpBucket {
     match ip {
         IpAddr::V4(a) => IpBucket::V4(a.octets()),
         IpAddr::V6(a) => {
@@ -756,7 +788,7 @@ impl DashApi {
     }
 
     /// 登录与初始化时：请求里带着的旧会话令牌一并撤销（不复用，防会话固定）。
-    async fn revoke_presented(&self, headers: &HeaderMap) {
+    pub(crate) async fn revoke_presented(&self, headers: &HeaderMap) {
         let name = self.cookies.session_name();
         if let Some(t) = cookie_value(headers, name).filter(|t| session::is_well_formed(t))
             && let Err(e) =
@@ -771,7 +803,12 @@ fn ttl_secs(d: Duration) -> i64 {
     i64::try_from(d.as_secs()).unwrap_or(i64::MAX)
 }
 
-fn user_json(id: i64, email: &str, name: Option<&str>, is_instance_admin: bool) -> Value {
+pub(crate) fn user_json(
+    id: i64,
+    email: &str,
+    name: Option<&str>,
+    is_instance_admin: bool,
+) -> Value {
     json!({"id": id, "email": email, "name": name, "is_instance_admin": is_instance_admin})
 }
 
@@ -927,6 +964,20 @@ async fn login(
             return Err(DashError::InvalidCredentials);
         }
     };
+    // 开了两步验证：密码对了只换来一个 challenge，凭它加验证码（`POST /api/internal/login/totp`）才建会话
+    if let Some(challenge) = crate::account::challenge_if_enabled(
+        &api,
+        user.id,
+        &user.email,
+        body.device_label.as_deref(),
+    )
+    .await?
+    {
+        return Ok(json_response(
+            StatusCode::OK,
+            json!({"totp_required": true, "challenge": challenge}),
+        ));
+    }
     api.revoke_presented(&headers).await;
     let cookie = api
         .start_session(user.id, body.device_label.as_deref(), &headers)
@@ -1840,6 +1891,7 @@ pub fn router(api: Arc<DashApi>) -> Router {
         .merge(crate::diagnostics::routes(a))
         .merge(crate::org_admin::routes(a))
         .merge(crate::imports_admin::routes(a))
+        .merge(crate::account::routes(a))
 }
 // ------------------------------------------------------------------------------------------
 // 后台：活跃会话数与清理
