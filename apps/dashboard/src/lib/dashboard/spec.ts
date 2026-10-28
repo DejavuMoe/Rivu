@@ -229,6 +229,11 @@ export function breakdownSpec(s: DashState, dim: string, limit: number, now: Dat
 /** 目标卡片：每个目标一行（只有有转化的目标），访客、完成次数、转化率。 */
 export const GOAL_LIMIT = 100;
 
+/** CSV 导出的请求体：当前的时间范围、筛选与趋势粒度（实时不能导出）。 */
+export function exportBody(s: DashState): { date_range: unknown; filters: unknown[][]; interval: Gran } {
+  return { date_range: s.range, filters: filtersSpec(s.filters), interval: s.gran };
+}
+
 export function goalsSpec(s: DashState, now: Date): Spec {
   const spec: Spec = {
     metrics: ["visitors", "events", "conversion_rate"],

@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { isValidDomain, normalizeDomain } from "../src/lib/admin/domain.ts";
 import { checkPattern, hostExamples, hostMatches, normalizeHost } from "../src/lib/admin/hostnames.ts";
 import { computeExpiry, endOfLocalDay, localYmd } from "../src/lib/admin/expiry.ts";
-import { canShareLinks, sectionReadOnly, sectionVisible, visibleSections } from "../src/lib/admin/sections.ts";
+import { canExport, canShareLinks, sectionReadOnly, sectionVisible, visibleSections } from "../src/lib/admin/sections.ts";
 
 test("normalizeDomain：协议、路径、端口、www、大小写、末尾点", () => {
   assert.equal(normalizeDomain("  HTTPS://WWW.Example.COM:8443/a/b?x=1#h "), "example.com");
@@ -111,5 +111,8 @@ test("设置分区可见性", () => {
   assert.equal(sectionVisible("goals", { role: "viewer", access: "guest" }), false);
   assert.equal(canShareLinks(guestEditor), false);
   assert.equal(canShareLinks(editor), true);
+  // 导出：editor 起（含站点访客 editor），viewer 不行
+  assert.equal(canExport(guestEditor), true);
+  assert.equal(canExport(viewer), false);
   assert.equal(sectionVisible("general", { role: "admin", access: "guest" }), false);
 });
