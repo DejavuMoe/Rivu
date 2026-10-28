@@ -1929,6 +1929,27 @@ async fn session_queries_equal_direct_execution_and_site_access_is_uniform() {
         r.body
     );
 
+    // 属性键列表：与查询同样的鉴权；这批事件没有属性，返回空列表；别的组织的站点 404
+    let keys_path = format!("/api/internal/sites/{}/property-keys", site_a.id);
+    let keys_spec = json!({"metrics": ["events"], "date_range": "all"});
+    let r = http
+        .post(&keys_path, &keys_spec)
+        .cookie(&c_viewer)
+        .send()
+        .await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.json(), json!({"keys": []}));
+    assert_eq!(r.header("cache-control"), Some("no-store"));
+    let r = http
+        .post(
+            &format!("/api/internal/sites/{}/property-keys", site_b.id),
+            &keys_spec,
+        )
+        .cookie(&c_owner)
+        .send()
+        .await;
+    assert_eq!(r.status, 404);
+
     // 请求体里的 site 与路径不一致：404（与「站点不存在」同一个响应）
     let spec = &specs()[0].1;
     let mut wrong_site = spec.clone();
@@ -2158,7 +2179,14 @@ async fn session_queries_equal_direct_execution_and_site_access_is_uniform() {
         .cookie(&c_owner)
         .send()
         .await;
-    assert_eq!(r.status, 400, "不支持的维度是校验错误：{}", r.body);
+    // 属性维度已支持：这批事件没有 plan 属性，全部归为 (none)
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(
+        r.json()["results"][0]["dimensions"],
+        json!(["(none)"]),
+        "{}",
+        r.body
+    );
 
     // 实时：最近 5 分钟的访客（11:58 两个人在窗口内，11:50 的那个不在）；等价于 date_range=realtime 的 visitors 查询
     let rt_spec = json!({"metrics": ["visitors"], "date_range": "realtime"});

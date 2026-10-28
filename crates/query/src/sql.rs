@@ -1291,6 +1291,29 @@ pub(crate) fn total_visitors_query(
     (sql, b.params)
 }
 
+/// 区间里（同样的过滤）非 engagement 事件上出现过的属性键与事件数，事件多的在前，至多 `limit` 个。
+pub(crate) fn property_keys_query(
+    scope: &TenantScope,
+    q: &ResolvedQuery,
+    plan: &Plan,
+    iv: Interval,
+    limit: u64,
+) -> (String, Params) {
+    let mut b = Builder::new(scope, q, plan, iv, None);
+    let mut needs = Needs::new();
+    let mut extra = String::from("name != 'engagement'");
+    if let Some(t) = b.tree_events(&mut needs) {
+        extra.push_str(" AND ");
+        extra.push_str(&t);
+    }
+    let scan = b.events_scan("arrayJoin(mapKeys(props)) AS k", Some(&extra));
+    let limit = b.p(ParamValue::U64(limit));
+    let sql = format!(
+        "SELECT k, count() AS c FROM ({scan}) GROUP BY k ORDER BY c DESC, k ASC LIMIT {limit}"
+    );
+    (sql, b.params)
+}
+
 /// 站点最早事件的时间（`date_range = all`）：`(行数, 毫秒)`，没有数据时行数为 0。
 /// 用排序键 `(site_id, toDate(ts), …)` 的前缀读最早的一天，再取这一天里最早的时刻。
 pub(crate) fn first_event_query(scope: &TenantScope) -> (String, Params) {
