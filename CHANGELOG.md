@@ -16,3 +16,4 @@
 - 原始数据保留期可配置（实例上限 `RIVU_RETENTION_DAYS`，站点可单独调短），过期数据由后台任务删除，汇总数据永久保留。
 - 看板：站点、统计、接入诊断、安装、站点设置、目标、共享链接、成员与邀请、API key、账号。
 - 生产镜像（`Dockerfile`）、compose 部署（`deploy/compose.yml`）、nginx / Caddy 反向代理示例、安装文档（`docs/install.md`）。
+- 备份与恢复脚本（`deploy/backup.sh`、`deploy/restore.sh`）。

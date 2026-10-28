@@ -418,7 +418,7 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 | ClickHouse | `rivu_writer` | `serve` 的采集 | `INSERT ON rivu.*`；`SELECT ON rivu.schema_migrations`、`SELECT ON rivu.sessions` | 启动时用它从 `sessions` 预热会话（`system-design.md` §4.6）；没有其他 `SELECT`，无 DDL。INSERT 的 settings 见 `system-design.md` |
 | ClickHouse | `rivu_reader` | api | `SELECT ON rivu.*`；profile `readonly=1` | `max_execution_time` 上限 20s、`max_memory_usage`（默认 4GiB，按机器调）、`max_rows_to_read`、`max_result_rows`、`max_concurrent_queries_for_user`；按小时限查询数的 quota |
 | ClickHouse | `rivu_maintainer`（本文新增） | `serve` 的后台任务 | `ALTER DELETE`、`SELECT`，以及 `events`、`sessions`、`ingest_counters` 上 `ALTER UPDATE(_row_exists)`（25.8 的轻量删除改写这一隐藏列，缺它报 `ACCESS_DENIED`，见 `deploy/clickhouse/users.d/rivu-dev.xml`）；日汇总表上另有 `INSERT` 与同样的 `ALTER UPDATE(_row_exists)`；`system.parts`、`system.merges`、`system.mutations` 的 `SELECT`（`ch_monitor`） | ClickHouse 没有单独的 DROP PARTITION 权限，`DROP PARTITION` 也由 `ALTER DELETE` 控制（E7）。删除批处理与 rollup 构建需要；不让 `rivu_writer` 带这些权限，也不复用 migrator |
-| ClickHouse | `rivu_backup`（运维） | 备份脚本 | `BACKUP`、`SELECT` | 与应用凭据分离 |
+| ClickHouse | `default`（只允许容器内访问） | `deploy/backup.sh`、`deploy/restore.sh` 经 `docker compose exec` | 全部 | 不经网络暴露；应用不使用 |
 
 - ClickHouse 账号经 `users.d/*.xml` 声明，密码用 `from_env` 注入（来自 Docker secrets），profile 与 quota 同处声明。
 - **与 `log_comment` 的冲突**：`readonly=1` 默认不允许修改任何 setting，而所有查询要带 `log_comment`（第 10 节），公开链接还要调低 `max_execution_time`。方案：在 `rivu_reader` profile 中对这两项声明 `CHANGEABLE_IN_READONLY` 约束；若所选版本验证不可行，降级为 `readonly=2` 加 `MAX` 约束锁住超时与内存。已在 25.8 验证：`rivu_reader` 能带 `log_comment` 查询，INSERT 被拒绝（E8）；每条查询都按档位设置 `max_execution_time`，readonly 账号的集成测试覆盖了这一点。
@@ -484,12 +484,12 @@ Plausible 自定义指标覆盖缓存命中、ingest buffer 入队与丢弃、�
 ### 11.1 备份与演练
 | 存储 | 方式 | 频率与保留 | 要点 |
 |---|---|---|---|
-| PostgreSQL | `pg_dump -Fc`，`age` 加密后上传独立存储 | 每日；保留 7 日 + 4 周 + 6 月 | **排除 `salts` 表数据**（`--exclude-table-data=salts`）：备份留盐会使旧访客哈希可被暴力还原，削弱「删除盐」的承诺；还原后由 `salts_rotate` 补生成 |
-| ClickHouse | 原生 `BACKUP DATABASE rivu TO S3(...)`（或 `Disk('backups', ...)`，需服务端配置 `allowed_disk`），账号 `rivu_backup` | 每周全量、每日增量（`base_backup`） | 必须落在独立存储（另一台机器或另一账号的桶），同机磁盘副本不算备份 |
+| PostgreSQL | `pg_dump -Fc`（`deploy/backup.sh`），拷到独立存储（可另行 `age` 加密） | 每日；保留 7 日 + 4 周 + 6 月 | **排除 `salts` 表数据**（`--exclude-table-data=salts`）：备份留盐会使旧访客哈希可被暴力还原，削弱「删除盐」的承诺；还原后由 `salts_rotate` 补生成 |
+| ClickHouse | 原生 `BACKUP DATABASE rivu TO File(...)`（`deploy/backup.sh`：写到 `deploy/prod/clickhouse/backups.xml` 允许的目录，再拷出容器），用容器内的 `default` 账号 | 每日全量 | 必须落在独立存储（另一台机器或另一账号的桶），同机磁盘副本不算备份 |
 
 配置与 secrets 另存于密码管理器（`RIVU_SECRET_KEY` 丢失则 TOTP 密钥不可解）。目标（需演练验证，非承诺）：PG 与 ClickHouse 的 RPO ≤ 24h，RTO ≤ 2h；需要更低 RPO 时再加 PG WAL 归档。
 
-**恢复演练（每周自动，compose profile `drill` 或 CI 定时）**：拉起临时 PG 与 ClickHouse → 还原最近备份 → `rivu migrate status` 无异常 → 冒烟查询（org 与站点数；ClickHouse 最近一天行数与线上差异在容差内）→ 输出结果与耗时，失败告警。耗时即 RTO 的实测来源。
+**恢复演练**（`tools/backup-drill/run.sh`）：用生产 compose 起独立项目 → 建站、发事件 → `deploy/backup.sh` → `down -v` 删掉全部卷 → `deploy/restore.sh` → 核对用户与站点数、`events` 与 `sessions`、同一查询的结果、盐重新生成、管理员登录。恢复耗时即 RTO 的实测来源。
 
 ### 11.2 灾难恢复顺序
 | 步骤 | 动作 |
@@ -497,7 +497,7 @@ Plausible 自定义指标覆盖缓存命中、ingest buffer 入队与丢弃、�
 | 1 | 停 `rivu`（代理返回 502，期间事件丢失，是单实例恢复的代价） |
 | 2 | 还原 PG，再还原 ClickHouse |
 | 3 | `rivu migrate`，把旧版本 schema 升到当前 |
-| 4 | **重放删除意图**：把 `completed_at` 晚于 ClickHouse 备份时间点的 `done` 记录重置为 `pending`，防止还原把用户已删除的数据找回来（`ch_delete_batch` 幂等，可重放） |
+| 4 | **重放删除意图**：把 `completed_at` 晚于 ClickHouse 备份时间点（`manifest`）的 `done` 记录重置为 `pending`，防止还原把用户已删除的数据找回来（`ch_delete_batch` 幂等，可重放）。`deploy/restore.sh` 依次执行 1–5 |
 | 5 | 启动 `rivu serve`（启动时先补盐），确认 `/readyz` |
 | 6 | 还原点之后的事件不可恢复 |
 
@@ -505,7 +505,7 @@ Plausible 自定义指标覆盖缓存命中、ingest buffer 入队与丢弃、�
 | 步骤 | 动作 | 失败时 |
 |---|---|---|
 | 0 | 阅读发布说明；`rivu migrate --plan` 预览；确认是否含 contract（破坏性）迁移 | 含 contract 迁移则必须先备份并通知维护窗口 |
-| 1 | **备份**：触发 PG `pg_dump` 与 ClickHouse `BACKUP`，确认成功并记录备份名 | 备份失败则中止 |
+| 1 | **备份**：`deploy/backup.sh`，确认成功并记录备份目录 | 备份失败则中止 |
 | 2 | `docker compose pull` | — |
 | 3 | **migrate**：`docker compose run --rm migrate`；其他服务依赖它 `service_completed_successfully` | 失败则停止，旧版本继续运行（迁移兼容旧二进制） |
 | 4 | **重启**：`docker compose up -d`（`rivu` 重启期间代理按 `lb_try_duration` / `proxy_next_upstream` 排队，通常无丢失） | 回滚镜像 tag 重启，仅在只做了 expand 迁移时安全；否则按 11.2 恢复 |

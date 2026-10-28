@@ -1,0 +1,10 @@
+<?xml version="1.0"?>
+<!--
+  原生 BACKUP / RESTORE 允许读写的目录（服务端配置，挂到 config.d）。deploy/backup.sh 先备份到这里，
+  再拷出容器并删除；目录在 ch-data 卷里，由 clickhouse 用户所有，不需要另外的卷。
+-->
+<clickhouse>
+    <backups>
+        <allowed_path>/var/lib/clickhouse/backups/</allowed_path>
+    </backups>
+</clickhouse>
