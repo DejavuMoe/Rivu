@@ -64,7 +64,9 @@
 - [ ] 分群（保存的筛选）
 - [ ] 滚动深度目标、目标的属性条件
 - [ ] 导出 CSV
-- [ ] 导入：Plausible CSV、GA4，写入日汇总层
+- [x] 导入 Plausible 的数据导出（zip）：`rivu import plausible|list|delete`，写入日汇总层（含属性族），查询覆盖导入的天时强制走汇总层；用一份真实导出（33.7 万天行级汇总、17.4 万行）核对数字一致
+- [ ] 看板里上传导出、查看与删除导入（站点设置）
+- [ ] 导入 GA4
 - [ ] 邮件：SMTP、邀请邮件、找回密码、定期报告
 - [ ] TOTP 双因素认证
 - [ ] Plausible 协议兼容端点 `POST /api/plausible/event`

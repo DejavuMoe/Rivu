@@ -7,6 +7,7 @@
 pub mod ch_monitor;
 pub mod datacenter;
 pub mod geoip;
+pub mod import_plausible;
 pub mod retention;
 pub mod rollup;
 pub mod stats_delete;

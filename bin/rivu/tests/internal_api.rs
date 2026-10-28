@@ -691,6 +691,7 @@ async fn direct(server: &Server, site: &Site, spec: &Value) -> String {
         geo_capability: server.geo.capability(),
         goals: Vec::new(),
         retention_days: None,
+        imported: None,
     };
     let result = execute(
         &server.reader,

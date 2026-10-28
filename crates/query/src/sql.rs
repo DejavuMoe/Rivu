@@ -933,8 +933,13 @@ impl<'a> Builder<'a> {
         let f = split.family;
         let r_from = self.p(ParamValue::Date(split.from.to_string()));
         let r_to = self.p(ParamValue::Date(split.rollup_to.to_string()));
+        // 属性族：只取这个键的行（`key` 是排序键里的列，可以放在 FINAL 之内）
+        let key = match f {
+            Family::Props(i) => format!(" AND key = {{pk{i}:String}}"),
+            _ => String::new(),
+        };
         let scan = format!(
-            "SELECT * FROM {} FINAL WHERE site_id = {{site:UInt64}} AND day >= {r_from} AND day <= {r_to}",
+            "SELECT * FROM {} FINAL WHERE site_id = {{site:UInt64}} AND day >= {r_from} AND day <= {r_to}{key}",
             f.table()
         );
         let q = self.q;
@@ -975,6 +980,8 @@ impl<'a> Builder<'a> {
         if self.plan.engagement {
             present.push("tp_n > 0");
         }
+        // 导入的行不套这条：导出里有「有访客、浏览为 0」的行（只有自定义事件的访问），它们也要算
+        present.push("origin = 'import'");
         let mut conds = vec![format!("({})", present.join(" OR "))];
         if let Some(t) = self.q.filter.clone() {
             let mut needs = Needs::new();
@@ -1260,16 +1267,25 @@ pub(crate) fn rollup_probe_query(
     tz: &str,
     from: &str,
     to: &str,
+    native_only: bool,
 ) -> (String, Params) {
     let mut params = Params::default();
     params.push("site", ParamValue::U64(scope.site_id()));
     params.push("tz", ParamValue::Str(tz.to_owned()));
     params.push("from_day", ParamValue::Date(from.to_owned()));
     params.push("to_day", ParamValue::Date(to.to_owned()));
-    let sql = "SELECT toString(maxOrNull(day)), countIf(tz != {tz:String}), \
-               sumIf(events, day >= {from_day:Date} AND day <= {to_day:Date}) \
-               FROM rollup_site FINAL WHERE site_id = {site:UInt64} AND origin = 'native'"
-        .to_owned();
+    // 已构建的最后一天：构建任务只看原生行；选层把导入的天也算上（它们只在汇总层里）。
+    // 时区不同只看原生行：导入的行按导入时的时区归日，不随站点改时区重建
+    let origin = if native_only {
+        " AND origin = 'native'"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "SELECT toString(maxOrNull(day)), countIf(origin = 'native' AND tz != {{tz:String}}), \
+         sumIf(events, day >= {{from_day:Date}} AND day <= {{to_day:Date}}) \
+         FROM rollup_site FINAL WHERE site_id = {{site:UInt64}}{origin}"
+    );
     (sql, params)
 }
 

@@ -89,6 +89,17 @@ deploy/restore.sh /srv/rivu-backups/rivu-20261028T020000Z --yes
 ```
 
 脚本停掉 rivu，还原 PostgreSQL 与 ClickHouse，把备份之后才完成的统计删除重新排队（避免恢复把已删除的数据找回来），再启动 migrate 与 rivu 并等就绪。备份之后到恢复之间的事件不可恢复。整个流程由 `tools/backup-drill/run.sh` 演练（删掉全部卷后恢复，逐项核对数据）。
+## 从 Plausible 迁移
+
+在 Plausible（CE 或云服务）的站点设置 → Imports & Exports → Export 导出数据，得到一个 zip。在 Rivu 里建好同一个站点（时区相同），然后：
+
+```bash
+docker compose -f deploy/compose.yml cp blog_example_com.zip rivu:/tmp/export.zip
+docker compose -f deploy/compose.yml exec rivu rivu import plausible --site <site_key> /tmp/export.zip
+```
+
+导出是按天、按维度的汇总，所以导入的那段时间里，单个维度的报表（来源、页面、国家、设备、事件、属性）和趋势图都有数据，多个维度交叉筛选没有（看板会提示）。只导入站点在 Rivu 里开始收数据之前的日子；`rivu import list --site <site_key>` 查看，`rivu import delete --site <site_key> --id <id>` 删除后可以重新导入。
+
 ## 排障
 
 - `docker compose -f deploy/compose.yml logs rivu`：结构化日志（JSON）。

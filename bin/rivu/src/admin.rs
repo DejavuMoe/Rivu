@@ -1,4 +1,4 @@
-//! 命令行管理命令：`rivu site add`、`rivu query`。
+//! 命令行管理命令：`rivu site add`、`rivu query`、`rivu import`。
 //!
 //! 它们直接连 PostgreSQL（`RIVU_DATABASE_URL`，应用账号）和 ClickHouse（reader 账号），不经过 HTTP；
 //! 配置按管理命令（`Role::Admin`）校验。结果写到 stdout，日志在 stderr。
@@ -12,7 +12,7 @@ use rivu_geo::GeoDb;
 use rivu_query::{ExecOptions, QuerySpec, TenantScope};
 use rivu_storage_pg::sites::NewSite;
 
-use crate::cli::{QueryArgs, SiteAddArgs};
+use crate::cli::{ImportAction, QueryArgs, SiteAddArgs};
 use crate::query_api::load_site_context;
 
 /// 规范化一条 hostname 白名单模式（实现与屏蔽规则的 hostname 类型共用，见 `rivu_ingest::hostname::validated_pattern`）。
@@ -96,6 +96,87 @@ pub async fn query(config: &Config, args: QueryArgs) -> Result<ExitCode> {
         .await
         .map_err(|e| anyhow!("查询失败：{e}"))?;
     println!("{}", serde_json::to_string_pretty(&result)?);
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `rivu import`：导入 Plausible 的数据导出、列出与删除导入。写汇总表用 `rivu_maintainer` 账号。
+/// 运行中的 `rivu serve` 的结果缓存最多 10 分钟后才看到导入的数据。
+pub async fn import(config: &Config, action: ImportAction) -> Result<ExitCode> {
+    let site_key = match &action {
+        ImportAction::Plausible { site, .. }
+        | ImportAction::List { site }
+        | ImportAction::Delete { site, .. } => site.clone(),
+    };
+    let pool = rivu_storage_pg::connect(config.database_url.expose(), 2).await?;
+    let Some(site) = rivu_storage_pg::sites::find_site_by_key(&pool, &site_key).await? else {
+        bail!("找不到站点 `{site_key}`（或已删除）");
+    };
+    let maintainer = || -> Result<clickhouse::Client> {
+        let account = config
+            .ch_maintainer
+            .as_ref()
+            .context("导入需要 RIVU_CH_MAINTAINER_USER / RIVU_CH_MAINTAINER_PASSWORD")?;
+        Ok(rivu_storage_ch::client(
+            &config.clickhouse_url,
+            account,
+            Some(&config.ch_database),
+        ))
+    };
+    match action {
+        ImportAction::Plausible { file, .. } => {
+            let ch = maintainer()?;
+            let name = file
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "export.zip".to_owned());
+            let (id, s) = rivu_jobs::import_plausible::import_file(
+                &pool,
+                &ch,
+                site.id,
+                &site.timezone,
+                &file,
+                &name,
+                None,
+            )
+            .await?;
+            println!("import_id: {id}");
+            println!("dates: {} – {}", s.start, s.end);
+            println!("rows: {}", s.rows);
+            if let Some(d) = s.clipped_from {
+                println!("skipped: {d} 及之后（站点自己的数据从这天开始）");
+            }
+        }
+        ImportAction::List { .. } => {
+            for r in rivu_storage_pg::imports::list(&pool, site.id).await? {
+                println!(
+                    "{}\t{}\t{}\t{} – {}\t{} 行\t{}{}",
+                    r.id,
+                    r.status,
+                    r.file_name,
+                    r.start_date.as_deref().unwrap_or("-"),
+                    r.end_date.as_deref().unwrap_or("-"),
+                    r.rows_imported,
+                    r.created_at,
+                    r.error.map(|e| format!("\t{e}")).unwrap_or_default()
+                );
+            }
+        }
+        ImportAction::Delete { id, .. } => {
+            if rivu_storage_pg::imports::get(&pool, site.id, id)
+                .await?
+                .is_none()
+            {
+                bail!("站点 `{site_key}` 没有导入 #{id}");
+            }
+            let ch = maintainer()?;
+            let import_id = u64::try_from(id).context("导入 id 为负数")?;
+            rivu_query::rollup::delete_import(&ch, &TenantScope::new(site.id), import_id)
+                .await
+                .map_err(|e| anyhow!("删除汇总行失败：{e}"))?;
+            rivu_storage_pg::imports::delete(&pool, site.id, id).await?;
+            println!("已删除导入 #{id}");
+        }
+    }
     Ok(ExitCode::SUCCESS)
 }
 

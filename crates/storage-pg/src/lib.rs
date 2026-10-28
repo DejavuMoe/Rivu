@@ -25,6 +25,7 @@ macro_rules! ts_sec {
 pub mod access;
 pub mod api_keys;
 pub mod goals;
+pub mod imports;
 pub mod members;
 pub mod salts;
 pub mod sessions;

@@ -1,4 +1,4 @@
-//! 命令行：`rivu serve | migrate | healthcheck | site add | shield add|list|remove | apikey create|list|revoke | stats |
+//! 命令行：`rivu serve | migrate | healthcheck | site add | import plausible|list|delete | shield add|list|remove | apikey create|list|revoke | stats |
 //! setup | user add|disable|enable|list | org create | org member add | share create|list|revoke`。
 
 use std::path::PathBuf;
@@ -30,6 +30,8 @@ pub enum Command {
     Migrate(MigrateArgs),
     /// 站点管理
     Site(SiteArgs),
+    /// 导入外部数据：plausible | list | delete
+    Import(ImportArgs),
     /// 执行一个 QuerySpec（同 `POST /api/v1/query`，不需要 API key），打印 QueryResult JSON
     Query(QueryArgs),
     /// 站点屏蔽规则管理（IP / CIDR / 国家 / 页面 / hostname）
@@ -379,6 +381,37 @@ pub struct SiteAddArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct ImportArgs {
+    #[command(subcommand)]
+    pub action: ImportAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ImportAction {
+    /// 导入 Plausible 的数据导出（站点设置 → Imports & Exports → Export 得到的 zip），写进日汇总层
+    Plausible {
+        /// 站点的 site_key
+        #[arg(long)]
+        site: String,
+        /// 导出的 zip 文件
+        file: PathBuf,
+    },
+    /// 列出站点的导入
+    List {
+        #[arg(long)]
+        site: String,
+    },
+    /// 删除一次导入（连同它写入的汇总数据）
+    Delete {
+        #[arg(long)]
+        site: String,
+        /// 导入的 id（见 list）
+        #[arg(long)]
+        id: i64,
+    },
+}
+
+#[derive(Debug, Args)]
 pub struct QueryArgs {
     /// QuerySpec JSON 文件（`site` 必填）；省略时从 stdin 读
     #[arg(long, value_name = "PATH")]
@@ -408,6 +441,7 @@ impl Command {
             // 管理命令连 PG（应用账号）和 ClickHouse（reader）
             Command::Site(_)
             | Command::Query(_)
+            | Command::Import(_)
             | Command::Shield(_)
             | Command::Apikey(_)
             | Command::Setup(_)
@@ -449,6 +483,7 @@ pub async fn main() -> ExitCode {
             action: SiteAction::Add(args),
         }) => admin::site_add(&config, args).await,
         Command::Query(args) => admin::query(&config, args).await,
+        Command::Import(ImportArgs { action }) => admin::import(&config, action).await,
         Command::Shield(ShieldArgs { action }) => shield_cmd::run(&config, action).await,
         Command::Apikey(ApikeyArgs { action }) => apikey_cmd::run(&config, action).await,
         Command::Setup(args) => user_cmd::setup(&config, args).await,

@@ -55,6 +55,8 @@ pub struct SiteContext {
     /// 原始数据保留的本地日数（站点设置与 `RIVU_RETENTION_DAYS` 取小）：早于「今天 − (N − 1)」的天只在日汇总层里。
     /// `None`：不限（测试用）。
     pub retention_days: Option<u32>,
+    /// 已完成的导入覆盖的本地日期（最早的开始、最晚的结束）：这些天只在日汇总层里（导入写的是汇总行）。
+    pub imported: Option<(Date, Date)>,
 }
 
 impl SiteContext {
@@ -69,6 +71,7 @@ impl SiteContext {
             geo_capability: None,
             goals: Vec::new(),
             retention_days: None,
+            imported: None,
         }
     }
 }
