@@ -12,7 +12,6 @@
 name: rivu
 
 x-rivu-env: &rivu-env
-  RIVU_MODE: single
   RIVU_DATABASE_URL: postgres://rivu_app:${RIVU_PG_APP_PASSWORD:?}@postgres:5432/rivu
   RIVU_MIGRATE_DATABASE_URL: postgres://rivu_migrator:${RIVU_PG_MIGRATOR_PASSWORD:?}@postgres:5432/rivu
   RIVU_CLICKHOUSE_URL: http://clickhouse:8123

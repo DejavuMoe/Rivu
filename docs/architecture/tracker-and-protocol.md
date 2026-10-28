@@ -296,7 +296,7 @@ rivu('event', 'Video Play', { interactive: false })   // 发 i:false，不影响
 | `408` | 读请求体超过 5 s | 空 | `Connection: close` |
 | `413` | 请求体 > 8192 B | `{"errors":{"body":["is too large (max 8192 bytes)"]}}` | `Connection: close` |
 | `414`/`431` | HTTP 层 | 空 | — |
-| `503` | 写缓冲满，或 JetStream 不可用 | 空 | `Retry-After: <秒>`（1–10 随机抖动）；客户端不重试，供代理与监控使用 |
+| `503` | 写缓冲满 | 空 | `Retry-After: <秒>`（1–10 随机抖动）；客户端不重试，供代理与监控使用 |
 | `500` | 未预期错误 | 空 | 计数 `internal_error`，不得泄露细节 |
 
 错误消息固定词表：`is required`、`must be a string`、`must be an integer`、`must be a boolean`、`must be an object`、`must be a JSON object`、`is not valid JSON`、`is too long (max N)`、`has too many keys (max 30)`、`is not supported`、`has an invalid format`、`must be a valid url`、`scheme is not allowed`、`at least one of sd or e is required`。其中请求体整体错误的键为 `body`。`has an invalid format` 用于 `s` 格式错、`n` 含控制字符、`$` 字段格式错（`a`、`c` 不符合格式）；`is not supported` 只用于 `v`（`system-design.md` §10 Q18）。
@@ -322,7 +322,7 @@ rivu('event', 'Video Play', { interactive: false })   // 发 i:false，不影响
 | 9 | 机器人、地理、国家规则（含 UA/来源富化）；engagement 整段跳过：它不能开会话，富化结果不会被使用；机器人的 pageview 已被丢弃，它的 engagement 自然记为 `dropped_no_session` | `202`+dropped | `dropped_bot` / `dropped_datacenter_ip` / `dropped_country_blocked` |
 | 10 | 身份：事件的站点本地日期没有盐（collector 不现场生成盐） | `202`+dropped | `dropped_salt_missing` |
 | 11 | 会话分配：engagement 没有会话 | `202`+dropped | `dropped_no_session` |
-| 12 | 写缓冲/JetStream | `503` | `dropped_overloaded` |
+| 12 | 写缓冲 | `503` | `dropped_overloaded` |
 
 `ingest_counters` 的维度为 `{分钟, 指标, site_id, script_version}`（进程内按 10 秒桶累加，桶用接收请求时的墙钟）；`sv` 超出 UInt16 的钳到 65535。未知站点统一记 `site_id = 0`，避免用户可控标签撑爆基数 `[01 §10.1]`。丢弃原因以 Rust 枚举 `DropReason` 为唯一来源（`system-design.md` §4.2、§10 Q13），指标名为 `dropped_<原因>`，仅内部可见。
 
@@ -407,7 +407,7 @@ rivu('event', 'Video Play', { interactive: false })   // 发 i:false，不影响
 ### 11.1 协议契约测试（Rust，表驱动）
 | 类别 | 用例 |
 |---|---|
-| 状态码 | 合法 → 202 空体；未知 `s`/hostname 不在白名单/机器人 UA → 202 + `x-rivu-dropped: 1`；各 400 场景逐一断言 JSON 体键与消息；`503` 带 `Retry-After`（注入写缓冲满/JetStream 故障） |
+| 状态码 | 合法 → 202 空体；未知 `s`/hostname 不在白名单/机器人 UA → 202 + `x-rivu-dropped: 1`；各 400 场景逐一断言 JSON 体键与消息；`503` 带 `Retry-After`（注入写缓冲满） |
 | 体积边界 | 8192 B 通过、8193 B → 413；分块无 `Content-Length` 超限 → 413；非 UTF-8、非对象、`null`、嵌套超深 → 400 |
 | 字段边界 | `n` 120/121 字符（含多字节）；`u` 超长 query 被丢弃、pathname 截断到 1024 字节，不回 400；`r` 超长截断；30/31 个属性；键 300/301 B；值 2000/2001 B；`p` 值为数字/布尔被转换，为 `null`/数组/对象 → 400 |
 | engagement | 仅 `sd`、仅 `e`、两者皆缺 → 400；`sd=101` 夹为 100；`e` ≥ 30 天 → 0；`sd:null`；无会话 → 202 + 计数；非 engagement 的 `sd/e` 被忽略 |

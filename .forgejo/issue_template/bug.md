@@ -4,7 +4,7 @@ about: 报告一个不符合预期的行为
 labels: [bug]
 ---
 
-**版本与部署方式**（`rivu --version`；compose / 自行构建；单机或集群）
+**版本与部署方式**（`rivu --version`；compose / 自行构建）
 
 **复现步骤**
 
