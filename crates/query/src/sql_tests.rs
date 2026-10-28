@@ -152,6 +152,34 @@ fn sql_breakdown_session_attribute() {
 }
 
 #[test]
+fn sql_breakdown_by_custom_property() {
+    // 同一个键在维度与过滤里共用 pk0；另一个键是 pk1；键名只以参数出现
+    snap(
+        "breakdown_props",
+        json!({
+            "metrics": ["visitors", "visits", "events"],
+            "date_range": "7d",
+            "dimensions": ["event:props:plan"],
+            "filters": [["is_not", "event:props:plan", ["(none)"]], ["contains", "event:props:Seats Count", ["1"]]],
+            "pagination": {"limit": 10}
+        }),
+    );
+    let (sql, params) = build(json!({
+        "metrics": ["visitors"],
+        "date_range": "7d",
+        "dimensions": ["event:props:plan"],
+        "filters": [["contains", "event:props:Seats Count", ["1"]]]
+    }))
+    .unwrap();
+    assert!(!sql.contains("plan") && !sql.contains("Seats"), "{sql}");
+    assert_eq!(params.get("pk0"), Some(&ParamValue::Str("plan".into())));
+    assert_eq!(
+        params.get("pk1"),
+        Some(&ParamValue::Str("Seats Count".into()))
+    );
+}
+
+#[test]
 fn sql_top_pages_with_event_dimension() {
     snap(
         "top_pages",
@@ -645,13 +673,27 @@ fn invalid_combinations_and_unsupported_features_fail_with_paths() {
             "metrics[1]",
             "not supported yet",
         ),
+        // 属性：会话指标、engagement 指标不能配，一次查询至多 8 个不同的键
         (
             base(
-                json!(["visitors"]),
+                json!(["visitors", "bounce_rate"]),
                 json!(["visit:country", "event:props:plan"]),
             ),
             "dimensions[1]",
-            "not supported yet",
+            "session metric `bounce_rate`",
+        ),
+        (
+            base(json!(["time_on_page"]), json!(["event:props:plan"])),
+            "dimensions[0]",
+            "engagement events",
+        ),
+        (
+            json!({"metrics": ["visitors"], "date_range": "day", "filters": [
+                ["is", "event:props:a", ["x"]], ["is", "event:props:b", ["x"]], ["is", "event:props:c", ["x"]],
+                ["is", "event:props:d", ["x"]], ["is", "event:props:e", ["x"]], ["is", "event:props:f", ["x"]],
+                ["is", "event:props:g", ["x"]], ["is", "event:props:h", ["x"]], ["is", "event:props:i", ["x"]]]}),
+            "filters[8][1]",
+            "at most 8 different property keys",
         ),
         (
             json!({"metrics": ["visitors"], "date_range": "day", "filters": [["has_done", ["is", "event:name", ["x"]]]]}),
@@ -660,11 +702,6 @@ fn invalid_combinations_and_unsupported_features_fail_with_paths() {
         ),
         (
             json!({"metrics": ["visitors"], "date_range": "day", "filters": [["is", "segment", [1]]]}),
-            "filters[0][1]",
-            "not supported yet",
-        ),
-        (
-            json!({"metrics": ["visitors"], "date_range": "day", "filters": [["is", "event:props:a", ["x"]]]}),
             "filters[0][1]",
             "not supported yet",
         ),

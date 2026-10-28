@@ -175,10 +175,27 @@ pub(crate) enum Col {
     BrowserVersion,
     Os,
     OsVersion,
+    /// `event:props:<k>`：键是 [`ResolvedQuery::prop_keys`] 的第几项（SQL 里是参数 `pk<i>`，键名不进 SQL 文本）。
+    Prop(u8),
 }
 
+/// 一次查询里最多出现的不同属性键（维度与过滤合计）。
+pub const MAX_PROP_KEYS: usize = 8;
+
 impl Col {
-    pub(crate) fn from_dimension(d: &Dimension) -> Option<Col> {
+    /// 维度对应的列；`event:props:<k>` 把键登记到 `keys`（已有则复用），超过 [`MAX_PROP_KEYS`] 个不同的键时为 `None`。
+    pub(crate) fn from_dimension(d: &Dimension, keys: &mut Vec<String>) -> Option<Col> {
+        if let Dimension::EventProp(k) = d {
+            let i = match keys.iter().position(|x| x == k) {
+                Some(i) => i,
+                None if keys.len() < MAX_PROP_KEYS => {
+                    keys.push(k.clone());
+                    keys.len() - 1
+                }
+                None => return None,
+            };
+            return Some(Col::Prop(u8::try_from(i).ok()?));
+        }
         Some(match d {
             Dimension::EventName => Col::EventName,
             Dimension::EventPage => Col::EventPage,
@@ -210,7 +227,7 @@ impl Col {
     pub(crate) fn is_event_level(self) -> bool {
         matches!(
             self,
-            Col::EventName | Col::EventPage | Col::EventHostname | Col::EventGoal
+            Col::EventName | Col::EventPage | Col::EventHostname | Col::EventGoal | Col::Prop(_)
         )
     }
 
@@ -238,7 +255,8 @@ impl Col {
             | Col::EventHostname
             | Col::EventGoal
             | Col::EntryPage
-            | Col::ExitPage => "(none)",
+            | Col::ExitPage
+            | Col::Prop(_) => "(none)",
         }
     }
 }
@@ -374,6 +392,7 @@ fn build_pred(
     leaves: &mut usize,
     first_event_leaf: &mut Option<String>,
     goals: &[GoalDef],
+    keys: &mut Vec<String>,
 ) -> Result<Pred, QueryError> {
     match f {
         Filter::Leaf(l) => {
@@ -384,7 +403,7 @@ fn build_pred(
                     format!("a query may have at most {MAX_FILTER_LEAVES} filter conditions"),
                 ));
             }
-            let leaf = build_leaf(l, path, goals)?;
+            let leaf = build_leaf(l, path, goals, keys)?;
             if leaf.col.is_event_level() && first_event_leaf.is_none() {
                 *first_event_leaf = Some(path.to_owned());
             }
@@ -399,6 +418,7 @@ fn build_pred(
                     leaves,
                     first_event_leaf,
                     goals,
+                    keys,
                 )?);
             }
             Ok(if matches!(f, Filter::And(_)) {
@@ -413,6 +433,7 @@ fn build_pred(
             leaves,
             first_event_leaf,
             goals,
+            keys,
         )?))),
         Filter::HasDone(_) | Filter::HasNotDone(_) => Err(QueryError::validation(
             format!("{path}[0]"),
@@ -421,7 +442,12 @@ fn build_pred(
     }
 }
 
-fn build_leaf(l: &FilterLeaf, path: &str, goals: &[GoalDef]) -> Result<Leaf, QueryError> {
+fn build_leaf(
+    l: &FilterLeaf,
+    path: &str,
+    goals: &[GoalDef],
+    keys: &mut Vec<String>,
+) -> Result<Leaf, QueryError> {
     let dim = match &l.target {
         FilterTarget::Segment => {
             return Err(leaf_path_error(
@@ -439,14 +465,13 @@ fn build_leaf(l: &FilterLeaf, path: &str, goals: &[GoalDef]) -> Result<Leaf, Que
             "time dimensions cannot be used in filters",
         ));
     }
-    if !dim.is_supported() {
-        return Err(leaf_path_error(
+    let col = Col::from_dimension(dim, keys).ok_or_else(|| {
+        leaf_path_error(
             path,
             "[1]",
-            format!("filtering by `{dim}` is not supported yet"),
-        ));
-    }
-    let col = Col::from_dimension(dim).expect("支持的非时间维度都有列");
+            format!("a query may use at most {MAX_PROP_KEYS} different property keys"),
+        )
+    })?;
     let cs = l.case_sensitive.unwrap_or(true);
     let negated = l.op.is_negated();
     if l.values.is_empty() {
@@ -1121,6 +1146,8 @@ pub struct ResolvedQuery {
     pub(crate) geo_touched: bool,
     /// 站点的目标（`event:goal` 维度用；过滤叶子里已经解析好了）。
     pub(crate) goals: Vec<GoalDef>,
+    /// 维度与过滤用到的属性键，[`Col::Prop`] 的序号指向这里。
+    pub(crate) prop_keys: Vec<String>,
 }
 
 /// `query` 回显里由 resolve 决定的部分（日期范围与时间粒度已展开）。
@@ -1209,17 +1236,12 @@ impl ResolvedQuery {
             ));
         }
         let mut dims = Vec::with_capacity(spec.dimensions.len());
+        let mut prop_keys: Vec<String> = Vec::new();
         let mut dim_names: Vec<String> = Vec::new();
         let mut seen_dims = BTreeSet::new();
         let mut time_seen = false;
         for (j, d) in spec.dimensions.iter().enumerate() {
             let path = format!("dimensions[{j}]");
-            if !d.is_supported() {
-                return Err(QueryError::validation(
-                    path,
-                    format!("`{d}` is not supported yet"),
-                ));
-            }
             if !seen_dims.insert(d.as_str().into_owned()) {
                 return Err(QueryError::validation(
                     path,
@@ -1246,9 +1268,13 @@ impl ResolvedQuery {
                 dims.push(RDim::Time(g));
                 dim_names.push(g.dimension_name().to_owned());
             } else {
-                dims.push(RDim::Col(
-                    Col::from_dimension(d).expect("支持的非时间维度都有列"),
-                ));
+                let col = Col::from_dimension(d, &mut prop_keys).ok_or_else(|| {
+                    QueryError::validation(
+                        path.clone(),
+                        format!("a query may use at most {MAX_PROP_KEYS} different property keys"),
+                    )
+                })?;
+                dims.push(RDim::Col(col));
                 dim_names.push(d.as_str().into_owned());
             }
         }
@@ -1264,6 +1290,7 @@ impl ResolvedQuery {
                 &mut leaves,
                 &mut first_event_leaf,
                 &site.goals,
+                &mut prop_keys,
             )?);
         }
         let filter = match parts.len() {
@@ -1355,6 +1382,7 @@ impl ResolvedQuery {
             geo_in_dims,
             geo_touched,
             goals: site.goals.clone(),
+            prop_keys,
         })
     }
 }
@@ -1387,6 +1415,9 @@ fn validate_combinations(
         dims.iter()
             .position(|d| matches!(d, RDim::Col(c) if *c == col))
     };
+    let prop_dim = dims
+        .iter()
+        .position(|d| matches!(d, RDim::Col(Col::Prop(_))));
 
     if let Some(i) = metric_index(Metric::Percentage) {
         if dims.is_empty() {
@@ -1413,7 +1444,7 @@ fn validate_combinations(
         if let Some(path) = first_event_leaf {
             return Err(QueryError::validation(
                 path,
-                "event-level filters (event:page, event:hostname, event:name, event:goal) cannot be combined with `exit_rate`",
+                "event-level filters (event:page, event:hostname, event:name, event:goal, event:props:*) cannot be combined with `exit_rate`",
             ));
         }
     }
@@ -1434,6 +1465,25 @@ fn validate_combinations(
                     first_event_leaf.unwrap_or("filters"),
                     format!(
                         "`event:name` filters cannot be combined with `{}` (it is computed from engagement events)",
+                        m.as_str()
+                    ),
+                ));
+            }
+            // 属性在非 engagement 事件上（`p` 字段），engagement 事件没有
+            if let Some(j) = prop_dim {
+                return Err(QueryError::validation(
+                    format!("dimensions[{j}]"),
+                    format!(
+                        "`event:props:*` cannot be combined with `{}` (it is computed from engagement events)",
+                        m.as_str()
+                    ),
+                ));
+            }
+            if filter.is_some_and(|f| f.any_leaf(&|l| matches!(l.col, Col::Prop(_)))) {
+                return Err(QueryError::validation(
+                    first_event_leaf.unwrap_or("filters"),
+                    format!(
+                        "`event:props:*` filters cannot be combined with `{}` (it is computed from engagement events)",
                         m.as_str()
                     ),
                 ));
@@ -1490,6 +1540,17 @@ fn validate_combinations(
             format!("dimensions[{j}]"),
             format!(
                 "`event:name` cannot be combined with the session metric `{}`",
+                m.as_str()
+            ),
+        ));
+    }
+    if let Some(j) = prop_dim
+        && let Some(m) = SESSION_METRICS.iter().find(|m| spec.metrics.contains(m))
+    {
+        return Err(QueryError::validation(
+            format!("dimensions[{j}]"),
+            format!(
+                "`event:props:*` cannot be combined with the session metric `{}`",
                 m.as_str()
             ),
         ));

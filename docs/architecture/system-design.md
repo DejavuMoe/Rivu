@@ -713,9 +713,9 @@ TTL minute + INTERVAL 90 DAY DELETE;
 | 类别 | 已支持 | 返回 `not supported yet` |
 |---|---|---|
 | 指标 | `visitors` `visits` `pageviews` `events` `views_per_visit` `bounce_rate` `visit_duration` `engaged_duration` `percentage` `exit_rate` `time_on_page` `scroll_depth` `conversion_rate` | 分组转化率（`group_conversion_rate`）、收入（`total_revenue` `average_revenue`） |
-| 维度 | `event:name` `event:page` `event:hostname` `event:goal` `visit:entry_page` `visit:exit_page` `visit:source` `visit:channel` `visit:referrer` `visit:utm_*` `visit:country` `visit:region` `visit:city` `visit:device` `visit:browser(_version)` `visit:os(_version)`、`time` `time:minute` `time:hour` `time:day` `time:week` `time:month`（`time:minute` 至多 1500 个桶，约 25 小时） | 属性（`event:props:<k>`） |
-| 过滤 | 上述维度（不含时间维度）上的 8 个叶子操作符，以及 `and` `or` `not`；`visit:city` 只支持 `is` `is_not`，取值是 GeoNames id；`event:goal` 只支持 `is` `is_not`，取值是目标的标签或 id | `has_done` `has_not_done`、`["is","segment",[id]]`、对属性的过滤 |
-| 目标 | 事件目标（事件名）与页面目标（pathname 通配），见 §6.6 | 滚动深度目标、目标的 props 条件（要改表结构，并依赖 `event:props`） |
+| 维度 | `event:name` `event:page` `event:hostname` `event:goal` `visit:entry_page` `visit:exit_page` `visit:source` `visit:channel` `visit:referrer` `visit:utm_*` `visit:country` `visit:region` `visit:city` `visit:device` `visit:browser(_version)` `visit:os(_version)`、`time` `time:minute` `time:hour` `time:day` `time:week` `time:month`（`time:minute` 至多 1500 个桶，约 25 小时）；属性 `event:props:<k>`：取 `props[k]`，没有这个键的事件为 `(none)`，是事件级维度（不能配会话指标与 `time_on_page` `scroll_depth`），一次查询至多 8 个不同的键，键名只以参数出现，暂不走日汇总层 | — |
+| 过滤 | 上述维度（不含时间维度）上的 8 个叶子操作符，以及 `and` `or` `not`；`visit:city` 只支持 `is` `is_not`，取值是 GeoNames id；`event:goal` 只支持 `is` `is_not`，取值是目标的标签或 id；属性上的过滤是事件级叶子（会话指标上是「存在」语义） | `has_done` `has_not_done`、`["is","segment",[id]]` |
+| 目标 | 事件目标（事件名）与页面目标（pathname 通配），见 §6.6 | 滚动深度目标、目标的 props 条件（要改表结构） |
 | `date_range` | `day` `24h` `month` `year` `all` `realtime` `Nd` `Nmo` `[from, to]` | — |
 | `include` | `time_labels` `total_rows` `compare` | `imports`（未实现，直接是未知字段） |
 | 数据层 | 原始层（`events` 与 `sessions`）与日汇总层（§5.5、§6.4 选层） | — |

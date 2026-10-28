@@ -7,7 +7,7 @@
 //! - [`QuerySpec::parse`] 返回带**字段路径**的校验错误（`filters[0][2][1]`）；
 //! - 业务校验（指标与维度的组合、时间范围换算、正则限制、「尚未支持」的功能）在 [`crate::resolve`]。
 //!
-//! 「尚未支持」的取值（`group_conversion_rate`、`event:props:<k>`、`has_done` 等）能解析成功，
+//! 「尚未支持」的取值（`group_conversion_rate`、`has_done` 等）能解析成功，
 //! 在 resolve 阶段才返回明确的 `not supported yet` 校验错误，这样 schema 与 Plausible 的取值集合一致。
 
 use std::borrow::Cow;
@@ -159,7 +159,7 @@ impl Metric {
 // 维度
 // ------------------------------------------------------------------------------------------
 
-/// 分组与过滤的维度。`event:props:<k>` 本轮不支持（能解析）。`event:goal` 的取值是站点目标的标签（§6.5）。
+/// 分组与过滤的维度。`event:props:<k>` 是事件的自定义属性 `k`。`event:goal` 的取值是站点目标的标签（§6.5）。
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Dimension {
     EventName,
@@ -297,11 +297,6 @@ impl Dimension {
                 | Dimension::EventProp(_)
         )
     }
-
-    /// 本轮不支持的维度。
-    pub fn is_supported(&self) -> bool {
-        !matches!(self, Dimension::EventProp(_))
-    }
 }
 
 impl fmt::Display for Dimension {
@@ -331,7 +326,7 @@ impl JsonSchema for Dimension {
     fn json_schema(_: &mut SchemaGenerator) -> Schema {
         let names: Vec<&str> = FIXED_DIMENSIONS.iter().map(|(n, _)| *n).collect();
         schema(json!({
-            "description": "A dimension. `event:goal` groups by the site's goals (values are goal labels). `event:props:<key>` is accepted by the schema but not supported yet.",
+            "description": "A dimension. `event:goal` groups by the site's goals (values are goal labels). `event:props:<key>` groups by a custom event property (events without the property are `(none)`).",
             "anyOf": [
                 {"type": "string", "enum": names},
                 {"type": "string", "pattern": "^event:props:.+$", "maxLength": 212}
