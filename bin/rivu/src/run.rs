@@ -538,7 +538,6 @@ pub async fn run(config: Config) -> Result<ExitCode> {
 
     tracing::info!(
         role = role.as_str(),
-        mode = ?config.mode,
         version = build_info::VERSION,
         commit = build_info::GIT_COMMIT,
         internal_addr = %config.internal_addr,

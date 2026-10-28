@@ -12,7 +12,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use rivu_domain::{EventKind, SessionAttrs};
 
-/// 分片数，等于集群模式的分区数 P（§10 Q8、Q15）。`routing % SHARDS` 同时是 [`Stamp::partition`]。
+/// 分片数（§10 Q15）。`routing % SHARDS` 同时是 [`Stamp::partition`]（写入事件的 `ingest_partition`）。
 pub const SHARDS: usize = 32;
 
 /// 一个会话最多持有的 visitor_id 个数：7 天最多跨 7 个本地午夜，加上原始 ID 共 8 个（§4.6「别名 key」）。

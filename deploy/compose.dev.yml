@@ -1,9 +1,8 @@
-# Rivu 开发依赖：只起 ClickHouse / PostgreSQL / NATS，Rust 在宿主机 cargo run。
+# Rivu 开发依赖：只起 ClickHouse / PostgreSQL，Rust 在宿主机 cargo run。
 # 仅用于开发：账号密码是公开的开发值，不得用于生产。
 # 端口都只绑 127.0.0.1，可用 deploy/.env（见 .env.dev.example）覆盖。
 #
-#   docker compose -f deploy/compose.dev.yml up -d                     # clickhouse + postgres
-#   docker compose -f deploy/compose.dev.yml --profile cluster up -d  # 另加 nats（JetStream）
+#   docker compose -f deploy/compose.dev.yml up -d
 name: rivu-dev
 
 services:
@@ -48,26 +47,9 @@ services:
       retries: 20
       start_period: 5s
 
-  nats:
-    image: nats:2.15.1-alpine
-    profiles: ["cluster"]
-    restart: unless-stopped
-    command: ["-js", "-sd", "/data", "-m", "8222"]
-    ports:
-      - "127.0.0.1:${RIVU_DEV_NATS_PORT:-4222}:4222"
-      - "127.0.0.1:${RIVU_DEV_NATS_MONITOR_PORT:-8222}:8222"
-    volumes:
-      - rivu-nats-data:/data
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8222/healthz | grep -q ok"]
-      interval: 5s
-      timeout: 3s
-      retries: 20
 
 volumes:
   rivu-ch-data:
     name: rivu-ch-data
   rivu-pg-data:
     name: rivu-pg-data
-  rivu-nats-data:
-    name: rivu-nats-data

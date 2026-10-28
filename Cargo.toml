@@ -53,7 +53,7 @@ rivu-writer = { path = "crates/writer" }
 rivu-storage-pg = { path = "crates/storage-pg" }
 rivu-storage-ch = { path = "crates/storage-ch" }
 
-# 第三方依赖：只加 P0 用到的（async-nats 留到 P3）
+# 第三方依赖
 anyhow = "1"
 arc-swap = "1"
 # 密码哈希（rivu-auth）：argon2id。0.5 系列；不开默认特性（rand_core 0.6 的 OsRng），盐用工作区的 rand 0.9 生成。
