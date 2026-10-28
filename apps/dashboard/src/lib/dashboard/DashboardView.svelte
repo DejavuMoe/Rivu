@@ -6,7 +6,7 @@
   页头的在线人数每 30 秒刷新，实时视图下其余数据也每 30 秒刷新。目标卡片在没有转化时不显示。
 -->
 <script lang="ts">
-  import { ChartSpline, CircleAlert, Clock, Hourglass, Inbox, Share2, Table2 } from "@lucide/svelte";
+  import { ChartSpline, CircleAlert, Clock, Download, Hourglass, Inbox, Share2, Table2 } from "@lucide/svelte";
   import { page } from "$app/state";
   import SiteHeader from "../app/SiteHeader.svelte";
   import Callout from "../ui/Callout.svelte";
@@ -18,10 +18,10 @@
   import Table from "../ui/Table.svelte";
   import TrendChart from "../charts/TrendChart.svelte";
   import { t } from "../i18n";
-  import { app } from "../state.svelte";
+  import { app, toast } from "../state.svelte";
   import { delta } from "../format";
   import { setQuery } from "../nav";
-  import type { QueryResult } from "../api";
+  import { api, type QueryResult } from "../api";
   import FilterBar from "./FilterBar.svelte";
   import KpiStrip from "./KpiStrip.svelte";
   import BreakdownCard from "./BreakdownCard.svelte";
@@ -29,6 +29,7 @@
   import PropsCard from "./PropsCard.svelte";
   import {
     breakdownSpec,
+    exportBody,
     goalsSpec,
     propertyKeysSpec,
     readGoals,
@@ -62,8 +63,10 @@
     siteId?: number;
     /** 能管理共享链接：页头出现「分享」入口（只在 app 模式） */
     canShare?: boolean;
+    /** 能导出 CSV：页头出现「导出」入口（只在 app 模式） */
+    canExport?: boolean;
   }
-  let { source, name, mode = "app", siteId, canShare = false }: Props = $props();
+  let { source, name, mode = "app", siteId, canShare = false, canExport = false }: Props = $props();
   const shared = $derived(mode === "shared");
 
   const POLL_MS = 30_000;
@@ -104,6 +107,28 @@
     const id = setInterval(() => tick++, POLL_MS);
     return () => clearInterval(id);
   });
+
+  // ---------- CSV 导出 ----------
+
+  let exporting = $state(false);
+  async function exportCsv() {
+    if (exporting || siteId === undefined) return;
+    exporting = true;
+    try {
+      const { blob, name: file } = await api.exportCsv(siteId, exportBody(dash));
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = file;
+      a.click();
+      URL.revokeObjectURL(url);
+      toast(t("dash.exportedFile", { f: file }), "good");
+    } catch {
+      toast(t("dash.exportFailed"), "bad");
+    } finally {
+      exporting = false;
+    }
+  }
 
   // ---------- 指标条与主图 ----------
 
@@ -252,6 +277,11 @@
 <div class="page">
   <SiteHeader {siteId} {name} {live} {shared}>
     {#snippet actions()}
+      {#if !shared && canExport}
+        <Button icon={Download} loading={exporting} disabled={realtime || (status === "ready" && neverReceived)} onclick={exportCsv}
+          >{t("dash.exportView")}</Button
+        >
+      {/if}
       {#if !shared && canShare}
         <Button icon={Share2} href="/s/{siteId}/settings/sharing">{t("dash.share")}</Button>
       {/if}

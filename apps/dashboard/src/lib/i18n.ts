@@ -164,6 +164,9 @@ const dict = {
   // ---- 看板 ----
   "dash.live": ["{n} 人在线", "{n} online"],
   "dash.share": ["分享", "Share"],
+  "dash.exportView": ["导出", "Export"],
+  "dash.exportedFile": ["已导出 {f}", "Exported {f}"],
+  "dash.exportFailed": ["导出失败，请稍后重试", "Export failed. Try again later"],
   "dash.export": ["导出 CSV", "Export CSV"],
   "dash.partial": ["数据未完整", "Incomplete"],
   "dash.searchRows": ["在 {dim} 中搜索", "Search {dim}"],
