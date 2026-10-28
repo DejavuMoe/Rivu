@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS {{database}}.events
     visitor_id       UInt64,                        -- 事件当天的 visitor_id（按站点本地日的盐算出，不跨午夜）
     session_id       UInt64,
     session_start    DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)),
-    ingest_partition UInt8,                         -- routing % 32（Reliable 的分区号；Lite 的分片号）
+    ingest_partition UInt8,                         -- routing % 32（会话分配的分片号）
     hostname         LowCardinality(String),
     pathname         String CODEC(ZSTD(3)),
     entry_pathname   String CODEC(ZSTD(3)),         -- 盖章：会话入口页
@@ -488,3 +488,36 @@ CREATE TABLE IF NOT EXISTS {{database}}.rollup_events
 ENGINE = ReplacingMergeTree(version)
 PARTITION BY toYYYYMM(day)
 ORDER BY (site_id, day, origin, import_id, name);
+
+-- rollup_props：自定义属性（键 × 取值）。目前只有导入的数据（Plausible 的 imported_custom_props）；
+-- 原生数据的属性查询走原始层，rollup_build 不构建这一族。
+CREATE TABLE IF NOT EXISTS {{database}}.rollup_props
+(
+    site_id    UInt64,
+    day        Date,
+    origin     Enum8('native' = 1, 'import' = 2),
+    import_id  UInt64,
+    version    UInt64,
+    key        String,
+    value      String,
+    visitors   UInt64,
+    pageviews  UInt64,
+    events     UInt64,
+    visits_ev  UInt64,
+    visits_s   UInt64,
+    s_n        UInt64,
+    s_pv       UInt64,
+    s_dur_ms   UInt64,
+    s_eng_ms   UInt64,
+    s_eng_n    UInt64,
+    b_n        UInt64,
+    bounces    UInt64,
+    exits      UInt64,
+    tp_ms      UInt64,
+    tp_n       UInt64,
+    sc_sum     UInt64,
+    sc_n       UInt64
+)
+ENGINE = ReplacingMergeTree(version)
+PARTITION BY toYYYYMM(day)
+ORDER BY (site_id, day, origin, import_id, key, value);

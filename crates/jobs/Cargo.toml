@@ -12,17 +12,21 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 clickhouse.workspace = true
+csv.workspace = true
 jiff.workspace = true
 metrics.workspace = true
 parking_lot.workspace = true
 rand.workspace = true
 rivu-common.workspace = true
+rivu-domain.workspace = true
 rivu-geo.workspace = true
 rivu-query.workspace = true
+rivu-source.workspace = true
 rivu-storage-pg.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+zip.workspace = true
 
 [dev-dependencies]
 flate2.workspace = true

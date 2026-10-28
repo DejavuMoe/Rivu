@@ -276,6 +276,27 @@ TABLE site_hostnames
   CREATE TRIGGER site_hostnames_notify_changed AFTER INSERT OR UPDATE ON public.site_hostnames FOR EACH ROW EXECUTE FUNCTION notify_site_changed('site_id')
   CREATE TRIGGER site_hostnames_set_updated_at BEFORE UPDATE ON public.site_hostnames FOR EACH ROW EXECUTE FUNCTION set_updated_at()
 
+TABLE site_imports
+  id bigint NOT NULL GENERATED ALWAYS AS IDENTITY
+  site_id bigint NOT NULL
+  source text NOT NULL
+  status text NOT NULL DEFAULT 'importing'::text
+  file_name text NOT NULL
+  start_date date
+  end_date date
+  rows_imported bigint NOT NULL DEFAULT 0
+  error text
+  imported_by bigint
+  created_at timestamp with time zone NOT NULL DEFAULT now()
+  completed_at timestamp with time zone
+  CONSTRAINT site_imports_check CHECK ((end_date >= start_date))
+  CONSTRAINT site_imports_imported_by_fkey FOREIGN KEY (imported_by) REFERENCES users(id) ON DELETE SET NULL
+  CONSTRAINT site_imports_pkey PRIMARY KEY (id)
+  CONSTRAINT site_imports_site_id_fkey FOREIGN KEY (site_id) REFERENCES sites(id) ON DELETE CASCADE
+  CONSTRAINT site_imports_source_check CHECK ((source = 'plausible_csv'::text))
+  CONSTRAINT site_imports_status_check CHECK ((status = ANY (ARRAY['importing'::text, 'completed'::text, 'failed'::text])))
+  CREATE INDEX site_imports_site ON public.site_imports USING btree (site_id)
+
 TABLE site_memberships
   id bigint NOT NULL GENERATED ALWAYS AS IDENTITY
   site_id bigint NOT NULL

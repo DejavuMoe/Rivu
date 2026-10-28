@@ -319,6 +319,26 @@ CREATE UNIQUE INDEX jobs_unique_active ON jobs (unique_key)
 CREATE INDEX jobs_lease ON jobs (locked_until) WHERE state = 'running';
 CREATE INDEX jobs_finished ON jobs (finished_at) WHERE finished_at IS NOT NULL;
 
+-- ------------------------------------------------------------- site_imports
+-- 外部数据导入：Plausible 导出的 CSV（zip）写进 ClickHouse 的日汇总层（origin = 'import'，import_id = id）。
+-- start_date / end_date 是实际写入的站点本地日期（截断到站点自己的数据开始之前）；status 为 completed 的才参与查询。
+CREATE TABLE site_imports (
+    id            bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    site_id       bigint NOT NULL REFERENCES sites (id) ON DELETE CASCADE,
+    source        text NOT NULL CHECK (source IN ('plausible_csv')),
+    status        text NOT NULL DEFAULT 'importing'
+                  CHECK (status IN ('importing', 'completed', 'failed')),
+    file_name     text NOT NULL,
+    start_date    date,
+    end_date      date,
+    rows_imported bigint NOT NULL DEFAULT 0,
+    error         text,
+    imported_by   bigint REFERENCES users (id) ON DELETE SET NULL,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    completed_at  timestamptz,
+    CHECK (end_date >= start_date)
+);
+CREATE INDEX site_imports_site ON site_imports (site_id);
 -- ----------------------------------------------------- pending_stats_deletions
 -- ClickHouse 删除意图：工作表，没有 deleted_at。
 CREATE TABLE pending_stats_deletions (

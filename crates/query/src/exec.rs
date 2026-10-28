@@ -116,6 +116,8 @@ struct Ctx<'a> {
     tiers: std::sync::Mutex<BTreeSet<Tier>>,
     /// 原始数据里最早的完整本地日（保留期，见 [`SiteContext::retention_days`]）；`None` 不限。
     raw_since: Option<jiff::civil::Date>,
+    /// 已完成的导入覆盖的本地日期（[`SiteContext::imported`]）。
+    imported: Option<(jiff::civil::Date, jiff::civil::Date)>,
 }
 
 /// 每条查询的 `log_comment`（JSON，只含 id 与固定标签）：调用方的额外字段在前，保留字段 `route`、`site`、`part`、`tier` 覆盖同名项。
@@ -467,8 +469,22 @@ async fn choose_tier(
     let Some(family) = rollup::compatible_family(q, plan) else {
         return raw;
     };
-    let (sql, params) =
-        sql::rollup_probe_query(cx.scope, &q.tz_name, &from.to_string(), &to.to_string());
+    // 导入的天只在汇总层里（导入写的是汇总行），与保留期之前的天一样：不看行数阈值
+    let imported = cx.imported.filter(|(a, b)| *a <= to && *b >= from);
+    // 属性族只有导入的数据：汇总层只回答导入的天，之后的天走原始层
+    if let rollup::Family::Props(_) = family {
+        let Some((_, imp_to)) = imported else {
+            return raw;
+        };
+        return split_at(q, iv, family, from, imp_to.min(to));
+    }
+    let (sql, params) = sql::rollup_probe_query(
+        cx.scope,
+        &q.tz_name,
+        &from.to_string(),
+        &to.to_string(),
+        false,
+    );
     let rows = cx.run(&format!("{part}.tier"), &sql, &params).await?;
     let row = rows.first();
     let built: Option<jiff::civil::Date> = row
@@ -481,11 +497,21 @@ async fn choose_tier(
         return raw;
     };
     // 超出原始数据保留期的天只在汇总层里：不看行数阈值
-    let beyond = cx.raw_since.is_some_and(|r| from < r);
+    let beyond = cx.raw_since.is_some_and(|r| from < r) || imported.is_some();
     if stale > 0 || built < from || (rows_in_range < min_rows && !beyond) {
         return raw;
     }
-    let rollup_to = built.min(to);
+    split_at(q, iv, family, from, built.min(to))
+}
+
+/// `[from, rollup_to]` 由汇总层回答，原始层只回答之后的天。
+fn split_at(
+    q: &ResolvedQuery,
+    iv: Interval,
+    family: rollup::Family,
+    from: jiff::civil::Date,
+    rollup_to: jiff::civil::Date,
+) -> Result<(Interval, Option<Split>), QueryError> {
     let raw_start = match rollup_to.tomorrow() {
         Ok(d) => day_start_ms(&q.tz, d)?.min(iv.end_ms),
         Err(_) => iv.end_ms,
@@ -588,6 +614,7 @@ pub async fn property_keys(
         deadline: Deadline::new(opts.timeout_secs),
         tiers: Default::default(),
         raw_since: None,
+        imported: None,
     };
     let data_start = if matches!(spec.date_range, DateRange::All) {
         first_event_ms(&cx).await?
@@ -638,10 +665,16 @@ pub async fn execute(
         deadline: Deadline::new(opts.timeout_secs),
         tiers: Default::default(),
         raw_since: raw_since(site, opts.now)?,
+        imported: site.imported,
     };
-    // `all` 要先知道站点最早事件的时间
+    // `all` 要先知道站点最早事件的时间；导入的数据更早时从导入的第一天算起
     let data_start = if matches!(spec.date_range, DateRange::All) {
-        first_event_ms(&cx).await?
+        let first = first_event_ms(&cx).await?;
+        let imported = match site.imported {
+            Some((from, _)) => Some(day_start_ms(&site.timezone, from)?),
+            None => None,
+        };
+        first.into_iter().chain(imported).min()
     } else {
         None
     };
@@ -805,6 +838,30 @@ pub async fn execute(
                 code: "range_beyond_raw_retention".to_owned(),
                 message: format!(
                     "Raw data is kept from {since}; earlier days of this range are only available from the daily rollup, which this query cannot use (see the rollup compatibility rules)."
+                ),
+            });
+        }
+    }
+    // 区间覆盖导入的天、而这次没有用汇总层（查询与汇总层不兼容）：导入的数据没有算进来
+    if let Some((imp_from, imp_to)) = site.imported {
+        let used_rollup = cx.tiers.lock().is_ok_and(|t| t.contains(&Tier::Rollup));
+        let overlaps = |iv: &Interval| match iv.kind {
+            IntervalKind::Dates { from, to } => from <= imp_to && to >= imp_from,
+            IntervalKind::Instants => {
+                let a = day_start_ms(&q.tz, imp_from).unwrap_or(i64::MAX);
+                let b = imp_to
+                    .tomorrow()
+                    .ok()
+                    .and_then(|d| day_start_ms(&q.tz, d).ok())
+                    .unwrap_or(i64::MIN);
+                iv.start_ms < b && iv.end_ms > a
+            }
+        };
+        if !used_rollup && (overlaps(&q.interval) || q.compare.as_ref().is_some_and(overlaps)) {
+            warnings.push(Warning {
+                code: "imported_data_excluded".to_owned(),
+                message: format!(
+                    "Imported data ({imp_from} to {imp_to}) is only kept as daily aggregates and is not included in this query (see the rollup compatibility rules)."
                 ),
             });
         }
