@@ -4,7 +4,7 @@
 #   & D:\WSL\Scripts\linux-task.ps1 -Mode build -Project 'D:\Forgejo\Rivu' -Command 'bash apps/tracker/probe/run-local.sh'
 #
 # 依次：构建 tracker 与 rivu -> migrate -> 建探针站点（白名单 127.0.0.1）、用户、owner 关系与只读 API key
-# -> 后台启动 rivu all -> probe.mjs 跑 ROUNDS 轮（每 INTERVAL 秒一轮）-> summary.mjs 汇总。
+# -> 后台启动 rivu serve -> probe.mjs 跑 ROUNDS 轮（每 INTERVAL 秒一轮）-> summary.mjs 汇总。
 # 结果在 $PROBE_OUT（默认 ~/probe-out/<时间戳>）。需要 dev 的 PostgreSQL / ClickHouse。
 set -Eeuo pipefail
 
@@ -53,7 +53,7 @@ KEY="$("$RIVU" apikey create --org "$ORG" --user "$EMAIL" --name "probe-$RUN_ID"
 [[ -n "$KEY" ]] || { echo "API key 创建失败"; exit 1; }
 echo "站点 $SITE（id $SITE_ID），组织 $ORG"
 
-"$RIVU" all >"$OUT/rivu.log" 2>&1 &
+"$RIVU" serve >"$OUT/rivu.log" 2>&1 &
 RIVU_PID=$!
 for _ in $(seq 1 120); do curl -sf "http://127.0.0.1:$INTERNAL/readyz" >/dev/null && break; sleep 0.5; done
 

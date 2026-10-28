@@ -86,7 +86,7 @@ services:
 
   rivu:
     image: ${RIVU_IMAGE:-rivu:latest}
-    command: ["all"]
+    command: ["serve"]
     restart: unless-stopped
     # deploy/.env 里的其他 RIVU_* 变量（可选功能）原样传给 rivu；上面 environment 里的值优先
     env_file: .env

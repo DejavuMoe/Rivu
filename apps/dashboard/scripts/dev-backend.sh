@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 看板开发用的本地后端（Linux）：构建 rivu -> migrate -> 准备演示账号、组织、两个站点、一个带密码的共享链接
-# -> 前台运行 `rivu all`（127.0.0.1:8080），启动后发一批模拟访问，让看板「今天」与「实时」有数据。
+# -> 前台运行 `rivu serve`（127.0.0.1:8080），启动后发一批模拟访问，让看板「今天」与「实时」有数据。
 #
 # 需要 dev 的 PostgreSQL 与 ClickHouse（deploy/compose.dev.yml），在仓库根目录的 WSL 构建镜像里运行：
 #
@@ -66,7 +66,7 @@ ORG_SLUG="$(docker exec rivu-dev-postgres-1 psql -U rivu_migrator -d rivu -Atc '
 docker exec rivu-dev-postgres-1 psql -U rivu_migrator -d rivu -qc "UPDATE sites SET is_public = true WHERE site_key = '$KEY_MAIN'"
 SHARE="$(printf '%s\n' "$DEMO_SHARE_PASSWORD" | "$RIVU" share create --site "$KEY_MAIN" --password-stdin | awk '/slug/ {print $NF}' | tail -1)"
 
-"$RIVU" all &
+"$RIVU" serve &
 RIVU_PID=$!
 trap 'kill -TERM "$RIVU_PID" 2>/dev/null || true; wait "$RIVU_PID" 2>/dev/null || true; rm -rf "$WORK"' EXIT INT TERM
 for _ in $(seq 1 60); do

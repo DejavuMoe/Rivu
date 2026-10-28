@@ -28,7 +28,7 @@ Linux 工具链，经 WSL 运行器执行（见仓库的开发环境说明）：
 linux-task.ps1 -Mode build -Project 'D:\Forgejo\Rivu\apps\dashboard' -Command 'pnpm install && pnpm test && pnpm run check && pnpm build'
 ```
 
-本地后端：`scripts/dev-backend.sh` 构建并启动 `rivu all`（127.0.0.1:8080），准备演示账号、两个站点、一个带密码的共享链接，
+本地后端：`scripts/dev-backend.sh` 构建并启动 `rivu serve`（127.0.0.1:8080），准备演示账号、两个站点、一个带密码的共享链接，
 并发一批模拟访问；然后 `pnpm dev`（5174 端口，`/api` 代理到 8080 并改写 `Origin`，满足 CSRF 检查）。
 
 注意：`svelte-kit sync`（`pnpm run check` 会执行）重写 `.svelte-kit/`，同一目录里正在运行的 dev server 需要重启；

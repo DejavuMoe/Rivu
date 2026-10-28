@@ -2,7 +2,7 @@
 # 边缘对账演练（brief-p1 验收第 1 条），在 WSL 里运行：
 #   pwsh linux-task.ps1 -Mode build -Project D:\Forgejo\Rivu -Command 'bash tools/reconcile/run.sh'
 #
-# 拓扑：loadgen 与 curl -> Caddy（按 deploy/Caddyfile 的写法，JSON 访问日志删 IP 与请求头）-> rivu all -> ClickHouse。
+# 拓扑：loadgen 与 curl -> Caddy（按 deploy/Caddyfile 的写法，JSON 访问日志删 IP 与请求头）-> rivu serve -> ClickHouse。
 # 流量：loadgen 的固定到达率事件（含规则丢弃：垃圾引荐、机器人、无会话），外加构造的未知站点（202 + dropped，记在 site 0）、
 # 400（坏 JSON）、413（超大请求体）；中途重启一次 rivu（Caddy 的 lb_try_duration 让重启窗口内的请求排队重试）。
 # 结束后用 tools/reconcile 把访问日志与 ingest_counters 逐项对账，报告写到 $OUT。
@@ -68,7 +68,7 @@ IDS_CSV="$(IFS=,; echo "${IDS[*]}")"
 log "站点 $IDS_CSV"
 
 start_rivu() {
-  "$RIVU" all >>"$OUT/rivu.log" 2>&1 &
+  "$RIVU" serve >>"$OUT/rivu.log" 2>&1 &
   RIVU_PID=$!
   for _ in $(seq 1 60); do
     curl -sf "http://$INTERNAL/readyz" >/dev/null && return 0

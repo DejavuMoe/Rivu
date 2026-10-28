@@ -1,6 +1,6 @@
 //! `ch_delete_batch`：执行 `pending_stats_deletions` 里到期的统计数据删除意图（`platform-and-ops.md` §6）。
 //!
-//! - 进程内定时（`RIVU_STATS_DELETE_INTERVAL_SECS`，默认 5 分钟），worker / all 运行；all 里看板写入日期范围意图后
+//! - 进程内定时（`RIVU_STATS_DELETE_INTERVAL_SECS`，默认 5 分钟）；看板写入日期范围意图后
 //!   会立即唤醒一次（[`StatsDeleteKick`]）。多个进程同时运行是安全的：领取用 `FOR UPDATE SKIP LOCKED`，
 //!   领取后 `not_before` 作为租约（见 `rivu_storage_pg::stats_deletions::claim_due`）。
 //! - ClickHouse 侧用 `rivu_maintainer` 账号（`ALTER DELETE` 权限）对 `events`、`sessions`、`ingest_counters`
@@ -33,7 +33,7 @@ use tokio::task::JoinHandle;
 /// 一轮最多领取的意图条数（领完再领，直到没有到期的）。
 const CLAIM_BATCH: i64 = 4;
 
-/// 看板写入日期范围意图后唤醒 `ch_delete_batch`（只在同一进程里运行 jobs 时有效，即 `rivu all`）。
+/// 看板写入日期范围意图后唤醒 `ch_delete_batch`。
 pub type StatsDeleteKick = Arc<Notify>;
 
 /// 删除涉及的一张表：表名、分区表达式、按时间删除时比较的列。
@@ -239,7 +239,7 @@ pub async fn run_batch(pg: &PgPool, ch: &Client) -> Result<usize> {
     run_batch_with_cache(pg, ch, None).await
 }
 
-/// 同 [`run_batch`]，每条意图完成后让同进程的结果缓存里那个站点的结果失效（`rivu all`）。
+/// 同 [`run_batch`]，每条意图完成后让结果缓存里那个站点的结果失效。
 pub async fn run_batch_with_cache(
     pg: &PgPool,
     ch: &Client,
@@ -296,7 +296,7 @@ pub async fn run_batch_with_cache(
 }
 
 /// 启动 `ch_delete_batch` 的定时任务：启动后先跑一轮，之后每 `interval` 一轮，`kick` 被通知时提前跑一轮。
-/// `cache`：同进程的结果缓存（`rivu all`），删除完成后让那个站点的缓存失效。
+/// `cache`：结果缓存，删除完成后让那个站点的缓存失效。
 pub fn spawn_stats_delete(
     pg: PgPool,
     ch: Client,

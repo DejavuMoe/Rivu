@@ -1,7 +1,7 @@
 import { defineConfig, devices } from '@playwright/test';
 
 // 真实浏览器 -> 真实运行的 rivu -> ClickHouse -> `rivu query` 的端到端测试（test/e2e-rivu）。
-// 不能单独运行：需要 `rivu all` 已在监听，并且为每个内核建好了站点，见 scripts/e2e-rivu.sh。
+// 不能单独运行：需要 `rivu serve` 已在监听，并且为每个内核建好了站点，见 scripts/e2e-rivu.sh。
 // 三个内核各一个站点（RIVU_E2E_SITE_CHROMIUM / _FIREFOX / _WEBKIT），所以每个项目的计数互不干扰。
 export default defineConfig({
   testDir: 'test/e2e-rivu',

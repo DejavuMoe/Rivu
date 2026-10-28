@@ -32,7 +32,7 @@ Rivu 保留这三个抽象，但替换 Plausible 最脆弱的一环。Plausible 
 | D7 | 响应语义 | 事件被接受或被过滤都回 `202`，用响应头 `x-rivu-dropped` 给出丢弃数量，不暴露原因。`400` 只用于协议错误，`503` 只用于过载 | R01 §3.2、§3.3；R00 §5.4 |
 | D9 | 站点标识 | 不透明的 `site_key`，与域名解耦（Plausible 的 `pa-<id>` 脚本也已改为与域名解耦）。域名只作为 hostname 白名单 | R01 §2.10、§6.5 |
 | D10 | 客户端 IP | 只信任可配置的可信代理 CIDR 列表给出的转发头。Plausible 无条件信任 5 种转发头，是反例 | R01 §4.4 |
-| D11 | 进程 | 1 个二进制，按角色启动：`rivu collector/worker/api/migrate/all`。`all` 就是最简单的自托管形态 | 降低自托管复杂度 |
+| D11 | 进程 | 1 个二进制、1 个实例：`rivu serve` 运行全部功能，`rivu migrate` 执行迁移 | 降低自托管复杂度 |
 | D12 | 原始数据保留 | 可配置，默认 731 天（连续两个自然年，含一个闰年），以支持同比。超出保留期的时间范围由日汇总层回答 | R02 §9 |
 
 ---
@@ -162,17 +162,15 @@ Rivu 保留这三个抽象，但替换 Plausible 最脆弱的一环。Plausible 
 
 ### 3.1 进程与角色
 
-Rivu 只支持单实例部署：一个 `rivu all` 进程，加 PostgreSQL 与 ClickHouse，前面放反向代理。
+Rivu 只支持单实例部署：一个 `rivu serve` 进程，加 PostgreSQL 与 ClickHouse，前面放反向代理。
 
-| 角色（`rivu <cmd>`） | 职责 | 状态 |
-|---|---|---|
-| `all` | 在一个进程里跑 collector、api 和后台任务（部署形态） | 会话状态（进程内分片） |
-| `collector` | 处理 `/api/event` 和 `/js/*`，运行接入管线、SessionAssigner 和 BatchWriter | 会话状态 |
-| `api` | 查询 DSL、管理 API、鉴权、看板静态文件 | 只有结果缓存 |
-| `worker` | 后台任务 | 无 |
-| `migrate` | 按顺序执行 PG 和 CH 的迁移 | 无（一次性任务） |
+| 子命令 | 职责 |
+|---|---|
+| `rivu serve` | 实例本身：采集（接入管线、SessionAssigner、BatchWriter）、查询 API 与看板（结果缓存）、全部后台任务 |
+| `rivu migrate` | 按顺序执行 PG 和 CH 的迁移（一次性任务） |
+| 管理命令 | `setup`、`site`、`user`、`org`、`share`、`shield`、`apikey`、`query`，直接读写数据库 |
 
-`collector`、`api`、`worker` 是 `all` 的组成部分，可以分开启动用于排障，但同一时间只能有一个 collector（会话状态在进程内）。
+会话状态在 `rivu serve` 的进程内（32 个分片），所以同一时间只能有一个实例。
 ### 3.2 Cargo workspace
 
 ```
@@ -196,7 +194,7 @@ rivu/
 │   ├── storage-ch/     # clickhouse crate 封装、CH 迁移
 │   ├── jobs/           # 后台任务：盐、汇总层构建、删除与保留、地理库更新、ClickHouse 监控
 │   └── common/         # 配置、遥测、错误类型
-├── bin/rivu/           # 单个二进制：collector | worker | api | migrate | all，以及管理命令
+├── bin/rivu/           # 单个二进制：serve | migrate | healthcheck，以及管理命令
 ├── tools/              # loadgen（压测）、reconcile（边缘日志对账）、reident（重识别测试）、replay（与 Plausible 并行回放）
 ├── migrations/{postgres,clickhouse}/
 └── deploy/{compose.dev.yml,compose.yml,Caddyfile,nginx.conf}
@@ -205,7 +203,7 @@ rivu/
 ### 3.3 数据流
 
 ```
-tracker ─► 反向代理 ─► rivu all
+tracker ─► 反向代理 ─► rivu serve
                      ├─ 接入管线 ─► SessionAssigner（进程内分片）─► BatchWriter（有界 channel）─► ClickHouse.events
                      │                                                         └─ mv_sessions ─► ClickHouse.sessions
                      ├─ api：查询引擎 ⇄ ClickHouse（只读账号）/ PostgreSQL；moka 结果缓存；看板静态文件
@@ -248,7 +246,7 @@ tracker ─► 反向代理 ─► rivu all
 - **顺序原则**与 Plausible 相同（R01 §5.2）：先做便宜的判断，昂贵的 UA 解析和地理查询放在规则之后。
 - **每个阶段**都记录耗时直方图 `rivu_ingest_stage_seconds{stage}`；每个丢弃原因都计入 `ingest_counters`（§5.4）。`stage` 标签共 10 个：`parse`（第 1 步）、`admit`（第 2–3 步，含客户端 IP 与限流）、`shield`（第 4 步）、`bot`（第 5 步；一次 `UaParser::parse` 的耗时记在这里）、`geo`（第 6 步，含国家规则）、`ua`（第 7 步，只是把解析结果写进会话属性）、`source`（第 8 步）、`identity`（第 10 步）、`session`（第 11 步的 SessionAssigner）、`write`（组装行并交给 BatchWriter）。engagement 不经过 `bot` `geo` `ua` `source`，这几个直方图的样本数只对应 pageview 与自定义事件。被限流拒绝的请求另计 `rivu_ratelimit_rejected_total{scope="ingest"}`。
 - **丢弃原因的标识符**（§10 Q13）以 Rust 枚举 `DropReason`（`rivu-domain`）为唯一来源，共 13 个：`unknown_site` `site_disabled` `hostname_not_allowed` `rate_limited` `spam_referrer` `ip_blocked` `page_blocked` `bot` `datacenter_ip` `country_blocked` `no_session` `salt_missing` `overloaded`。`ingest_counters.metric` 取 `accepted` 或 `dropped_<原因>`；未知站点记 `site_id = 0`；已删除的站点从快照摘除后，同样按 `unknown_site` 计。机器人一律记 `dropped_bot`；`rivu-ua` 的 `BotKind`（`spider` `headless` `automation` `empty`）只用于统计与排错，不进 `ingest_counters.metric`（§10 Q21）。`salt_missing` 表示事件的站点本地日期没有盐：collector 不现场生成盐（`platform-and-ops.md` §3.3）。
-- **采集限流**（`rivu-ratelimit::KeyedLimiter`）：每站一个令牌桶，容量 N、补充速率 N/60 每秒（N = 每分钟额度，所以可以一次突发一分钟的量）。额度取站点 `ingest_rate_limit_per_min`，为空取 `RIVU_INGEST_RATE_LIMIT_PER_MIN`，设为 `0` 表示不限流。默认 300000 个/分钟，即 5000 个/秒的系统峰值目标（§7）：`site_key` 是公开的，没有默认上限就等于没有限流；而单站日均 1000 万事件、20 倍峰值约 2300 个/秒，默认值不会误伤目标规模内的真实流量，小站想更严就设站点自己的额度。状态在进程内，多副本 collector 各自本地计数（总额度约为副本数倍），重启清零；站点额度变化时就地调整桶，不重置已有令牌；站点被删除后，它的桶在下一轮会话清扫（每 60 秒）时丢掉。engagement 同样计数：限流是洪水防护，不分事件类型。
+- **采集限流**（`rivu-ratelimit::KeyedLimiter`）：每站一个令牌桶，容量 N、补充速率 N/60 每秒（N = 每分钟额度，所以可以一次突发一分钟的量）。额度取站点 `ingest_rate_limit_per_min`，为空取 `RIVU_INGEST_RATE_LIMIT_PER_MIN`，设为 `0` 表示不限流。默认 300000 个/分钟，即 5000 个/秒的系统峰值目标（§7）：`site_key` 是公开的，没有默认上限就等于没有限流；而单站日均 1000 万事件、20 倍峰值约 2300 个/秒，默认值不会误伤目标规模内的真实流量，小站想更严就设站点自己的额度。状态在进程内，重启清零；站点额度变化时就地调整桶，不重置已有令牌；站点被删除后，它的桶在下一轮会话清扫（每 60 秒）时丢掉。engagement 同样计数：限流是洪水防护，不分事件类型。
 - **屏蔽规则的语义**（`platform-and-ops.md` §3.3）：规则随站点快照编译成不可变的 `ShieldRules`，`deny` 命中就丢弃，`allow` 是同一类型内的例外。只有 `allow` 没有 `deny` 时不起作用，不是白名单模式。页面通配用分段比较而不是正则（无回溯，pathname ≤1024 字节、模式 ≤250 字节），所以匹配代价有界。
 - **可选优化**：续期会话的事件最终会被盖上会话属性，所以第 5–8 步的结果会被覆盖。可以在第 10 步之后先查会话，命中时跳过这几步。
 - **UA 与机器人**（`rivu-ua`，详见 `docs/research/enrich-ua.md`）：第 5、7 步共用一次解析。机器人在第 5 步丢弃，其余字段第 7 步取用。`browser` 的取值不受 uap-core 控制（兜底规则会把任意 token 当家族名），所以查询层展示该维度必须 top-N 加「其它」（§6.10）。
@@ -275,7 +273,7 @@ tracker ─► 反向代理 ─► rivu all
 | 用途 | 选型 | 许可与注意 |
 |---|---|---|
 | UA 解析 | `ua-parser` 0.2（uap-core 官方 Rust 实现）+ 固定 commit 的 `regexes.yaml`，随仓库嵌入（`crates/ua/data/uap-core/`），运行期不读文件、不联网。固定 commit 与升级流程见该目录的 `PROVENANCE.md`；uap-core 自带测试集 100% 通过（`test_ua` 1601、`test_os` 483、`test_device` 16129，见 `docs/research/enrich-ua.md` §6.1） | Apache-2.0。Plausible 用的 Matomo device-detector 数据是 LGPL-3.0，不用。上游在固定 commit 没有 `NOTICE`，仓库里的 `NOTICE` 是我们写的署名说明 |
-| 数据中心网段（可选，`RIVU_DATACENTER_FILTER=on`，默认关） | AWS `ip-ranges.json`、Google Cloud `cloud.json`、Oracle Cloud `public_ip_ranges.json`、DigitalOcean 与 Linode 的 geofeed（RFC 8805），worker 每天下载、合并成 `${RIVU_DATA_DIR}/datacenter/ranges.txt`，全部来源成功才替换；collector 按修改时间热加载，管线第 5 步在 UA 机器人判定之后查（合并后的区间二分查找），命中记 `datacenter_ip`。Azure 的 Service Tags 没有固定地址，需要时用 `RIVU_DATACENTER_SOURCES` 指向自己镜像的文件。默认关闭：不少 VPN 与企业代理的出口在云上。2026-10-27 实测五个来源去重后约 2.06 万条 | 各家公开发布、供客户配置防火墙的清单，只下载到本地、不随仓库分发 |
+| 数据中心网段（可选，`RIVU_DATACENTER_FILTER=on`，默认关） | AWS `ip-ranges.json`、Google Cloud `cloud.json`、Oracle Cloud `public_ip_ranges.json`、DigitalOcean 与 Linode 的 geofeed（RFC 8805），每天下载、合并成 `${RIVU_DATA_DIR}/datacenter/ranges.txt`，全部来源成功才替换；collector 按修改时间热加载，管线第 5 步在 UA 机器人判定之后查（合并后的区间二分查找），命中记 `datacenter_ip`。Azure 的 Service Tags 没有固定地址，需要时用 `RIVU_DATACENTER_SOURCES` 指向自己镜像的文件。默认关闭：不少 VPN 与企业代理的出口在云上。2026-10-27 实测五个来源去重后约 2.06 万条 | 各家公开发布、供客户配置防火墙的清单，只下载到本地、不随仓库分发 |
 | 机器人 | uap-core 的 device=Spider，加自维护的 Headless、自动化框架、脚本 HTTP 客户端、爬虫名与自报家门规则（全是子串或前缀比较，没有正则）；空 UA 算机器人（§10 Q21）。在 crawler-user-agents 的 2120 个样例 UA 上检测率 84.58%（uap-core 单独 62.36%）；这是对一份名单的数字，不代表线上流量（§6.10） | 规则库同上；自维护名字表每条要有证据。crawler-user-agents 是 MIT，只当测试输入，不嵌入其正则 |
 | GeoIP | 默认 DB-IP Lite；可选 MaxMind GeoLite2；可选自定义 mmdb 直链（§10 Q5，详见下） | DB-IP Lite 为 CC BY 4.0，必须署名；GeoLite2 需要 Account ID 加 license key 并遵守其 EULA，也要求署名；自定义库的许可由运维者负责 |
 | 地名 | GeoNames（查询时经 CH 字典转换，与 Plausible 的 `location_data_dict` 做法相同） | CC BY 4.0。默认来源 DB-IP Lite 没有城市的 GeoNames id、也没有子区划代码（§10 Q24），字典只在 MaxMind 或同结构的自定义库下有数据可转换 |
@@ -442,7 +440,7 @@ AggregatingMergeTree 的状态本身不幂等，一旦漏掉去重，就会永�
 |---|---|---|---|---|
 | `events` | MergeTree | BatchWriter | 原始事件，是事实来源 | 按站点的保留期（默认 731 天，§5.6、§10 Q1） |
 | `sessions` | AggregatingMergeTree | 物化视图 `mv_sessions`（数据来自 `events`） | 会话级聚合 | 同上 |
-| `ingest_counters` | SummingMergeTree | collector / worker | 接入计数：站点 × 指标 × 脚本版本 × 分钟 | 90 天 |
+| `ingest_counters` | SummingMergeTree | 采集管线 | 接入计数：站点 × 指标 × 脚本版本 × 分钟 | 90 天 |
 | `rollup_*`（10 张） | ReplacingMergeTree(version) | 后台任务重算，或导入 | 日汇总层，同时存放原生和导入数据 | 永久 |
 | `geo_names`（字典） | Dictionary | 迁移或后台任务 | 地名 | 无 |
 
@@ -885,7 +883,7 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 - 进程内的 moka（`crates/query/src/cache.rs`），看板与公开 API 共用，按结果行数限容（50 万行），只缓存成功的结果。
 - key 是以下内容的哈希：站点 id、规范化的 `QuerySpec`（共享链接叠加的过滤已经并入）、影响结果的站点配置（时区、周起始日、目标、地理库的署名与能力）、站点的数据代数、「现在」所在的时间桶。配置直接进键，改目标或时区立即生效。
 - 时间桶的长度：`realtime` 3 s，`day` 与 `24h` 10 s，含今天的范围 60 s，已结束的历史范围 10 min。同一个桶里的请求拿到同一份结果。
-- 删除统计数据完成后，同进程（`rivu all`）的 `ch_delete_batch` 让该站点的数据代数加一；api 与 worker 分开启动时，旧结果最多再存活一个桶长。汇总层构建不改变结果（两层口径一致，§6.4），不需要失效。
+- 删除统计数据完成后，`ch_delete_batch` 让该站点的数据代数加一。汇总层构建不改变结果（两层口径一致，§6.4），不需要失效。
 - `rivu_query_seconds` 带 `cache` 标签（`hit` / `miss`），命中与未命中分开统计。
 - Plausible 完全没有结果缓存（R03 §11）。多节点 api 部署时，先接受各节点各自缓存；确实出现不一致问题后再引入 Valkey。
 

@@ -3,7 +3,7 @@
 #   pwsh linux-task.ps1 -Mode build -Project D:\Forgejo\Rivu -Command 'bash tools/replay/run.sh'
 #
 # 依次：起 Plausible CE（tools/replay/plausible/compose.yml）-> 在 Plausible 里建用户与站点（公开，内部统计 API 不需要登录）
-# -> 构建 rivu、loadgen、replay -> rivu 建同名站点与只读 API key -> 后台启动 rivu all
+# -> 构建 rivu、loadgen、replay -> rivu 建同名站点与只读 API key -> 后台启动 rivu serve
 # -> loadgen --dump 生成确定的事件流 -> replay send 同时发给两边 -> 等写入 -> replay compare 对比当天的统计。
 # 结果在 $REPLAY_OUT（默认 ~/replay-out/<时间戳>）。需要 dev 的 PostgreSQL / ClickHouse（rivu 用）。
 set -Eeuo pipefail
@@ -77,7 +77,7 @@ head -c 24 /dev/urandom | base64 | "$RIVU" user add --email "$EMAIL" --password-
 "$RIVU" org member add --org "$ORG" --email "$EMAIL" --role owner >/dev/null
 export REPLAY_RIVU_API_KEY="$("$RIVU" apikey create --org "$ORG" --user "$EMAIL" --name "replay-$RUN_ID" --scopes stats:read | awk -F': ' '/^key:/{print $2}')"
 
-"$RIVU" all >"$OUT/rivu.log" 2>&1 &
+"$RIVU" serve >"$OUT/rivu.log" 2>&1 &
 RIVU_PID=$!
 for _ in $(seq 1 120); do curl -sf "http://127.0.0.1:$INTERNAL/readyz" >/dev/null && break; sleep 0.5; done
 log "rivu 就绪"
