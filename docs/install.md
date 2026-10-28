@@ -72,21 +72,23 @@ docker compose -f deploy/compose.yml --env-file deploy/.env up -d
 
 ## 备份与恢复
 
-数据在三个命名卷里：`rivu_pg-data`（账号、站点、设置）、`rivu_ch-data`（统计数据）、`rivu_rivu-data`（GeoIP 库，可重新下载）。
+数据在三个命名卷里：`rivu_pg-data`（账号、站点、设置）、`rivu_ch-data`（统计数据与日汇总）、`rivu_rivu-data`（GeoIP 库与会话快照，可重建）。
 
-PostgreSQL，每天：
+备份（rivu 不用停，建议每天用 cron 跑一次）：
 
 ```bash
-docker compose -f deploy/compose.yml exec -T postgres \
-  pg_dump -U rivu_migrator -Fc --exclude-table-data=salts rivu > rivu-$(date +%F).pgdump
+deploy/backup.sh /srv/rivu-backups        # 生成 /srv/rivu-backups/rivu-<UTC 时间>/
 ```
 
-排除 `salts` 表的数据是有意的：备份里留着盐，旧的访客 ID 就能被暴力还原（`privacy.md`）。恢复后 rivu 会自动生成新的盐。
+目录里是 ClickHouse 原生 `BACKUP` 的 `clickhouse.zip`、PostgreSQL 的 `postgres.pgdump` 和记录备份时间的 `manifest`。PostgreSQL 的 `salts` 表只备份结构：备份里留着盐，旧的访客 ID 就能被暴力还原（`privacy.md`），恢复后 rivu 会生成新的盐。把备份目录拷到另一台机器或另一个存储账号；同一块磁盘上的副本不算备份。`deploy/.env` 里的密码与 `RIVU_VISITOR_PEPPER` 不在备份里，单独保管。
 
-ClickHouse：用 `BACKUP DATABASE rivu TO Disk(...)` 或 `S3(...)`，需要在 ClickHouse 里配置备份磁盘；也可以停掉 `clickhouse` 后直接备份卷。备份要放在另一台机器或另一个存储账号里。
+恢复（覆盖现有数据；卷已经丢失时也可以直接恢复）：
 
-恢复顺序：先恢复 PostgreSQL 与 ClickHouse 的数据，再启动 `migrate` 与 `rivu`，等 `/readyz` 为 200。
+```bash
+deploy/restore.sh /srv/rivu-backups/rivu-20261028T020000Z --yes
+```
 
+脚本停掉 rivu，还原 PostgreSQL 与 ClickHouse，把备份之后才完成的统计删除重新排队（避免恢复把已删除的数据找回来），再启动 migrate 与 rivu 并等就绪。备份之后到恢复之间的事件不可恢复。整个流程由 `tools/backup-drill/run.sh` 演练（删掉全部卷后恢复，逐项核对数据）。
 ## 排障
 
 - `docker compose -f deploy/compose.yml logs rivu`：结构化日志（JSON）。

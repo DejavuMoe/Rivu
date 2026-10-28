@@ -22,7 +22,7 @@
 | P1 最小闭环 | tracker、接入管线、会话、查询引擎、公开 API、看板 | 完成，只差「已知答案探针连续 7 天」 |
 | 交付 | 看板由 rivu 提供、镜像、生产 compose、反向代理示例、安装与升级文档、发布流程、开源基础文件 | 完成，只差常驻实例的 7 天探针 |
 | P2 性能 | 日汇总层与规划器选层、结果缓存、merge 监控、保留期、压测达标 | 完成 |
-| P3 可靠 | 单实例的崩溃与重启测试、备份恢复演练、写入积压告警 | 未开始 |
+| P3 可靠 | 单实例的崩溃与重启测试、备份恢复演练、写入积压告警 | 完成 |
 | P4 产品 | 漏斗、收入、属性报表、分群、导入导出、邮件、TOTP、Plausible 兼容端点 | 部分已提前完成（目标、共享链接、公开 API） |
 
 ## 交付
@@ -53,9 +53,9 @@
 
 验收：持续写入时对 rivu 执行 `kill -9`、重启 ClickHouse，各 100 次：ClickHouse 重启不丢事件；rivu 崩溃丢失的事件不超过崩溃前写缓冲里的数量；`events` 与 `sessions` 没有重复行，会话指标与无故障的对照组的差异只来自被切开的会话。
 
-- [ ] 故障注入脚本：持续写入下反复 `kill -9` rivu、重启 ClickHouse，逐轮对账
-- [ ] 备份与恢复演练脚本（PostgreSQL `pg_dump`、ClickHouse `BACKUP`；RTO 实测）
-- [ ] 写入积压与 ClickHouse 不可用的告警建议（写缓冲深度、flush 失败、`503`）
+- [x] 故障注入：`tools/faults/run.sh`，`kill -9` rivu 与重启 ClickHouse 各 100 轮全部通过（ClickHouse 重启零丢失；rivu 崩溃每次至多丢约 1 s 的流量；无重复；`docs/research/fault-injection-2026-10.md`）
+- [x] 备份与恢复：`deploy/backup.sh`、`deploy/restore.sh`；演练 `tools/backup-drill/run.sh` 删掉全部卷后恢复，数据一致（小数据量 RTO 11 s）
+- [x] 告警建议：写入积压、ClickHouse 写入失败与整批丢弃、采集过载、未就绪、part 过多、删除卡住、汇总层、地理库、备份（`platform-and-ops.md` §10）；指标清单改成与代码一致
 ## P4 产品
 
 - [ ] 漏斗
