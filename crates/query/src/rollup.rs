@@ -52,6 +52,9 @@ pub enum Family {
     Browsers,
     Os,
     Events,
+    /// 自定义属性（`rollup_props`，键 × 取值）：只有导入的数据，序号指向查询的属性键（[`Col::Prop`]）。
+    /// 不在 [`Family::ALL`] 里：`rollup_build` 不构建它，原生数据的属性查询走原始层。
+    Props(u8),
 }
 
 impl Family {
@@ -81,6 +84,7 @@ impl Family {
             Family::Browsers => "rollup_browsers",
             Family::Os => "rollup_os",
             Family::Events => "rollup_events",
+            Family::Props(_) => "rollup_props",
         }
     }
 
@@ -113,12 +117,32 @@ impl Family {
             ],
             Family::Os => &[(Col::Os, "os"), (Col::OsVersion, "os_version")],
             Family::Events => &[(Col::EventName, "name")],
+            // 维度是 `value`，键另由条件 `key = pk<i>` 限定（见 [`Family::column`]）
+            Family::Props(_) => &[],
         }
     }
 
     pub(crate) fn column(self, col: Col) -> Option<&'static str> {
+        if let Family::Props(i) = self {
+            return (col == Col::Prop(i)).then_some("value");
+        }
         self.dims().iter().find(|(c, _)| *c == col).map(|(_, n)| *n)
     }
+
+    /// 全部汇总表（含 `rollup_props`），删除数据时用。
+    pub const TABLES: [&'static str; 11] = [
+        "rollup_pages",
+        "rollup_entry_pages",
+        "rollup_exit_pages",
+        "rollup_sources",
+        "rollup_locations",
+        "rollup_devices",
+        "rollup_browsers",
+        "rollup_os",
+        "rollup_events",
+        "rollup_props",
+        "rollup_site",
+    ];
 
     fn of(col: Col) -> Option<Family> {
         Family::ALL.into_iter().find(|f| f.column(col).is_some())
@@ -131,6 +155,7 @@ impl Family {
                 m,
                 Measure::Visitors | Measure::Pageviews | Measure::Events | Measure::Visits
             ),
+            Family::Props(_) => matches!(m, Measure::Visitors | Measure::Events),
             Family::Pages => m != Measure::CrBase,
             _ => !matches!(m, Measure::Exits | Measure::CrBase),
         }
@@ -139,7 +164,7 @@ impl Family {
     /// 构建时这一族的 `visits` 口径：有事件级维度的族是事件形式。
     pub(crate) fn visits_form(self) -> VisitsForm {
         match self {
-            Family::Pages | Family::Events => VisitsForm::Events,
+            Family::Pages | Family::Events | Family::Props(_) => VisitsForm::Events,
             _ => VisitsForm::Sessions,
         }
     }
@@ -222,9 +247,11 @@ pub(crate) fn compatible_family(q: &ResolvedQuery, plan: &Plan) -> Option<Family
     {
         return None;
     }
-    let family = match cols.first() {
-        None => Family::Site,
-        Some(c) => Family::of(*c)?,
+    let family = match cols.as_slice() {
+        [] => Family::Site,
+        // 属性只有单独一个属性维度时能用（rollup_props 只有键 × 取值）
+        [Col::Prop(i)] => Family::Props(*i),
+        [c, ..] => Family::of(*c)?,
     };
     if cols.iter().any(|c| family.column(*c).is_none()) {
         return None;
@@ -367,7 +394,7 @@ pub async fn build_state(
     tz: &TimeZone,
 ) -> Result<BuildState, QueryError> {
     let tz_name = tz.iana_name().unwrap_or("UTC");
-    let (sql, params) = sql::rollup_probe_query(scope, tz_name, "1970-01-01", "1970-01-01");
+    let (sql, params) = sql::rollup_probe_query(scope, tz_name, "1970-01-01", "1970-01-01", true);
     let rows = fetch(client, &sql, &params).await?;
     let row = rows.first();
     let built_to = row
@@ -440,12 +467,304 @@ pub async fn delete(
         cond.push_str(" AND day >= {from_day:Date} AND day <= {to_day:Date}");
     }
     // site 先删：中途失败时这些天不再算「已构建」
-    let order =
-        std::iter::once(Family::Site).chain(Family::ALL.into_iter().filter(|f| *f != Family::Site));
-    for family in order {
+    let order = std::iter::once("rollup_site")
+        .chain(Family::TABLES.into_iter().filter(|t| *t != "rollup_site"));
+    for table in order {
+        let sql = format!("DELETE FROM {table} WHERE site_id = {{site:UInt64}}{cond}");
+        execute(client, &sql, &params).await?;
+    }
+    Ok(())
+}
+
+/// 汇总行的度量（列名同 [`MEASURE_COLUMNS`] 加 `visits_ev`）。导入时按「日期 × 维度」先在内存里相加再写入：
+/// `ReplacingMergeTree` 会让同键的行互相覆盖。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Measures {
+    pub visitors: u64,
+    pub pageviews: u64,
+    pub events: u64,
+    pub visits_ev: u64,
+    pub visits_s: u64,
+    pub s_n: u64,
+    pub s_pv: u64,
+    pub s_dur_ms: u64,
+    pub s_eng_ms: u64,
+    pub s_eng_n: u64,
+    pub b_n: u64,
+    pub bounces: u64,
+    pub exits: u64,
+    pub tp_ms: u64,
+    pub tp_n: u64,
+    pub sc_sum: u64,
+    pub sc_n: u64,
+}
+
+impl Measures {
+    pub fn add(&mut self, o: &Measures) {
+        for (a, b) in self.fields_mut().into_iter().zip(o.fields()) {
+            *a = a.saturating_add(b.1);
+        }
+    }
+
+    fn fields(&self) -> [(&'static str, u64); 17] {
+        [
+            ("visitors", self.visitors),
+            ("pageviews", self.pageviews),
+            ("events", self.events),
+            ("visits_ev", self.visits_ev),
+            ("visits_s", self.visits_s),
+            ("s_n", self.s_n),
+            ("s_pv", self.s_pv),
+            ("s_dur_ms", self.s_dur_ms),
+            ("s_eng_ms", self.s_eng_ms),
+            ("s_eng_n", self.s_eng_n),
+            ("b_n", self.b_n),
+            ("bounces", self.bounces),
+            ("exits", self.exits),
+            ("tp_ms", self.tp_ms),
+            ("tp_n", self.tp_n),
+            ("sc_sum", self.sc_sum),
+            ("sc_n", self.sc_n),
+        ]
+    }
+
+    fn fields_mut(&mut self) -> [&mut u64; 17] {
+        [
+            &mut self.visitors,
+            &mut self.pageviews,
+            &mut self.events,
+            &mut self.visits_ev,
+            &mut self.visits_s,
+            &mut self.s_n,
+            &mut self.s_pv,
+            &mut self.s_dur_ms,
+            &mut self.s_eng_ms,
+            &mut self.s_eng_n,
+            &mut self.b_n,
+            &mut self.bounces,
+            &mut self.exits,
+            &mut self.tp_ms,
+            &mut self.tp_n,
+            &mut self.sc_sum,
+            &mut self.sc_n,
+        ]
+    }
+}
+
+/// 导入写入的一行：站点本地日、维度取值（与表的维度列一一对应）、度量。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImportRow {
+    pub day: Date,
+    pub dims: Vec<String>,
+    pub m: Measures,
+}
+
+/// 各汇总表的维度列（导入写入时的白名单；`rollup_site` 另有 `tz`）。
+pub const IMPORT_DIMS: [(&str, &[&str]); 11] = [
+    ("rollup_site", &[]),
+    ("rollup_pages", &["page"]),
+    ("rollup_entry_pages", &["entry_page"]),
+    ("rollup_exit_pages", &["exit_page"]),
+    (
+        "rollup_sources",
+        &[
+            "channel",
+            "source",
+            "referrer",
+            "utm_source",
+            "utm_medium",
+            "utm_campaign",
+            "utm_content",
+            "utm_term",
+        ],
+    ),
+    ("rollup_locations", &["country", "region", "city"]),
+    ("rollup_devices", &["device"]),
+    ("rollup_browsers", &["browser", "browser_version"]),
+    ("rollup_os", &["os", "os_version"]),
+    ("rollup_events", &["name"]),
+    ("rollup_props", &["key", "value"]),
+];
+
+/// 导入写入的行：每张汇总表一个结构体（列名即字段名），维度列不同、度量列相同。
+/// `day` 是 RowBinary 的 `Date`（1970-01-01 起的天数），`origin` 是 `Enum8` 的 `'import' = 2`。
+macro_rules! import_row {
+    ($name:ident $(with $tz:ident)? { $($dim:ident),* }) => {
+        #[derive(clickhouse::Row, serde::Serialize)]
+        struct $name {
+            site_id: u64,
+            day: u16,
+            origin: i8,
+            import_id: u64,
+            version: u64,
+            $($tz: String,)?
+            $($dim: String,)*
+            visitors: u64,
+            pageviews: u64,
+            events: u64,
+            visits_ev: u64,
+            visits_s: u64,
+            s_n: u64,
+            s_pv: u64,
+            s_dur_ms: u64,
+            s_eng_ms: u64,
+            s_eng_n: u64,
+            b_n: u64,
+            bounces: u64,
+            exits: u64,
+            tp_ms: u64,
+            tp_n: u64,
+            sc_sum: u64,
+            sc_n: u64,
+        }
+
+        impl $name {
+            #[allow(unused_variables, unused_mut)]
+            fn new(site_id: u64, import_id: u64, tz: &str, r: &ImportRow) -> Result<Self, QueryError> {
+                let mut dims = r.dims.iter().cloned();
+                let m = &r.m;
+                Ok($name {
+                    site_id,
+                    day: rowbinary_date(r.day)?,
+                    origin: 2,
+                    import_id,
+                    version: 1,
+                    $($tz: tz.to_owned(),)?
+                    $($dim: dims.next().unwrap_or_default(),)*
+                    visitors: m.visitors,
+                    pageviews: m.pageviews,
+                    events: m.events,
+                    visits_ev: m.visits_ev,
+                    visits_s: m.visits_s,
+                    s_n: m.s_n,
+                    s_pv: m.s_pv,
+                    s_dur_ms: m.s_dur_ms,
+                    s_eng_ms: m.s_eng_ms,
+                    s_eng_n: m.s_eng_n,
+                    b_n: m.b_n,
+                    bounces: m.bounces,
+                    exits: m.exits,
+                    tp_ms: m.tp_ms,
+                    tp_n: m.tp_n,
+                    sc_sum: m.sc_sum,
+                    sc_n: m.sc_n,
+                })
+            }
+        }
+    };
+}
+
+import_row!(SiteImportRow with tz {});
+import_row!(PagesImportRow { page });
+import_row!(EntryPagesImportRow { entry_page });
+import_row!(ExitPagesImportRow { exit_page });
+import_row!(SourcesImportRow {
+    channel,
+    source,
+    referrer,
+    utm_source,
+    utm_medium,
+    utm_campaign,
+    utm_content,
+    utm_term
+});
+import_row!(LocationsImportRow {
+    country,
+    region,
+    city
+});
+import_row!(DevicesImportRow { device });
+import_row!(BrowsersImportRow {
+    browser,
+    browser_version
+});
+import_row!(OsImportRow { os, os_version });
+import_row!(EventsImportRow { name });
+import_row!(PropsImportRow { key, value });
+
+fn rowbinary_date(d: Date) -> Result<u16, QueryError> {
+    let days = Date::constant(1970, 1, 1)
+        .until(d)
+        .map_err(|e| QueryError::internal(anyhow::anyhow!("日期超出范围：{e}")))?
+        .get_days();
+    u16::try_from(days).map_err(|_| QueryError::internal(anyhow::anyhow!("日期超出范围：{d}")))
+}
+
+async fn write_rows<T>(client: &Client, table: &str, rows: Vec<T>) -> Result<(), QueryError>
+where
+    T: for<'a> clickhouse::Row<Value<'a> = T> + serde::Serialize,
+{
+    let mut insert = client
+        .insert::<T>(table)
+        .await
+        .map_err(QueryError::internal)?
+        .with_setting("async_insert", "0");
+    for row in &rows {
+        insert.write(row).await.map_err(QueryError::internal)?;
+    }
+    insert.end().await.map_err(QueryError::internal)
+}
+
+/// 把导入的行写进一张汇总表（`origin = 'import'`，`import_id`，`version = 1`，一次 RowBinary 写入）。
+/// `table` 必须在 [`IMPORT_DIMS`] 里，每行的 `dims` 与该表的维度列一一对应；`tz` 是站点时区（写进 `rollup_site.tz`）。
+pub async fn insert_import(
+    client: &Client,
+    scope: &TenantScope,
+    table: &str,
+    tz: &str,
+    import_id: u64,
+    rows: &[ImportRow],
+) -> Result<(), QueryError> {
+    let want = IMPORT_DIMS
+        .iter()
+        .find(|(t, _)| *t == table)
+        .map(|(_, d)| d.len())
+        .ok_or_else(|| QueryError::internal(anyhow::anyhow!("unknown rollup table {table}")))?;
+    if let Some(r) = rows.iter().find(|r| r.dims.len() != want) {
+        return Err(QueryError::internal(anyhow::anyhow!(
+            "import row for {table} has {} dimensions, expected {want}",
+            r.dims.len()
+        )));
+    }
+    let site = scope.site_id();
+    macro_rules! go {
+        ($ty:ident) => {
+            write_rows(
+                client,
+                table,
+                rows.iter()
+                    .map(|r| $ty::new(site, import_id, tz, r))
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+            .await
+        };
+    }
+    match table {
+        "rollup_site" => go!(SiteImportRow),
+        "rollup_pages" => go!(PagesImportRow),
+        "rollup_entry_pages" => go!(EntryPagesImportRow),
+        "rollup_exit_pages" => go!(ExitPagesImportRow),
+        "rollup_sources" => go!(SourcesImportRow),
+        "rollup_locations" => go!(LocationsImportRow),
+        "rollup_devices" => go!(DevicesImportRow),
+        "rollup_browsers" => go!(BrowsersImportRow),
+        "rollup_os" => go!(OsImportRow),
+        "rollup_events" => go!(EventsImportRow),
+        _ => go!(PropsImportRow),
+    }
+}
+/// 删除一次导入写入的全部汇总行（各表的 `origin = 'import' AND import_id = …`）。幂等。
+pub async fn delete_import(
+    client: &Client,
+    scope: &TenantScope,
+    import_id: u64,
+) -> Result<(), QueryError> {
+    let mut params = Params::default();
+    params.push("site", ParamValue::U64(scope.site_id()));
+    params.push("imp", ParamValue::U64(import_id));
+    for table in Family::TABLES {
         let sql = format!(
-            "DELETE FROM {} WHERE site_id = {{site:UInt64}}{cond}",
-            family.table()
+            "DELETE FROM {table} WHERE site_id = {{site:UInt64}} AND origin = 'import' AND import_id = {{imp:UInt64}}"
         );
         execute(client, &sql, &params).await?;
     }

@@ -623,6 +623,7 @@ TTL minute + INTERVAL 90 DAY DELETE;
 | `rollup_browsers` | `browser` `browser_version` | 同上 |
 | `rollup_os` | `os` `os_version` | 同上 |
 | `rollup_events` | `name` | `visitors` `pageviews` `events`，事件形式的 `visits` |
+| `rollup_props` | `key` `value` | `visitors` `events`。只有导入的数据：原生数据的属性查询走原始层，`rollup_build` 不构建这一族 |
 
 **度量列**（所有表相同，不适用的为 0）与查询引擎组件的度量一一对应：`visitors` `pageviews` `events` `visits_ev`（事件形式）`visits_s`（会话形式）`s_n` `s_pv` `s_dur_ms` `s_eng_ms` `s_eng_n` `b_n` `bounces` `exits` `tp_ms` `tp_n` `sc_sum` `sc_n`。比率在查询时用分子分母重算。
 
@@ -639,7 +640,7 @@ TTL minute + INTERVAL 90 DAY DELETE;
 **用途**
 
 1. 大站长时间范围的加速层（§6.4 选层）；
-2. 存放导入数据（`origin = 'import'`），例如 Plausible 导出的 CSV，它天然对应这些表（P4）；
+2. 存放导入数据（`origin = 'import'`，`import_id` = PG `site_imports.id`）：Plausible 的数据导出（`imported_*.csv`）按族写入，换算规则见 `crates/jobs/src/import_plausible.rs`；只写站点自己的数据开始之前的天，与已有导入重叠时拒绝；用 `rivu import plausible` 导入；
 3. 回答超出原始数据保留期的时间范围（P2，随可配置保留期一起做）。
 
 **访客数跨天直接求和**：访客 ID 每个本地日轮换，而事件保留自己当天的 `visitor_id`（盖章不改写，§4.6、§10 Q9），所以原始层任意范围的 `uniq(visitor_id)` 严格等于各本地日去重访客数之和（R03 §12.2 #16），与日汇总层逐日相加一致。日汇总层只存每日去重的访客数，不需要 HLL 状态。两层都排除 engagement，并用同一个 `uniq`，日汇总层存的就是按同样方法算出的每日值（§6.5、§10 Q10、Q17）。
@@ -775,6 +776,8 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 |---|---|
 | 查询兼容、区间里有已构建的天，且这些天的事件数（`rollup_site.events`）不少于 `RIVU_ROLLUP_MIN_ROWS`（默认 100 万） | `[起点, R]` 用日汇总层（R = 已构建的最后一天），之后的天用原始层，两部分作为组件 `UNION ALL` 后一起聚合 |
 | 查询兼容，区间伸到原始数据保留期之前（站点保留期，§5.6） | 同上，不看行数阈值：保留期之前的天只在汇总层里 |
+| 区间覆盖导入的天（`site_imports` 里已完成的导入），查询兼容 | 同上，不看行数阈值：导入的天只在汇总层里；属性查询（单独一个 `event:props:<k>` 维度）的汇总层只回答导入的天 |
+| 区间覆盖导入的天，但查询不兼容 | 原始层；导入的数据没有算进来，`meta.warnings` 带 `imported_data_excluded` |
 | 区间伸到保留期之前，但查询不兼容 | 原始层；那些天没有数据，`meta.warnings` 带 `range_beyond_raw_retention`（看板显示提示） |
 | 其余 | 原始层 |
 
@@ -787,7 +790,7 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 - 没有 `percentage`、`conversion_rate`；
 - `visits` 的口径（事件形式或会话形式）与族相同，所需度量在该族里都有。
 
-汇总层的行带着全部度量，原始层只在规划用到的组件有数据时才出行，所以汇总组件只取这些组件有数据的行（例如只查 `time_on_page` 时，没有 engagement 事件的页面不出现）。比率在外层用分子分母重算，与 Plausible imported 的合并公式一致（R03 §9.4）。`meta.tiers` 列出这次查询实际用到的层，`log_comment` 的 `tier` 是 `raw`、`rollup` 或 `rollup+raw`。
+汇总层的行带着全部度量，原始层只在规划用到的组件有数据时才出行，所以汇总组件只取这些组件有数据的原生行（例如只查 `time_on_page` 时，没有 engagement 事件的页面不出现）；导入的行都参与（导出里有「有访客、浏览为 0」的行）。比率在外层用分子分母重算，与 Plausible imported 的合并公式一致（R03 §9.4）。`meta.tiers` 列出这次查询实际用到的层，`log_comment` 的 `tier` 是 `raw`、`rollup` 或 `rollup+raw`。
 
 已知近似（`bin/rivu/tests/rollup_tier.rs` 在避开它们的数据上验证两层结果完全相同）：
 

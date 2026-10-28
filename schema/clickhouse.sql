@@ -388,6 +388,38 @@ PARTITION BY toYYYYMM(day)
 ORDER BY (site_id, day, origin, import_id, page)
 SETTINGS index_granularity = 8192;
 
+CREATE TABLE {{database}}.rollup_props
+(
+    `site_id` UInt64,
+    `day` Date,
+    `origin` Enum8('native' = 1, 'import' = 2),
+    `import_id` UInt64,
+    `version` UInt64,
+    `key` String,
+    `value` String,
+    `visitors` UInt64,
+    `pageviews` UInt64,
+    `events` UInt64,
+    `visits_ev` UInt64,
+    `visits_s` UInt64,
+    `s_n` UInt64,
+    `s_pv` UInt64,
+    `s_dur_ms` UInt64,
+    `s_eng_ms` UInt64,
+    `s_eng_n` UInt64,
+    `b_n` UInt64,
+    `bounces` UInt64,
+    `exits` UInt64,
+    `tp_ms` UInt64,
+    `tp_n` UInt64,
+    `sc_sum` UInt64,
+    `sc_n` UInt64
+)
+ENGINE = ReplacingMergeTree(version)
+PARTITION BY toYYYYMM(day)
+ORDER BY (site_id, day, origin, import_id, key, value)
+SETTINGS index_granularity = 8192;
+
 CREATE TABLE {{database}}.rollup_site
 (
     `site_id` UInt64,
