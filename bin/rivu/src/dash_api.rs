@@ -13,6 +13,7 @@
 //! | `POST /api/internal/me/password` | 会话 | 改密码，请求体 `{"current","new"}`；当前密码不对 400 `wrong_password`（总是做哈希校验）、新密码长度不合 400 `invalid_new_password`、与当前相同 400 `same_password`；`(用户, IP)` 5 次 / 60 秒（429）；同一事务换哈希并撤销全部会话，再签发新会话（`Set-Cookie`），响应 `{}` |
 //! | `GET /api/internal/sites` | 会话 | 可见的站点（按组织） |
 //! | `POST /api/internal/sites/{site}/query` | 会话、共享链接或公开站点 | 看板查询，请求体是 `QuerySpec` |
+//! | `POST /api/internal/sites/{site}/property-keys` | 同上 | 属性卡片的键列表：请求体是看板当前的 QuerySpec（只用时间范围与筛选），返回 `{"keys":[{"key","events"}]}`，事件多的在前，至多 100 个 |
 //! | `GET /api/internal/sites/{site}/realtime` | 同上 | 最近 5 分钟的访客，等价于 `date_range: "realtime"` 的 `visitors` 查询 |
 //! | `GET /api/internal/shared/{slug}` | 无（限流） | 共享链接的入口信息：是否要密码、是否已授权；已授权才带站点 |
 //! | `POST /api/internal/shared/{slug}/auth` | 无（限流） | 共享链接密码，通过后签发 12 小时的访问凭证 cookie |
@@ -120,7 +121,9 @@ use rivu_common::config::{
 };
 use rivu_geo::GeoDb;
 use rivu_query::spec::Filter;
-use rivu_query::{ExecOptions, QueryCache, QueryError, QueryResult, QuerySpec};
+use rivu_query::{
+    ExecOptions, QueryCache, QueryError, QueryResult, QuerySpec, SiteContext, TenantScope,
+};
 use rivu_ratelimit::PolicyLimiter;
 use rivu_storage_pg::access::{self, SiteRef, UserSiteRoles};
 use rivu_storage_pg::sessions::ActiveSession;
@@ -1318,22 +1321,25 @@ fn overlay_segment(spec: &mut QuerySpec, filter_json: &str) -> Result<(), ()> {
 fn route_name(surface: &str, op: &str) -> &'static str {
     match (surface, op) {
         ("internal", "query") => "internal.query",
+        ("internal", "property_keys") => "internal.property_keys",
         ("internal", _) => "internal.realtime",
         ("shared", "query") => "shared.query",
+        ("shared", "property_keys") => "shared.property_keys",
         ("shared", _) => "shared.realtime",
         (_, "query") => "public.query",
+        (_, "property_keys") => "public.property_keys",
         _ => "public.realtime",
     }
 }
 
 impl DashApi {
-    async fn execute(
+    /// 查询前的公共准备：共享链接绑定的 segment 叠加到过滤上、读站点上下文、按调用方定超时与 `log_comment`。
+    async fn prepare(
         &self,
         auth: &Authorized,
-        mut spec: QuerySpec,
-        op: &'static str,
-    ) -> Result<QueryResult, DashError> {
-        let route = route_name(auth.principal.surface(), op);
+        spec: &mut QuerySpec,
+        route: &'static str,
+    ) -> Result<(SiteContext, ExecOptions, u64), DashError> {
         let (timeout, comment): (u64, Option<(&str, i64)>) = match &auth.principal {
             Principal::Session(c) => (self.dashboard_timeout_secs, Some(("user", c.s.user_id))),
             Principal::Shared(l) => (self.public_timeout_secs, Some(("shared_link", l.id))),
@@ -1341,7 +1347,7 @@ impl DashApi {
         };
         if let Principal::Shared(l) = &auth.principal
             && let Some(filter) = &l.segment_filter
-            && overlay_segment(&mut spec, filter).is_err()
+            && overlay_segment(spec, filter).is_err()
         {
             tracing::error!(link_id = l.id, "共享链接绑定的 segment 过滤无法解析");
             return Err(DashError::Internal);
@@ -1366,6 +1372,17 @@ impl DashApi {
             opts = opts.with_comment(k, v);
         }
         opts.rollup_min_rows = self.rollup_min_rows;
+        Ok((site, opts, timeout))
+    }
+
+    async fn execute(
+        &self,
+        auth: &Authorized,
+        mut spec: QuerySpec,
+        op: &'static str,
+    ) -> Result<QueryResult, DashError> {
+        let route = route_name(auth.principal.surface(), op);
+        let (site, opts, timeout) = self.prepare(auth, &mut spec, route).await?;
         query_api::execute_cached(
             &self.reader,
             self.cache.as_deref(),
@@ -1379,14 +1396,9 @@ impl DashApi {
     }
 }
 
-async fn site_query(
-    State(api): State<Arc<DashApi>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    Path(site_seg): Path<String>,
-    req: Request,
-) -> Res<Response> {
-    let headers = req.headers().clone();
-    let auth = api.authorize(peer, &headers, &site_seg).await?;
+/// 看板请求体里的 QuerySpec：`site`（site_key）可以省略，给出时必须与路径指向的站点一致，否则 404（不是 400：
+/// 不让调用者靠「改 site」来探测别的站点），`resolve` 还会再核对一次。
+async fn read_spec(api: &DashApi, auth: &Authorized, req: Request) -> Res<QuerySpec> {
     let bytes = query_api::read_body(req, QUERY_BODY_MAX)
         .await
         .map_err(|f| DashError::Fail(f, api.dashboard_timeout_secs))?;
@@ -1396,8 +1408,6 @@ async fn site_query(
             api.dashboard_timeout_secs,
         )
     })?;
-    // 请求体里的 `site`（site_key）可以省略；给出时必须与路径指向的站点一致，否则 404（不是 400：
-    // 不让调用者靠「改 site」来探测别的站点），`resolve` 还会再核对一次
     if let Some(Value::String(key)) = value.get("site")
         && *key != auth.site.site_key
     {
@@ -1407,7 +1417,45 @@ async fn site_query(
         Principal::Session(_) => api.dashboard_timeout_secs,
         _ => api.public_timeout_secs,
     };
-    let spec = QuerySpec::parse(&value).map_err(|e| DashError::Fail(Fail::Query(e), timeout))?;
+    QuerySpec::parse(&value).map_err(|e| DashError::Fail(Fail::Query(e), timeout))
+}
+
+/// 属性卡片的键列表：请求体是看板当前的 QuerySpec（只用时间范围与筛选），返回 `{"keys":[{"key","events"}]}`。
+async fn site_property_keys(
+    State(api): State<Arc<DashApi>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path(site_seg): Path<String>,
+    req: Request,
+) -> Res<Response> {
+    let headers = req.headers().clone();
+    let auth = api.authorize(peer, &headers, &site_seg).await?;
+    let mut spec = read_spec(&api, &auth, req).await?;
+    let route = route_name(auth.principal.surface(), "property_keys");
+    let (site, opts, timeout) = api.prepare(&auth, &mut spec, route).await?;
+    let keys = rivu_query::property_keys(
+        &api.reader,
+        &TenantScope::new(site.site_id),
+        &site,
+        spec,
+        opts,
+    )
+    .await
+    .map_err(|e| DashError::Fail(Fail::Query(e), timeout))?;
+    let resp = ns(Json(json!({ "keys": keys })).into_response());
+    Ok(match &auth.principal {
+        Principal::Session(ctx) => api.finish(resp, ctx),
+        _ => resp,
+    })
+}
+async fn site_query(
+    State(api): State<Arc<DashApi>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path(site_seg): Path<String>,
+    req: Request,
+) -> Res<Response> {
+    let headers = req.headers().clone();
+    let auth = api.authorize(peer, &headers, &site_seg).await?;
+    let spec = read_spec(&api, &auth, req).await?;
     let result = api.execute(&auth, spec, "query").await?;
     let resp = ns(Json(result).into_response());
     Ok(match &auth.principal {
@@ -1415,7 +1463,6 @@ async fn site_query(
         _ => resp,
     })
 }
-
 async fn site_realtime(
     State(api): State<Arc<DashApi>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -1678,6 +1725,12 @@ pub fn router(api: Arc<DashApi>) -> Router {
         ))
         .merge(endpoint(
             a,
+            "internal.site_property_keys",
+            "/api/internal/sites/{site}/property-keys",
+            post_only(post(site_property_keys)),
+        ))
+        .merge(endpoint(
+            a,
             "internal.shared_info",
             "/api/internal/shared/{slug}",
             get_only(get(shared_info)),
@@ -1896,6 +1949,10 @@ mod tests {
         assert_eq!(route_name("shared", "realtime"), "shared.realtime");
         assert_eq!(route_name("public", "query"), "public.query");
         assert_eq!(route_name("public", "realtime"), "public.realtime");
+        assert_eq!(
+            route_name("shared", "property_keys"),
+            "shared.property_keys"
+        );
     }
 
     #[test]

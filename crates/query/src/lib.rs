@@ -33,7 +33,7 @@ mod sql_tests;
 
 pub use cache::QueryCache;
 pub use error::QueryError;
-pub use exec::{ExecOptions, execute, explain};
+pub use exec::{ExecOptions, PropertyKey, execute, explain, property_keys};
 pub use resolve::{GoalDef, GoalKind, ResolvedQuery, SiteContext};
 pub use result::QueryResult;
 pub use spec::QuerySpec;

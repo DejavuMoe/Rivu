@@ -1073,6 +1073,18 @@ async fn http_endpoint_end_to_end() {
     )
     .await;
     assert_eq!(seats.results[0].metrics[0].as_f64(), 1.0);
+    // 属性键列表：事件多的在前
+    let keys = rivu_query::property_keys(
+        &reader,
+        &TenantScope::new(created.id),
+        &SiteContext::new(created.id, TimeZone::UTC),
+        QuerySpec::parse(&json!({"metrics": ["events"], "date_range": "day"})).unwrap(),
+        ExecOptions::new(QUERY_TIMEOUT_SECS),
+    )
+    .await
+    .expect("属性键");
+    let keys: Vec<(String, u64)> = keys.into_iter().map(|k| (k.key, k.events)).collect();
+    assert_eq!(keys, vec![("plan".to_owned(), 3), ("seats".to_owned(), 1)]);
     cleanup(&admin_client(&env.ch_url), created.id).await;
 }
 
