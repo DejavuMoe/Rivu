@@ -21,9 +21,9 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
-url.workspace = true
 clap.workspace = true
 clickhouse.workspace = true
+csv.workspace = true
 http-body-util.workspace = true
 jiff.workspace = true
 metrics.workspace = true
@@ -49,6 +49,8 @@ sha2.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+url.workspace = true
+zip.workspace = true
 
 [dev-dependencies]
 clickhouse = { workspace = true, features = ["time", "uuid"] }
@@ -58,5 +60,4 @@ time.workspace = true
 tower.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
-zip.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

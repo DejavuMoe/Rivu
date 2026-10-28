@@ -13,7 +13,8 @@
 //! | `POST /api/internal/me/password` | 会话 | 改密码，请求体 `{"current","new"}`；当前密码不对 400 `wrong_password`（总是做哈希校验）、新密码长度不合 400 `invalid_new_password`、与当前相同 400 `same_password`；`(用户, IP)` 5 次 / 60 秒（429）；同一事务换哈希并撤销全部会话，再签发新会话（`Set-Cookie`），响应 `{}` |
 //! | `GET /api/internal/sites` | 会话 | 可见的站点（按组织） |
 //! | `POST /api/internal/sites/{site}/query` | 会话、共享链接或公开站点 | 看板查询，请求体是 `QuerySpec` |
-//! | `POST /api/internal/sites/{site}/property-keys` | 同上 | 属性卡片的键列表：请求体是看板当前的 QuerySpec（只用时间范围与筛选），返回 `{"keys":[{"key","events"}]}`，事件多的在前，至多 100 个 |
+//! | `POST /api/internal/sites/{site}/property-keys` | 同上 | 属性卡片的键列表：请求体是看板当前的 QuerySpec（只用时间范围与筛选），返回 `{"keys":[{"key","events"}]}`，事件多的在前，至多 100 个；含导入的属性（区间覆盖导入的天、没有筛选时） |
+//! | `POST /api/internal/sites/{site}/export` | 会话，有效角色 editor+（`export.create`） | CSV 导出：请求体 `{"date_range","filters"?,"interval"?}`，返回 zip（`Content-Disposition: attachment`），文件与列见 [`crate::export`] |
 //! | `GET /api/internal/sites/{site}/realtime` | 同上 | 最近 5 分钟的访客，等价于 `date_range: "realtime"` 的 `visitors` 查询 |
 //! | `GET /api/internal/shared/{slug}` | 无（限流） | 共享链接的入口信息：是否要密码、是否已授权；已授权才带站点 |
 //! | `POST /api/internal/shared/{slug}/auth` | 无（限流） | 共享链接密码，通过后签发 12 小时的访问凭证 cookie |
@@ -1473,6 +1474,77 @@ async fn site_query(
         _ => resp,
     })
 }
+/// CSV 导出：请求体 `{"date_range","filters"?,"interval"?}`（看板当前视图），返回 zip（见 [`crate::export`]）。
+/// 只认登录会话，有效角色 editor+（`export.create`）；共享链接与公开站点不能导出。
+async fn site_export(
+    State(api): State<Arc<DashApi>>,
+    Path(site_seg): Path<String>,
+    req: Request,
+) -> Res<Response> {
+    let headers = req.headers().clone();
+    let c = api
+        .authorize_admin(&headers, &site_seg, Action::ExportsRead, false)
+        .await?;
+    let timeout = api.dashboard_timeout_secs;
+    let bytes = query_api::read_body(req, QUERY_BODY_MAX)
+        .await
+        .map_err(|f| DashError::Fail(f, timeout))?;
+    let invalid = |e: QueryError| DashError::Fail(Fail::Query(e), timeout);
+    let value: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| invalid(QueryError::validation("", "the body is not valid JSON")))?;
+    if let Some(Value::String(key)) = value.get("site")
+        && *key != c.site.site_key
+    {
+        return Err(DashError::NotFound);
+    }
+    let request = crate::export::ExportRequest::parse(&value).map_err(invalid)?;
+    let summary = access::site_summary(&api.pg, c.site.id)
+        .await?
+        .ok_or(DashError::NotFound)?;
+    let auth = Authorized {
+        site: c.site,
+        principal: Principal::Session(c.session),
+    };
+    const ROUTE: &str = "internal.export";
+    let mut keys_spec = request.keys_spec().map_err(invalid)?;
+    let (site, opts, _) = api.prepare(&auth, &mut keys_spec, ROUTE).await?;
+    let keys: Vec<String> = rivu_query::property_keys(
+        &api.reader,
+        &TenantScope::new(site.site_id),
+        &site,
+        keys_spec,
+        opts.clone(),
+    )
+    .await
+    .map_err(invalid)?
+    .into_iter()
+    .map(|k| k.key)
+    .collect();
+    let (reader, cache, site_ref) = (&api.reader, api.cache.as_deref(), &site);
+    let export = crate::export::build(&request, &keys, move |spec| {
+        query_api::execute_cached(reader, cache, site_ref, spec, opts.clone(), ROUTE)
+    })
+    .await
+    .map_err(invalid)?;
+    let name = crate::export::file_name(&summary.name, &export);
+    let mut resp = ns((
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/zip"),
+        )],
+        export.zip,
+    )
+        .into_response());
+    if let Ok(v) = HeaderValue::from_str(&format!("attachment; filename=\"{name}\"")) {
+        resp.headers_mut().insert(header::CONTENT_DISPOSITION, v);
+    }
+    Ok(match &auth.principal {
+        Principal::Session(ctx) => api.finish(resp, ctx),
+        _ => resp,
+    })
+}
+
 async fn site_realtime(
     State(api): State<Arc<DashApi>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -1732,6 +1804,12 @@ pub fn router(api: Arc<DashApi>) -> Router {
             "internal.site_realtime",
             "/api/internal/sites/{site}/realtime",
             get_only(get(site_realtime)),
+        ))
+        .merge(endpoint(
+            a,
+            "internal.site_export",
+            "/api/internal/sites/{site}/export",
+            post_only(post(site_export)),
         ))
         .merge(endpoint(
             a,

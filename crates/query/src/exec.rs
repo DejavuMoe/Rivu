@@ -617,7 +617,12 @@ pub async fn property_keys(
         imported: None,
     };
     let data_start = if matches!(spec.date_range, DateRange::All) {
-        first_event_ms(&cx).await?
+        let first = first_event_ms(&cx).await?;
+        let imported = match site.imported {
+            Some((from, _)) => Some(day_start_ms(&site.timezone, from)?),
+            None => None,
+        };
+        first.into_iter().chain(imported).min()
     } else {
         None
     };
@@ -625,19 +630,38 @@ pub async fn property_keys(
     let plan = plan::plan(&q);
     let (sql, params) =
         sql::property_keys_query(scope, &q, &plan, q.interval, MAX_LISTED_PROPERTY_KEYS);
-    let rows = cx.run("property_keys", &sql, &params).await?;
-    rows.into_iter()
-        .map(|r| {
-            let key = r.first().and_then(Value::as_str).map(str::to_owned);
-            let events = r.get(1).and_then(cell_u64);
-            match (key, events) {
-                (Some(key), Some(events)) => Ok(PropertyKey { key, events }),
-                _ => Err(QueryError::internal(anyhow::anyhow!(
-                    "unexpected ClickHouse row (property_keys)"
-                ))),
-            }
-        })
-        .collect()
+    let mut rows = cx.run("property_keys", &sql, &params).await?;
+    // 导入的属性只在汇总层（`rollup_props`）：区间覆盖导入的天、又没有筛选时（汇总层不能按别的维度筛选）把它们的键也算上
+    if let (Some((imp_from, imp_to)), &IntervalKind::Dates { from, to }, None) =
+        (site.imported, &q.interval.kind, &q.filter)
+        && from <= imp_to
+        && to >= imp_from
+    {
+        let (sql, params) = sql::imported_property_keys_query(
+            scope,
+            &from.max(imp_from).to_string(),
+            &to.min(imp_to).to_string(),
+            MAX_LISTED_PROPERTY_KEYS,
+        );
+        rows.extend(cx.run("property_keys.imported", &sql, &params).await?);
+    }
+    let mut keys: Vec<PropertyKey> = Vec::new();
+    for r in rows {
+        let key = r.first().and_then(Value::as_str).map(str::to_owned);
+        let events = r.get(1).and_then(cell_u64);
+        let (Some(key), Some(events)) = (key, events) else {
+            return Err(QueryError::internal(anyhow::anyhow!(
+                "unexpected ClickHouse row (property_keys)"
+            )));
+        };
+        match keys.iter_mut().find(|k| k.key == key) {
+            Some(k) => k.events += events,
+            None => keys.push(PropertyKey { key, events }),
+        }
+    }
+    keys.sort_by(|a, b| b.events.cmp(&a.events).then_with(|| a.key.cmp(&b.key)));
+    keys.truncate(MAX_LISTED_PROPERTY_KEYS as usize);
+    Ok(keys)
 }
 
 /// 执行一条 `QuerySpec`。

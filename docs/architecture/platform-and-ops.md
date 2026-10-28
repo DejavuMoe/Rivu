@@ -106,8 +106,9 @@ Rivu 只支持单实例：会话分配依赖单写者，同一时间只能有一
 | `salts` | 访客 ID 盐 | `day` PK、`salt bytea(16)` | 见 3.3 |
 | `jobs` | 后台任务队列 | `kind`、`payload`、`state`、`run_at`、`attempts`、`locked_until`、`unique_key` | 见 3.3 |
 | `pending_stats_deletions` | ClickHouse 删除意图（04§1.2 有同名表，用途为推断） | `site_id`、`scope`、`date_from/to`、`status`、`partitions_done` | 见 3.3 |
-| `imports` | 历史数据导入（04§1.2 `site_imports`） | `site_id`、`source`、`status`、`date_from/to`、`rows_imported`、`error` | `INDEX(site_id,created_at DESC)` |
-| `exports` | 数据导出（04§8） | `site_id`、`requested_by`、`status`、`storage` ∈ s3/local、`object_key`、`expires_at` | `INDEX(site_id,created_at DESC)` |
+| `site_imports` | 历史数据导入（Plausible 导出的 zip；数据在 ClickHouse 日汇总层，`origin = 'import'`） | `site_id`、`source`、`status` ∈ importing/completed/failed、`file_name`、`start_date`/`end_date`、`rows_imported`、`error_code`、`error`、`imported_by` | `INDEX(site_id)`；部分唯一 `(site_id) WHERE status = 'importing'`：一个站点同时只跑一个导入 |
+
+导出不建表：CSV 导出是同步的（看板当前视图的趋势与各维度明细，一次请求返回 zip，见 `bin/rivu/src/export.rs`），不落盘、不排队。
 
 不建 Plausible 的计费与套餐、SSO/OAuth、`trial_prospects`、`google_auth`、各类邮件去重表（改用 `jobs.unique_key`）（04§1.2、04§5）。
 
@@ -347,8 +348,7 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 | `site_delete_schedule` | 无 | — | 不需要单独的任务：删除站点的同一事务里直接插入 `scope='site'` 意图，`not_before = 删除时刻 + RIVU_SITE_RESTORE_DAYS`，到期由 `ch_delete_batch` 领取；恢复站点把意图置为 `cancelled`。部分唯一索引保证一个站点只有一条未取消的站点意图 |
 | `geoip_refresh` | 进程启动（无本地副本时立即执行）+ 定时 | 每 `RIVU_GEOIP_REFRESH_INTERVAL`（默认 24h；`0` 表示不定期刷新）。有本地副本时，第一次检查在 meta 最近检查时间加一个周期（带抖动），已过期则立即 | 来源按优先级选择：`RIVU_GEOIP_DB_URL` > `RIVU_MAXMIND_LICENSE_KEY` > DB-IP Lite（默认），所以默认配置下也会运行。条件 GET（ETag / Last-Modified）；服务器没有校验头就整文件下载，按解压后 mmdb 的 SHA-256 判断是否替换；临时文件校验后原子 rename；失败保留上一份有效副本并退避重试。没有 meta 的文件：默认来源不刷新，配置了 URL 或 key 则立即下载（`system-design.md` §10 Q28）。进程内定时器（同 `salts_rotate`），不经任务队列；临时文件校验后原子替换，下载成功后直接热加载，另外每小时检查 mtime（手工替换文件时生效，§10 Q25）。细节见 `system-design.md` §4.4（04§4.2 `MAXMIND_*`；Plausible 在构建时下载库） |
 | `sources_update` | cron | 每周 | 只更新垃圾 referrer 名单，原子替换。来源分类库（Matomo 数据加补充表）和 UA 规则库（uap-core）在编译期嵌入，随版本升级，不在线更新、不联网（`system-design.md` §4.4、§10 Q20） |
-| `import_run` | 用户触发 | 按需 | `unique_key = import:{id}`，`max_attempts = 3`；永久失败不重试（04§3.2 `ImportAnalytics`、04§8） |
-| `export_build` | 用户触发 | 按需 | `unique_key = export:{id}`，超时 15 分钟；ClickHouse 流式输出，S3 multipart 或本地临时文件后原子移动（04§8、04§9.10）；完成后由独立任务 `export_notify` 发邮件（`max_attempts = 5`，04§3.2） |
+| 导入 | 上传 Plausible 导出（看板或 `rivu import plausible`） | 按需 | 进程内任务（`rivu_jobs::import_plausible`），不经任务队列：先建 `site_imports` 记录（`importing`），写完各汇总表后置 `completed`；失败删除已写入的汇总行并置 `failed`（带 `error_code`）。进程启动时把仍是 `importing` 的记录当作中断：删除汇总行、置 `failed`（`interrupted`）。同一段日期不能导入两次 |
 | `ingest_counters` 过期 | 表级 TTL | 无 | 由 ClickHouse TTL 处理（默认 90 天，见 `system-design.md` §5.4），不需要单独任务 |
 | `tombstone_purge` | cron | 每日 | 硬删除 30 天前的软删除行（`sites` 除外） |
 | `jobs_reaper`、`jobs_prune` | cron | 每分钟 / 每日 | 租约回收；清理历史 |
@@ -535,6 +535,6 @@ Plausible 自定义指标覆盖缓存命中、ingest buffer 入队与丢弃、�
 | schema 快照 | `structure.sql` 陈旧，CE/EE 分叉（04§0#1、04§9.6） | 改：CI 强制快照与迁移一致；无 CE/EE | 避免真相漂移 |
 | 指标与就绪 | PromEx 默认关；就绪查 PG、CH、缓存（04§0#6、04§6、04§9.8） | 改：指标默认开仅内部口；就绪增加盐、schema | 自托管排障；覆盖全部依赖 |
 | 日志、追踪、错误上报 | 请求日志含查询串；span 含邮箱；Sentry 过滤（04§6） | 改：不记查询串与邮箱；白名单载荷 | 隐私 |
-| 导入导出 | CSV 流式、S3 multipart、本地原子移动、15 分钟超时、独立通知任务（04§8、04§9.10） | 借鉴 | 避免大结果集占内存 |
+| 导入导出 | CSV 流式、S3 multipart、本地原子移动、15 分钟超时、独立通知任务（04§8、04§9.10） | 改：导出是同步的聚合报表（每个文件至多 1 万行，走日汇总层，内存里打包）；导入读 Plausible 自己的导出格式，写进日汇总层 | 单实例；聚合结果小，不需要对象存储与通知 |
 | 入口与分层 | `db <name>` 脚本；编译期 CE/EE（04§7.1、04§5） | 改：`rivu` 子命令；单一代码库 | 单二进制；无需两套迁移 |
 | 杂项表 | 每类邮件一张去重表、`tracker_script_configuration`、云端任务（04§1.2、04§3.2） | 改：`jobs.unique_key`、`site_settings.tracker`；云端任务不借鉴 | 少表；不适用 |
