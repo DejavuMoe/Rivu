@@ -239,6 +239,8 @@ struct Resp {
     status: u16,
     headers: Vec<(String, String)>,
     body: String,
+    /// 响应体原样的字节（二进制响应用，如导出的 zip）。
+    bytes: Vec<u8>,
 }
 
 impl Resp {
@@ -365,6 +367,7 @@ impl Rb<'_> {
                 .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned()))
                 .collect(),
             body: String::from_utf8_lossy(&raw[split..]).into_owned(),
+            bytes: raw[split..].to_vec(),
         }
     }
 }
@@ -1950,6 +1953,96 @@ async fn session_queries_equal_direct_execution_and_site_access_is_uniform() {
         .send()
         .await;
     assert_eq!(r.status, 404);
+
+    // CSV 导出：editor+（viewer 403），数字与直接查询一致
+    let export_path = format!("/api/internal/sites/{}/export", site_a.id);
+    let export_body = json!({"date_range": ["2026-03-09", "2026-03-11"]});
+    let r = http
+        .post(&export_path, &export_body)
+        .cookie(&c_viewer)
+        .send()
+        .await;
+    assert_eq!(r.status, 403, "{}", r.body);
+    let r = http
+        .post(&export_path, &export_body)
+        .cookie(&c_outsider)
+        .send()
+        .await;
+    assert_eq!(r.status, 404, "{}", r.body);
+    let r = http
+        .post(&export_path, &json!({"date_range": "realtime"}))
+        .cookie(&c_owner)
+        .send()
+        .await;
+    assert_eq!(r.status, 400, "{}", r.body);
+    let r = http
+        .post(&export_path, &export_body)
+        .cookie(&c_owner)
+        .send()
+        .await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.header("content-type"), Some("application/zip"));
+    assert_eq!(r.header("cache-control"), Some("no-store"));
+    let disposition = r.header("content-disposition").unwrap_or_default();
+    assert!(
+        disposition.starts_with("attachment; filename=\"rivu-")
+            && disposition.ends_with("-2026-03-09-2026-03-11.zip\""),
+        "{disposition}"
+    );
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(r.bytes.clone())).expect("zip");
+    let mut read = |name: &str| {
+        let mut s = String::new();
+        std::io::Read::read_to_string(&mut zip.by_name(name).expect(name), &mut s).unwrap();
+        s
+    };
+    // 趋势：三天都在（没有数据的天记 0），列与请求的指标一致
+    let trend = read("visitors.csv");
+    let lines: Vec<&str> = trend.lines().collect();
+    assert_eq!(
+        lines[0],
+        "\u{feff}date,visitors,visits,pageviews,views_per_visit,bounce_rate,visit_duration"
+    );
+    assert_eq!(lines.len(), 4, "{trend}");
+    // 国家明细与直接查询相同
+    let want: Value = serde_json::from_str(
+        &direct(
+            &server,
+            &site_a,
+            &json!({"metrics": ["visitors", "visits", "pageviews", "bounce_rate", "visit_duration"],
+                    "dimensions": ["visit:country"], "date_range": ["2026-03-09", "2026-03-11"],
+                    "pagination": {"limit": 10000}}),
+        )
+        .await,
+    )
+    .unwrap();
+    let countries = read("countries.csv");
+    let mut got = countries.lines();
+    assert_eq!(
+        got.next(),
+        Some("\u{feff}country,visitors,visits,pageviews,bounce_rate,visit_duration")
+    );
+    let rows = want["results"].as_array().unwrap();
+    assert!(!rows.is_empty());
+    for (line, row) in got.zip(rows) {
+        let cols: Vec<&str> = line.split(',').collect();
+        assert_eq!(cols[0], row["dimensions"][0], "{line}");
+        assert_eq!(cols[1], row["metrics"][0].to_string(), "{line}");
+        assert_eq!(cols[3], row["metrics"][2].to_string(), "{line}");
+    }
+    for f in [
+        "sources.csv",
+        "pages.csv",
+        "entry_pages.csv",
+        "browser_versions.csv",
+        "custom_props.csv",
+        "conversions.csv",
+    ] {
+        assert!(!read(f).is_empty(), "{f}");
+    }
+    assert_eq!(
+        read("custom_props.csv"),
+        "\u{feff}property,value,visitors,events\n"
+    );
 
     // 请求体里的 site 与路径不一致：404（与「站点不存在」同一个响应）
     let spec = &specs()[0].1;

@@ -329,6 +329,23 @@ async fn plausible_export_is_imported_into_the_rollup_tier() {
         cross.meta.warnings
     );
 
+    // 属性键列表也包括导入的键（看板属性卡片与导出用）
+    let keys = rivu_query::property_keys(
+        &reader,
+        &TenantScope::new(site.site_id),
+        &site,
+        QuerySpec::parse(&json!({"metrics": ["events"], "date_range": all})).unwrap(),
+        ExecOptions::new(15).with_now("2026-07-01T12:00:00Z".parse::<Timestamp>().unwrap()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        keys.iter()
+            .map(|k| (k.key.as_str(), k.events))
+            .collect::<Vec<_>>(),
+        [("url", 5), ("plan", 2)]
+    );
+
     // ---- 重复导入被拒绝；删除 ------------------------------------------------------------------
     let again = rivu_jobs::import_plausible::import_file(
         &pg,

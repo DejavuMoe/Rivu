@@ -7,6 +7,7 @@ pub mod cli;
 pub mod dash_api;
 pub mod dashboard;
 pub mod diagnostics;
+pub mod export;
 pub mod goals_admin;
 pub mod healthcheck;
 pub mod imports_admin;

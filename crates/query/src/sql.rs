@@ -1330,6 +1330,26 @@ pub(crate) fn property_keys_query(
     (sql, b.params)
 }
 
+/// 导入的属性键（`rollup_props`，只有导入的行）：`[from, to]` 是站点本地日。
+pub(crate) fn imported_property_keys_query(
+    scope: &TenantScope,
+    from: &str,
+    to: &str,
+    limit: u64,
+) -> (String, Params) {
+    let mut params = Params::default();
+    params.push("site", ParamValue::U64(scope.site_id()));
+    params.push("from_day", ParamValue::Date(from.to_owned()));
+    params.push("to_day", ParamValue::Date(to.to_owned()));
+    params.push("lim", ParamValue::U64(limit));
+    let sql = "SELECT key, sum(events) AS c FROM rollup_props FINAL \
+               WHERE site_id = {site:UInt64} AND origin = 'import' \
+               AND day >= {from_day:Date} AND day <= {to_day:Date} \
+               GROUP BY key ORDER BY c DESC, key ASC LIMIT {lim:UInt64}"
+        .to_owned();
+    (sql, params)
+}
+
 /// 站点最早事件的时间（`date_range = all`）：`(行数, 毫秒)`，没有数据时行数为 0。
 /// 用排序键 `(site_id, toDate(ts), …)` 的前缀读最早的一天，再取这一天里最早的时刻。
 pub(crate) fn first_event_query(scope: &TenantScope) -> (String, Params) {
