@@ -4,9 +4,9 @@
 //! 无表单提交；同源部署不开 CORS。实现（比文档更严一点）：
 //!
 //! 1. 只检查会改变状态的方法（`POST`、`PUT`、`PATCH`、`DELETE`；`GET`、`HEAD`、`OPTIONS` 放行——内部的 `GET` 端点都是只读的）；
-//! 2. `Content-Type` 必须是 `application/json`（参数如 `; charset=utf-8` 忽略）：跨站的 `<form>` 只能发
-//!    `application/x-www-form-urlencoded`、`multipart/form-data`、`text/plain`，发 JSON 要走 `fetch`，而没有 CORS 应答
-//!    时浏览器会在预检就拦下；
+//! 2. `Content-Type` 必须是 `application/json`（参数如 `; charset=utf-8` 忽略），上传导出的 zip 用 `application/zip`：
+//!    跨站的 `<form>` 只能发 `application/x-www-form-urlencoded`、`multipart/form-data`、`text/plain`，别的类型要走
+//!    `fetch`，而没有 CORS 应答时浏览器会在预检就拦下；
 //! 3. 必须带 `Origin`，且与 `RIVU_BASE_URL` 的源（协议、主机、端口，不只是主机）相同；`Origin: null`、缺失、
 //!    别的源一律拒绝。浏览器对所有 `POST` 与跨源请求都会发 `Origin`，所以缺失说明不是浏览器的同源请求；
 //!    非浏览器客户端（运维脚本）用命令行 `rivu ...`，公开 API 用 API key；
@@ -20,7 +20,7 @@ use url::{Origin, Url};
 /// CSRF 判定失败的原因（响应里只给通用文字）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CsrfError {
-    /// `Content-Type` 不是 `application/json`。
+    /// `Content-Type` 不是 `application/json`（或 `application/zip`）。
     ContentType,
     /// 没有 `Origin`（或不止一个）。
     OriginMissing,
@@ -70,9 +70,11 @@ impl Csrf {
             .collect::<Vec<_>>();
         let is_json = json.len() == 1
             && json[0].to_str().is_ok_and(|v| {
-                v.split(';')
-                    .next()
-                    .is_some_and(|m| m.trim().eq_ignore_ascii_case("application/json"))
+                v.split(';').next().is_some_and(|m| {
+                    let m = m.trim();
+                    m.eq_ignore_ascii_case("application/json")
+                        || m.eq_ignore_ascii_case("application/zip")
+                })
             });
         if !is_json {
             return Err(CsrfError::ContentType);
@@ -140,6 +142,12 @@ mod tests {
             ("origin", "https://stats.example.com"),
         ]);
         assert_eq!(csrf().check(&Method::POST, &ok), Ok(()));
+        // 上传导出：同样不是表单能发的类型
+        let zip = headers(&[
+            ("content-type", "application/zip"),
+            ("origin", "https://stats.example.com"),
+        ]);
+        assert_eq!(csrf().check(&Method::POST, &zip), Ok(()));
     }
 
     #[test]

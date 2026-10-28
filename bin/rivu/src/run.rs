@@ -347,9 +347,15 @@ pub async fn run(config: Config) -> Result<ExitCode> {
         config.ch_database.clone(),
         bg_stop_rx.clone(),
     ));
+    // 上次进程退出时没导完的导入：删除写到一半的汇总行，置为失败
+    match rivu_jobs::import_plausible::recover_interrupted(&pg, &maintainer).await {
+        Ok(0) => {}
+        Ok(n) => tracing::warn!(imports = n, "已清理上次没有完成的导入"),
+        Err(e) => tracing::error!(error = %format!("{e:#}"), "清理没有完成的导入失败"),
+    }
     background.push(rivu_jobs::spawn_rollup_build(
         pg.clone(),
-        maintainer,
+        maintainer.clone(),
         config.rollup_interval,
         bg_stop_rx.clone(),
     ));
@@ -436,6 +442,7 @@ pub async fn run(config: Config) -> Result<ExitCode> {
         )
         .context("装配内部端点失败")?
         .with_stats_delete_kick(Some(stats_delete_kick))
+        .with_maintainer(maintainer)
         .with_cache(Arc::clone(&query_cache)),
     );
     background.push(dash_api::spawn_maintenance(pg.clone(), bg_stop_rx.clone()));

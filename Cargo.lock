@@ -2321,7 +2321,9 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
+ "zip",
 ]
 
 [[package]]
@@ -2429,8 +2431,10 @@ dependencies = [
  "parking_lot",
  "rand 0.9.5",
  "rivu-common",
+ "rivu-domain",
  "rivu-geo",
  "rivu-query",
+ "rivu-source",
  "rivu-storage-pg",
  "sqlx",
  "tokio",

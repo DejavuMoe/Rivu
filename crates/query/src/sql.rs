@@ -1283,7 +1283,7 @@ pub(crate) fn rollup_probe_query(
     };
     let sql = format!(
         "SELECT toString(maxOrNull(day)), countIf(origin = 'native' AND tz != {{tz:String}}), \
-         sumIf(events, day >= {{from_day:Date}} AND day <= {{to_day:Date}}) \
+         sumIf(events, day >= {{from_day:Date}} AND day <= {{to_day:Date}}), toString(minOrNull(day)) \
          FROM rollup_site FINAL WHERE site_id = {{site:UInt64}}{origin}"
     );
     (sql, params)

@@ -10,6 +10,7 @@
 //! - `site_delete_and_restore`：权限（非成员 404、低角色 403）、删除写入意图、已删除列表、恢复与意图取消、
 //!   恢复后再删除（部分唯一索引）、窗口已过或清除已开始时 409；
 //! - `stats_deletion_requests`：日期范围的校验、权限、列表顺序；
+//! - `plausible_imports_over_http`：上传导出、后台导入完成、带代码的失败、同一站点一次只跑一个导入、删除；
 //! - `purge_deletes_exactly_the_targeted_rows`：两个站点、多个日期与分区的 events / sessions / ingest_counters，
 //!   按日期范围删除（站点时区 +8，跨 UTC 月界）与整站删除只删目标行；`partitions_done` 断点续跑；重复执行幂等。
 
@@ -261,6 +262,12 @@ impl Http {
             .header("Origin", &self.origin)
     }
 
+    fn upload(&self, path: &str, body: Vec<u8>) -> Rb<'_> {
+        self.rb("POST", path, body)
+            .header("Content-Type", "application/zip")
+            .header("Origin", &self.origin)
+    }
+
     fn post(&self, path: &str, body: &Value) -> Rb<'_> {
         self.json_rb("POST", path, body)
     }
@@ -278,6 +285,11 @@ async fn start(env: &TestEnv, pg: &PgPool) -> Http {
     let dash = DashApi::new(&cfg, pg.clone(), reader, None)
         .expect("装配内部端点")
         .with_limits(loose())
+        .with_maintainer(rivu_storage_ch::client(
+            &env.ch_url,
+            &account("maintainer"),
+            Some(&ch_database()),
+        ))
         .with_clock(move || now);
     let app = public::router_full(None, None, Some(dash_api::router(Arc::new(dash))));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -669,6 +681,202 @@ async fn site_delete_and_restore() {
 
 // ------------------------------------------------------------------ 日期范围删除请求
 
+// ------------------------------------------------------------------ Plausible 导入
+
+/// 只有 `imported_visitors` 的最小导出（其余族可以缺）。
+fn visitors_zip() -> Vec<u8> {
+    use std::io::Write;
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    zip.start_file(
+        "imported_visitors_20260601_20260603.csv",
+        zip::write::SimpleFileOptions::default(),
+    )
+    .unwrap();
+    zip.write_all(
+        b"\"date\",\"visitors\",\"pageviews\",\"bounces\",\"visits\",\"visit_duration\"\n\
+          \"2026-06-01\",10,20,5,12,600\n\"2026-06-02\",8,15,4,9,300\n\"2026-06-03\",5,7,2,6,120\n",
+    )
+    .unwrap();
+    zip.finish().unwrap().into_inner()
+}
+
+/// 轮询列表直到这次导入不再是 `importing`。
+async fn settled(http: &Http, cookie: &str, path: &str, id: i64) -> Value {
+    for _ in 0..300 {
+        let list = expect(&http.get(path).cookie(cookie).send().await, 200);
+        let row = list["imports"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["id"] == id)
+            .cloned()
+            .expect("列表里有这次导入");
+        if row["status"] != "importing" {
+            return row;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("导入 #{id} 30 秒内没有结束");
+}
+
+#[tokio::test]
+async fn plausible_imports_over_http() {
+    let Some(env) = test_env("plausible_imports_over_http") else {
+        return;
+    };
+    let pg = pg(&env).await;
+    let http = start(&env, &pg).await;
+    let w = world(&pg, &http).await;
+    let site = make_site(&pg, w.org.id, &unique("Imported"), "UTC").await;
+    let path = format!("/api/internal/sites/{site}/imports");
+    let upload = format!("{path}?file_name=..%2F..%2Fblog_export.zip");
+
+    // 权限：组织 admin+
+    expect_err(
+        &http.get(&path).cookie(&w.editor.cookie).send().await,
+        403,
+        "forbidden",
+    );
+    expect_err(
+        &http
+            .upload(&upload, visitors_zip())
+            .cookie(&w.viewer.cookie)
+            .send()
+            .await,
+        403,
+        "forbidden",
+    );
+    expect_err(
+        &http.get(&path).cookie(&w.outsider.cookie).send().await,
+        404,
+        "not_found",
+    );
+    // 表单能发的类型被 CSRF 判定拒绝
+    let r = http
+        .rb("POST", &upload, visitors_zip())
+        .header("Content-Type", "text/plain")
+        .header("Origin", &http.origin)
+        .cookie(&w.admin.cookie)
+        .send()
+        .await;
+    assert_eq!(r.status, 403, "{}", r.body);
+
+    let list = expect(&http.get(&path).cookie(&w.admin.cookie).send().await, 200);
+    assert_eq!(list["imports"], json!([]));
+    assert_eq!(list["native_from"], Value::Null, "站点还没有数据");
+
+    // 上传：202，后台导入完成
+    let v = expect(
+        &http
+            .upload(&upload, visitors_zip())
+            .cookie(&w.admin.cookie)
+            .send()
+            .await,
+        202,
+    );
+    assert_eq!(v["import"]["status"], "importing");
+    assert_eq!(v["import"]["file_name"], "blog_export.zip", "路径部分去掉");
+    let id = v["import"]["id"].as_i64().unwrap();
+    let done = settled(&http, &w.admin.cookie, &path, id).await;
+    assert_eq!(done["status"], "completed", "{done}");
+    assert_eq!(done["start_date"], "2026-06-01");
+    assert_eq!(done["end_date"], "2026-06-03");
+    assert_eq!(done["imported_by"], "Test User");
+    assert_eq!(done["error_code"], Value::Null);
+
+    // 失败带代码：不是 zip、日期与已有导入重叠
+    for (body, code) in [
+        (b"not a zip".to_vec(), "invalid_zip"),
+        (visitors_zip(), "overlap"),
+    ] {
+        let v = expect(
+            &http
+                .upload(&upload, body)
+                .cookie(&w.owner.cookie)
+                .send()
+                .await,
+            202,
+        );
+        let row = settled(
+            &http,
+            &w.owner.cookie,
+            &path,
+            v["import"]["id"].as_i64().unwrap(),
+        )
+        .await;
+        assert_eq!(row["status"], "failed", "{row}");
+        assert_eq!(row["error_code"], code, "{row}");
+    }
+    expect_err(
+        &http
+            .upload(&upload, Vec::new())
+            .cookie(&w.admin.cookie)
+            .send()
+            .await,
+        400,
+        "invalid_request",
+    );
+
+    // 一个站点同时只有一个进行中的导入；进行中的不能删
+    let running = rivu_storage_pg::imports::create(&pg, site, "plausible_csv", "x.zip", None)
+        .await
+        .unwrap()
+        .expect("建记录");
+    expect_err(
+        &http
+            .upload(&upload, visitors_zip())
+            .cookie(&w.admin.cookie)
+            .send()
+            .await,
+        409,
+        "import_running",
+    );
+    expect_err(
+        &http
+            .delete_with(&format!("{path}/{running}"), &json!({}))
+            .cookie(&w.admin.cookie)
+            .send()
+            .await,
+        409,
+        "import_running",
+    );
+    rivu_storage_pg::imports::fail(&pg, running, "interrupted", "test")
+        .await
+        .unwrap();
+
+    // 删除：汇总行与记录都没有了，失败的记录直接删
+    let r = http
+        .delete_with(&format!("{path}/{id}"), &json!({}))
+        .cookie(&w.admin.cookie)
+        .send()
+        .await;
+    expect(&r, 204);
+    assert_eq!(
+        rivu_storage_pg::imports::completed_range(&pg, site)
+            .await
+            .unwrap(),
+        None
+    );
+    let list = expect(&http.get(&path).cookie(&w.admin.cookie).send().await, 200);
+    for row in list["imports"].as_array().unwrap() {
+        assert_eq!(row["status"], "failed");
+        let r = http
+            .delete_with(&format!("{path}/{}", row["id"]), &json!({}))
+            .cookie(&w.admin.cookie)
+            .send()
+            .await;
+        expect(&r, 204);
+    }
+    expect_err(
+        &http
+            .delete_with(&format!("{path}/{id}"), &json!({}))
+            .cookie(&w.admin.cookie)
+            .send()
+            .await,
+        404,
+        "not_found",
+    );
+}
 #[tokio::test]
 async fn stats_deletion_requests() {
     let Some(env) = test_env("stats_deletion_requests") else {

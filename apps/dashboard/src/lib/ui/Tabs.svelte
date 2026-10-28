@@ -19,6 +19,18 @@
   let ind: HTMLSpanElement;
   $effect(() => trackIndicator(box, ind, '[aria-selected="true"]'));
 
+  // 选项横向放不下时（窄屏的设置分区），选中项保持在可见区域里：首次直接定位，之后平滑滚过去
+  let placed = false;
+  $effect(() => {
+    void value;
+    const el = box.querySelector<HTMLElement>('[aria-selected="true"]');
+    if (!el || box.scrollWidth <= box.clientWidth) return;
+    const left = el.offsetLeft;
+    if (left >= box.scrollLeft && left + el.offsetWidth <= box.scrollLeft + box.clientWidth) return;
+    box.scrollTo({ left: left - (box.clientWidth - el.offsetWidth) / 2, behavior: placed ? "smooth" : "instant" });
+    placed = true;
+  });
+
   function onKeydown(e: KeyboardEvent) {
     if (e.key !== "ArrowRight" && e.key !== "ArrowLeft") return;
     const i = options.findIndex((o) => o.value === value);

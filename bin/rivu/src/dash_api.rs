@@ -30,6 +30,7 @@
 //! | `GET /api/internal/sites/{site}/shield`（editor+）、`POST`（admin+）、`DELETE …/shield/{id}`（admin+） | 会话 | 屏蔽规则 |
 //! | `GET /api/internal/sites/{site}/shared-links`、`POST`、`DELETE …/shared-links/{id}` | 会话，组织 editor+ | 共享链接的列表、创建、吊销 |
 //! | `GET /api/internal/sites/{site}/goals`、`POST`、`DELETE …/goals/{id}` | 会话，有效角色 editor+（含站点访客 editor，`site.content.write`） | 目标的列表、添加（`{"kind":"event","event_name"}` 或 `{"kind":"page","page_path"}`，可带 `display_name`；同类同值或同名 409 `conflict`，每站 100 个 409 `limit_reached`）、删除；实现在 [`crate::goals_admin`] |
+//! | `GET /api/internal/sites/{site}/imports`、`POST …/imports?file_name=`、`DELETE …/imports/{id}` | 会话，组织 admin+ | Plausible 导出的导入：列表（带 `native_from`，站点自己的数据开始的那天）、上传 zip（请求体是原样字节，最大 128 MiB；202，后台导入；进行中时 409 `import_running`）、删除（进行中 409）；实现在 [`crate::imports_admin`] |
 //!
 //! | `GET /api/internal/orgs/{org_id}/members` | 会话，任一组织成员 | 成员、待处理邀请、站点访客，带 `can_manage` 与 `my_role` |
 //! | `PATCH /api/internal/orgs/{org_id}/members/{user_id}`、`DELETE` | 会话，组织 admin+ | 改角色、移除成员（移除同时吊销其在该组织的 API key）；admin 不能碰 owner，不能改自己，最后一名 owner 409 |
@@ -71,7 +72,7 @@
 //!
 //! # CSRF
 //!
-//! 所有会改变状态的方法（含查询用的 `POST`）：`Content-Type: application/json` 且 `Origin` 与 `RIVU_BASE_URL` 同源，
+//! 所有会改变状态的方法（含查询用的 `POST`）：`Content-Type: application/json`（上传导出用 `application/zip`）且 `Origin` 与 `RIVU_BASE_URL` 同源，
 //! 见 [`rivu_auth::csrf`]；拒绝时 `403 csrf_rejected`。没有 CORS。
 //!
 //! # 限流（`platform-and-ops.md` §4.4，`rivu-ratelimit::PolicyLimiter`，进程内）
@@ -350,6 +351,8 @@ pub struct DashApi {
     pub(crate) site_restore_days: u32,
     /// 用来在写入日期范围删除意图后立即唤醒它。
     pub(crate) stats_delete_kick: Option<rivu_jobs::StatsDeleteKick>,
+    /// `rivu_maintainer` 账号的客户端：导入写汇总层、删除导入；`None` 时导入端点返回 503。
+    pub(crate) maintainer: Option<clickhouse::Client>,
     csrf: Csrf,
     cookies: CookieConfig,
     /// `RIVU_SETUP_TOKEN` 的 SHA-256：比较时两边都是定长摘要，常数时间。
@@ -360,7 +363,7 @@ pub struct DashApi {
     /// `RIVU_ROLLUP_MIN_ROWS`（§6.4 选层）。
     rollup_min_rows: Option<u64>,
     /// 结果缓存（与公开 API 共用，§6.9）；`None` 不缓存。
-    cache: Option<Arc<QueryCache>>,
+    pub(crate) cache: Option<Arc<QueryCache>>,
     /// `RIVU_RETENTION_DAYS`。
     pub(crate) retention_days: u32,
     limiters: Limiters,
@@ -390,6 +393,7 @@ impl DashApi {
             api_rate: config.api_rate,
             site_restore_days: config.site_restore_days,
             stats_delete_kick: None,
+            maintainer: None,
             csrf,
             cookies: CookieConfig {
                 secure: config.cookie_secure,
@@ -431,6 +435,12 @@ impl DashApi {
     /// 同进程的 `ch_delete_batch` 唤醒器；`None` 时只等它的定时周期（测试）。
     pub fn with_stats_delete_kick(mut self, kick: Option<rivu_jobs::StatsDeleteKick>) -> Self {
         self.stats_delete_kick = kick;
+        self
+    }
+
+    /// 导入用的 `rivu_maintainer` 客户端。
+    pub fn with_maintainer(mut self, ch: clickhouse::Client) -> Self {
+        self.maintainer = Some(ch);
         self
     }
 
@@ -1751,6 +1761,7 @@ pub fn router(api: Arc<DashApi>) -> Router {
         .merge(crate::goals_admin::routes(a))
         .merge(crate::diagnostics::routes(a))
         .merge(crate::org_admin::routes(a))
+        .merge(crate::imports_admin::routes(a))
 }
 // ------------------------------------------------------------------------------------------
 // 后台：活跃会话数与清理
