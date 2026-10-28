@@ -279,6 +279,13 @@ export interface SiteImport {
   completed_at: string | null;
 }
 
+/** 账户的两步验证状态（`available`：服务器配置了 RIVU_SECRET_KEY）。 */
+export interface TotpStatus {
+  available: boolean;
+  enabled: boolean;
+  recovery_remaining: number | null;
+}
+
 export class ApiError extends Error {
   constructor(
     readonly status: number,
@@ -397,8 +404,23 @@ function uploadImport(site: number | string, file: File, onProgress: (fraction: 
 export const api = {
   setup: (body: { token?: string; email: string; password: string; org_name: string; name?: string }) =>
     request<{ user: User; organization: Org }>("POST", `${base}/setup`, { body }),
+  /** 开了两步验证的账号：密码正确只返回 challenge，凭它调 loginTotp。 */
   login: (body: { email: string; password: string; device_label?: string }) =>
-    request<{ user: User }>("POST", `${base}/login`, { body }),
+    request<{ user?: User; totp_required?: boolean; challenge?: string }>("POST", `${base}/login`, { body }),
+  loginTotp: (body: { challenge: string; code: string }) =>
+    request<{ user: User; recovery_remaining?: number }>("POST", `${base}/login/totp`, { body }),
+  authOptions: () => request<{ password_reset: boolean }>("GET", `${base}/auth-options`),
+  requestPasswordReset: (email: string) => request<void>("POST", `${base}/password-reset`, { body: { email } }),
+  checkPasswordReset: (token: string) => request<void>("GET", `${base}/password-reset/${encodeURIComponent(token)}`),
+  resetPassword: (token: string, password: string) =>
+    request<void>("POST", `${base}/password-reset/${encodeURIComponent(token)}`, { body: { password } }),
+  totpStatus: () => request<TotpStatus>("GET", `${base}/me/totp`),
+  totpSetup: (password: string) =>
+    request<{ secret: string; uri: string; qr_svg: string }>("POST", `${base}/me/totp/setup`, { body: { password } }),
+  totpEnable: (code: string) => request<{ recovery_codes: string[] }>("POST", `${base}/me/totp/enable`, { body: { code } }),
+  totpRecoveryCodes: (password: string) =>
+    request<{ recovery_codes: string[] }>("POST", `${base}/me/totp/recovery-codes`, { body: { password } }),
+  totpDisable: (password: string) => request<void>("POST", `${base}/me/totp/disable`, { body: { password } }),
   logout: () => request<void>("POST", `${base}/logout`),
   logoutAll: () => request<void>("POST", `${base}/logout-all`),
   me: () => request<Me>("GET", `${base}/me`),
@@ -447,7 +469,7 @@ export const api = {
     request<OrgMember>("PATCH", `${base}/orgs/${org}/members/${user}`, { body: { role } }),
   removeMember: (org: number, user: number) => request<void>("DELETE", `${base}/orgs/${org}/members/${user}`),
   invite: (org: number, body: InviteBody) =>
-    request<{ invitation: OrgInvitation; url: string }>("POST", `${base}/orgs/${org}/invitations`, { body }),
+    request<{ invitation: OrgInvitation; url: string; email_sent: boolean }>("POST", `${base}/orgs/${org}/invitations`, { body }),
   revokeInvitation: (org: number, id: number) => request<void>("DELETE", `${base}/orgs/${org}/invitations/${id}`),
   removeGuest: (org: number, id: number) => request<void>("DELETE", `${base}/orgs/${org}/guests/${id}`),
   apiKeys: (org: number) => request<ApiKeysBody>("GET", `${base}/orgs/${org}/api-keys`),

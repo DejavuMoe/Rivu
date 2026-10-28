@@ -164,6 +164,8 @@
   let tried = $state(false);
   let serverEmail = $state("");
   let link = $state("");
+  /** 服务端配置了 SMTP 时邀请邮件已发出（发给 `mailedTo`） */
+  let mailedTo = $state("");
 
   const emailOk = $derived(/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim()) && email.trim().length <= 320);
   const emailError = $derived(serverEmail || (emailOk ? "" : t("inv.email.invalid")));
@@ -193,6 +195,7 @@
     try {
       const res = await api.invite(orgId, body);
       link = res.url;
+      mailedTo = res.email_sent ? res.invitation.email : "";
       phase = "done";
       toast(t("inv.createdToast", { email: addr }), "good");
       void load(orgId, true);
@@ -405,7 +408,11 @@
     </form>
   {:else}
     <div class="form">
-      <Callout tone="warn">{t("inv.once")}</Callout>
+      {#if mailedTo}
+        <Callout tone="good">{t("inv.mailed", { email: mailedTo })}</Callout>
+      {:else}
+        <Callout tone="warn">{t("inv.once")}</Callout>
+      {/if}
       <CopyField label={t("inv.link")} value={link} />
     </div>
   {/if}

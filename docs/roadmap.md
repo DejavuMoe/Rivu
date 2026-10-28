@@ -70,7 +70,7 @@
 - [ ] 导入 GA4
 - [x] 邮件：SMTP（`RIVU_SMTP_URL`，`rivu mail test`）、邀请邮件、找回密码
 - [ ] 定期报告邮件
-- [x] TOTP 两步验证：接口、恢复码、`rivu user reset-2fa`（看板界面待原型审）
+- [x] TOTP 两步验证：接口、恢复码、`rivu user reset-2fa`；看板的登录第二步、账号页设置，找回密码与重设密码页
 - [ ] Plausible 协议兼容端点 `POST /api/plausible/event`
 
 ## 已知限制
