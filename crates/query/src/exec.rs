@@ -554,7 +554,67 @@ fn raw_since(site: &SiteContext, now: Timestamp) -> Result<Option<jiff::civil::D
         .ok())
 }
 
-/// 执行一条 `QuerySpec`。///
+/// 属性键列表里的一项（看板的属性卡片用）。
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct PropertyKey {
+    pub key: String,
+    /// 区间里带这个键的非 engagement 事件数。
+    pub events: u64,
+}
+
+/// [`property_keys`] 至多返回的键数。
+pub const MAX_LISTED_PROPERTY_KEYS: u64 = 100;
+
+/// 区间里（同样的过滤）出现过的属性键，事件多的在前。`spec` 只用它的 `date_range` 与 `filters`，
+/// 指标与维度照常校验（看板传 `{"metrics":["events"], …}`）。
+pub async fn property_keys(
+    reader: &Client,
+    scope: &TenantScope,
+    site: &SiteContext,
+    spec: QuerySpec,
+    opts: ExecOptions,
+) -> Result<Vec<PropertyKey>, QueryError> {
+    if scope.site_id() != site.site_id {
+        return Err(QueryError::internal(anyhow::anyhow!(
+            "tenant scope ({}) does not match the site context ({})",
+            scope.site_id(),
+            site.site_id
+        )));
+    }
+    let cx = Ctx {
+        reader,
+        scope,
+        opts: &opts,
+        deadline: Deadline::new(opts.timeout_secs),
+        tiers: Default::default(),
+        raw_since: None,
+    };
+    let data_start = if matches!(spec.date_range, DateRange::All) {
+        first_event_ms(&cx).await?
+    } else {
+        None
+    };
+    let q = ResolvedQuery::build(&spec, site, opts.now, data_start)?;
+    let plan = plan::plan(&q);
+    let (sql, params) =
+        sql::property_keys_query(scope, &q, &plan, q.interval, MAX_LISTED_PROPERTY_KEYS);
+    let rows = cx.run("property_keys", &sql, &params).await?;
+    rows.into_iter()
+        .map(|r| {
+            let key = r.first().and_then(Value::as_str).map(str::to_owned);
+            let events = r.get(1).and_then(cell_u64);
+            match (key, events) {
+                (Some(key), Some(events)) => Ok(PropertyKey { key, events }),
+                _ => Err(QueryError::internal(anyhow::anyhow!(
+                    "unexpected ClickHouse row (property_keys)"
+                ))),
+            }
+        })
+        .collect()
+}
+
+/// 执行一条 `QuerySpec`。
+///
 /// `reader` 用 `rivu_reader` 账号构造并绑定库（`rivu_storage_ch::client`）；`scope` 与 `site.site_id` 必须一致；
 /// `spec` 来自 [`QuerySpec::parse`]。解析之外的校验（组合、时间换算、正则限制）在这里完成。
 pub async fn execute(
