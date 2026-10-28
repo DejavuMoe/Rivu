@@ -8,7 +8,7 @@
 //!   `Authorization: Bearer` → 401 → 按组织限流 429 → 作用域 403 → 把 [`AuthContext`] 放进请求扩展，响应带 `X-RateLimit-*`；
 //!   处理函数里用 [`ApiGuard::authorize_site`] 做站点访问判定（无权限一律 404，不泄露站点是否存在）；
 //! - [`password`]（argon2id）、[`session`]（登录会话令牌与 cookie）、[`csrf`]（内部端点的 CSRF 判定）：
-//!   看板的会话鉴权用，HTTP 处理在 `bin/rivu` 的 `dash_api`；
+//!   看板的会话鉴权用，HTTP 处理在 `bin/rivu` 的 `dash_api`；[`totp`]：两步验证；
 //! - [`store`]：存储抽象（[`AuthStore`]）与 PostgreSQL 实现（[`PgStore`]）。
 //!
 //! 检查顺序：401（缺失、格式错、未知、吊销、过期、用户被禁用或被移出组织）→ 429（小时配额、突发令牌桶、并发排队超时）
@@ -23,6 +23,7 @@ pub mod password;
 pub mod scope;
 pub mod session;
 pub mod store;
+pub mod totp;
 
 pub use guard::{ApiError, ApiGuard, AuthContext, GuardState, Required, guard_middleware, protect};
 pub use scope::{Action, OrgRole, Resource, Scope, ScopeAction, Scopes, Target};

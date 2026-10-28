@@ -11,7 +11,9 @@
 //! - `invitations_*`：邀请 → 查询 → 接受（新用户登录、已有账号的会话）、邮箱不符、过期与撤销、过期后重新邀请、限流、日志里没有秘密；
 //! - `guests_*`：站点访客的邀请、接受、移除；
 //! - `api_keys_*`：创建（全部站点、指定站点、别的组织的站点）、只列自己的、吊销别人的 404、创建出来的 key 能被鉴权查到；
-//! - `csrf_*`：缺 Origin 的写请求被拒。
+//! - `csrf_*`：缺 Origin 的写请求被拒；
+//! - `account_security_*`：邀请邮件、找回密码（邮件、令牌一次性、撤销会话）、两步验证（设置、启用、登录第二步、
+//!   重放、恢复码、尝试次数、关闭）。
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -106,6 +108,10 @@ fn config(env: &TestEnv) -> Config {
         ),
         ("RIVU_TRUSTED_PROXIES".into(), "127.0.0.0/8".into()),
         ("RIVU_BASE_URL".into(), HTTP_ORIGIN.into()),
+        (
+            "RIVU_SECRET_KEY".into(),
+            "test-secret-key-0123456789abcdef0123".into(),
+        ),
     ];
     Config::from_env(Role::Admin, &Env::from_pairs(pairs)).expect("测试配置")
 }
@@ -153,6 +159,8 @@ impl Resp {
 struct Http {
     addr: SocketAddr,
     origin: String,
+    /// 内存发信器收到的邮件。
+    outbox: rivu_mail::Outbox,
 }
 
 struct Rb<'a> {
@@ -282,9 +290,11 @@ async fn start(env: &TestEnv, pg: &PgPool, limits: DashLimits) -> (Http, Config)
     let reader: Client =
         rivu_storage_ch::client(&env.ch_url, &account("reader"), Some(&ch_database()));
     let now: Timestamp = "2026-03-12T12:00:00Z".parse().unwrap();
+    let (mailer, outbox) = rivu_mail::Mailer::memory("Rivu <rivu@example.test>");
     let dash = DashApi::new(&cfg, pg.clone(), reader, None)
         .expect("装配内部端点")
         .with_limits(limits)
+        .with_mailer(mailer)
         .with_clock(move || now);
     let app = public::router_full(None, None, Some(dash_api::router(Arc::new(dash))));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -301,6 +311,7 @@ async fn start(env: &TestEnv, pg: &PgPool, limits: DashLimits) -> (Http, Config)
         Http {
             addr,
             origin: cfg.base_url.clone(),
+            outbox,
         },
         cfg,
     )
@@ -2047,4 +2058,284 @@ async fn csrf_rejects_mutations_without_origin() {
             .await,
         200,
     );
+}
+
+// ------------------------------------------------------------------ 账号安全
+
+/// 等后台发出的邮件（发信在 `tokio::spawn` 里）。
+async fn mails(http: &Http, n: usize) -> Vec<rivu_mail::Mail> {
+    let mut got = Vec::new();
+    for _ in 0..100 {
+        got.extend(http.outbox.take());
+        if got.len() >= n {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    got
+}
+
+fn base32_decode(s: &str) -> Vec<u8> {
+    let (mut out, mut buf, mut bits) = (Vec::new(), 0u32, 0u32);
+    for c in s.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'2'..=b'7' => c - b'2' + 26,
+            _ => panic!("不是 base32：{s}"),
+        };
+        buf = (buf << 5) | u32::from(v);
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn account_security_reset_totp_and_invitation_email() {
+    let Some(env) = test_env("account_security") else {
+        return;
+    };
+    migrate_once(&env).await;
+    let pg = rivu_storage_pg::connect(&env.pg_url, 4).await.unwrap();
+    let (http, _) = start(&env, &pg, loose()).await;
+    let org = make_org(&pg).await;
+    let owner = actor(&pg, &http, Some((&org, "owner"))).await;
+
+    // ---- 邀请邮件：语言跟随请求
+    let email = format!("{}@example.test", unique("invitee"));
+    let r = http
+        .post(
+            &invitations_path(&org),
+            &json!({"email": email, "role": "viewer"}),
+        )
+        .cookie(&owner.cookie)
+        .header("Accept-Language", "zh-CN,zh;q=0.9")
+        .send()
+        .await;
+    let v = expect(&r, 201);
+    assert_eq!(v["email_sent"], true);
+    let sent = mails(&http, 1).await;
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].to, email);
+    assert!(
+        sent[0].subject.contains("邀请你加入"),
+        "{}",
+        sent[0].subject
+    );
+    assert!(sent[0].body.contains(v["url"].as_str().unwrap()));
+
+    // ---- 找回密码
+    let r = http.get("/api/internal/auth-options").send().await;
+    assert_eq!(expect(&r, 200), json!({"password_reset": true}));
+    let r = http
+        .post(
+            "/api/internal/password-reset",
+            &json!({"email": "nobody-here@example.test"}),
+        )
+        .send()
+        .await;
+    expect(&r, 202);
+    let r = http
+        .post(
+            "/api/internal/password-reset",
+            &json!({"email": owner.email.to_uppercase()}),
+        )
+        .send()
+        .await;
+    expect(&r, 202);
+    let sent = mails(&http, 1).await;
+    assert_eq!(sent.len(), 1, "不存在的账号不发信");
+    assert_eq!(sent[0].to, owner.email);
+    assert_eq!(sent[0].subject, "Reset your Rivu password");
+    let token = sent[0]
+        .body
+        .split("/reset-password/")
+        .nth(1)
+        .and_then(|s| s.split_whitespace().next())
+        .unwrap()
+        .to_owned();
+    let path = format!("/api/internal/password-reset/{token}");
+    expect(&http.get(&path).send().await, 200);
+    assert_eq!(
+        http.get("/api/internal/password-reset/nope")
+            .send()
+            .await
+            .status,
+        404
+    );
+    let r = http.post(&path, &json!({"password": "short"})).send().await;
+    assert_eq!(expect(&r, 400)["error"], "invalid_new_password");
+    let new_password = "a brand new passphrase";
+    expect(
+        &http
+            .post(&path, &json!({"password": new_password}))
+            .send()
+            .await,
+        200,
+    );
+    // 令牌只能用一次；旧会话全部失效；新密码能登录
+    assert_eq!(
+        http.post(&path, &json!({"password": new_password}))
+            .send()
+            .await
+            .status,
+        404
+    );
+    assert_eq!(
+        http.get("/api/internal/me")
+            .cookie(&owner.cookie)
+            .send()
+            .await
+            .status,
+        401
+    );
+    let login = |password: &'static str| {
+        let http = http.clone();
+        let email = owner.email.clone();
+        async move {
+            http.post(
+                "/api/internal/login",
+                &json!({"email": email, "password": password}),
+            )
+            .send()
+            .await
+        }
+    };
+    let r = login(new_password).await;
+    expect(&r, 200);
+    let cookie = r.cookie_pair("rivu_session").expect("会话");
+
+    // ---- 两步验证：设置要当前密码，第一个验证码确认后启用
+    let r = http
+        .get("/api/internal/me/totp")
+        .cookie(&cookie)
+        .send()
+        .await;
+    assert_eq!(
+        expect(&r, 200),
+        json!({"available": true, "enabled": false, "recovery_remaining": null})
+    );
+    let r = http
+        .post(
+            "/api/internal/me/totp/setup",
+            &json!({"password": PASSWORD}),
+        )
+        .cookie(&cookie)
+        .send()
+        .await;
+    assert_eq!(expect(&r, 400)["error"], "wrong_password");
+    let r = http
+        .post(
+            "/api/internal/me/totp/setup",
+            &json!({"password": new_password}),
+        )
+        .cookie(&cookie)
+        .send()
+        .await;
+    let setup = expect(&r, 200);
+    assert!(setup["qr_svg"].as_str().unwrap().contains("<svg"));
+    assert!(
+        setup["uri"]
+            .as_str()
+            .unwrap()
+            .starts_with("otpauth://totp/Rivu:")
+    );
+    let secret = base32_decode(setup["secret"].as_str().unwrap());
+    // 服务端的时钟固定在 2026-03-12T12:00:00Z
+    let step = 1_773_316_800 / 30;
+    let code = |s: u64| format!("{:06}", rivu_auth::totp::code_at(&secret, s));
+    let enable = |c: String| {
+        let http = http.clone();
+        let cookie = cookie.clone();
+        async move {
+            http.post("/api/internal/me/totp/enable", &json!({"code": c}))
+                .cookie(&cookie)
+                .send()
+                .await
+        }
+    };
+    assert_eq!(
+        expect(&enable(code(step + 5)).await, 400)["error"],
+        "invalid_code"
+    );
+    let codes = expect(&enable(code(step)).await, 200)["recovery_codes"].clone();
+    let codes: Vec<String> = serde_json::from_value(codes).unwrap();
+    assert_eq!(codes.len(), 10);
+    let r = http
+        .get("/api/internal/me/totp")
+        .cookie(&cookie)
+        .send()
+        .await;
+    assert_eq!(expect(&r, 200)["recovery_remaining"], 10);
+
+    // ---- 登录第二步：密码对了只拿到 challenge
+    let second = |challenge: String, c: String| {
+        let http = http.clone();
+        async move {
+            http.post(
+                "/api/internal/login/totp",
+                &json!({"challenge": challenge, "code": c}),
+            )
+            .send()
+            .await
+        }
+    };
+    let challenge = || async {
+        let r = login(new_password).await;
+        let v = expect(&r, 200);
+        assert_eq!(v["totp_required"], true, "{v}");
+        assert!(r.cookie_pair("rivu_session").is_none(), "第一步不发会话");
+        v["challenge"].as_str().unwrap().to_owned()
+    };
+    let ch = challenge().await;
+    // 启用时用过的那一步不能再用（重放）
+    assert_eq!(
+        expect(&second(ch.clone(), code(step)).await, 400)["error"],
+        "invalid_code"
+    );
+    let r = second(ch.clone(), code(step + 1)).await;
+    assert_eq!(expect(&r, 200)["user"]["email"], owner.email);
+    assert!(r.cookie_pair("rivu_session").is_some());
+    // challenge 用过就作废
+    assert_eq!(
+        expect(&second(ch, code(step + 1)).await, 400)["error"],
+        "challenge_expired"
+    );
+    // 恢复码：格式随意，用一次少一个
+    let ch = challenge().await;
+    let messy = codes[0].to_uppercase().replace('-', " ");
+    let v = expect(&second(ch, messy.clone()).await, 200);
+    assert_eq!(v["recovery_remaining"], 9);
+    let ch = challenge().await;
+    assert_eq!(
+        expect(&second(ch.clone(), messy).await, 400)["error"],
+        "invalid_code"
+    );
+    // 一个 challenge 最多试 5 次
+    for _ in 0..4 {
+        assert_eq!(
+            expect(&second(ch.clone(), "000000".into()).await, 400)["error"],
+            "invalid_code"
+        );
+    }
+    assert_eq!(
+        expect(&second(ch, codes[1].clone()).await, 400)["error"],
+        "challenge_expired"
+    );
+
+    // ---- 关闭：要当前密码；之后登录只要密码
+    let r = http
+        .post(
+            "/api/internal/me/totp/disable",
+            &json!({"password": new_password}),
+        )
+        .cookie(&cookie)
+        .send()
+        .await;
+    expect(&r, 200);
+    let r = login(new_password).await;
+    assert!(r.cookie_pair("rivu_session").is_some(), "{}", r.body);
 }

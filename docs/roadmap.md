@@ -68,8 +68,9 @@
 - [x] 导入 Plausible 的数据导出（zip）：`rivu import plausible|list|delete`，写入日汇总层（含属性族），查询覆盖导入的天时强制走汇总层；用一份真实导出（33.7 万天行级汇总、17.4 万行）核对数字一致
 - [x] 看板里上传导出、查看与删除导入（站点设置 → 导入）：后台导入，失败带原因，进程重启时清理没导完的导入
 - [ ] 导入 GA4
-- [ ] 邮件：SMTP、邀请邮件、找回密码、定期报告
-- [ ] TOTP 双因素认证
+- [x] 邮件：SMTP（`RIVU_SMTP_URL`，`rivu mail test`）、邀请邮件、找回密码
+- [ ] 定期报告邮件
+- [x] TOTP 两步验证：接口、恢复码、`rivu user reset-2fa`（看板界面待原型审）
 - [ ] Plausible 协议兼容端点 `POST /api/plausible/event`
 
 ## 已知限制

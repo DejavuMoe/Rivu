@@ -50,6 +50,24 @@ pub enum Command {
     Share(ShareArgs),
     /// 容器健康检查：请求内部端口的 /readyz，200 时退出码 0，否则 1（不读取其他配置）
     Healthcheck(HealthcheckArgs),
+    /// 邮件：test（检查 SMTP 配置并发一封测试邮件）
+    Mail(MailArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct MailArgs {
+    #[command(subcommand)]
+    pub action: MailAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum MailAction {
+    /// 连接 SMTP 服务器并发一封测试邮件
+    Test {
+        /// 收件人
+        #[arg(long)]
+        to: String,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -104,6 +122,8 @@ pub enum UserAction {
     Enable(UserEmailArgs),
     /// 列出用户
     List,
+    /// 关闭用户的两步验证（用户丢了验证器又没有恢复码时）；用户下次登录只要密码
+    Reset2fa(UserEmailArgs),
 }
 
 #[derive(Debug, Args)]
@@ -468,6 +488,7 @@ impl Command {
             | Command::Apikey(_)
             | Command::Setup(_)
             | Command::User(_)
+            | Command::Mail(_)
             | Command::Org(_)
             | Command::Share(_)
             | Command::Healthcheck(_) => Role::Admin,
@@ -511,6 +532,7 @@ pub async fn main() -> ExitCode {
         Command::Apikey(ApikeyArgs { action }) => apikey_cmd::run(&config, action).await,
         Command::Setup(args) => user_cmd::setup(&config, args).await,
         Command::User(args) => user_cmd::user(&config, args).await,
+        Command::Mail(MailArgs { action }) => admin::mail(&config, action).await,
         Command::Org(args) => user_cmd::org(&config, args).await,
         Command::Share(args) => user_cmd::share(&config, args).await,
         Command::Serve => run::run(config).await,

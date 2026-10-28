@@ -18,13 +18,15 @@ cp deploy/.env.example deploy/.env
 编辑 `deploy/.env`：填写 `RIVU_DOMAIN`，为每个密码与密钥生成随机值：
 
 ```bash
-for k in RIVU_SETUP_TOKEN RIVU_VISITOR_PEPPER RIVU_PG_MIGRATOR_PASSWORD RIVU_PG_APP_PASSWORD \
+for k in RIVU_SETUP_TOKEN RIVU_VISITOR_PEPPER RIVU_SECRET_KEY RIVU_PG_MIGRATOR_PASSWORD RIVU_PG_APP_PASSWORD \
          RIVU_CH_MIGRATOR_PASSWORD RIVU_CH_WRITER_PASSWORD RIVU_CH_READER_PASSWORD RIVU_CH_MAINTAINER_PASSWORD; do
   sed -i "s|^$k=.*|$k=$(openssl rand -hex 24)|" deploy/.env
 done
 ```
 
-`RIVU_VISITOR_PEPPER` 不在数据库里，单独备份：它丢失只会让当天的访客 ID 断开一次，但泄露会削弱隐私保护（`privacy.md`）。
+`RIVU_VISITOR_PEPPER` 与 `RIVU_SECRET_KEY` 不在数据库里，单独备份。`RIVU_VISITOR_PEPPER` 丢失只会让当天的访客 ID 断开一次，但泄露会削弱隐私保护（`privacy.md`）；`RIVU_SECRET_KEY` 加密两步验证的密钥，丢失后开了两步验证的账号无法登录，要用 `rivu user reset-2fa --email <邮箱>` 逐个关掉。
+
+要发邮件（邀请、找回密码），在 `deploy/.env` 里填 `RIVU_SMTP_URL` 与 `RIVU_SMTP_FROM`，启动后用 `docker compose -f deploy/compose.yml exec rivu rivu mail test --to <你的邮箱>` 检查。不配置时邀请只给链接，登录页没有「忘记密码」。
 
 启动。选一种反向代理：
 

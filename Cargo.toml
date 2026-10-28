@@ -10,6 +10,7 @@ members = [
     "crates/geo",
     "crates/ingest",
     "crates/jobs",
+    "crates/mail",
     "crates/query",
     "crates/ratelimit",
     "crates/reference",
@@ -43,6 +44,7 @@ rivu-domain = { path = "crates/domain" }
 rivu-geo = { path = "crates/geo" }
 rivu-ingest = { path = "crates/ingest" }
 rivu-jobs = { path = "crates/jobs" }
+rivu-mail = { path = "crates/mail" }
 rivu-query = { path = "crates/query" }
 rivu-ratelimit = { path = "crates/ratelimit" }
 rivu-reference = { path = "crates/reference" }
@@ -90,6 +92,12 @@ regex = "1"
 insta = { version = "1", features = ["json"] }
 proptest = "1"
 rand = "0.9"
+# 两步验证（rivu-auth）：HMAC-SHA1、HKDF、AES-256-GCM。与 rustls 用同一个 ring。
+ring = "0.17"
+# 两步验证设置页的二维码（服务端生成 SVG）。
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+# 邮件（rivu-mail）：SMTP，TLS 用 rustls + ring + webpki-roots（与其余出站连接一致）。
+lettre = { version = "0.11", default-features = false, features = ["builder", "hostname", "smtp-transport", "pool", "tokio1", "tokio1-rustls", "rustls-tls"] }
 siphasher = "1"
 url = "2"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }

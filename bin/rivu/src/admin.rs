@@ -13,7 +13,7 @@ use rivu_query::{ExecOptions, QuerySpec, SiteContext, TenantScope};
 use rivu_storage_pg::sites::NewSite;
 use serde_json::{Value, json};
 
-use crate::cli::{ExportArgs, ImportAction, QueryArgs, SiteAddArgs};
+use crate::cli::{ExportArgs, ImportAction, MailAction, QueryArgs, SiteAddArgs};
 use crate::export::ExportRequest;
 use crate::query_api::load_site_context;
 
@@ -236,6 +236,20 @@ pub async fn import(config: &Config, action: ImportAction) -> Result<ExitCode> {
             println!("已删除导入 #{id}");
         }
     }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `rivu mail test`：用 `RIVU_SMTP_*` 连接 SMTP 服务器并发一封测试邮件。
+pub async fn mail(config: &Config, action: MailAction) -> Result<ExitCode> {
+    let MailAction::Test { to } = action;
+    let smtp = config
+        .smtp
+        .as_ref()
+        .context("没有配置 SMTP：设置 RIVU_SMTP_URL 与 RIVU_SMTP_FROM")?;
+    let mailer = rivu_mail::Mailer::smtp(smtp.url.expose(), &smtp.from)?;
+    mailer.check().await?;
+    mailer.send(rivu_mail::test_mail(&to)).await?;
+    println!("已发送测试邮件到 {to}");
     Ok(ExitCode::SUCCESS)
 }
 

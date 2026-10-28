@@ -101,8 +101,8 @@ Rivu 只支持单实例：会话分配依赖单写者，同一时间只能有一
 | `shield_rules` | 屏蔽规则，单表（Plausible 为 4 张，04§1.2） | `site_id`、`type`、`action`、`value` | `UNIQUE(site,type,value)` 部分唯一；每站上限见 3.3 |
 | `api_keys` | API 密钥 | `organization_id`、`user_id`、`name`、`key_prefix`、`key_hash`、`scopes text[]`、`last_used_at`、`expires_at` | `UNIQUE(key_hash)`；`INDEX(user_id)` |
 | `auth_sessions` | 后台登录会话 | `user_id`、`token_hash`、`device_label`、`last_used_at`、`expires_at` | `UNIQUE(token_hash)`；`INDEX(expires_at)` |
-| `auth_tokens` | 邮箱验证、密码重置令牌（本文新增） | `user_id`、`kind`、`token_hash`、`expires_at`、`used_at` | `UNIQUE(token_hash)` |
-| `totp` | 2FA（第 4 阶段） | `user_id` PK、`secret_enc`、`recovery_hashes bytea[]`、`last_step` | 秘钥加密，恢复码只存摘要（04§2.4） |
+| `auth_tokens` | 一次性令牌，目前只有找回密码（1 小时，只有最新一封有效） | `user_id`、`kind`、`token_hash`、`expires_at`、`used_at` | `UNIQUE(token_hash)`；`auth_sessions_cleanup` 删除过期与用过的行 |
+| `user_totp` | 两步验证 | `user_id` PK、`secret_enc`（nonce + AES-256-GCM 密文，48 字节）、`enabled_at`（空 = 设置中）、`last_step`、`recovery_hashes bytea[]` | 密钥加密，恢复码只存摘要（04§2.4）；时间步与恢复码在一条 UPDATE 里检查加修改，防重放 |
 | `salts` | 访客 ID 盐 | `day` PK、`salt bytea(16)` | 见 3.3 |
 | `jobs` | 后台任务队列 | `kind`、`payload`、`state`、`run_at`、`attempts`、`locked_until`、`unique_key` | 见 3.3 |
 | `pending_stats_deletions` | ClickHouse 删除意图（04§1.2 有同名表，用途为推断） | `site_id`、`scope`、`date_from/to`、`status`、`partitions_done` | 见 3.3 |
@@ -329,7 +329,8 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 | 修改密码 | `POST /api/internal/me/password`（会话 + CSRF），请求体 `{"current","new"}`：先按 `(用户, IP)` 限流（同登录的 `(账号, IP)` 桶，5 次 / 60 秒，429），再校验新密码长度（400 `invalid_new_password`），然后**总是**对当前密码做一次 argon2id 校验（不对 400 `wrong_password`；与登录同样的哈希耗时），与当前相同 400 `same_password`；通过后在同一事务内更新 `password_hash` 并撤销该用户的全部会话（含发起请求的这一个），再签发新会话（`Set-Cookie`），响应 `{}` |
 | shared link 密码 | 通过后签发绑定 `link_id` 的短时（12h）HttpOnly cookie，免重复输入 |
 | 清理 | `auth_sessions_cleanup` 每小时清理过期与撤销行（Plausible 每 2 小时，04§3.2）；读取路径始终校验 `expires_at`，清理滞后不影响安全 |
-| TOTP（第 4 阶段） | 密钥用 `RIVU_SECRET_KEY` 经 HKDF 派生的 AES-256-GCM 加密；轮换期用 `RIVU_SECRET_KEY_FALLBACK` 解旧数据；恢复码 10 个只存摘要、用后移除；`last_step` 防重放（04§2.4、04§4.2 `TOTP_VAULT_KEY_FALLBACK`）；org 级强制 2FA 属状态规则 |
+| TOTP | 密钥用 `RIVU_SECRET_KEY` 经 HKDF 派生的 AES-256-GCM 加密；轮换期用 `RIVU_SECRET_KEY_FALLBACK` 解旧数据；恢复码 10 个只存摘要、用后移除；`last_step` 防重放（04§2.4、04§4.2 `TOTP_VAULT_KEY_FALLBACK`）。登录：密码正确后只返回 challenge（内存里 5 分钟、最多试 5 次），凭验证码或恢复码换会话；设置、换恢复码、关闭都要再输当前密码。丢了验证器又没有恢复码时由管理员 `rivu user reset-2fa`。实现在 `crates/auth/src/totp.rs`、`bin/rivu/src/account.rs` |
+| 找回密码 | 需要 SMTP（`RIVU_SMTP_URL`）。请求总是 202，查账号与发信在后台，响应与账号是否存在无关；按 IP 与邮箱限流。令牌 1 小时、一次性，用掉时同一个事务里改密码并撤销全部会话；不自动登录，开了两步验证仍要验证码 |
 
 ## 6. 后台任务
 调度模型：
