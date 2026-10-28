@@ -104,8 +104,8 @@ pub const RETRY_AFTER_SECS: u64 = 10;
 /// schema 的 `Cache-Control: max-age`（秒）：schema 只随版本变化，配合 `ETag` 重新验证。
 pub const SCHEMA_MAX_AGE_SECS: u64 = 3600;
 /// 查询耗时直方图的桶（秒）：覆盖毫秒级到 API 档的 20 s 上限。
-pub const QUERY_SECONDS_BUCKETS: [f64; 13] = [
-    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 30.0,
+pub const QUERY_SECONDS_BUCKETS: [f64; 15] = [
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.15, 0.25, 0.3, 0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 30.0,
 ];
 
 type Clock = Arc<dyn Fn() -> Timestamp + Send + Sync>;
