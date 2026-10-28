@@ -32,6 +32,8 @@ pub enum Command {
     Site(SiteArgs),
     /// 导入外部数据：plausible | list | delete
     Import(ImportArgs),
+    /// 导出 CSV：时间范围与筛选下的趋势与各维度明细，写成一个 zip（同看板的「导出」）
+    Export(ExportArgs),
     /// 执行一个 QuerySpec（同 `POST /api/v1/query`，不需要 API key），打印 QueryResult JSON
     Query(QueryArgs),
     /// 站点屏蔽规则管理（IP / CIDR / 国家 / 页面 / hostname）
@@ -412,6 +414,25 @@ pub enum ImportAction {
 }
 
 #[derive(Debug, Args)]
+pub struct ExportArgs {
+    /// 站点的 site_key
+    #[arg(long)]
+    pub site: String,
+    /// 时间范围，QuerySpec 的写法：30d、month、12mo、all，或 2026-01-01,2026-03-31
+    #[arg(long, default_value = "30d")]
+    pub range: String,
+    /// 筛选，QuerySpec 的 filters JSON 数组
+    #[arg(long, value_name = "JSON")]
+    pub filters: Option<String>,
+    /// 趋势的粒度：minute | hour | day | week | month
+    #[arg(long, default_value = "day")]
+    pub interval: String,
+    /// 输出文件；省略时写到当前目录，文件名同看板下载
+    #[arg(long, value_name = "PATH")]
+    pub out: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
 pub struct QueryArgs {
     /// QuerySpec JSON 文件（`site` 必填）；省略时从 stdin 读
     #[arg(long, value_name = "PATH")]
@@ -441,6 +462,7 @@ impl Command {
             // 管理命令连 PG（应用账号）和 ClickHouse（reader）
             Command::Site(_)
             | Command::Query(_)
+            | Command::Export(_)
             | Command::Import(_)
             | Command::Shield(_)
             | Command::Apikey(_)
@@ -483,6 +505,7 @@ pub async fn main() -> ExitCode {
             action: SiteAction::Add(args),
         }) => admin::site_add(&config, args).await,
         Command::Query(args) => admin::query(&config, args).await,
+        Command::Export(args) => admin::export(&config, args).await,
         Command::Import(ImportArgs { action }) => admin::import(&config, action).await,
         Command::Shield(ShieldArgs { action }) => shield_cmd::run(&config, action).await,
         Command::Apikey(ApikeyArgs { action }) => apikey_cmd::run(&config, action).await,

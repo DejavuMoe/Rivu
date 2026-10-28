@@ -18,4 +18,5 @@
 - 生产镜像（`Dockerfile`）、compose 部署（`deploy/compose.yml`）、nginx / Caddy 反向代理示例、安装文档（`docs/install.md`）。
 - 备份与恢复脚本（`deploy/backup.sh`、`deploy/restore.sh`）。
 - 自定义属性：查询维度与筛选，看板「属性」卡片。
+- CSV 导出：当前时间范围与筛选下的趋势与各维度明细，打成一个 zip（`rivu export`）。
 - 从 Plausible 迁移：在站点设置「导入」上传 Plausible 的数据导出，或用 `rivu import plausible`。

@@ -9,10 +9,12 @@ use anyhow::{Context, Result, anyhow, bail};
 use jiff::tz::TimeZone;
 use rivu_common::config::Config;
 use rivu_geo::GeoDb;
-use rivu_query::{ExecOptions, QuerySpec, TenantScope};
+use rivu_query::{ExecOptions, QuerySpec, SiteContext, TenantScope};
 use rivu_storage_pg::sites::NewSite;
+use serde_json::{Value, json};
 
-use crate::cli::{ImportAction, QueryArgs, SiteAddArgs};
+use crate::cli::{ExportArgs, ImportAction, QueryArgs, SiteAddArgs};
+use crate::export::ExportRequest;
 use crate::query_api::load_site_context;
 
 /// 规范化一条 hostname 白名单模式（实现与屏蔽规则的 hostname 类型共用，见 `rivu_ingest::hostname::validated_pattern`）。
@@ -63,14 +65,31 @@ pub async fn query(config: &Config, args: QueryArgs) -> Result<ExitCode> {
         bail!("QuerySpec 的 `site` 必填");
     };
 
+    let (reader, ctx) = query_context(config, &site_key).await?;
+    // 等同看板查询，用看板档的超时（§10 Q14）。
+    let opts = ExecOptions::new(config.query_timeouts.dashboard_secs)
+        .with_route("cli.query")
+        .with_rollup(config.rollup_min_rows);
+    let result = rivu_query::execute(&reader, &TenantScope::new(ctx.site_id), &ctx, spec, opts)
+        .await
+        .map_err(|e| anyhow!("查询失败：{e}"))?;
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    Ok(ExitCode::SUCCESS)
+}
+
+/// 查询用的 `rivu_reader` 客户端与站点上下文（`rivu query`、`rivu export`）。
+async fn query_context(
+    config: &Config,
+    site_key: &str,
+) -> Result<(clickhouse::Client, SiteContext)> {
     let pool = rivu_storage_pg::connect(config.database_url.expose(), 2).await?;
-    let Some(site) = rivu_storage_pg::sites::find_site_by_key(&pool, &site_key).await? else {
+    let Some(site) = rivu_storage_pg::sites::find_site_by_key(&pool, site_key).await? else {
         bail!("找不到站点 `{site_key}`（或已删除）");
     };
     let account = config
         .ch_reader
         .as_ref()
-        .context("query 需要 RIVU_CH_READER_USER / RIVU_CH_READER_PASSWORD")?;
+        .context("需要 RIVU_CH_READER_USER / RIVU_CH_READER_PASSWORD")?;
     let reader =
         rivu_storage_ch::client(&config.clickhouse_url, account, Some(&config.ch_database));
 
@@ -88,14 +107,53 @@ pub async fn query(config: &Config, args: QueryArgs) -> Result<ExitCode> {
     )
     .await
     .map_err(|e| anyhow!("读取站点 `{site_key}` 的查询设置失败：{e:?}"))?;
-    // 等同看板查询，用看板档的超时（§10 Q14）。
+    Ok((reader, ctx))
+}
+
+/// `rivu export`：看板「导出」的命令行版本（[`crate::export`]），写一个 zip。
+pub async fn export(config: &Config, args: ExportArgs) -> Result<ExitCode> {
+    let date_range = match args.range.split_once(',') {
+        Some((a, b)) => json!([a.trim(), b.trim()]),
+        None => json!(args.range),
+    };
+    let filters: Value = match &args.filters {
+        Some(f) => serde_json::from_str(f).context("--filters 不是有效的 JSON")?,
+        None => json!([]),
+    };
+    let body = json!({"date_range": date_range, "filters": filters, "interval": args.interval});
+    let request = ExportRequest::parse(&body).map_err(|e| anyhow!("导出参数无效：{e}"))?;
+    let (reader, ctx) = query_context(config, &args.site).await?;
+    let scope = TenantScope::new(ctx.site_id);
     let opts = ExecOptions::new(config.query_timeouts.dashboard_secs)
-        .with_route("cli.query")
+        .with_route("cli.export")
         .with_rollup(config.rollup_min_rows);
-    let result = rivu_query::execute(&reader, &TenantScope::new(site.id), &ctx, spec, opts)
-        .await
-        .map_err(|e| anyhow!("查询失败：{e}"))?;
-    println!("{}", serde_json::to_string_pretty(&result)?);
+    let keys = rivu_query::property_keys(
+        &reader,
+        &scope,
+        &ctx,
+        request.keys_spec().map_err(|e| anyhow!("{e}"))?,
+        opts.clone(),
+    )
+    .await
+    .map_err(|e| anyhow!("读取属性键失败：{e}"))?;
+    let keys: Vec<String> = keys.into_iter().map(|k| k.key).collect();
+    let (reader, ctx_ref, scope_ref) = (&reader, &ctx, &scope);
+    let export = crate::export::build(&request, &keys, move |spec| {
+        rivu_query::execute(reader, scope_ref, ctx_ref, spec, opts.clone())
+    })
+    .await
+    .map_err(|e| anyhow!("导出失败：{e}"))?;
+    let path = args
+        .out
+        .unwrap_or_else(|| crate::export::file_name(&args.site, &export).into());
+    std::fs::write(&path, &export.zip).with_context(|| format!("写入 {} 失败", path.display()))?;
+    println!(
+        "{}（{} – {}，{} 字节）",
+        path.display(),
+        export.from,
+        export.to,
+        export.zip.len()
+    );
     Ok(ExitCode::SUCCESS)
 }
 
