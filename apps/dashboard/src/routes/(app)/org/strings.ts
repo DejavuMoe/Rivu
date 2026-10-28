@@ -47,6 +47,7 @@ extend({
   "inv.created": ["邀请已创建", "Invitation created"],
   "inv.createdToast": ["已创建给 {email} 的邀请", "Created an invitation for {email}"],
   "inv.link": ["邀请链接", "Invitation link"],
+  "inv.mailed": ["邀请邮件已发到 {email}。也可以复制下面的链接自己转发，7 天内有效，只显示这一次。", "An invitation email is on its way to {email}. You can also copy the link below and send it yourself. It's valid for 7 days and shown only once."],
   "inv.once": ["链接 7 天内有效，只显示这一次。", "The link is valid for 7 days and is shown only once."],
 
   // ---- API 密钥 ----

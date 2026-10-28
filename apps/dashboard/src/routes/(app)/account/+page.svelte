@@ -1,5 +1,5 @@
 <!--
-  账号与安全：个人资料（只读）、修改密码、登录会话。主题与语言在侧栏用户菜单里设置。
+  账号与安全：个人资料（只读）、修改密码、两步验证、登录会话。主题与语言在侧栏用户菜单里设置。
   后端目前没有改名、改邮箱的接口。改密码成功后服务端撤销全部旧会话并换发新会话（cookie 已更新），会话列表重新加载。
 -->
 <script lang="ts">
@@ -21,6 +21,7 @@
   import { t } from "#lib/i18n.ts";
   import { clearSession, session } from "#lib/session.svelte.ts";
   import { app, toast } from "#lib/state.svelte.ts";
+  import TwoFactorCard from "./TwoFactorCard.svelte";
   import "./strings";
 
   let sessions = $state<SessionInfo[]>([]);
@@ -182,6 +183,8 @@
       {/snippet}
     </Card>
   </form>
+
+  <TwoFactorCard {unauthorized} />
 
   <Card title={t("ac.sessions")} flush>
     {#snippet actions()}
