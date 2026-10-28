@@ -53,6 +53,21 @@ export const DIMS: Record<string, string> = {
   os: "visit:os",
 };
 
+/** 自定义属性的界面维度名：`prop:<键>`。 */
+export const PROP_PREFIX = "prop:";
+
+/** 属性键的长度上限（与服务端 `event:props:<k>` 一致）。 */
+const MAX_PROP_KEY = 200;
+
+export function isPropDim(dim: string): boolean {
+  return dim.startsWith(PROP_PREFIX) && dim.length > PROP_PREFIX.length && dim.length <= PROP_PREFIX.length + MAX_PROP_KEY;
+}
+
+/** 界面维度名 → QuerySpec 维度（属性是 `event:props:<键>`）。 */
+export function specDim(dim: string): string {
+  return isPropDim(dim) ? `event:props:${dim.slice(PROP_PREFIX.length)}` : DIMS[dim];
+}
+
 /** 只有国家级地理库时没有意义的维度。 */
 export const CITY_LEVEL_DIMS = new Set(["region", "city"]);
 
@@ -91,8 +106,14 @@ export function decodeFilters(s: string | null): Filter[] {
   if (!s) return [];
   const out: Filter[] = [];
   for (const p of s.split(";")) {
-    const [dim, op, v] = p.split("~");
-    if (!dim || !(dim in DIMS) || !OPS.has(op as Op)) continue;
+    const [rawDim, op, v] = p.split("~");
+    let dim = rawDim;
+    try {
+      dim = decodeURIComponent(rawDim ?? "");
+    } catch {
+      continue;
+    }
+    if (!dim || !(dim in DIMS || isPropDim(dim)) || !OPS.has(op as Op)) continue;
     if (dim === "goal" && op !== "is" && op !== "is_not") continue;
     const values = (v ?? "")
       .split("|")
@@ -117,7 +138,8 @@ export function decodeFilters(s: string | null): Filter[] {
 export function encodeFilters(fs: Filter[]): string {
   // encodeURIComponent 不编码 ~，而 ~ 是这里的字段分隔符
   const enc = (v: string) => encodeURIComponent(v).replaceAll("~", "%7E");
-  return fs.map((f) => [f.dim, f.op, f.values.map(enc).join("|")].join("~")).join(";");
+  // 维度名也编码：属性键里可能有分隔符
+  return fs.map((f) => [enc(f.dim), f.op, f.values.map(enc).join("|")].join("~")).join(";");
 }
 
 export function readState(q: { get(key: string): string | null }): DashState {
@@ -144,7 +166,7 @@ export function readState(q: { get(key: string): string | null }): DashState {
 export type Spec = Record<string, unknown>;
 
 export function filtersSpec(fs: Filter[]): unknown[][] {
-  return fs.map((f) => [f.op, DIMS[f.dim], f.values]);
+  return fs.map((f) => [f.op, specDim(f.dim), f.values]);
 }
 
 /** 实时窗口的时刻区间（含起点、不含终点），终点取下一个整分钟，让最后一个桶是当前分钟。 */
@@ -187,15 +209,20 @@ export function seriesSpec(s: DashState, now: Date): Spec {
   return withCompare(spec, s);
 }
 
-/** 分解卡片：按一个维度的访客数排行。 */
+/**
+ * 分解卡片：按一个维度的访客数排行。属性只列带这个键的事件（去掉 `(none)`，否则所有浏览都落在那一行），
+ * 除非已经按这个键筛选了。
+ */
 export function breakdownSpec(s: DashState, dim: string, limit: number, now: Date): Spec {
   const spec: Spec = {
     metrics: ["visitors"],
     date_range: dateRange(s, now),
-    dimensions: [DIMS[dim]],
+    dimensions: [specDim(dim)],
     pagination: { limit },
   };
-  if (s.filters.length) spec.filters = filtersSpec(s.filters);
+  const filters = filtersSpec(s.filters);
+  if (isPropDim(dim) && !s.filters.some((f) => f.dim === dim)) filters.push(["is_not", specDim(dim), ["(none)"]]);
+  if (filters.length) spec.filters = filters;
   return spec;
 }
 
@@ -209,6 +236,13 @@ export function goalsSpec(s: DashState, now: Date): Spec {
     dimensions: ["event:goal"],
     pagination: { limit: GOAL_LIMIT },
   };
+  if (s.filters.length) spec.filters = filtersSpec(s.filters);
+  return spec;
+}
+
+/** 属性卡片的键列表：时间范围与筛选同看板（服务端只用这两项）。 */
+export function propertyKeysSpec(s: DashState, now: Date): Spec {
+  const spec: Spec = { metrics: ["events"], date_range: dateRange(s, now) };
   if (s.filters.length) spec.filters = filtersSpec(s.filters);
   return spec;
 }

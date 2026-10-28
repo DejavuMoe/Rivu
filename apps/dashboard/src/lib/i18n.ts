@@ -153,6 +153,8 @@ const dict = {
   "fdim.os": ["操作系统", "OS"],
   "fdim.goal": ["目标", "Goal"],
   "fdim.hostname": ["主机名", "Hostname"],
+  "dash.card.props": ["属性", "Properties"],
+  "dash.propKey": ["属性键", "Property key"],
   "op.is": ["等于", "is"],
   "op.is_not": ["不等于", "is not"],
   "op.contains": ["包含", "contains"],

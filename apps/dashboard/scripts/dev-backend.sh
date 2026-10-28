@@ -96,6 +96,25 @@ for i in $(seq 0 59); do
   done
 done
 
+# 自定义事件与属性：一部分访客注册（plan、method），一部分点了外链（url），让目标与属性卡片有数据
+PLANS=(free free pro team)
+METHODS=(email github google)
+LINKS=("https://github.com/rivu" "https://docs.rivu.test/install" "https://twitter.com/rivu")
+for i in $(seq 0 59); do
+  ua="${UAS[$((i % ${#UAS[@]}))]} v$i"
+  if [ $((i % 3)) = 0 ]; then
+    props="{\"plan\":\"${PLANS[$((i / 3 % ${#PLANS[@]}))]}\",\"method\":\"${METHODS[$((i / 3 % ${#METHODS[@]}))]}\"}"
+    curl -fsS -o /dev/null -X POST "http://127.0.0.1:${PORT}/api/event" \
+      -H "Content-Type: text/plain" -H "User-Agent: $ua" \
+      --data "{\"v\":1,\"s\":\"$KEY_MAIN\",\"n\":\"Signup\",\"u\":\"https://demo.rivu.test/pricing\",\"p\":$props}" || true
+  fi
+  if [ $((i % 4)) = 1 ]; then
+    curl -fsS -o /dev/null -X POST "http://127.0.0.1:${PORT}/api/event" \
+      -H "Content-Type: text/plain" -H "User-Agent: $ua" \
+      --data "{\"v\":1,\"s\":\"$KEY_MAIN\",\"n\":\"Outbound Link: Click\",\"u\":\"https://demo.rivu.test/\",\"p\":{\"url\":\"${LINKS[$((i % ${#LINKS[@]}))]}\"}}" || true
+  fi
+done
+
 cat <<EOF
 
 看板开发后端已就绪：http://127.0.0.1:${PORT}

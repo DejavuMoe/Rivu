@@ -26,9 +26,11 @@
   import KpiStrip from "./KpiStrip.svelte";
   import BreakdownCard from "./BreakdownCard.svelte";
   import GoalsCard from "./GoalsCard.svelte";
+  import PropsCard from "./PropsCard.svelte";
   import {
     breakdownSpec,
     goalsSpec,
+    propertyKeysSpec,
     readGoals,
     CITY_LEVEL_DIMS,
     DIMS,
@@ -50,7 +52,7 @@
   } from "./spec";
   import { alignTo, axisLabels, tipLabels } from "./labels";
   import { fmtAxis, fmtMetric, lowerIsBetter } from "./metrics";
-  import { failureOf, isAbort, runQuery, runRealtime, type Failure, type Source } from "./source";
+  import { failureOf, isAbort, runPropertyKeys, runQuery, runRealtime, type Failure, type Source } from "./source";
 
   interface Props {
     source: Source;
@@ -219,6 +221,14 @@
     const src = source;
     void tick;
     return (signal: AbortSignal) => runQuery(src, goalsSpec(s, new Date()), signal).then(readGoals);
+  });
+
+  /** 属性卡片的键列表：看板状态变了换一个新函数 */
+  const loadPropertyKeys = $derived.by(() => {
+    const s = dash;
+    const src = source;
+    void tick;
+    return (signal: AbortSignal) => runPropertyKeys(src, propertyKeysSpec(s, new Date()), signal);
   });
 
   /** 筛选对话框里的候选值：该维度的排行，去掉这个维度自己的筛选 */
@@ -401,7 +411,10 @@
       />
     </div>
 
-    <GoalsCard load={loadGoals} onpick={addFilter} />
+    <div class="grid">
+      <GoalsCard load={loadGoals} onpick={addFilter} />
+      <PropsCard loadKeys={loadPropertyKeys} load={loadRows} total={totalVisitors} onpick={addFilter} />
+    </div>
   {/if}
 </div>
 

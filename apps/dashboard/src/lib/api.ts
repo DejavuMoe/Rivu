@@ -386,6 +386,9 @@ export const api = {
     ),
   query: (site: number | string, spec: unknown, opts: { share?: string; signal?: AbortSignal } = {}) =>
     request<QueryResult>("POST", `${base}/sites/${site}/query`, { ...opts, body: spec }),
+  /** 属性卡片的键列表（时间范围与筛选同看板），事件多的在前 */
+  propertyKeys: (site: number | string, spec: unknown, opts: { share?: string; signal?: AbortSignal } = {}) =>
+    request<{ keys: { key: string; events: number }[] }>("POST", `${base}/sites/${site}/property-keys`, { ...opts, body: spec }),
   realtime: (site: number | string, opts: { share?: string; signal?: AbortSignal } = {}) =>
     request<QueryResult>("GET", `${base}/sites/${site}/realtime`, opts),
   shared: (slug: string) =>
