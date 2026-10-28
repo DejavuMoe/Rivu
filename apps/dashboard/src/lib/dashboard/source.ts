@@ -13,6 +13,11 @@ export function runQuery(src: Source, spec: Spec, signal?: AbortSignal): Promise
   return api.query(src.site, spec, { share: src.share, signal });
 }
 
+/** 属性键（只要键名，按事件数排好序）。 */
+export function runPropertyKeys(src: Source, spec: Spec, signal?: AbortSignal): Promise<string[]> {
+  return api.propertyKeys(src.site, spec, { share: src.share, signal }).then((r) => r.keys.map((k) => k.key));
+}
+
 export function runRealtime(src: Source, signal?: AbortSignal): Promise<QueryResult> {
   return api.realtime(src.site, { share: src.share, signal });
 }

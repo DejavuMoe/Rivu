@@ -12,7 +12,7 @@
   import { t } from "../i18n";
   import { app } from "../state.svelte";
   import { displayValue } from "./values";
-  import { RANGES, type CompareKey, type DashState, type Filter, type RangeKey } from "./spec";
+  import { PROP_PREFIX, RANGES, isPropDim, type CompareKey, type DashState, type Filter, type RangeKey } from "./spec";
   import FilterDialog from "./FilterDialog.svelte";
 
   interface Props {
@@ -47,7 +47,8 @@
     onfilters(next);
   }
 
-  const dimName = (d: string) => t(`fdim.${d}`);
+  // 属性筛选直接显示键名（`prop:plan` → `plan`）
+  const dimName = (d: string) => (isPropDim(d) ? d.slice(PROP_PREFIX.length) : t(`fdim.${d}`));
   const opName = (o: string) => t(`op.${o}`);
 </script>
 
@@ -114,7 +115,14 @@
   {/if}
 </div>
 
-<FilterDialog bind:open={dialogOpen} initial={editing === null ? null : dash.filters[editing]} {dims} {suggest} onsave={save} />
+<!-- 编辑属性筛选时，维度下拉里补上这个属性（新建筛选只列固定维度；属性从属性卡片点选） -->
+<FilterDialog
+  bind:open={dialogOpen}
+  initial={editing === null ? null : dash.filters[editing]}
+  dims={editing !== null && isPropDim(dash.filters[editing].dim) ? [...dims, dash.filters[editing].dim] : dims}
+  {suggest}
+  onsave={save}
+/>
 
 <style>
   .bar {

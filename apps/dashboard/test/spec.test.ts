@@ -7,6 +7,8 @@ import {
   encodeFilters,
   goalsSpec,
   opsFor,
+  propertyKeysSpec,
+  specDim,
   readGoals,
   readRows,
   readSeries,
@@ -147,4 +149,27 @@ test("目标卡片的 QuerySpec、目标筛选与结果", () => {
 
 test("分解行", () => {
   assert.deepEqual(readRows(result({ results: [{ dimensions: ["CN"], metrics: [7] }] })), [{ label: "CN", visitors: 7 }]);
+});
+
+test("属性：维度换算、URL 往返（键里有分隔符）、键列表的 QuerySpec", () => {
+  assert.equal(specDim("prop:plan"), "event:props:plan");
+  assert.equal(specDim("country"), "visit:country");
+  const fs = [{ dim: "prop:a~b;c", op: "is" as const, values: ["x|y", "(none)"] }];
+  const enc = encodeFilters(fs);
+  assert.deepEqual(decodeFilters(enc), fs);
+  // 空键、未知维度丢弃
+  assert.deepEqual(decodeFilters("prop:~is~x;bogus~is~x"), []);
+  assert.deepEqual(opsFor("prop:plan"), ["is", "is_not", "contains"]);
+  const s = q(`range=7d&f=${encodeURIComponent(enc)}`);
+  const b = breakdownSpec(s, "prop:plan", 8, now);
+  assert.deepEqual(b.dimensions, ["event:props:plan"]);
+  // 属性卡片去掉 (none)；已经按这个键筛选时不加
+  assert.deepEqual((b.filters as unknown[][]).at(-1), ["is_not", "event:props:plan", ["(none)"]]);
+  const own = q(`range=7d&f=${encodeURIComponent(encodeFilters([{ dim: "prop:plan", op: "is", values: ["pro"] }]))}`);
+  assert.deepEqual(breakdownSpec(own, "prop:plan", 8, now).filters, [["is", "event:props:plan", ["pro"]]]);
+  assert.deepEqual(propertyKeysSpec(s, now), {
+    metrics: ["events"],
+    date_range: "7d",
+    filters: [["is", "event:props:a~b;c", ["x|y", "(none)"]]],
+  });
 });
