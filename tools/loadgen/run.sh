@@ -6,6 +6,7 @@
 # -> 场景 A（持续 SUSTAINED_RATE 事件/s，SUSTAINED_SECS 秒）-> 静置 SETTLE_SECS 秒
 # -> 场景 B（峰值 PEAK_RATE 事件/s，PEAK_SECS 秒）；两个场景里都同时以 QUERY_RATE 次/s 发 POST /api/v1/query
 # 可选 PREFILL_ROWS：场景之前往这些站点预填历史事件（大表上的查询延迟），QUERY_RANGE 改查询的范围（默认 7d）。
+# 有预填时，rivu 启动后先等日汇总层（rollup_build）把预填的天建完，再开始场景（记录构建用时）。
 # -> 每个场景结束后对账（生成器 202 数 vs ingest_counters、events 行数 vs accepted）并收集 ClickHouse 指标
 # -> 停止 rivu。全程每 SAMPLE_SECS 秒采样 rivu / loadgen 的 CPU 与 RSS、会话数、写缓冲深度、活跃 part 数、merge 数。
 #
@@ -185,6 +186,26 @@ done
 curl -sf "http://$INTERNAL_ADDR/readyz" >"$OUT/readyz.txt" || { echo "/readyz 超时"; exit 1; }
 log "rivu 就绪（pid $RIVU_PID）"
 
+# ------------------------------------------------------------------ 等日汇总层建完（有预填时）
+# rollup_build 启动后立即运行，一轮建到「结束超过 2 小时的最后一个本地日」（站点时区 UTC）
+if [[ "$PREFILL_ROWS" -gt 0 ]]; then
+  log "等日汇总层构建"
+  t0=$(date +%s)
+  want="$(ch "SELECT toDate(now() - INTERVAL 2 HOUR) - 1")"
+  for _ in $(seq 1 360); do
+    built="$(ch "SELECT count() FROM (SELECT site_id, max(day) AS d FROM rivu.rollup_site FINAL WHERE site_id IN ($IDS_CSV) GROUP BY site_id) WHERE d >= '$want'")"
+    [[ "$built" -ge "$SITES" ]] && break
+    kill -0 "$RIVU_PID" 2>/dev/null || { echo "rivu 提前退出"; tail -20 "$OUT/rivu.log"; exit 1; }
+    sleep 5
+  done
+  {
+    echo "日汇总层构建到 $want 用时 $(( $(date +%s) - t0 )) s（$built / $SITES 个站点完成）"
+    echo "  汇总表行数（本次站点）："
+    for t in rollup_site rollup_pages rollup_sources rollup_locations; do
+      echo "    $t $(ch "SELECT count() FROM rivu.$t FINAL WHERE site_id IN ($IDS_CSV)")"
+    done
+  } | tee "$OUT/rollup.txt"
+fi
 # ------------------------------------------------------------------ 采样
 metric() { curl -s "http://$INTERNAL_ADDR/metrics" | awk -v m="$1" '$1==m {print $2; exit}'; }
 sampler() {
@@ -263,8 +284,37 @@ reconcile() {
     ch "SELECT count(), round(quantile(0.95)(duration_ms)) FROM system.part_log WHERE event_time >= toDateTime($start_unix) AND event_type = 'MergeParts' AND database = 'rivu'" | sed 's/^/    /'
   } | tee "$OUT/clickhouse-$label.txt"
   curl -s "http://$INTERNAL_ADDR/metrics" >"$OUT/metrics-$label.txt"
+  { echo "查询耗时 $label（rivu 侧，api.query）"; query_latency "$PREV_METRICS" "$OUT/metrics-$label.txt"; } | tee "$OUT/query-$label.txt"
+  PREV_METRICS="$OUT/metrics-$label.txt"
 }
 
+# 本场景的查询耗时（rivu 侧，api.query）：由两次 /metrics 快照的直方图相减，按结果缓存命中与否分开；
+# 分位数取所在桶的上界（桶见 QUERY_SECONDS_BUCKETS）
+query_latency() {
+  awk '
+    /^rivu_query_seconds_bucket\{route="api.query"/ {
+      match($0, /cache="[a-z]+"/); c = substr($0, RSTART + 7, RLENGTH - 8)
+      match($0, /le="[^"]+"/); le = substr($0, RSTART + 4, RLENGTH - 5)
+      if (FILENAME == ARGV[1]) { p[c, le] = $NF } else { cur[c, le] = $NF - p[c, le]; les[le] = 1; cs[c] = 1 }
+    }
+    END {
+      n = 0
+      for (le in les) if (le != "+Inf") { n++; v[n] = le + 0; s[le + 0] = le }
+      for (i = 2; i <= n; i++) { x = v[i]; j = i - 1; while (j > 0 && v[j] > x) { v[j + 1] = v[j]; j-- } v[j + 1] = x }
+      for (c in cs) {
+        total = cur[c, "+Inf"]
+        line = sprintf("  cache=%s：%d 次", c, total)
+        split("0.5 0.95 0.99", qs, " ")
+        for (k = 1; k <= 3; k++) {
+          ans = "> " v[n] " s"
+          for (i = 1; i <= n; i++) if (total > 0 && cur[c, s[v[i]]] >= qs[k] * total) { ans = "≤ " s[v[i]] " s"; break }
+          line = line sprintf("，p%g %s", qs[k] * 100, ans)
+        }
+        print line
+      }
+    }' "$1" "$2"
+}
+PREV_METRICS=/dev/null
 run_scenario() {
   local label="$1"; shift
   local start_unix; start_unix="$(date +%s)"
