@@ -640,7 +640,7 @@ TTL minute + INTERVAL 90 DAY DELETE;
 **用途**
 
 1. 大站长时间范围的加速层（§6.4 选层）；
-2. 存放导入数据（`origin = 'import'`，`import_id` = PG `site_imports.id`）：Plausible 的数据导出（`imported_*.csv`）按族写入，换算规则见 `crates/jobs/src/import_plausible.rs`；只写站点自己的数据开始之前的天，与已有导入重叠时拒绝；用 `rivu import plausible` 导入；
+2. 存放导入数据（`origin = 'import'`，`import_id` = PG `site_imports.id`）：Plausible 的数据导出（`imported_*.csv`）按族写入，换算规则见 `crates/jobs/src/import_plausible.rs`；只写站点自己的数据开始之前的天，与已有导入重叠时拒绝；在看板「站点设置 → 导入」上传，或用 `rivu import plausible`；
 3. 回答超出原始数据保留期的时间范围（P2，随可配置保留期一起做）。
 
 **访客数跨天直接求和**：访客 ID 每个本地日轮换，而事件保留自己当天的 `visitor_id`（盖章不改写，§4.6、§10 Q9），所以原始层任意范围的 `uniq(visitor_id)` 严格等于各本地日去重访客数之和（R03 §12.2 #16），与日汇总层逐日相加一致。日汇总层只存每日去重的访客数，不需要 HLL 状态。两层都排除 engagement，并用同一个 `uniq`，日汇总层存的就是按同样方法算出的每日值（§6.5、§10 Q10、Q17）。

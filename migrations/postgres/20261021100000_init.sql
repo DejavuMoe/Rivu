@@ -322,6 +322,7 @@ CREATE INDEX jobs_finished ON jobs (finished_at) WHERE finished_at IS NOT NULL;
 -- ------------------------------------------------------------- site_imports
 -- 外部数据导入：Plausible 导出的 CSV（zip）写进 ClickHouse 的日汇总层（origin = 'import'，import_id = id）。
 -- start_date / end_date 是实际写入的站点本地日期（截断到站点自己的数据开始之前）；status 为 completed 的才参与查询。
+-- error_code 是给看板翻译的失败原因，error 是详细信息（日志与 CLI）。一个站点同时只有一个进行中的导入。
 CREATE TABLE site_imports (
     id            bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     site_id       bigint NOT NULL REFERENCES sites (id) ON DELETE CASCADE,
@@ -332,6 +333,8 @@ CREATE TABLE site_imports (
     start_date    date,
     end_date      date,
     rows_imported bigint NOT NULL DEFAULT 0,
+    error_code    text CHECK (error_code IN ('invalid_zip', 'not_plausible', 'invalid_csv', 'no_days',
+                                             'overlap', 'interrupted', 'internal')),
     error         text,
     imported_by   bigint REFERENCES users (id) ON DELETE SET NULL,
     created_at    timestamptz NOT NULL DEFAULT now(),
@@ -339,6 +342,7 @@ CREATE TABLE site_imports (
     CHECK (end_date >= start_date)
 );
 CREATE INDEX site_imports_site ON site_imports (site_id);
+CREATE UNIQUE INDEX site_imports_running ON site_imports (site_id) WHERE status = 'importing';
 -- ----------------------------------------------------- pending_stats_deletions
 -- ClickHouse 删除意图：工作表，没有 deleted_at。
 CREATE TABLE pending_stats_deletions (

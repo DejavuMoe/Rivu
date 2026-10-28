@@ -151,6 +151,7 @@ mod tests {
             built_to,
             tz_changed,
             first_day,
+            native_from: first_day,
         }
     }
 

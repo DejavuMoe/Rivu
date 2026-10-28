@@ -10,6 +10,7 @@
   import ShieldSection from "../ShieldSection.svelte";
   import GoalsSection from "../GoalsSection.svelte";
   import SharingSection from "../SharingSection.svelte";
+  import ImportsSection from "../ImportsSection.svelte";
   import DangerSection from "../DangerSection.svelte";
 
   const site = $derived(findSite(Number(page.params.id)));
@@ -36,6 +37,8 @@
     <GoalsSection {site} readOnly={sectionReadOnly("goals", site)} />
   {:else if section === "sharing"}
     <SharingSection {site} />
+  {:else if section === "imports"}
+    <ImportsSection {site} />
   {:else if section === "danger"}
     <DangerSection {site} />
   {/if}

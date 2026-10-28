@@ -20,7 +20,11 @@ pub struct ImportRow {
     pub start_date: Option<String>,
     pub end_date: Option<String>,
     pub rows_imported: i64,
+    /// 失败原因的代码（看板翻译用）；`error` 是详细信息。
+    pub error_code: Option<String>,
     pub error: Option<String>,
+    /// 导入的人（CLI 导入或账号已删除为 `None`）。
+    pub imported_by: Option<String>,
     pub created_at: String,
     pub completed_at: Option<String>,
 }
@@ -29,7 +33,8 @@ macro_rules! import_columns {
     () => {
         concat!(
             "id, source, status, file_name, to_char(start_date, 'YYYY-MM-DD') AS start_date, ",
-            "to_char(end_date, 'YYYY-MM-DD') AS end_date, rows_imported, error, ",
+            "to_char(end_date, 'YYYY-MM-DD') AS end_date, rows_imported, error_code, error, ",
+            "(SELECT coalesce(u.name, u.email) FROM users u WHERE u.id = site_imports.imported_by) AS imported_by_name, ",
             ts_sec!("created_at"),
             " AS created_at, ",
             ts_sec!("completed_at"),
@@ -47,28 +52,32 @@ fn import_row(r: &sqlx::postgres::PgRow) -> Result<ImportRow> {
         start_date: r.try_get("start_date")?,
         end_date: r.try_get("end_date")?,
         rows_imported: r.try_get("rows_imported")?,
+        error_code: r.try_get("error_code")?,
         error: r.try_get("error")?,
+        imported_by: r.try_get("imported_by_name")?,
         created_at: r.try_get("created_at")?,
         completed_at: r.try_get("completed_at")?,
     })
 }
 
-/// 开始一次导入（状态 `importing`），返回记录 id（也是 ClickHouse 里的 `import_id`）。
+/// 开始一次导入（状态 `importing`），返回记录 id（也是 ClickHouse 里的 `import_id`）；
+/// 站点已有进行中的导入时返回 `None`。
 pub async fn create(
     pool: &PgPool,
     site_id: u64,
     source: &str,
     file_name: &str,
     imported_by: Option<i64>,
-) -> Result<i64> {
+) -> Result<Option<i64>> {
     sqlx::query_scalar(
-        "INSERT INTO site_imports (site_id, source, file_name, imported_by) VALUES ($1, $2, $3, $4) RETURNING id",
+        "INSERT INTO site_imports (site_id, source, file_name, imported_by) VALUES ($1, $2, $3, $4)
+         ON CONFLICT (site_id) WHERE status = 'importing' DO NOTHING RETURNING id",
     )
     .bind(id_i64(site_id)?)
     .bind(source)
     .bind(file_name)
     .bind(imported_by)
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await
     .context("写入导入记录失败")
 }
@@ -77,7 +86,7 @@ pub async fn create(
 pub async fn complete(pool: &PgPool, id: i64, start: &str, end: &str, rows: i64) -> Result<()> {
     sqlx::query(
         "UPDATE site_imports SET status = 'completed', start_date = $2::date, end_date = $3::date,
-                rows_imported = $4, error = NULL, completed_at = now()
+                rows_imported = $4, error_code = NULL, error = NULL, completed_at = now()
          WHERE id = $1",
     )
     .bind(id)
@@ -90,12 +99,13 @@ pub async fn complete(pool: &PgPool, id: i64, start: &str, end: &str, rows: i64)
     Ok(())
 }
 
-/// 导入失败（已写入的汇总行由调用方删除）。
-pub async fn fail(pool: &PgPool, id: i64, error: &str) -> Result<()> {
+/// 导入失败（已写入的汇总行由调用方删除）。`code` 见表的 `error_code` 约束。
+pub async fn fail(pool: &PgPool, id: i64, code: &str, error: &str) -> Result<()> {
     sqlx::query(
-        "UPDATE site_imports SET status = 'failed', error = $2, completed_at = now() WHERE id = $1",
+        "UPDATE site_imports SET status = 'failed', error_code = $2, error = $3, completed_at = now() WHERE id = $1",
     )
     .bind(id)
+    .bind(code)
     .bind(error)
     .execute(pool)
     .await

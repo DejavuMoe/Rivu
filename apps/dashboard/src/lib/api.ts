@@ -263,6 +263,22 @@ export interface StatsDeletion {
   completed_at: string | null;
 }
 
+/** 一次数据导入（Plausible 导出）；日期是站点本地日期，导入完成前为 null。 */
+export interface SiteImport {
+  id: number;
+  source: "plausible_csv";
+  status: "importing" | "completed" | "failed";
+  file_name: string;
+  start_date: string | null;
+  end_date: string | null;
+  rows_imported: number;
+  /** 失败原因的代码，界面据此给出说明 */
+  error_code: "invalid_zip" | "not_plausible" | "invalid_csv" | "no_days" | "overlap" | "interrupted" | "internal" | null;
+  imported_by: string | null;
+  created_at: string;
+  completed_at: string | null;
+}
+
 export class ApiError extends Error {
   constructor(
     readonly status: number,
@@ -322,6 +338,36 @@ export async function request<T>(method: string, path: string, opts: Options = {
 
 const base = "/api/internal";
 
+/**
+ * 上传 Plausible 导出的 zip（请求体是原样字节，`Content-Type: application/zip`）。用 XHR 是为了上传进度；
+ * 服务端读完请求体后返回 202，导入在后台跑。
+ */
+function uploadImport(site: number | string, file: File, onProgress: (fraction: number) => void): Promise<{ import: SiteImport }> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `${base}/sites/${site}/imports?file_name=${encodeURIComponent(file.name)}`);
+    xhr.setRequestHeader("Content-Type", "application/zip");
+    xhr.setRequestHeader("Accept", "application/json");
+    xhr.withCredentials = true;
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) onProgress(e.loaded / e.total);
+    };
+    xhr.onerror = () => reject(new ApiError(0, "network", "network error"));
+    xhr.onload = () => {
+      let data: unknown = null;
+      try {
+        data = xhr.responseText ? JSON.parse(xhr.responseText) : null;
+      } catch {
+        /* 非 JSON（代理错误页等），按状态码处理 */
+      }
+      if (xhr.status >= 200 && xhr.status < 300) return resolve(data as { import: SiteImport });
+      const d = (data ?? {}) as { error?: string; message?: string };
+      reject(new ApiError(xhr.status, d.error ?? `http_${xhr.status}`, d.message ?? xhr.statusText));
+    };
+    xhr.send(file);
+  });
+}
+
 export const api = {
   setup: (body: { token?: string; email: string; password: string; org_name: string; name?: string }) =>
     request<{ user: User; organization: Org }>("POST", `${base}/setup`, { body }),
@@ -354,6 +400,10 @@ export const api = {
   goals: (site: number | string) => request<{ goals: Goal[]; max_goals: number }>("GET", `${base}/sites/${site}/goals`),
   addGoal: (site: number | string, body: NewGoal) => request<{ goal: Goal }>("POST", `${base}/sites/${site}/goals`, { body }),
   removeGoal: (site: number | string, id: number) => request<void>("DELETE", `${base}/sites/${site}/goals/${id}`),
+  imports: (site: number | string) =>
+    request<{ imports: SiteImport[]; native_from: string | null }>("GET", `${base}/sites/${site}/imports`),
+  uploadImport,
+  removeImport: (site: number | string, id: number) => request<void>("DELETE", `${base}/sites/${site}/imports/${id}`),
   sharedLinks: (site: number | string) => request<{ links: SharedLink[] }>("GET", `${base}/sites/${site}/shared-links`),
   createSharedLink: (site: number | string, body: { name?: string; password?: string; expires_at?: string }) =>
     request<{ link: SharedLink }>("POST", `${base}/sites/${site}/shared-links`, { body }),

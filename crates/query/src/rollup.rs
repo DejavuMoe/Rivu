@@ -386,6 +386,9 @@ pub struct BuildState {
     pub tz_changed: bool,
     /// 站点最早事件的本地日（没有事件为 `None`）。
     pub first_day: Option<Date>,
+    /// 站点自己的数据从哪天开始：最早事件与最早的原生汇总行中较早的一天（保留期删掉旧事件后，
+    /// 汇总行还在）。导入只写这天之前的日子。
+    pub native_from: Option<Date>,
 }
 
 pub async fn build_state(
@@ -399,6 +402,10 @@ pub async fn build_state(
     let row = rows.first();
     let built_to = row
         .and_then(|r| r.first())
+        .and_then(serde_json::Value::as_str)
+        .and_then(|s| s.parse().ok());
+    let first_built: Option<Date> = row
+        .and_then(|r| r.get(3))
         .and_then(serde_json::Value::as_str)
         .and_then(|s| s.parse().ok());
     let tz_changed = row
@@ -423,10 +430,15 @@ pub async fn build_state(
         Some(ms) => Some(local_date(tz, ms)?),
         None => None,
     };
+    let native_from = match (first_day, first_built) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
     Ok(BuildState {
         built_to,
         tz_changed,
         first_day,
+        native_from,
     })
 }
 
