@@ -1,6 +1,6 @@
 # 安装与运维
 
-Rivu 默认以单机方式部署：一个 `rivu` 进程加 PostgreSQL 与 ClickHouse，全部功能都可用。前面放一个反向代理（nginx 或 Caddy）负责 HTTPS。
+Rivu 以单实例方式部署：一个 `rivu` 进程加 PostgreSQL 与 ClickHouse，全部功能都可用。前面放一个反向代理（nginx 或 Caddy）负责 HTTPS。
 
 ## 需要什么
 

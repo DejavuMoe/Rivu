@@ -99,15 +99,6 @@ pub enum LogFormat {
     Pretty,
 }
 
-/// 部署方式（`RIVU_MODE`）。两种都是全功能的，区别只在事件怎样到达会话分配。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode {
-    /// 单机（默认）：`rivu all` 一个进程，接入、会话分配、写入都在进程内。
-    Single,
-    /// 集群（可选）：多个 collector 把事件发到 NATS JetStream，worker 按分区消费并分配会话。
-    Cluster,
-}
-
 /// CIDR 网段（`RIVU_TRUSTED_PROXIES` 的元素），用于客户端 IP 判定。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cidr {
@@ -534,7 +525,6 @@ pub struct Config {
     pub internal_addr: SocketAddr,
     pub log_format: LogFormat,
     pub log_level: String,
-    pub mode: Mode,
     pub trusted_proxies: Vec<Cidr>,
     pub buffer: BufferConfig,
     pub query_timeouts: QueryTimeouts,
@@ -681,20 +671,6 @@ impl Config {
         if let Err(e) = check_level(&log_level) {
             l.problems
                 .push(format!("RIVU_LOG_LEVEL=`{log_level}` 无效: {e}"));
-        }
-
-        let mode = match l.optional("RIVU_MODE").as_deref() {
-            None | Some("single") => Mode::Single,
-            Some("cluster") => Mode::Cluster,
-            Some(other) => {
-                l.problems
-                    .push(format!("RIVU_MODE=`{other}` 无效，可选 single | cluster"));
-                Mode::Single
-            }
-        };
-        if role == Role::All && mode == Mode::Cluster {
-            l.problems
-                .push("`rivu all` 只用于单机部署（RIVU_MODE=single）；集群模式请分别运行 collector / worker / api".into());
         }
 
         let mut trusted_proxies = Vec::new();
@@ -929,7 +905,6 @@ impl Config {
             internal_addr,
             log_format,
             log_level,
-            mode,
             trusted_proxies,
             buffer: BufferConfig {
                 flush_interval: Duration::from_millis(flush_interval_ms),
@@ -1296,7 +1271,6 @@ mod tests {
         assert_eq!(cfg.internal_addr, "127.0.0.1:9090".parse().unwrap());
         assert_eq!(cfg.log_format, LogFormat::Json);
         assert_eq!(cfg.log_level, "info");
-        assert_eq!(cfg.mode, Mode::Single);
         assert!(cfg.trusted_proxies.is_empty());
         // 写缓冲默认值取 system-design §4.7（§10 Q16）
         assert_eq!(cfg.buffer.flush_interval, Duration::from_millis(1000));
@@ -1663,7 +1637,6 @@ mod tests {
         let env = Env::from_pairs([
             ("RIVU_LISTEN_ADDR", "nonsense"),
             ("RIVU_LOG_FORMAT", "xml"),
-            ("RIVU_MODE", "turbo"),
             ("RIVU_TRUSTED_PROXIES", "10.0.0.0/8, 10.0.0.0/99, nope"),
         ]);
         let err = Config::from_env(Role::All, &env).unwrap_err();
@@ -1676,13 +1649,12 @@ mod tests {
             "RIVU_CH_MAINTAINER_USER 必填",
             "RIVU_LISTEN_ADDR",
             "RIVU_LOG_FORMAT",
-            "RIVU_MODE",
             "10.0.0.0/99",
             "nope",
         ] {
             assert!(text.contains(needle), "缺少 `{needle}`:\n{text}");
         }
-        assert!(err.problems.len() >= 10);
+        assert!(err.problems.len() >= 9);
     }
 
     #[test]
@@ -1731,14 +1703,6 @@ mod tests {
         ]);
         let err = Config::from_env(Role::Migrate, &env).unwrap_err();
         assert!(err.to_string().contains("RIVU_CH_WRITER_PASSWORD 缺失"));
-    }
-
-    #[test]
-    fn all_with_cluster_mode_is_rejected() {
-        let mut env = Env::from_pairs(base_pairs());
-        env.vars.insert("RIVU_MODE".into(), "cluster".into());
-        assert!(Config::from_env(Role::All, &env).is_err());
-        assert!(Config::from_env(Role::Collector, &env).is_ok());
     }
 
     #[test]

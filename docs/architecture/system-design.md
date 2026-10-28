@@ -17,7 +17,7 @@ Plausible 的系统设计可以抽象成三件东西：
 - 一个进程内的**会话状态机**；
 - 一个所有报表共用的**统一查询内核**。
 
-Rivu 保留这三个抽象，但替换 Plausible 最脆弱的一环。Plausible 用 `-1/+1` 成对写入的折叠行来维护会话表；Rivu 改为接入时只给事件分配 `session_id` 并盖上会话属性，会话指标交给 ClickHouse 物化视图聚合。这样做有两个结果：单机和集群两种部署共用同一套会话逻辑；JetStream 重放消息也不会把统计弄错。
+Rivu 保留这三个抽象，但替换 Plausible 最脆弱的一环。Plausible 用 `-1/+1` 成对写入的折叠行来维护会话表；Rivu 改为接入时只给事件分配 `session_id` 并盖上会话属性，会话指标交给 ClickHouse 物化视图聚合。这样写入是追加式的：会话指标由物化视图聚合，重试写入（带去重 token）也不会把统计弄错。
 
 ### 0.2 关键决策
 
@@ -28,9 +28,8 @@ Rivu 保留这三个抽象，但替换 Plausible 最脆弱的一环。Plausible 
 | D3 | 预聚合 | 以直接查原始层为主，不用 MV 维护按小时、按天的聚合表。另设「日汇总层」，由后台任务按站点本地日期幂等重算，表结构对齐 Plausible 的 `imported_*` 维度族，导入数据和超出保留期的数据都放这一层。查询规划器自动选层 | R02 §8.4；R03 §8、§9 |
 | D4 | 时区 | 存 UTC，查询时换算（与 Plausible 相同），排序键里没有本地日期。只有日汇总层按站点本地日期存储，站点改时区时重建 | R03 §7.1 |
 | D5 | 访客 ID | 盐按日期存。事件使用「站点本地日期」对应的盐，所以 ID 在站点本地午夜轮换。同时计算前一天的 ID，用于跨午夜续会话；会话最长 7 天，跨多个午夜靠会话的别名 key（§4.6） | R01 §9.2、§9.3 |
-| D6 | 写入确认 | 应用内批量写入（1 s、2 万行或 8 MB 先到先写），不用 ClickHouse 的 `async_insert`。事件进入有界缓冲就回 `202`，缓冲满时回 `503`。集群模式在 JetStream 返回 PubAck 后回 `202` | R01 §2.5、§3.3；R02 §5、§7 |
+| D6 | 写入确认 | 应用内批量写入（1 s、2 万行或 8 MB 先到先写），不用 ClickHouse 的 `async_insert`。事件进入有界缓冲就回 `202`，缓冲满时回 `503` | R01 §2.5、§3.3；R02 §5、§7 |
 | D7 | 响应语义 | 事件被接受或被过滤都回 `202`，用响应头 `x-rivu-dropped` 给出丢弃数量，不暴露原因。`400` 只用于协议错误，`503` 只用于过载 | R01 §3.2、§3.3；R00 §5.4 |
-| D8 | 可靠模式去重 | 用稳定的分区键，每个分区只有一个消费者；批次边界先写入 NATS KV，保证重放时批次不变；写入时带 `insert_deduplication_token`。会话状态尽量小，重放不改变结果 | R02 §11.2 #10 |
 | D9 | 站点标识 | 不透明的 `site_key`，与域名解耦（Plausible 的 `pa-<id>` 脚本也已改为与域名解耦）。域名只作为 hostname 白名单 | R01 §2.10、§6.5 |
 | D10 | 客户端 IP | 只信任可配置的可信代理 CIDR 列表给出的转发头。Plausible 无条件信任 5 种转发头，是反例 | R01 §4.4 |
 | D11 | 进程 | 1 个二进制，按角色启动：`rivu collector/worker/api/migrate/all`。`all` 就是最简单的自托管形态 | 降低自托管复杂度 |
@@ -113,7 +112,7 @@ Rivu 保留这三个抽象，但替换 Plausible 最脆弱的一环。Plausible 
 - 调用超时并不会取消已经入队的会话更新（幽灵执行），结果是事件被丢弃，会话计数却已经增加。
 - 写缓冲 flush 失败时，进程内的缓存仍然存活，之后会写出没有对应 `+1` 行的孤儿 `-1` 行。
 - version 列必须严格单调递增，所以 engagement 事件不能修改会话。
-- 消息重放不幂等，无法直接搬到 JetStream 之后。
+- 写入重试不幂等：重复写入会让 `-1/+1` 折叠行算错。
 
 ### 2.4 统计：统一查询内核
 
@@ -145,7 +144,7 @@ Rivu 保留这三个抽象，但替换 Plausible 最脆弱的一环。Plausible 
 | `-1/+1` 折叠会话表 + 100 个串行进程 | 替换 | `session_id` 盖章 + MV 聚合 |
 | TinySock 会话交接 | 替换 | 快照文件，或从 ClickHouse 预热 |
 | 5 s / 100 KB 写缓冲，失败即丢弃 | 改进 | 1 s 批量、重试、有界背压 |
-| Remote persistor（Erlang term 序列化后 base64） | 替换 | JetStream + 带版本号的 MessagePack |
+| Remote persistor（Erlang term 序列化后 base64） | 去掉 | 只有进程内写入（BatchWriter），不需要跨进程传递事件 |
 | 无物化视图、无结果缓存、采样仅 EE 提供 | 改进 | 日汇总层自动分层 + moka 结果缓存；暂不做采样（§10 Q6） |
 | 统一 DSL、两段式解析、白名单 | 保留 | §6 |
 | 公开 schema 和内部解析器各一套 | 改进 | 从同一套 Rust 类型生成 |
@@ -163,16 +162,17 @@ Rivu 保留这三个抽象，但替换 Plausible 最脆弱的一环。Plausible 
 
 ### 3.1 进程与角色
 
-| 角色（`rivu <cmd>`） | 职责 | 状态 | 单机部署 | 集群模式 |
-|---|---|---|---|---|
-| `collector` | 处理 `/api/event` 和 `/js/*`，运行接入管线；单机模式下还运行 SessionAssigner 和 BatchWriter | 单机有会话状态；集群无状态 | 在 `all` 进程内 | N 个副本 |
-| `worker` | 消费 JetStream 分区，运行 SessionAssigner、BatchWriter 和后台任务 | 每个分区有自己的会话状态 | 无 | 1 个以上，按分区租约分配 |
-| `api` | 查询 DSL、管理 API、鉴权 | 无状态，只有结果缓存 | 在 `all` 进程内 | M 个副本 |
-| `migrate` | 按顺序执行 PG 和 CH 的迁移 | 无 | 一次性任务 | 一次性任务 |
-| `all` | 在一个进程里跑 collector、api 和后台任务 | 与 collector 相同 | 默认形态 | 不使用 |
+Rivu 只支持单实例部署：一个 `rivu all` 进程，加 PostgreSQL 与 ClickHouse，前面放反向代理。
 
-单机模式要多副本时，Caddy 用 `lb_policy client_ip_hash` 按客户端 IP 路由。访客 ID 本身包含 IP，所以同一访客的事件总会落到同一个 collector，会话仍然成立。代价是扩缩容那一刻会有少量会话断开。如果需要更大规模，或者要求故障期间不丢数据，就换成集群模式。
+| 角色（`rivu <cmd>`） | 职责 | 状态 |
+|---|---|---|
+| `all` | 在一个进程里跑 collector、api 和后台任务（部署形态） | 会话状态（进程内分片） |
+| `collector` | 处理 `/api/event` 和 `/js/*`，运行接入管线、SessionAssigner 和 BatchWriter | 会话状态 |
+| `api` | 查询 DSL、管理 API、鉴权、看板静态文件 | 只有结果缓存 |
+| `worker` | 后台任务 | 无 |
+| `migrate` | 按顺序执行 PG 和 CH 的迁移 | 无（一次性任务） |
 
+`collector`、`api`、`worker` 是 `all` 的组成部分，可以分开启动用于排障，但同一时间只能有一个 collector（会话状态在进程内）。
 ### 3.2 Cargo workspace
 
 ```
@@ -186,44 +186,31 @@ rivu/
 │   ├── ua/             # rivu-ua：UA 解析、机器人判定、设备类别（纯库）
 │   ├── geo/            # rivu-geo：GeoIP 库的读取、下载、校验、署名（定时刷新由 `jobs` 调用）
 │   ├── source/         # rivu-source：referrer → source、渠道规则（纯库，数据编译期嵌入）
-│   ├── session/        # SessionAssigner：单机时跑在 collector 内，集群时跑在 worker 内
+│   ├── session/        # SessionAssigner：跑在 collector 内
 │   ├── writer/         # ClickHouse 批量写入、重试、去重 token
-│   ├── bus/            # （P3 新增）JetStream 发布与消费、分区租约（集群）
 │   ├── query/          # QuerySpec → ResolvedQuery → Plan → SQL → Result
 │   ├── reference/      # rivu-reference：QuerySpec 的独立参照执行器（内存里算），只用于差分测试（`brief-p1.md`）
 │   ├── auth/           # rivu-auth：API key 格式与鉴权、scope、角色矩阵、站点访问判定（axum 中间件）
 │   ├── ratelimit/      # rivu-ratelimit：令牌桶、采集按站点限流、API 按组织限流
 │   ├── storage-pg/     # sqlx
 │   ├── storage-ch/     # clickhouse crate 封装、CH 迁移
-│   ├── jobs/           # PG 任务队列、cron leader、汇总层构建
+│   ├── jobs/           # 后台任务：盐、汇总层构建、删除与保留、地理库更新、ClickHouse 监控
 │   └── common/         # 配置、遥测、错误类型
 ├── bin/rivu/           # 单个二进制：collector | worker | api | migrate | all，以及管理命令
 ├── tools/              # loadgen（压测）、reconcile（边缘日志对账）、reident（重识别测试）、replay（与 Plausible 并行回放）
 ├── migrations/{postgres,clickhouse}/
-└── deploy/{compose.dev.yml,compose.yml,compose.cluster.yml,Caddyfile}
+└── deploy/{compose.dev.yml,compose.yml,Caddyfile,nginx.conf}
 ```
 
 ### 3.3 数据流
 
-**单机**（个人和轻量自托管）
-
 ```
-tracker ─► Caddy ─► rivu all
+tracker ─► 反向代理 ─► rivu all
                      ├─ 接入管线 ─► SessionAssigner（进程内分片）─► BatchWriter（有界 channel）─► ClickHouse.events
                      │                                                         └─ mv_sessions ─► ClickHouse.sessions
-                     ├─ api：查询引擎 ⇄ ClickHouse（只读账号）/ PostgreSQL；moka 结果缓存
-                     └─ jobs：盐、日汇总层、删除批处理、地理库更新…
+                     ├─ api：查询引擎 ⇄ ClickHouse（只读账号）/ PostgreSQL；moka 结果缓存；看板静态文件
+                     └─ jobs：盐、日汇总层、删除与保留、地理库更新、ClickHouse 监控
 ```
-
-**集群**（多站点平台）
-
-```
-tracker ─► Caddy ─► collector × N（无状态：管线 + visitor_id + partition）
-                        └─► JetStream RIVU_EVENTS（subject rivu.ev.<p>，WorkQueue）
-                               └─► worker（独占分区 p：SessionAssigner + BatchWriter）─► ClickHouse
-api × M ─► ClickHouse（只读账号）/ PostgreSQL          jobs：运行在 worker 上（PG advisory lock 选 leader）
-```
-
 ---
 
 ## 4. 接入
@@ -232,12 +219,12 @@ api × M ─► ClickHouse（只读账号）/ PostgreSQL          jobs：运行�
 
 | 情况 | 状态码 | 说明 |
 |---|---|---|
-| 接受 | `202`，空响应体 | 单机：已进入有界缓冲；集群：已收到 PubAck |
+| 接受 | `202`，空响应体 | 已进入有界缓冲 |
 | 被过滤（机器人、未知站点、限流、规则命中、没有会话的 engagement） | `202` + `x-rivu-dropped: <数量>` | 不暴露原因，原因只进 `ingest_counters` |
 | 协议错误（JSON 不合法、缺字段、超长、格式不对） | `400` + `{"errors":{…}}` | 不计入 dropped，也不进 `ingest_counters`；按 `rejected_<字段>` 只进 Prometheus（§10 Q13） |
 | 请求体超过 8 KB | `413` + `Connection: close` | |
 | 读请求体超时（5 s） | `408` + `Connection: close` | |
-| 过载（缓冲满、JetStream 不可用） | `503` + `Retry-After` | 计入 `dropped_overloaded` |
+| 过载（写缓冲满） | `503` + `Retry-After` | 计入 `dropped_overloaded` |
 
 浏览器端不重试（R01 §2.5），所以「等 ClickHouse 确认后再回复」对数据完整性没有帮助，只会拉长请求时间、增加并发连接（D6）。
 
@@ -256,14 +243,14 @@ api × M ─► ClickHouse（只读账号）/ PostgreSQL          jobs：运行�
 | 8 | 来源 | `rivu-source` 的 `classify`：referrer → source（host 命中站点白名单的视为内部引荐，调用方传 `None`）；UTM（空串视为缺失）；click id 只记参数名；渠道分类（只有一份 Rust 实现，规则带版本号） | 无 | Matomo 来源库（CC0）、自维护补充表、渠道规则 |
 | 9 | 属性 | 规范化 props；可选的站点 props 白名单；收入（P4） | 无 | SiteConfig |
 | 10 | 身份 | 计算 `visitor_id`、`prev_visitor_id`、`partition`（§4.5） | `salt_missing` | salts |
-| 11 | 交接 | 单机：交给 SessionAssigner，再交给 BatchWriter；集群：发布到 JetStream | `no_session`（engagement）、`overloaded` | 无 |
+| 11 | 交接 | 交给 SessionAssigner，再交给 BatchWriter | `no_session`（engagement）、`overloaded` | 无 |
 
 - **顺序原则**与 Plausible 相同（R01 §5.2）：先做便宜的判断，昂贵的 UA 解析和地理查询放在规则之后。
 - **每个阶段**都记录耗时直方图 `rivu_ingest_stage_seconds{stage}`；每个丢弃原因都计入 `ingest_counters`（§5.4）。`stage` 标签共 10 个：`parse`（第 1 步）、`admit`（第 2–3 步，含客户端 IP 与限流）、`shield`（第 4 步）、`bot`（第 5 步；一次 `UaParser::parse` 的耗时记在这里）、`geo`（第 6 步，含国家规则）、`ua`（第 7 步，只是把解析结果写进会话属性）、`source`（第 8 步）、`identity`（第 10 步）、`session`（第 11 步的 SessionAssigner）、`write`（组装行并交给 BatchWriter）。engagement 不经过 `bot` `geo` `ua` `source`，这几个直方图的样本数只对应 pageview 与自定义事件。被限流拒绝的请求另计 `rivu_ratelimit_rejected_total{scope="ingest"}`。
 - **丢弃原因的标识符**（§10 Q13）以 Rust 枚举 `DropReason`（`rivu-domain`）为唯一来源，共 13 个：`unknown_site` `site_disabled` `hostname_not_allowed` `rate_limited` `spam_referrer` `ip_blocked` `page_blocked` `bot` `datacenter_ip` `country_blocked` `no_session` `salt_missing` `overloaded`。`ingest_counters.metric` 取 `accepted` 或 `dropped_<原因>`；未知站点记 `site_id = 0`；已删除的站点从快照摘除后，同样按 `unknown_site` 计。机器人一律记 `dropped_bot`；`rivu-ua` 的 `BotKind`（`spider` `headless` `automation` `empty`）只用于统计与排错，不进 `ingest_counters.metric`（§10 Q21）。`salt_missing` 表示事件的站点本地日期没有盐：collector 不现场生成盐（`platform-and-ops.md` §3.3）。
 - **采集限流**（`rivu-ratelimit::KeyedLimiter`）：每站一个令牌桶，容量 N、补充速率 N/60 每秒（N = 每分钟额度，所以可以一次突发一分钟的量）。额度取站点 `ingest_rate_limit_per_min`，为空取 `RIVU_INGEST_RATE_LIMIT_PER_MIN`，设为 `0` 表示不限流。默认 300000 个/分钟，即 5000 个/秒的系统峰值目标（§7）：`site_key` 是公开的，没有默认上限就等于没有限流；而单站日均 1000 万事件、20 倍峰值约 2300 个/秒，默认值不会误伤目标规模内的真实流量，小站想更严就设站点自己的额度。状态在进程内，多副本 collector 各自本地计数（总额度约为副本数倍），重启清零；站点额度变化时就地调整桶，不重置已有令牌；站点被删除后，它的桶在下一轮会话清扫（每 60 秒）时丢掉。engagement 同样计数：限流是洪水防护，不分事件类型。
 - **屏蔽规则的语义**（`platform-and-ops.md` §3.3）：规则随站点快照编译成不可变的 `ShieldRules`，`deny` 命中就丢弃，`allow` 是同一类型内的例外。只有 `allow` 没有 `deny` 时不起作用，不是白名单模式。页面通配用分段比较而不是正则（无回溯，pathname ≤1024 字节、模式 ≤250 字节），所以匹配代价有界。
-- **可选优化（仅单机）**：续期会话的事件最终会被盖上会话属性，所以第 5–8 步的结果会被覆盖。可以在第 10 步之后先查会话，命中时跳过这几步。
+- **可选优化**：续期会话的事件最终会被盖上会话属性，所以第 5–8 步的结果会被覆盖。可以在第 10 步之后先查会话，命中时跳过这几步。
 - **UA 与机器人**（`rivu-ua`，详见 `docs/research/enrich-ua.md`）：第 5、7 步共用一次解析。机器人在第 5 步丢弃，其余字段第 7 步取用。`browser` 的取值不受 uap-core 控制（兜底规则会把任意 token 当家族名），所以查询层展示该维度必须 top-N 加「其它」（§6.10）。
 - **来源与渠道的实现**（`rivu-source`，`classify(&SourceInput) -> SourceInfo`，只有这一份；详见 `docs/research/enrich-source.md`）：
   - 渠道取值是 GA4 默认渠道分组的 19 个渠道（不含 `Unassigned`），规则是一张 21 条的有序表，先匹配先赢；英文标识就是 ClickHouse `channel` 列的值，中文名在 UI 层按标识映射（§10 Q19）。
@@ -363,7 +350,7 @@ salt(d)           = salts 表中日期 d 的 16 字节随机数（只存在 PG�
 local_date        = date(ts in site.timezone)
 visitor_id        = SipHash-2-4(salt(local_date),     site_id ‖ len‖ip ‖ len‖ua) → u64
 prev_visitor_id   = SipHash-2-4(salt(local_date - 1), site_id ‖ len‖ip ‖ len‖ua) → u64
-partition         = SipHash-2-4(routing_secret,       site_id ‖ len‖ip ‖ len‖ua) mod 32  （P = 32：集群的分区号，单机的分片号；两种模式都写入 `ingest_partition`，§10 Q8、Q15）
+partition         = SipHash-2-4(routing_secret,       site_id ‖ len‖ip ‖ len‖ua) mod 32  （会话分配的分片号，写入 `ingest_partition`，§10 Q15）
 ```
 
 - **按站点本地日期选盐**（D5）。Plausible 在 UTC 午夜轮换全局盐，对 UTC+8 的站点来说 ID 在本地 08:00 切换。同一个人 07:30 来一次、09:00 再来一次，当天会被算成 2 个访客。
@@ -371,7 +358,7 @@ partition         = SipHash-2-4(routing_secret,       site_id ‖ len‖ip ‖ l
 - **盐的数量**：全球时区横跨 UTC−12 到 +14，任意时刻需要保留 `utc_date-2 … utc_date+1` 共 4 份盐。后台任务提前生成次日的盐，删除更早的盐（见 `platform-and-ops.md`）。
 - **输入用长度前缀拼接**。Plausible 直接拼接、没有分隔符，存在边界歧义（R01 §11.2 #18）。哈希输入用 `site_id` 而不用域名：站点就是隐私边界，改域名也不会让访客 ID 断开。
 - **`partition` 用长期不变的 `routing_secret`**，不随盐轮换。所以跨午夜时，`prev_visitor_id` 对应的会话和新事件仍在同一个分区。持久化的只有分区号（5 bit），不能识别个人。密钥本身存在 PG 的 `instance_secrets`（`name = 'routing'`，16 字节），第一个启动的 collector 写入随机值，之后所有进程只读：重启前后、各副本之间分片一致，关停快照与 ClickHouse 预热（§4.6）才对得上。
-- **原始 IP 和 UA 不进入** ClickHouse、JetStream、日志和错误上报。Plausible 把整个 Request 放进了 Sentry 上下文（R01 §8.2），这是反例。
+- **原始 IP 和 UA 不进入** ClickHouse、日志和错误上报。Plausible 把整个 Request 放进了 Sentry 上下文（R01 §8.2），这是反例。
 
 ### 4.6 SessionAssigner
 
@@ -384,7 +371,6 @@ partition         = SipHash-2-4(routing_secret,       site_id ‖ len‖ip ‖ l
 | `started_at`、`last_seen_at` | 毫秒；`last_seen_at` 取 max，乱序事件不会让它倒退（Plausible 直接覆盖，R02 §11.2 #6） |
 | `entry`（hostname、pathname） | 会话中的第一个 pageview；在它之前为空 |
 | `attrs` | 首个事件的 referrer、source、channel、utm×5、click_id_param、country、region、city、device、browser(+ver)、os(+ver)，字符串做驻留 |
-| `partition` | 仅集群使用 |
 
 **规则**（语义与 Plausible 一致，R02 §2）
 
@@ -399,8 +385,7 @@ partition         = SipHash-2-4(routing_secret,       site_id ‖ len‖ip ‖ l
 
 **并发**
 
-- 单机：32 个分片，每个是 `parking_lot::Mutex<HashMap<…>>`，分片号取 routing 哈希（§4.5）对 32 取模，并写入事件的 `ingest_partition`（§10 Q15）。routing 哈希不随盐轮换，所以同一访客的所有 key（原始、别名、前一天）总在同一个分片，一次加锁就能完成查找和加别名。临界区只有查找、更新、盖章，不做任何 IO，也没有 `.await`。没有调用超时，所以不会出现 Plausible 的幽灵执行。
-- 集群：每个分区由一个任务顺序处理，不需要锁。
+- 32 个分片，每个是 `parking_lot::Mutex<HashMap<…>>`，分片号取 routing 哈希（§4.5）对 32 取模，并写入事件的 `ingest_partition`（§10 Q15）。routing 哈希不随盐轮换，所以同一访客的所有 key（原始、别名、前一天）总在同一个分片，一次加锁就能完成查找和加别名。临界区只有查找、更新、盖章，不做任何 IO，也没有 `.await`。没有调用超时，所以不会出现 Plausible 的幽灵执行。
 
 **过期**
 
@@ -413,18 +398,18 @@ partition         = SipHash-2-4(routing_secret,       site_id ‖ len‖ip ‖ l
 **预热**（替代 TinySock）
 
 1. 优雅关停时，把状态写到 `${DATA_DIR}/sessions.snapshot`，带格式版本号和结构哈希，这一点借鉴 Plausible 的版本门控（R02 §4.1）。快照包含每个会话的全部 key。启动时，如果快照不超过 30 分钟且版本一致，就直接加载。
-2. 否则从 ClickHouse 的 `sessions` 表重建最近 31 分钟内活跃的会话。每个会话按 `last_visitor_id`（会话最后一个事件的当天 ID，§5.3）建一个 key，别名无法恢复，也不需要（见「失败语义」）。分片号取 `ingest_partition`，单机和集群都是 `routing % 32`（§10 Q15）；集群模式下按 `ingest_partition` 分区过滤，并以分区内最新事件时间为准。
-3. 预热完成之前 `/readyz` 返回未就绪；集群模式下，预热完成前不消费该分区。
+2. 否则从 ClickHouse 的 `sessions` 表重建最近 31 分钟内活跃的会话。每个会话按 `last_visitor_id`（会话最后一个事件的当天 ID，§5.3）建一个 key，别名无法恢复，也不需要（见「失败语义」）。分片号取 `ingest_partition`（`routing % 32`，§10 Q15）。
+3. 预热完成之前 `/readyz` 返回未就绪。
 
 **失败语义**
 
 状态丢失只会让会话被切开，访问数和跳出率略高。不会产生孤儿行，聚合结果也不会损坏，因为根本没有 `-1` 行。
 
-崩溃后从 ClickHouse 预热（含集群的故障恢复）只恢复一个 key：`last_visitor_id`。多日会话不会因此被切开：会话的下一个事件与最后一个事件相隔不超过 30 min，所以至多跨过一个本地午夜，它的 `visitor_id`（同一本地日）或 `prev_visitor_id`（刚过午夜）必有一个等于这个 key，会话照常续上，别名在恢复后的事件上重新建立。仍会被切开的只有迟到、乱序的更早日期的事件：它们的 ID 不是最新的 key，查不到会话，代价同上，可以接受。优雅关停的快照保留全部 key，不受影响。
+崩溃后从 ClickHouse 预热只恢复一个 key：`last_visitor_id`。多日会话不会因此被切开：会话的下一个事件与最后一个事件相隔不超过 30 min，所以至多跨过一个本地午夜，它的 `visitor_id`（同一本地日）或 `prev_visitor_id`（刚过午夜）必有一个等于这个 key，会话照常续上，别名在恢复后的事件上重新建立。仍会被切开的只有迟到、乱序的更早日期的事件：它们的 ID 不是最新的 key，查不到会话，代价同上，可以接受。优雅关停的快照保留全部 key，不受影响。
 
 写缓冲满（`503`）的事件已经推进了会话状态（`last_seen_at`、入口页、别名），却没有写入 ClickHouse，与「状态丢失只会切开会话」同类：内存状态与库里的会话行可能在入口页等字段上略有出入，不会产生孤儿行，聚合结果也不会损坏。
 
-### 4.7 写入（单机：BatchWriter）
+### 4.7 写入（BatchWriter）
 
 | 项 | 设计 |
 |---|---|
@@ -437,49 +422,15 @@ partition         = SipHash-2-4(routing_secret,       site_id ‖ len‖ip ‖ l
 | 关停 | 先停止接收新请求（Caddy 用 `lb_try_duration` 把请求排队），排空 channel，flush，再写会话快照 |
 | 保证 | 至多一次，损失有上界：崩溃时丢失 channel 中的数据和正在写的那一批，约等于几秒的流量，都会计入指标 |
 
-### 4.8 集群模式
-
-**流**
-
-| 项 | 值 | 原因 |
-|---|---|---|
-| 名称与 subject | `RIVU_EVENTS`，subject 为 `rivu.ev.<p>`，`p ∈ [0, P)`，**P = 32，安装时固定**（§10 Q8） | 分区内顺序处理，同一访客总在同一分区。32 个分区可让最多 32 个 worker 并行；峰值 5000 事件/s 下每个分区约 160 事件/s，`ingest_partition` 是 UInt8，上限 256。`RIVU_PARTITIONS`（默认 32）只在首次创建流时读取，之后以流元数据里记录的 P 为准，两者不一致就拒绝启动；以后要改，必须先排空队列再迁移 |
-| 保留策略 | `WorkQueue`，`max_age = 72h`，`max_bytes` 按磁盘设定，`discard = New` | 消息确认后即删除；满了拒收新消息，collector 回 `503`，而不是悄悄丢掉未消费的旧消息 |
-| 去重窗口 | 2 分钟，`Nats-Msg-Id = event_id`（UUIDv7） | collector 重试发布时不会重复 |
-| 副本 | 单机 1 个，集群 3 个 | |
-| 消息格式 | MessagePack，信封带 `schema` 版本号；内容是富化后的事件加 `visitor_id`、`prev_visitor_id`，不含原始 IP 和 UA | 不重蹈 Plausible remote persistor 用 Erlang term 序列化的覆辙（R01 §11.2 #15） |
-
-**worker 处理每个分区的循环**
-
-每个分区一个 durable pull consumer，`AckPolicy::Explicit`。分区归属在 NATS KV `rivu_leases` 中维护：租约 TTL 10 s，每 3 s 心跳一次。
-
-1. 读取 KV `rivu_batches/<p>`。如果存在批次标记，进入重放模式，按标记里的 `[first_seq, last_seq]` 原样重组这一批。
-2. 否则拉取消息，直到满 5000 条或等待满 500 ms。
-3. 把批次边界 `{first_seq, last_seq}` 写入 KV。
-4. 在状态副本上依次做会话分配。
-5. `INSERT`，带 `insert_deduplication_token = p<p>:<first_seq>-<last_seq>`。
-6. 成功后：提交状态副本，`ack` 到 `last_seq`，删除批次标记。
-7. 失败时：用同一个 token 退避重试。插入成功之前绝不 ack。
-
-**崩溃分析**
-
-| 崩溃时机 | 结果 |
-|---|---|
-| 写批次标记之前 | 消息重投，组成新的一批，正确 |
-| 写标记之后、插入之前 | 按标记重放同一批，插入，正确 |
-| 插入之后、ack 之前 | 重放同一批，插入因 token 相同被跳过。状态由 ClickHouse 预热得到，已经包含这一批，正确 |
-| ack 之后、删除标记之前 | 标记里的 `first_seq` 已经低于 ack floor，判定为陈旧标记并删除，正确 |
-
-**前提**（核实报告 #1、#2）：
+**去重前提**（BatchWriter 用同一个 token 重试写入时，核实报告 #1、#2）：
 
 - 源表 `events` 和 MV 目标表 `sessions` 都要开启 `non_replicated_deduplication_window`；
 - 显式设置 `deduplicate_blocks_in_dependent_materialized_views=1`（26.2 起为默认值）。这样重试时 MV 会用自己的去重日志，只补写缺失的部分。旧默认值 0 很危险：在 25.8 上实测，用同一个 token 重放一批，`events` 去重了，`sessions` 却又写了一遍，pageviews 翻倍（核实报告 E1）；
 - `deduplicate_insert=enable` 只在 26.2 及以上设置。25.8 没有这个设置，发送未知设置会被拒绝（E2）；
-- 去重窗口要大于在途批次数加上重放范围内的批次数。
+- 去重窗口（1000 个块）要大于一次重试期间写入的批次数。
 
 AggregatingMergeTree 的状态本身不幂等，一旦漏掉去重，就会永久重复计数。因此还要保留兜底手段：`sessions` 可以按月分区从 `events` 重建，日汇总层随时可以重算。上线前必须通过故障注入测试（§9 P3）。
 
-**背压**：ClickHouse 不可用时 worker 不 ack，流不断增长，直到 `max_bytes`；之后 collector 发布失败，回 `503`。JetStream 最多能吸收 72 小时或 `max_bytes` 的积压。
 
 ---
 
@@ -511,7 +462,7 @@ CREATE TABLE rivu.events
     visitor_id       UInt64,                        -- 事件当天的 visitor_id（按站点本地日的盐算出，不跨午夜）
     session_id       UInt64,
     session_start    DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)),
-    ingest_partition UInt8,                         -- routing % 32（集群的分区号；单机的分片号）
+    ingest_partition UInt8,                         -- routing % 32（会话分配的分片号）
     hostname         LowCardinality(String),
     pathname         String CODEC(ZSTD(3)),
     entry_pathname   String CODEC(ZSTD(3)),         -- 盖章：会话入口页；首个 pageview 之前为空，查询不读（§5.2）
@@ -624,7 +575,7 @@ GROUP BY site_id, start_date, session_id;
 **为什么不用 Plausible 的折叠表**
 
 - 写入只有事件这一路。会话行由 ClickHouse 在同一个 INSERT 内同步生成，写放大比 `-1/+1` 成对写入更小。
-- `min`、`max`、`any`、`argMin`、`argMax` 都是幂等的。重复投递只会影响计数类指标，而这些指标在 `events` 表上同样受影响，可以用同一个去重机制（§4.8）一并解决。
+- `min`、`max`、`any`、`argMin`、`argMax` 都是幂等的。重复投递只会影响计数类指标，而这些指标在 `events` 表上同样受影响，可以用同一个去重机制（§4.7）一并解决。
 - engagement 事件可以推进 `last_seen_at`、累加 `engagement_ms`。Plausible 因为受 version 列约束，这两件事都做不了。
 
 **代价**：查询需要两级聚合。内层按 `GROUP BY site_id, start_date, session_id` 合并部分行，外层再算指标。
@@ -844,7 +795,7 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 
 - 跨本地午夜的会话在两天里各算一次（`visits` 与会话类指标偏多）；
 - 只按族的部分维度分组时（例如 `sources` 只按渠道），同一访客同一天有两个会话、族里的其他维度不同时，`visitors` 多算（与 Plausible 的导入数据相同）；
-- 一天构建之后才写入的事件（集群模式下积压超过 2 小时）不会补进汇总层。
+- 一天构建之后才写入的事件（写入积压超过 2 小时）不会补进汇总层。
 
 ### 6.5 指标定义（原始层）
 
@@ -934,7 +885,7 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 - 进程内的 moka（`crates/query/src/cache.rs`），看板与公开 API 共用，按结果行数限容（50 万行），只缓存成功的结果。
 - key 是以下内容的哈希：站点 id、规范化的 `QuerySpec`（共享链接叠加的过滤已经并入）、影响结果的站点配置（时区、周起始日、目标、地理库的署名与能力）、站点的数据代数、「现在」所在的时间桶。配置直接进键，改目标或时区立即生效。
 - 时间桶的长度：`realtime` 3 s，`day` 与 `24h` 10 s，含今天的范围 60 s，已结束的历史范围 10 min。同一个桶里的请求拿到同一份结果。
-- 删除统计数据完成后，同进程（`rivu all`）的 `ch_delete_batch` 让该站点的数据代数加一；api 与 worker 分开部署时，旧结果最多再存活一个桶长。汇总层构建不改变结果（两层口径一致，§6.4），不需要失效。
+- 删除统计数据完成后，同进程（`rivu all`）的 `ch_delete_batch` 让该站点的数据代数加一；api 与 worker 分开启动时，旧结果最多再存活一个桶长。汇总层构建不改变结果（两层口径一致，§6.4），不需要失效。
 - `rivu_query_seconds` 带 `cache` 标签（`hit` / `miss`），命中与未命中分开统计。
 - Plausible 完全没有结果缓存（R03 §11）。多节点 api 部署时，先接受各节点各自缓存；确实出现不一致问题后再引入 Valkey。
 
@@ -974,17 +925,16 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 | 写入 | 5000 事件/s 约等于每秒 1 次 INSERT、每次 5000 行；RowBinary 约 2 MB/s | §4.7 |
 | collector CPU | 每个事件 ≤50 µs（JSON 解析约 5 µs，UA 缓存命中约 1 µs、未命中 50–200 µs，地理查询约 2 µs，SipHash ×3 可忽略），5000 事件/s 约 0.25 核。UA 的实测（Windows，release，单线程，690 条 uap-core 样本）：缓存命中均值约 150 ns，未命中均值约 22 µs（p99 约 130–180 µs），都在预算内；来源与渠道 `classify` 约 143 ns/次；`UaParser::embedded()`（解析 222 KB YAML、编译全部正则）约 130 ms，只在启动时一次 | 需压测（并发与 Linux 数字未测；`docs/research/enrich-ua.md` §9、`enrich-source.md` §7.4） |
 | GeoIP 内存 | 库读入内存，每个加载库的进程各占一份：City 约 121 MiB，Country 约 8 MiB；热加载期间新旧并存，刷新校验时再临时读一份。UA 缓存键上界约 50 MB（§4.3）。内存紧张的部署选 DB-IP country | §4.3、§10 Q25 |
-| 事件可见 | p95 < 2 s（单机），< 2.5 s（集群） | §4.7、§4.8 |
+| 事件可见 | p95 < 2 s | §4.7 |
 | 会话内存 | 常态几十 MB；上限 `max_sessions` 200 万 × 约 350 B（含平均不到 1 个别名 key）≈ 700 MB。理论最坏是每个会话 8 个 key、约 650 B，合计约 1.3 GB，实际不会出现，因为多个别名需要会话跨多个午夜 | §4.6 |
-| 磁盘 | 每事件估算 60–150 B（压缩后，需实测），`sessions` 约再加 30–50%，保留 731 天。日均 1000 万事件：7.31 十亿事件，事件表约 0.44–1.1 TB，加 `sessions` 后约 0.6–1.6 TB，超出单机参考配置（§7.1）的 500 GB：这个规模应把 `RIVU_RETENTION_DAYS` 调低到 180 天（约 0.14–0.4 TB）或扩容磁盘。日均 100 万事件：约 60–165 GB。过期数据每小时删除（§5.6） | §7.1 |
+| 磁盘 | 每事件估算 60–150 B（压缩后，需实测），`sessions` 约再加 30–50%，保留 731 天。日均 1000 万事件：7.31 十亿事件，事件表约 0.44–1.1 TB，加 `sessions` 后约 0.6–1.6 TB，超出参考配置（§7.1）的 500 GB：这个规模应把 `RIVU_RETENTION_DAYS` 调低到 180 天（约 0.14–0.4 TB）或扩容磁盘。日均 100 万事件：约 60–165 GB。过期数据每小时删除（§5.6） | §7.1 |
 | 查询 | 中小站：原始层 30 天约几百万行，几十 ms。大站（每天 200 万事件）30 天约 6000 万行：已结束的天走日汇总层，今天走原始层，目标 p95 < 300 ms | §6.4 |
 
 压测目标：持续 1000 事件/s，峰值 5000 事件/s，同时有并发看板查询。需要观察以下指标：
 
 - ClickHouse 的 `parts` 数、merge 与 mutation 积压（`rivu_ch_*`，`ch_monitor`）、插入延迟（`write_flush_seconds`）；
 - 查询 p95，未命中缓存和命中缓存分开统计；
-- 会话数、channel 深度；
-- JetStream 积压（集群）。
+- 会话数、写缓冲深度；
 
 ### 7.1 流量假设与参考部署
 
@@ -1000,10 +950,10 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 
 | 部署 | 配置起点 | 组件 |
 |---|---|---|
-| 单机（默认） | 8 vCPU / 32 GB / 500 GB NVMe | 全部组件，`docker compose` 一条命令完成初始化、迁移、启动与健康检查 |
-| 两机（查询压力明显增长时） | 应用节点 4 vCPU / 8 GB；分析节点 8 vCPU / 32 GB / 500 GB NVMe | 应用节点：Caddy、rivu、NATS、PostgreSQL；分析节点：ClickHouse |
+| 一台机器（默认） | 8 vCPU / 32 GB / 500 GB NVMe | 全部组件，`docker compose` 一条命令完成初始化、迁移、启动与健康检查 |
+| 两机（查询压力明显增长时） | 应用节点 4 vCPU / 8 GB；分析节点 8 vCPU / 32 GB / 500 GB NVMe | 应用节点：反向代理、rivu、PostgreSQL；分析节点：ClickHouse |
 
-两机部署只是资源隔离，不是高可用：要容忍整个节点宕机，还需要 PostgreSQL 故障切换、JetStream 副本和 ClickHouse 复制。配置是规划起点，不是性能保证，要用真实事件的压缩率、保留期和查询并发验证。
+两机部署只是资源隔离，不是高可用：要容忍整个节点宕机，还需要 PostgreSQL 故障切换和 ClickHouse 复制，Rivu 不提供。配置是规划起点，不是性能保证，要用真实事件的压缩率、保留期和查询并发验证。
 
 ---
 
@@ -1013,7 +963,7 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 |---|---|
 | 无持久标识 | 不读写 Cookie；tracker 不写任何存储，唯一的读取是站点所有者手动设置的 `localStorage.rivu_ignore`，只读，不用于标识（§10 Q3）；访客 ID 按站点本地日轮换，盐 2 天后删除，跨天无法关联同一个人（会话连续的情形见下一行） |
 | 跨天连续性 | 事件表里没有跨天可关联的 ID：每个事件只带自己本地日的 `visitor_id`，盐 2 天后删除。跨天只剩 `session_id` 能把同一会话的事件串起来，前提是活动间隔始终不超过 30 min，且最长 7 天。别名 key 只存在于内存和关停快照，不落库；`sessions.last_visitor_id` 只是会话最后一个事件的当天 ID，无法关联到前一天（§4.6、§5.3、§10 Q9） |
-| 数据最小化 | IP 和 UA 只在内存中短暂使用，不进入 ClickHouse、JetStream、日志和错误上报；query 参数只保留 UTM 和 click id 参数名；props 有长度限制，可选白名单；地理精度可按站点设为国家、地区或城市 |
+| 数据最小化 | IP 和 UA 只在内存中短暂使用，不进入 ClickHouse、日志和错误上报；query 参数只保留 UTM 和 click id 参数名；props 有长度限制，可选白名单；地理精度可按站点设为国家、地区或城市 |
 | `site_key` 不是密钥 | 它是公开的，只用来路由。真实性靠 hostname 白名单、限流和机器人过滤，只能提高门槛，不能保证每个事件都真实 |
 | 租户隔离 | `TenantScope`、服务端参数、只读账号、按租户的超时和并发上限（§6.8） |
 | 可信代理 | 只信任 `RIVU_TRUSTED_PROXIES` 中的地址设置的转发头（§4.2 第 2 步） |
@@ -1026,9 +976,9 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 | 阶段 | 交付 | 验收 |
 |---|---|---|
 | P0 基础 | workspace、单个二进制、配置、`rivu migrate`、`compose.dev.yml`、CI（fmt、clippy、测试、tracker 体积预算） | `docker compose -f deploy/compose.dev.yml up -d` 后，`cargo run -- migrate` 能建好 PG 和 CH |
-| P1 MVP（单机） | tracker core/full；collector 管线（准入、hostname、IP 和页面规则、机器人、地理、UA、来源、身份）；SessionAssigner；BatchWriter；`events`、`sessions`、`ingest_counters`；查询 DSL 的核心指标与维度；看板主视图；PG 基础表 | 端到端：pageview 在 5 s 内可见；visits、跳出、停留时长的样例与手工计算一致；跨本地午夜的会话连续 |
+| P1 MVP | tracker core/full；collector 管线（准入、hostname、IP 和页面规则、机器人、地理、UA、来源、身份）；SessionAssigner；BatchWriter；`events`、`sessions`、`ingest_counters`；查询 DSL 的核心指标与维度；看板主视图；PG 基础表 | 端到端：pageview 在 5 s 内可见；visits、跳出、停留时长的样例与手工计算一致；跨本地午夜的会话连续 |
 | P2 性能 | 日汇总层和规划器；结果缓存；租户并发限制；压测（持续 1000/s、峰值 5000/s，加并发查询）；merge 监控 | 常见报表 p95 < 300 ms（分别报告命中和未命中缓存）；事件可见 p95 < 5 s |
-| P3 可靠 | JetStream、worker、分区租约、确定性批次与去重 token；故障注入（对 worker、collector 执行 `kill -9`，重启 CH，各 100 次）；备份恢复演练；积压告警；配额 | 故障注入后，`events` 行数与发送数一致，会话指标与无故障的对照组一致 |
+| P3 可靠 | 单实例故障注入（持续写入下对 rivu 执行 `kill -9`、重启 CH，各 100 次）；备份恢复演练；写入积压告警 | CH 重启不丢事件；rivu 崩溃的损失不超过写缓冲里的事件；没有重复行（`docs/roadmap.md` P3） |
 | P4 产品 | 目标、转化、漏斗；engagement 指标；自定义属性；收入；分群；共享链接；公开 API；导入（Plausible CSV 进日汇总层、GA4）；导出；邮件报告；Plausible 协议兼容端点 | 按功能逐项验收 |
 
 ---
@@ -1046,14 +996,13 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 | Q5 | UA 库和 GeoIP 库的选型与许可 | UA 用 uap-core（Apache-2.0）。GeoIP 默认 DB-IP Lite（CC BY 4.0，必须署名）；继续支持 MaxMind GeoLite2；新增自定义 mmdb 直链 `RIVU_GEOIP_DB_URL`。优先级：自定义 URL > MaxMind key > DB-IP | §4.4（来源、更新、校验、署名）；看板必须在显示位置数据处署名，查询 API 返回当前库的署名；`platform-and-ops.md` 的 `geoip_refresh` 任务、配置变量、指标 |
 | Q6 | 是否做 `SAMPLE` 采样 | 暂不做，用日汇总层的自动分层代替；DDL 里保留 `SAMPLE BY visitor_id` | §2.6；§5.2；§6.4 |
 | Q7 | 会话最长时长 | 7 天。续期条件：`ts − last_seen_at ≤ 30 min` 且 `ts − started_at ≤ 7 d`。跨午夜靠会话的别名 key，最多 8 个 | §4.6（规则、并发、内存、预热、失败语义）；§4.5；§6.5 `visits` 回溯 7 天；§7 内存；§8 |
-| Q8 | 集群的分区数 P | P = 32，安装时固定；以后要改，必须先排空队列再迁移 | §4.8；`platform-and-ops.md` 的 `RIVU_PARTITIONS` |
 | Q9 | 盖章是否改写 `visitor_id` | 不改写：事件保留自己当天的 `visitor_id`，会话只靠 `session_id` 串联。`sessions` 的排序键是 `(site_id, start_date, session_id)`，`SAMPLE BY session_id`，不含 `visitor_id`；聚合列 `last_visitor_id`（`argMax(visitor_id, ts)`）是会话最后一个事件的当天 ID。任意范围的 `uniq(visitor_id)` 因此严格等于各本地日访客数之和 | §4.6（盖章、预热、失败语义）；§5.2、§5.3（DDL、MV、两级聚合）；§5.5 访客数跨天求和；§6.4 `visitors` 只从 `events` 计算；§6.5；§8 跨天连续性 |
 | Q10 | 原始层近似去重、汇总层精确去重 | 两层用同一个 `uniq`，日汇总层存的就是按同样方法算出的每日值；容差写进指标口径文档，实测误差见 §6.5 | §5.5；§6.5 |
 | Q11 | `site_key` 的格式 | 12 位 base32 小写（`^[a-z2-7]{12}$`）。PG 的 CHECK、线协议、站点脚本路径与 API key 的 scope 用同一条规则（`rivu_domain::is_site_key`）；格式合法但不存在的 key 落到 `unknown_site` | `tracker-and-protocol.md` §5.1 |
 | Q12 | hostname 白名单为空时怎么处理 | fail-closed：全部丢弃（`hostname_not_allowed`）；建站时自动加入主域名 | §4.2 第 3 步；`platform-and-ops.md` §3.3；`tracker-and-protocol.md` §7 |
 | Q13 | 丢弃原因的标识符 | Rust 枚举 `DropReason` 为唯一来源。`ingest_counters.metric` 取 `accepted` 或 `dropped_<原因>`（含 `salt_missing`）；400 按 `rejected_<字段>` 只进 Prometheus，不进 `ingest_counters`；未知站点记 `site_id = 0`；已删除的站点从快照摘除后按 `unknown_site` 计 | §2.2；§4.1；§4.2；§5.4；`tracker-and-protocol.md` §6.4；`platform-and-ops.md` §3 站点删除 |
 | Q14 | 查询超时 | 按调用方分三档：看板 `RIVU_QUERY_TIMEOUT_SECS`（默认 10）、公开 API `RIVU_API_QUERY_TIMEOUT_SECS`（默认 20）、公开看板与共享链接 `RIVU_PUBLIC_QUERY_TIMEOUT_SECS`（默认 5）；每档不得大于 reader 配额上限 | §6.8；`platform-and-ops.md` §4.4、§7 |
-| Q15 | 单机从 ClickHouse 预热时找不到分片 | 单机也把 `routing % 32` 写入 `ingest_partition`，分片数固定为 32，与集群的 P 相同；预热按 `ingest_partition` 放回分片 | §4.5；§4.6（并发、预热）；§5.2 DDL 注释 |
+| Q15 | 从 ClickHouse 预热时找不到分片 | 把 `routing % 32` 写入 `ingest_partition`，分片数固定为 32；预热按 `ingest_partition` 放回分片 | §4.5；§4.6（并发、预热）；§5.2 DDL 注释 |
 | Q16 | 写缓冲默认值 | 变量名取 `platform-and-ops.md` 的，默认值以 §4.7 为准：1000 ms、20000 行、8388608 字节、channel 20 万条；P2 压测后再调 | §4.7；`platform-and-ops.md` §7 |
 | Q17 | `visitors` 是否统计 engagement 事件 | 排除，与 `realtime` 同口径 | §5.5；§6.5 |
 | Q18 | 线协议的错误词表与测试清单 | 词表补一条 `has an invalid format`，用于 `s` 格式错、`n` 含控制字符、`$` 字段格式错；`u` 不限长，超长 query 被丢弃、pathname 截断到 1024 字节，不回 400 | `tracker-and-protocol.md` §6.2、§11.1 |
@@ -1080,7 +1029,7 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 | `Session.CacheStore` + `Balancer` | `SessionAssigner` |
 | `Session.Transfer`（TinySock） | 会话快照文件，或从 ClickHouse 预热 |
 | `Event.WriteBuffer`（5 s / 100 KB） | `BatchWriter`（1 s / 2 万行 / 8 MB） |
-| `Persistor`（embedded / remote） | 单机（进程内）/ 集群（JetStream + worker） |
+| `Persistor`（embedded / remote） | 进程内 BatchWriter |
 | `GateKeeper` + `Site.Cache` | 准入阶段 + `SiteSnapshot` |
 | `Shields`（4 张规则表） | `shield_rules`（单表） |
 | `Salts`（全局，UTC 午夜轮换） | 按日期存的盐（站点本地午夜轮换） |
