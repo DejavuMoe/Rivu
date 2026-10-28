@@ -2,7 +2,7 @@
 # Rivu 固定到达率压测编排（在 WSL 里运行，经 linux-task 的 build 模式）：
 #   pwsh linux-task.ps1 -Mode build -Project D:\Forgejo\Rivu -Command 'bash tools/loadgen/run.sh'
 #
-# 做什么：release 构建 rivu 与 loadgen -> 迁移 -> 建站（SITES 个）与 API key -> 启动 `rivu all` 并等 /readyz
+# 做什么：release 构建 rivu 与 loadgen -> 迁移 -> 建站（SITES 个）与 API key -> 启动 `rivu serve` 并等 /readyz
 # -> 场景 A（持续 SUSTAINED_RATE 事件/s，SUSTAINED_SECS 秒）-> 静置 SETTLE_SECS 秒
 # -> 场景 B（峰值 PEAK_RATE 事件/s，PEAK_SECS 秒）；两个场景里都同时以 QUERY_RATE 次/s 发 POST /api/v1/query
 # 可选 PREFILL_ROWS：场景之前往这些站点预填历史事件（大表上的查询延迟），QUERY_RANGE 改查询的范围（默认 7d）。
@@ -175,8 +175,8 @@ export LOADGEN_API_KEY="$("$RIVU" apikey create --org "$ORG_SLUG" --user "$LT_US
 export LOADGEN_CH_PASSWORD="$RIVU_CH_READER_PASSWORD"
 
 # ------------------------------------------------------------------ 启动 rivu
-log "启动 rivu all"
-"$RIVU" all >"$OUT/rivu.log" 2>&1 &
+log "启动 rivu serve"
+"$RIVU" serve >"$OUT/rivu.log" 2>&1 &
 RIVU_PID=$!
 for _ in $(seq 1 90); do
   curl -sf "http://$INTERNAL_ADDR/readyz" >/dev/null && break

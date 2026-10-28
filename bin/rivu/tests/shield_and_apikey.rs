@@ -116,7 +116,7 @@ async fn migrate_once(env: &TestEnv) {
     .await;
 }
 
-/// api 角色的配置：PG 用测试连接串，限流与规则上限可以按用例覆盖。
+/// 查询与看板端点用的配置：PG 用测试连接串，限流与规则上限可以按用例覆盖。
 fn api_config(env: &TestEnv, extra: &[(&str, &str)]) -> Config {
     let reader = account("reader");
     let mut pairs: Vec<(String, String)> = vec![
@@ -134,7 +134,7 @@ fn api_config(env: &TestEnv, extra: &[(&str, &str)]) -> Config {
             .iter()
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
     );
-    Config::from_env(Role::Api, &Env::from_pairs(pairs)).expect("测试配置")
+    Config::from_env(Role::Admin, &Env::from_pairs(pairs)).expect("测试配置")
 }
 
 fn unique(prefix: &str) -> String {

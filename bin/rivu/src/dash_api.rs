@@ -1,4 +1,4 @@
-//! 看板的内部端点（`/api/internal/*`，api 与 all 角色，挂在公共端口上）：首次初始化、登录与会话、
+//! 看板的内部端点（`/api/internal/*`，挂在公共端口上）：首次初始化、登录与会话、
 //! 看板用的只读端点。**只有后端，没有任何页面**（页面要等 `designs/` 原型审批）。
 //!
 //! | 方法与路径 | 鉴权 | 说明 |
@@ -345,7 +345,7 @@ pub struct DashApi {
     pub(crate) api_rate: rivu_common::config::ApiRateConfig,
     /// `RIVU_SITE_RESTORE_DAYS`：站点软删除后的恢复窗口。
     pub(crate) site_restore_days: u32,
-    /// 同进程运行 `ch_delete_batch` 时（`rivu all`）用来在写入日期范围删除意图后立即唤醒它。
+    /// 用来在写入日期范围删除意图后立即唤醒它。
     pub(crate) stats_delete_kick: Option<rivu_jobs::StatsDeleteKick>,
     csrf: Csrf,
     cookies: CookieConfig,
@@ -425,7 +425,7 @@ impl DashApi {
         self
     }
 
-    /// 同进程的 `ch_delete_batch` 唤醒器（`rivu all`）；`None` 时只等它的定时周期。
+    /// 同进程的 `ch_delete_batch` 唤醒器；`None` 时只等它的定时周期（测试）。
     pub fn with_stats_delete_kick(mut self, kick: Option<rivu_jobs::StatsDeleteKick>) -> Self {
         self.stats_delete_kick = kick;
         self

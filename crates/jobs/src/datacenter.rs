@@ -26,7 +26,7 @@ pub fn first_delay(path: &Path, interval: Duration, now: SystemTime) -> Duration
     interval.saturating_sub(age)
 }
 
-/// 启动 `datacenter_refresh`。`db` 是本进程持有的网段表（`all` 角色），下载成功后立即热加载。
+/// 启动 `datacenter_refresh`。`db` 是本进程持有的网段表，下载成功后立即热加载。
 pub fn spawn_datacenter_refresh(
     cfg: DatacenterConfig,
     db: Option<Arc<DcDb>>,

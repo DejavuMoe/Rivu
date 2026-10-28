@@ -11,7 +11,7 @@ const pkg = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), 
 const api = process.env.RIVU_DEV_API ?? "http://127.0.0.1:8080";
 
 export default defineConfig({
-  // 单页应用：rivu（api / all 角色）提供构建产物，没有对应文件的页面路径回落到 index.html（bin/rivu/src/dashboard.rs），
+  // 单页应用：rivu serve 提供构建产物，没有对应文件的页面路径回落到 index.html（bin/rivu/src/dashboard.rs），
   // 页面在浏览器里渲染，数据全部来自 /api/internal/*。
   // CSP 由构建写进 index.html 的 <meta>：入口页的启动脚本是内联的，按哈希放行，其余脚本只许同源。
   // 反向代理不要再给页面另加 CSP（两份策略取交集，会把启动脚本挡掉）。

@@ -57,7 +57,7 @@
 
 ## 接入服务端（rivu 已实现）
 
-- `GET /js/<site_key>.js`（collector / all 角色）：响应 = 配置前缀（规范 §2.3，唯一的映射函数是 `bin/rivu/src/script.rs` 的 `tracker_prefix`；`endpoint` 取 `RIVU_PUBLIC_BASE_URL`，不取请求的 `Host`）+ `core.js` 的字节；
+- `GET /js/<site_key>.js`：响应 = 配置前缀（规范 §2.3，唯一的映射函数是 `bin/rivu/src/script.rs` 的 `tracker_prefix`；`endpoint` 取 `RIVU_PUBLIC_BASE_URL`，不取请求的 `Host`）+ `core.js` 的字节；
   头与缓存按规范 §2.4（`ETag`、`public, max-age=300`、`nosniff`、CORP、CORS `*`，`If-None-Match` 命中 304）；
   未知、已删除、已停用（`collect_enabled = false`）的站点返回 404 + `no-store`。站点开了任一 full 专属能力（`site_settings.tracker` 的 `engagement`、`outbound`、`downloads`、`forms`、`tagged`；新站点默认开 engagement 与 tagged）就发 full，否则发 core。
 - `core.js`、`full.js` 与构建号来自 `RIVU_TRACKER_DIR`（默认 `apps/tracker/dist`，相对进程工作目录）里的 `core.js`、`full.js` 和 `meta.json`：rivu 启动时读入并缓存，不在 cargo 构建里跑 pnpm，也不改写 `sv`。
@@ -72,5 +72,5 @@
 & D:\WSL\Scripts\linux-task.ps1 -Mode build -Project 'D:\Forgejo\Rivu' -Command 'set -a; . ./.env.example; set +a; bash apps/tracker/scripts/e2e-rivu.sh'
 ```
 
-脚本依次：`pnpm build` → `cargo build -p rivu` → `rivu migrate` → 为 chromium / firefox / webkit 各 `rivu site add` → 后台启动 `rivu all`（端口 18080 / 19090）→ 等 `/readyz` → Playwright → 停 rivu（trap 保证清理）。
+脚本依次：`pnpm build` → `cargo build -p rivu` → `rivu migrate` → 为 chromium / firefox / webkit 各 `rivu site add` → 后台启动 `rivu serve`（端口 18080 / 19090）→ 等 `/readyz` → Playwright → 停 rivu（trap 保证清理）。
 需要 dev 的 PostgreSQL / ClickHouse。页面主机名是 `127.0.0.1`（在站点白名单里）；tracker 默认排除 127.x，所以脚本标签带 `data-local="true"`。

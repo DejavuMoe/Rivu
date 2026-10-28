@@ -11,7 +11,6 @@ use axum::response::{IntoResponse, Json};
 use axum::routing::get;
 use metrics_exporter_prometheus::PrometheusHandle;
 use rivu_common::build_info;
-use rivu_common::config::Role;
 use rivu_common::migration::{self, Store};
 use rivu_geo::GeoDb;
 use rivu_geo::datacenter::DcDb;
@@ -52,7 +51,7 @@ impl Probe {
     }
 }
 
-/// collector 角色的就绪条件：站点快照已加载、盐已加载（今天前后各一天）。
+/// 采集的就绪条件：站点快照已加载、盐已加载（今天前后各一天）。
 /// 会话预热在开始服务之前同步完成，`sessions` 只报告结果，不判失败。
 #[derive(Clone)]
 pub struct CollectorReadiness {
@@ -64,25 +63,24 @@ pub struct CollectorReadiness {
 /// `/readyz` 里 geoip 项的数据来源。**只报告状态，永远不判失败**：库可能还在后台下载
 /// （City 版约 60 MB 压缩、127 MB 解压，远超预热预算），下载完成前事件的位置字段为空（`system-design.md` §4.4）。
 pub struct GeoReadiness {
-    /// 当前进程持有的库（collector / all）。
+    /// 当前进程持有的库。
     pub db: Option<Arc<GeoDb>>,
-    /// `geoip_refresh` 的状态（worker / all）。
+    /// `geoip_refresh` 的状态。
     pub refresh: Option<Arc<GeoRefreshState>>,
     pub db_path: PathBuf,
 }
 
 pub struct InternalState {
-    pub role: Role,
     pub probe: Probe,
-    /// 只有 collector / all 有。
+    /// 会话预热与写入器的状态（测试里可以没有）。
     pub collector: Option<CollectorReadiness>,
-    /// tracker 构建产物（`/js/<site_key>.js` 的来源），只有 collector / all 有。**只报告，不判就绪失败**：
+    /// tracker 构建产物（`/js/<site_key>.js` 的来源）。**只报告，不判就绪失败**：
     /// 缺失时脚本路由返回 503，但事件采集不依赖它。
     pub tracker: Option<Arc<TrackerAssets>>,
-    /// 看板静态文件，只有 api / all 有。**只报告，不判就绪失败**：缺失时页面返回 503，API 照常。
+    /// 看板静态文件。**只报告，不判就绪失败**：缺失时页面返回 503，API 照常。
     pub dashboard: Option<Arc<crate::dashboard::DashboardAssets>>,
     pub geo: GeoReadiness,
-    /// 数据中心网段表：只在开启过滤的 collector / all 有。**只报告，不判就绪失败**：未加载时不丢弃任何事件。
+    /// 数据中心网段表：只在开启过滤时有。**只报告，不判就绪失败**：未加载时不丢弃任何事件。
     pub datacenter: Option<Arc<DcDb>>,
     pub metrics: PrometheusHandle,
     pub started: Instant,
@@ -221,7 +219,6 @@ async fn readyz(State(state): State<Arc<InternalState>>) -> impl IntoResponse {
         "status": if ready { "ready" } else { "not_ready" },
         "version": build_info::VERSION,
         "commit": build_info::GIT_COMMIT,
-        "role": state.role.as_str(),
         "checks": checks,
     });
     let status = if ready {

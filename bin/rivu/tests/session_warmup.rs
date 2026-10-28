@@ -82,7 +82,7 @@ async fn collector(
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let app = rivu::public::router_with_scripts(Role::Collector, Some(Arc::clone(&pipeline)), None);
+    let app = rivu::public::router_with_scripts(Some(Arc::clone(&pipeline)), None);
     tokio::spawn(async move {
         axum::serve(
             listener,

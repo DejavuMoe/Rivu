@@ -4,7 +4,7 @@
 #
 #   docker build -t rivu --build-arg RIVU_VERSION=0.1.0 --build-arg RIVU_GIT_COMMIT=$(git rev-parse --short HEAD) .
 #
-# 运行方式见 docs/install.md 与 deploy/compose.yml。容器默认以非 root 用户运行 `rivu all`，
+# 运行方式见 docs/install.md 与 deploy/compose.yml。容器默认以非 root 用户运行 `rivu serve`，
 # 公共端口 8080（采集、API、看板），内部端口 9090（/healthz /readyz /metrics，只给编排与监控用，不要对外开放）。
 
 ARG RIVU_VERSION=0.0.0-dev
@@ -71,4 +71,4 @@ VOLUME ["/var/lib/rivu"]
 EXPOSE 8080 9090
 HEALTHCHECK --interval=10s --timeout=6s --start-period=60s --retries=3 CMD ["rivu", "healthcheck"]
 ENTRYPOINT ["rivu"]
-CMD ["all"]
+CMD ["serve"]

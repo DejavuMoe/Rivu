@@ -5,7 +5,7 @@
 //! - `events` 按 `ts`、`sessions` 按开始时间 `started_at`；日汇总层与 `ingest_counters`（表级 TTL 90 天）不在这里处理。
 //! - 每个月分区：整月都早于所有站点的截止时刻 → `DROP PARTITION`；与截止时刻交叠且确实有过期行 →
 //!   一条轻量删除，按站点取各自的截止时刻（`transform(site_id, …)`）；其余不动。所以平时每天至多一两条 mutation。
-//! - 进程内定时（每 [`INTERVAL`]），worker / all 运行，`rivu_maintainer` 账号；重复执行没有副作用。
+//! - 进程内定时（每 [`INTERVAL`]），`rivu_maintainer` 账号；重复执行没有副作用。
 
 use std::time::Duration;
 

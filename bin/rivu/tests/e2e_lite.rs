@@ -969,7 +969,7 @@ async fn http_endpoint_end_to_end() {
         assets,
         "https://stats.example.test",
     ));
-    let app = rivu::public::router_with_scripts(Role::Collector, Some(pipeline), Some(scripts));
+    let app = rivu::public::router_with_scripts(Some(pipeline), Some(scripts));
     tokio::spawn(async move {
         axum::serve(
             listener,

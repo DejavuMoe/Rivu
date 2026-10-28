@@ -1,5 +1,5 @@
 //! 看板的内部端点（`/api/internal/*`：首次初始化、登录与会话、站点与查询、共享链接、公开看板）的端到端测试：
-//! 真实的 PostgreSQL 与 ClickHouse，真实的本地 TCP 端口，路由由 `public::router_full` 装配（与 `rivu all` 同一条路径）。
+//! 真实的 PostgreSQL 与 ClickHouse，真实的本地 TCP 端口，路由由 `public::router_full` 装配（与 `rivu serve` 同一条路径）。
 //!
 //! 缺少环境变量时跳过并打印原因（同 `public_api.rs`）：
 //!   RIVU_TEST_DATABASE_URL     有 DDL 与写权限的 PostgreSQL 连接串（rivu_migrator）
@@ -129,7 +129,7 @@ fn unique(prefix: &str) -> String {
     format!("{prefix}-{:08x}", rand::random::<u32>())
 }
 
-/// api 角色的配置。默认 http 开发模式（`RIVU_BASE_URL=http://127.0.0.1:8080`），信任回环代理（测试用 `X-Forwarded-For` 区分客户端）。
+/// 看板端点用的配置。默认 http 开发模式（`RIVU_BASE_URL=http://127.0.0.1:8080`），信任回环代理（测试用 `X-Forwarded-For` 区分客户端）。
 fn config(env: &TestEnv, extra: &[(&str, &str)]) -> Config {
     let reader = account("reader");
     let mut pairs: Vec<(String, String)> = vec![
@@ -148,7 +148,7 @@ fn config(env: &TestEnv, extra: &[(&str, &str)]) -> Config {
         pairs.retain(|(pk, _)| pk != k);
         pairs.push(((*k).into(), (*v).into()));
     }
-    Config::from_env(Role::Api, &Env::from_pairs(pairs)).expect("测试配置")
+    Config::from_env(Role::Admin, &Env::from_pairs(pairs)).expect("测试配置")
 }
 
 /// 放得很宽的限流：不是在测限流的用例用它。
@@ -436,12 +436,7 @@ async fn start(env: &TestEnv, pg: &PgPool, config: &Config, limits: DashLimits) 
         .expect("装配内部端点")
         .with_limits(limits)
         .with_clock(move || now);
-    let app = public::router_full(
-        Role::Api,
-        None,
-        None,
-        Some(dash_api::router(Arc::new(dash))),
-    );
+    let app = public::router_full(None, None, Some(dash_api::router(Arc::new(dash))));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {

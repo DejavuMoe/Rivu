@@ -16,7 +16,7 @@ Rivu 是开源、自托管的网站分析系统（Plausible 的替代品）：�
 | 查询 | 统一查询内核 `rivu-query`（`QuerySpec`：12 个指标、维度、过滤树、日期范围、时间序列、对比期、目标）；公开 API `POST /api/v1/query`（API key、按组织限流）与 `GET /api/v1/query/schema.json`；命令行 `rivu query` |
 | 看板（`apps/dashboard`） | 登录与首次初始化、站点列表、统计看板、安装与安装验证、站点设置（主机名、采集、脚本功能、隐私、屏蔽规则、目标、共享、危险操作）、接入诊断、成员与邀请、API key、账号与登录会话、共享链接与公开看板 |
 | 后台任务 | 盐轮换、GeoIP 与数据中心网段刷新、站点与日期范围的统计数据删除 |
-| 运维 | 单个二进制按角色启动（`collector \| worker \| api \| migrate \| all`）；PG 与 ClickHouse 迁移共用版本序列，带冻结校验与 schema 快照；内部端口 `/healthz` `/readyz` `/metrics` |
+| 运维 | 单个二进制：`rivu serve` 运行实例，`rivu migrate` 执行迁移；PG 与 ClickHouse 迁移共用版本序列，带冻结校验与 schema 快照；内部端口 `/healthz` `/readyz` `/metrics` |
 
 尚未实现的部分（导入导出、邮件、Plausible 兼容端点等）与进度见 [`docs/roadmap.md`](docs/roadmap.md)。
 
@@ -80,7 +80,7 @@ set -a; source .env.example; set +a
 cargo run -p rivu -- migrate          # 应用全部迁移；再执行一次输出「没有待执行的迁移」
 cargo run -p rivu -- migrate status   # 列出每个版本的状态
 cargo run -p rivu -- setup --email you@example.com --org-name Acme --password-file pw.txt   # 首个用户与组织
-cargo run -p rivu -- all
+cargo run -p rivu -- serve
 ```
 
 看板的开发方式见 [`apps/dashboard/README.md`](apps/dashboard/README.md)。
@@ -105,7 +105,7 @@ curl -i http://127.0.0.1:8080/api/v1/query/schema.json     # 无需 key
 
 错误体都是 `{"error":"<代码>","message":"..."}`；400 另有 `errors:[{"path":"filters[0][2]","message":"..."}]`；站点不存在与无权访问都是同一个 404。
 
-内部端口 `127.0.0.1:9090`：`/healthz`、`/metrics`，以及逐项 JSON 的 `/readyz`（PG 与 ClickHouse 可连、schema 版本达到编译期最高版本；collector / all 还检查站点快照与盐已加载）。
+内部端口 `127.0.0.1:9090`：`/healthz`、`/metrics`，以及逐项 JSON 的 `/readyz`（PG 与 ClickHouse 可连、schema 版本达到编译期最高版本，以及站点快照与盐已加载）。
 
 ### 4. 测试
 
@@ -124,7 +124,7 @@ cargo test        # 需要数据库的集成测试在缺少 RIVU_TEST_* 变量�
 
 SQL 与 JSON Schema 的 insta 快照在 `crates/query/src/snapshots/`（`INSTA_UPDATE=always cargo test -p rivu-query` 更新）。
 
-采集脚本的单元测试、Playwright（chromium / firefox / webkit）与体积预算见 [`apps/tracker/README.md`](apps/tracker/README.md)。`apps/tracker/scripts/e2e-rivu.sh` 用真实浏览器对真实运行的 `rivu all` 做一组已知动作，再用 `rivu query` 断言数字完全一致。
+采集脚本的单元测试、Playwright（chromium / firefox / webkit）与体积预算见 [`apps/tracker/README.md`](apps/tracker/README.md)。`apps/tracker/scripts/e2e-rivu.sh` 用真实浏览器对真实运行的 `rivu serve` 做一组已知动作，再用 `rivu query` 断言数字完全一致。
 
 ### 5. 清理
 

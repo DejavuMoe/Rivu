@@ -1,7 +1,7 @@
 //! 命令行管理命令：`rivu site add`、`rivu query`。
 //!
 //! 它们直接连 PostgreSQL（`RIVU_DATABASE_URL`，应用账号）和 ClickHouse（reader 账号），不经过 HTTP；
-//! 配置按 api 角色校验。结果写到 stdout，日志在 stderr。
+//! 配置按管理命令（`Role::Admin`）校验。结果写到 stdout，日志在 stderr。
 
 use std::process::ExitCode;
 
@@ -74,7 +74,7 @@ pub async fn query(config: &Config, args: QueryArgs) -> Result<ExitCode> {
     let reader =
         rivu_storage_ch::client(&config.clickhouse_url, account, Some(&config.ch_database));
 
-    // 署名与能力跟随实际加载的库（§4.4、§6.10）：读 collector / all 热加载的同一个文件；文件不存在则为 null。
+    // 署名与能力跟随实际加载的库（§4.4、§6.10）：读 `rivu serve` 热加载的同一个文件；文件不存在则为 null。
     let geo = GeoDb::from_config(&config.geo);
     if let Err(e) = geo.reload_if_changed(&config.geo.db_path) {
         tracing::warn!(error = %format!("{e:#}"), "读取 GeoIP 库失败，geo_attribution 与 geo_capability 为 null");

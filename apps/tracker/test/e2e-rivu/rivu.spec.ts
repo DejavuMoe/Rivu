@@ -1,4 +1,4 @@
-// 真实浏览器 -> 真实运行的 rivu（`rivu all`，连 dev 的 PostgreSQL / ClickHouse）-> `rivu query`。
+// 真实浏览器 -> 真实运行的 rivu（`rivu serve`，连 dev 的 PostgreSQL / ClickHouse）-> `rivu query`。
 // 「已知答案探针」（docs/brief-p1.md 验收项）的雏形：浏览器做一组已知动作，系统里查到的数字必须与之完全一致。
 //
 // 与 test/e2e 的区别：这里**没有任何模拟的采集端**。
