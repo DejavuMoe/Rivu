@@ -107,7 +107,7 @@ fn config(env: &TestEnv) -> Config {
         ("RIVU_TRUSTED_PROXIES".into(), "127.0.0.0/8".into()),
         ("RIVU_BASE_URL".into(), HTTP_ORIGIN.into()),
     ];
-    Config::from_env(Role::Api, &Env::from_pairs(pairs)).expect("测试配置")
+    Config::from_env(Role::Admin, &Env::from_pairs(pairs)).expect("测试配置")
 }
 
 /// 放得很宽的限流：不是在测限流的用例用它。
@@ -286,12 +286,7 @@ async fn start(env: &TestEnv, pg: &PgPool, limits: DashLimits) -> (Http, Config)
         .expect("装配内部端点")
         .with_limits(limits)
         .with_clock(move || now);
-    let app = public::router_full(
-        Role::Api,
-        None,
-        None,
-        Some(dash_api::router(Arc::new(dash))),
-    );
+    let app = public::router_full(None, None, Some(dash_api::router(Arc::new(dash))));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {

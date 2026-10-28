@@ -1,18 +1,17 @@
-//! 角色的公共启动流程：构建依赖 -> 绑定端口 -> 装配 -> 服务 -> 优雅关停。
+//! `rivu serve` 的启动流程：构建依赖 -> 绑定端口 -> 装配 -> 服务 -> 优雅关停。
 //!
-//! 装配（按角色）：
-//! - collector / all：BatchWriter（`rivu_writer` 账号）、站点快照（含屏蔽规则与站点限额）、盐缓存、UA 解析器、
+//! 装配（一个实例里全部都有）：
+//! - 采集：BatchWriter（`rivu_writer` 账号）、站点快照（含屏蔽规则与站点限额）、盐缓存、UA 解析器、
 //!   接入管线（hostname、限流、垃圾引荐、屏蔽规则、机器人、地理、UA、来源）、
 //!   会话预热（关停快照或 ClickHouse，开始服务之前完成）与清扫、站点脚本分发（`GET /js/<site_key>.js`，`core.js` 启动时从 `RIVU_TRACKER_DIR` 读入）；
-//! - worker / all：后台任务 `salts_rotate`（启动时补跑一次，之后每小时一次）、`geoip_refresh`
-//!   （无本地副本时立即下载，之后按 `RIVU_GEOIP_REFRESH_INTERVAL` 条件 GET）、`ch_delete_batch`
-//!   （启动后一轮，之后每 `RIVU_STATS_DELETE_INTERVAL_SECS` 一轮，`rivu_maintainer` 账号）、`rollup_build`
-//!   （日汇总层，每 `RIVU_ROLLUP_INTERVAL_SECS` 一轮，同一账号）、`retention_purge`（按 `RIVU_RETENTION_DAYS` 与站点保留期删除原始数据，每小时）、
-//!   `ch_monitor`（ClickHouse parts / merge / mutation 积压，每 30 秒）；
-//! - collector / all：持有 GeoIP 库并每小时检查文件修改时间、热加载；管线第 6 步用它查询位置；
-//! - api / all：看板静态文件（`RIVU_DASHBOARD_DIR`，见 [`crate::dashboard`]）；公开查询 API（`POST /api/v1/query`、`GET /api/v1/query/schema.json`，见 [`crate::query_api`]）：
+//! - 后台任务：`salts_rotate`（启动时补跑一次，之后每小时一次）、`geoip_refresh`
+//!   （无本地副本时立即下载，之后按 `RIVU_GEOIP_REFRESH_INTERVAL` 条件 GET）；`rivu_maintainer` 账号的 `ch_delete_batch`
+//!   （启动后一轮，之后每 `RIVU_STATS_DELETE_INTERVAL_SECS` 一轮）、`rollup_build`（日汇总层，每 `RIVU_ROLLUP_INTERVAL_SECS` 一轮）、
+//!   `retention_purge`（按 `RIVU_RETENTION_DAYS` 与站点保留期删除原始数据，每小时）、`ch_monitor`（parts / merge / mutation 积压，每 30 秒）；
+//! - GeoIP 库：每小时检查文件修改时间、热加载；管线第 6 步用它查询位置，查询 API 用它回显署名与精度；
+//! - 查询：看板静态文件（`RIVU_DASHBOARD_DIR`，见 [`crate::dashboard`]）；公开查询 API（`POST /api/v1/query`、`GET /api/v1/query/schema.json`，见 [`crate::query_api`]）：
 //!   `rivu_reader` 账号的 ClickHouse 客户端、API key 鉴权与按组织限流（[`crate::api_auth::build_guard`]）；
-//!   看板与它的内部端点（[`crate::dash_api`]）；api 角色也持有 GeoIP 库（只用来在 `meta` 里回显署名与精度）。
+//!   看板与它的内部端点（[`crate::dash_api`]）；结果缓存（看板与 API 共用）。
 //!
 //! 关停顺序：停止接收（HTTP 服务优雅关停）→ 停止后台刷新任务 → 写会话快照 → 排空 BatchWriter 并 flush →
 //! 刷出全部接入计数（包括还没结束的 10 秒桶）。
@@ -25,7 +24,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 use rivu_common::build_info;
-use rivu_common::config::{Config, Role};
+use rivu_common::config::Config;
 use rivu_geo::GeoDb;
 use rivu_geo::datacenter::DcDb;
 use rivu_ingest::pipeline::{Pipeline, SaltCache, SiteSnapshot, salt_window, utc_today};
@@ -106,16 +105,8 @@ async fn serve(
     .with_context(|| format!("{name} 服务异常退出"))
 }
 
-/// PG 连接池上限（`platform-and-ops.md` §7：collector 4 / api 16 / worker 8 / all 24）。
-fn pg_max_connections(role: Role) -> u32 {
-    match role {
-        Role::Collector => 4,
-        Role::Api => 16,
-        Role::Worker => 8,
-        Role::All => 24,
-        Role::Migrate => 2,
-    }
-}
+/// PG 连接池上限（`platform-and-ops.md` §7）。
+const PG_MAX_CONNECTIONS: u32 = 24;
 
 /// collector 一侧装配出的组件。
 struct Collector {
@@ -257,14 +248,13 @@ fn with_dashboard(
 }
 
 pub async fn run(config: Config) -> Result<ExitCode> {
-    let role = config.role;
     let started = Instant::now();
 
     // 依赖：懒连接，依赖暂时不可用时进程照常启动，由 /readyz 报告。
     let ch_account = config
         .ch_probe_account()
         .context("没有可用于 /readyz 的 ClickHouse 账号")?;
-    let pg = rivu_storage_pg::connect_lazy(config.database_url.expose(), pg_max_connections(role))?;
+    let pg = rivu_storage_pg::connect_lazy(config.database_url.expose(), PG_MAX_CONNECTIONS)?;
     let probe = Probe::new(
         pg.clone(),
         rivu_storage_ch::client(&config.clickhouse_url, ch_account, None),
@@ -305,231 +295,178 @@ pub async fn run(config: Config) -> Result<ExitCode> {
     let internal_listener = TcpListener::bind(config.internal_addr)
         .await
         .with_context(|| format!("无法绑定内部端口 {}", config.internal_addr))?;
-    let public_listener = if role == Role::Worker {
-        None
-    } else {
-        Some(
-            TcpListener::bind(config.listen_addr)
-                .await
-                .with_context(|| format!("无法绑定公共端口 {}", config.listen_addr))?,
-        )
-    };
+    let public_listener = TcpListener::bind(config.listen_addr)
+        .await
+        .with_context(|| format!("无法绑定公共端口 {}", config.listen_addr))?;
 
     // 后台任务的停止信号与 HTTP 服务分开：先停服务，再停后台任务，最后排空写缓冲。
     let (bg_stop_tx, bg_stop_rx) = watch::channel(false);
     let mut background: Vec<JoinHandle<()>> = Vec::new();
 
     // 后台任务 salts_rotate：启动时先补跑一次（collector 才有盐可读），之后每小时一次。
-    if role.runs_jobs() {
-        rivu_jobs::run_once(&pg).await;
-        background.push(rivu_jobs::spawn_salts_rotation(
-            pg.clone(),
-            bg_stop_rx.clone(),
-            false,
-        ));
-    }
+    rivu_jobs::run_once(&pg).await;
+    background.push(rivu_jobs::spawn_salts_rotation(
+        pg.clone(),
+        bg_stop_rx.clone(),
+        false,
+    ));
 
-    // 后台任务 ch_delete_batch：执行到期的统计数据删除意图（`rivu_maintainer` 账号）。
-    // all 里看板写入日期范围意图后通过 `stats_delete_kick` 立即唤醒一次。
-    // 结果缓存（§6.9）：看板与公开 API 共用；同进程的 ch_delete_batch 删除完成后让站点的结果失效
-    let query_cache = role.serves_api().then(|| {
-        Arc::new(rivu_query::QueryCache::new(
-            rivu_query::cache::DEFAULT_CAPACITY_ROWS,
-        ))
-    });
-    let stats_delete_kick = if role.runs_jobs() {
-        let account = config
+    // 结果缓存（§6.9）：看板与公开 API 共用；ch_delete_batch 删除完成后让站点的结果失效
+    let query_cache = Arc::new(rivu_query::QueryCache::new(
+        rivu_query::cache::DEFAULT_CAPACITY_ROWS,
+    ));
+
+    // 用 `rivu_maintainer` 账号的后台任务：ch_delete_batch（到期的统计数据删除意图；看板写入日期范围意图后
+    // 通过 `stats_delete_kick` 立即唤醒一次）、retention_purge、ch_monitor、rollup_build
+    let maintainer = rivu_storage_ch::client(
+        &config.clickhouse_url,
+        config
             .ch_maintainer
             .as_ref()
-            .context("worker 需要 RIVU_CH_MAINTAINER_USER / RIVU_CH_MAINTAINER_PASSWORD")?;
-        let maintainer =
-            rivu_storage_ch::client(&config.clickhouse_url, account, Some(&config.ch_database));
-        let kick = rivu_jobs::StatsDeleteKick::default();
-        background.push(rivu_jobs::spawn_stats_delete(
-            pg.clone(),
-            maintainer.clone(),
-            config.stats_delete_interval,
-            Arc::clone(&kick),
-            query_cache.clone(),
-            bg_stop_rx.clone(),
-        ));
-        // 后台任务 rollup_build：日汇总层（同一个 maintainer 账号）
-        // 后台任务 retention_purge：按保留期删除原始数据
-        background.push(rivu_jobs::spawn_retention_purge(
-            pg.clone(),
-            maintainer.clone(),
-            config.ch_database.clone(),
-            config.retention_days,
-            bg_stop_rx.clone(),
-        ));
-        // 后台任务 ch_monitor：parts、merge 与 mutation 积压
-        background.push(rivu_jobs::spawn_ch_monitor(
-            maintainer.clone(),
-            config.ch_database.clone(),
-            bg_stop_rx.clone(),
-        ));
-        // 后台任务 retention_purge：按保留期删除原始数据
-        background.push(rivu_jobs::spawn_retention_purge(
-            pg.clone(),
-            maintainer.clone(),
-            config.ch_database.clone(),
-            config.retention_days,
-            bg_stop_rx.clone(),
-        ));
-        // 后台任务 ch_monitor：parts、merge 与 mutation 积压
-        background.push(rivu_jobs::spawn_ch_monitor(
-            maintainer.clone(),
-            config.ch_database.clone(),
-            bg_stop_rx.clone(),
-        ));
-        background.push(rivu_jobs::spawn_rollup_build(
-            pg.clone(),
-            maintainer,
-            config.rollup_interval,
-            bg_stop_rx.clone(),
-        ));
-        Some(kick)
-    } else {
-        None
-    };
+            .context("需要 RIVU_CH_MAINTAINER_USER / RIVU_CH_MAINTAINER_PASSWORD")?,
+        Some(&config.ch_database),
+    );
+    let stats_delete_kick = rivu_jobs::StatsDeleteKick::default();
+    background.push(rivu_jobs::spawn_stats_delete(
+        pg.clone(),
+        maintainer.clone(),
+        config.stats_delete_interval,
+        Arc::clone(&stats_delete_kick),
+        Some(Arc::clone(&query_cache)),
+        bg_stop_rx.clone(),
+    ));
+    background.push(rivu_jobs::spawn_retention_purge(
+        pg.clone(),
+        maintainer.clone(),
+        config.ch_database.clone(),
+        config.retention_days,
+        bg_stop_rx.clone(),
+    ));
+    background.push(rivu_jobs::spawn_ch_monitor(
+        maintainer.clone(),
+        config.ch_database.clone(),
+        bg_stop_rx.clone(),
+    ));
+    background.push(rivu_jobs::spawn_rollup_build(
+        pg.clone(),
+        maintainer,
+        config.rollup_interval,
+        bg_stop_rx.clone(),
+    ));
 
-    // GeoIP：collector / all 持有库并热加载（管线接入之前只是加载与报告状态）；
-    // worker / all 运行 `geoip_refresh`，all 里刷新成功后直接热加载同一个库。
+    // GeoIP：持有库并热加载；管线用它查位置，查询 API 用它回显署名与精度。`geoip_refresh` 刷新成功后直接热加载同一个库。
     for w in config.geo.warnings() {
         tracing::warn!("{w}");
     }
-    // collector 用它查位置；api 只用它回显署名与精度（`meta.geo_attribution` / `geo_capability`）。
-    let geo_db = (role.serves_collector() || role.serves_api())
-        .then(|| Arc::new(GeoDb::from_config(&config.geo)));
-    if let Some(db) = &geo_db {
-        background.push(db.spawn_reloader(
-            config.geo.db_path.clone(),
-            GEO_RELOAD_CHECK_INTERVAL,
-            bg_stop_rx.clone(),
-        ));
-    }
-    let geo_refresh = role
-        .runs_jobs()
-        .then(|| Arc::new(GeoRefreshState::default()));
-    if let Some(state) = &geo_refresh {
-        background.push(rivu_jobs::spawn_geoip_refresh(
-            config.geo.clone(),
-            geo_db.clone(),
-            Arc::clone(state),
-            bg_stop_rx.clone(),
-        ));
-    }
+    let geo_db = Arc::new(GeoDb::from_config(&config.geo));
+    background.push(geo_db.spawn_reloader(
+        config.geo.db_path.clone(),
+        GEO_RELOAD_CHECK_INTERVAL,
+        bg_stop_rx.clone(),
+    ));
+    let geo_refresh = Arc::new(GeoRefreshState::default());
+    background.push(rivu_jobs::spawn_geoip_refresh(
+        config.geo.clone(),
+        Some(Arc::clone(&geo_db)),
+        Arc::clone(&geo_refresh),
+        bg_stop_rx.clone(),
+    ));
 
-    // 数据中心网段过滤（默认关闭）：worker / all 下载清单，collector / all 热加载并在管线第 5 步使用。
-    let datacenter = (config.datacenter.enabled && (role.serves_collector() || role.runs_jobs()))
-        .then(|| Arc::new(DcDb::new()));
+    // 数据中心网段过滤（默认关闭）：下载清单、热加载，管线第 5 步使用。
+    let datacenter = config.datacenter.enabled.then(|| Arc::new(DcDb::new()));
     if config.datacenter.enabled {
         tracing::info!(
             sources = config.datacenter.sources.len(),
             path = %config.datacenter.path.display(),
             "数据中心网段过滤已开启：命中的事件按 datacenter_ip 丢弃"
         );
-        if role.runs_jobs() {
-            background.push(rivu_jobs::spawn_datacenter_refresh(
-                config.datacenter.clone(),
-                datacenter.clone().filter(|_| role.serves_collector()),
-                bg_stop_rx.clone(),
-            ));
-        }
+        background.push(rivu_jobs::spawn_datacenter_refresh(
+            config.datacenter.clone(),
+            datacenter.clone(),
+            bg_stop_rx.clone(),
+        ));
     }
 
-    let collector = if role.serves_collector() {
-        let geo = geo_db.clone().context("collector 角色没有 GeoIP 库对象")?;
-        Some(
-            start_collector(
-                &config,
-                &pg,
-                geo,
-                datacenter.clone(),
-                &bg_stop_rx,
-                &mut background,
-            )
-            .await?,
-        )
-    } else {
-        None
-    };
+    let collector = start_collector(
+        &config,
+        &pg,
+        Arc::clone(&geo_db),
+        datacenter.clone(),
+        &bg_stop_rx,
+        &mut background,
+    )
+    .await?;
 
-    // 公开查询 API：只在 api / all 角色。reader 账号是 readonly=1，客户端不设任何 setting（见 `rivu_storage_ch::client`）。
-    let query_routes = if role.serves_api() {
-        let reader_account = config
-            .ch_reader
-            .as_ref()
-            .context("api 需要 RIVU_CH_READER_USER / RIVU_CH_READER_PASSWORD")?;
-        let reader = rivu_storage_ch::client(
-            &config.clickhouse_url,
-            reader_account,
-            Some(&config.ch_database),
+    // 公开查询 API 与看板端点。reader 账号是 readonly=1，客户端不设任何 setting（见 `rivu_storage_ch::client`）。
+    let reader_account = config
+        .ch_reader
+        .as_ref()
+        .context("需要 RIVU_CH_READER_USER / RIVU_CH_READER_PASSWORD")?;
+    let reader = rivu_storage_ch::client(
+        &config.clickhouse_url,
+        reader_account,
+        Some(&config.ch_database),
+    );
+    let guard = api_auth::build_guard(&config, pg.clone());
+    if !config.base_url_explicit {
+        tracing::warn!(
+            base_url = %config.base_url,
+            "未设置 RIVU_BASE_URL：内部端点的 CSRF 按 Origin == http://<RIVU_LISTEN_ADDR> 校验，只适合开发；生产必须设置为对外的 https 地址"
         );
-        let guard = api_auth::build_guard(&config, pg.clone());
-        if !config.base_url_explicit {
-            tracing::warn!(
-                base_url = %config.base_url,
-                "未设置 RIVU_BASE_URL：内部端点的 CSRF 按 Origin == http://<RIVU_LISTEN_ADDR> 校验，只适合开发；生产必须设置为对外的 https 地址"
-            );
-        }
-        if !config.cookie_secure {
-            tracing::warn!(
-                "会话 cookie 不带 Secure（RIVU_BASE_URL 是 http 或 RIVU_COOKIE_SECURE=off）：只适合开发"
-            );
-        }
-        match rivu_storage_pg::users::any_user_exists(&pg).await {
-            Ok(false) => tracing::warn!(
-                token_required = config.setup_token.is_some(),
-                "实例还没有用户：POST /api/internal/setup 或 `rivu setup` 可以创建首个用户（建议设置 RIVU_SETUP_TOKEN）"
-            ),
-            Ok(true) => {}
-            Err(e) => tracing::warn!(error = %format!("{e:#}"), "检查实例是否已初始化失败"),
-        }
-        let cache = query_cache.clone().context("api 角色的结果缓存")?;
-        let dash = Arc::new(
-            DashApi::new(&config, pg.clone(), reader.clone(), geo_db.clone())
-                .context("装配内部端点失败")?
-                .with_stats_delete_kick(stats_delete_kick.clone())
-                .with_cache(Arc::clone(&cache)),
+    }
+    if !config.cookie_secure {
+        tracing::warn!(
+            "会话 cookie 不带 Secure（RIVU_BASE_URL 是 http 或 RIVU_COOKIE_SECURE=off）：只适合开发"
         );
-        background.push(dash_api::spawn_maintenance(pg.clone(), bg_stop_rx.clone()));
-        Some(
-            query_api::router(Arc::new(
-                QueryApi::new(
-                    guard,
-                    pg.clone(),
-                    reader,
-                    geo_db.clone(),
-                    config.query_timeouts.api_secs,
-                )
-                .with_rollup(config.rollup_min_rows)
-                .with_retention(config.retention_days)
-                .with_cache(cache),
-            ))
-            .merge(dash_api::router(dash)),
+    }
+    match rivu_storage_pg::users::any_user_exists(&pg).await {
+        Ok(false) => tracing::warn!(
+            token_required = config.setup_token.is_some(),
+            "实例还没有用户：POST /api/internal/setup 或 `rivu setup` 可以创建首个用户（建议设置 RIVU_SETUP_TOKEN）"
+        ),
+        Ok(true) => {}
+        Err(e) => tracing::warn!(error = %format!("{e:#}"), "检查实例是否已初始化失败"),
+    }
+    let dash = Arc::new(
+        DashApi::new(
+            &config,
+            pg.clone(),
+            reader.clone(),
+            Some(Arc::clone(&geo_db)),
         )
-    } else {
-        None
-    };
+        .context("装配内部端点失败")?
+        .with_stats_delete_kick(Some(stats_delete_kick))
+        .with_cache(Arc::clone(&query_cache)),
+    );
+    background.push(dash_api::spawn_maintenance(pg.clone(), bg_stop_rx.clone()));
+    let query_routes = query_api::router(Arc::new(
+        QueryApi::new(
+            guard,
+            pg.clone(),
+            reader,
+            Some(Arc::clone(&geo_db)),
+            config.query_timeouts.api_secs,
+        )
+        .with_rollup(config.rollup_min_rows)
+        .with_retention(config.retention_days)
+        .with_cache(query_cache),
+    ))
+    .merge(dash_api::router(dash));
 
-    // 看板静态文件：api / all 角色，启动时读进内存
-    let dashboard = role.serves_api().then(|| {
-        Arc::new(crate::dashboard::DashboardAssets::load(
-            &config.dashboard_dir,
-        ))
-    });
+    // 看板静态文件：启动时读进内存
+    let dashboard = Arc::new(crate::dashboard::DashboardAssets::load(
+        &config.dashboard_dir,
+    ));
 
     let state = Arc::new(InternalState {
-        role,
         probe,
-        collector: collector.as_ref().map(|c| c.readiness.clone()),
-        datacenter: datacenter.filter(|_| role.serves_collector()),
-        tracker: collector.as_ref().map(|c| Arc::clone(&c.tracker)),
-        dashboard: dashboard.clone(),
+        collector: Some(collector.readiness.clone()),
+        datacenter,
+        tracker: Some(Arc::clone(&collector.tracker)),
+        dashboard: Some(Arc::clone(&dashboard)),
         geo: GeoReadiness {
-            db: geo_db,
-            refresh: geo_refresh,
+            db: Some(geo_db),
+            refresh: Some(geo_refresh),
             db_path: config.geo.db_path.clone(),
         },
         metrics,
@@ -537,14 +474,12 @@ pub async fn run(config: Config) -> Result<ExitCode> {
     });
 
     tracing::info!(
-        role = role.as_str(),
         version = build_info::VERSION,
         commit = build_info::GIT_COMMIT,
         internal_addr = %config.internal_addr,
-        listen_addr = ?public_listener.as_ref().map(|_| config.listen_addr),
+        listen_addr = %config.listen_addr,
         "rivu 已启动"
     );
-
     let (stop_tx, stop_rx) = watch::channel(false);
     tokio::spawn(async move {
         wait_for_signal().await;
@@ -557,25 +492,19 @@ pub async fn run(config: Config) -> Result<ExitCode> {
         internal::router(state),
         stop_rx.clone(),
     );
-    let pipeline = collector.as_ref().map(|c| Arc::clone(&c.pipeline));
-    let scripts = collector.as_ref().map(|c| Arc::clone(&c.scripts));
-    let public_task = async {
-        match public_listener {
-            Some(l) => {
-                serve(
-                    "公共端口",
-                    l,
-                    with_dashboard(
-                        public::router_full(role, pipeline, scripts, query_routes),
-                        dashboard,
-                    ),
-                    stop_rx.clone(),
-                )
-                .await
-            }
-            None => Ok(()),
-        }
-    };
+    let public_task = serve(
+        "公共端口",
+        public_listener,
+        with_dashboard(
+            public::router_full(
+                Some(Arc::clone(&collector.pipeline)),
+                Some(Arc::clone(&collector.scripts)),
+                Some(query_routes),
+            ),
+            Some(dashboard),
+        ),
+        stop_rx.clone(),
+    );
     let (internal_result, public_result) = tokio::join!(internal_task, public_task);
 
     // 关停：HTTP 已停止接收 -> 停后台任务 -> 排空写缓冲、刷出计数。
@@ -585,14 +514,9 @@ pub async fn run(config: Config) -> Result<ExitCode> {
     for task in background {
         let _ = task.await;
     }
-    let drained = match collector {
-        Some(c) => {
-            session_warm::save(&c.pipeline, &config.geo.data_dir).await;
-            drop(c.pipeline);
-            c.writer.shutdown().await
-        }
-        None => Ok(()),
-    };
+    session_warm::save(&collector.pipeline, &config.geo.data_dir).await;
+    drop(collector.pipeline);
+    let drained = collector.writer.shutdown().await;
 
     internal_result?;
     public_result?;

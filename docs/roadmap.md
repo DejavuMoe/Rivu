@@ -27,7 +27,7 @@
 
 ## 交付
 
-- [x] 看板静态文件由 `rivu` 的 api / all 角色提供（`RIVU_DASHBOARD_DIR`），单页应用回落到 `index.html`，带哈希的资源长期缓存
+- [x] 看板静态文件由 `rivu serve` 提供（`RIVU_DASHBOARD_DIR`），单页应用回落到 `index.html`，带哈希的资源长期缓存
 - [x] Dockerfile：多阶段构建 rivu、tracker、看板，产出一个镜像（161 MB，`rivu healthcheck` 作健康检查）
 - [x] 生产 compose：rivu + PostgreSQL + ClickHouse，可选内置 Caddy；nginx 与 Caddy 反向代理示例
 - [x] 安装、升级、备份文档（`docs/install.md`）

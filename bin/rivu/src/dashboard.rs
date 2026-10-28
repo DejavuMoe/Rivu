@@ -1,4 +1,4 @@
-//! 看板静态文件（api / all 角色）。看板是 SvelteKit 的单页应用（`apps/dashboard`，adapter-static），由 rivu 直接提供，
+//! 看板静态文件。看板是 SvelteKit 的单页应用（`apps/dashboard`，adapter-static），由 rivu 直接提供，
 //! 反向代理（nginx / Caddy）只需把整个站点转给 rivu。
 //!
 //! - 启动时把 `RIVU_DASHBOARD_DIR`（默认 `apps/dashboard/build`）里的全部文件读进内存，之后不再读盘；
@@ -181,7 +181,7 @@ impl DashboardAssets {
     }
 }
 
-/// 看板路径的处理函数，作为公共路由的 fallback 挂在 api / all 角色上。
+/// 看板路径的处理函数，作为公共路由的 fallback。
 pub async fn serve(State(assets): State<Arc<DashboardAssets>>, req: Request) -> Response {
     if req.method() != Method::GET && req.method() != Method::HEAD {
         let mut r = StatusCode::METHOD_NOT_ALLOWED.into_response();

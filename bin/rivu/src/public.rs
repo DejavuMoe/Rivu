@@ -1,6 +1,6 @@
 //! 公共端口（`RIVU_LISTEN_ADDR`）的路由。
 //!
-//! collector / all 角色实现 `POST /api/event` 与 `OPTIONS /api/event`，严格照
+//! 实现 `POST /api/event` 与 `OPTIONS /api/event`，严格照
 //! `docs/architecture/tracker-and-protocol.md` §6.1–§6.3：
 //!
 //! | 情况 | 响应 |
@@ -15,10 +15,10 @@
 //!
 //! 所有响应都带 `Access-Control-Allow-Origin: *`、`Access-Control-Expose-Headers`、`Cache-Control: no-store`、
 //! `Cross-Origin-Resource-Policy: cross-origin`；不带 `Allow-Credentials`，也不设 cookie（请求里的 `Cookie` 被忽略）。
-//! api / all 角色另有公开查询 API（`POST /api/v1/query`、`GET /api/v1/query/schema.json`，实现在 [`crate::query_api`]，
+//! 另有公开查询 API（`POST /api/v1/query`、`GET /api/v1/query/schema.json`，实现在 [`crate::query_api`]，
 //! 不带 CORS）与看板的内部端点（[`crate::dash_api`]）；没有匹配的 `/api/*` 返回 `404`。
 //!
-//! collector / all 角色另有 `GET /js/<site_key>.js`（站点专属脚本，实现在 [`crate::script`]）。
+//! 以及 `GET /js/<site_key>.js`（站点专属脚本，实现在 [`crate::script`]）。
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -30,7 +30,6 @@ use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{any, post};
-use rivu_common::config::Role;
 use rivu_ingest::pipeline::{Outcome, Pipeline, RequestCtx};
 use rivu_ingest::protocol::MAX_BODY_BYTES;
 use serde_json::{Value, json};
@@ -43,36 +42,32 @@ const BODY_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 const X_RIVU_DROPPED: HeaderName = HeaderName::from_static("x-rivu-dropped");
 
-/// 公共端口的路由（不含站点脚本）。`pipeline` 只在 collector / all 角色有值。
-pub fn router(role: Role, pipeline: Option<Arc<Pipeline>>) -> Router {
-    router_with_scripts(role, pipeline, None)
+/// 公共端口的路由（不含站点脚本与查询 API，测试用）。
+pub fn router(pipeline: Option<Arc<Pipeline>>) -> Router {
+    router_with_scripts(pipeline, None)
 }
 
-/// 公共端口的路由。`pipeline` 与 `scripts` 只在 collector / all 角色有值；
-/// `scripts` 提供 `GET /js/<site_key>.js`（`tracker-and-protocol.md` §2.3、§2.4）。
+/// 公共端口的路由（不含查询 API，测试用）。`scripts` 提供 `GET /js/<site_key>.js`（`tracker-and-protocol.md` §2.3、§2.4）。
 pub fn router_with_scripts(
-    role: Role,
     pipeline: Option<Arc<Pipeline>>,
     scripts: Option<Arc<ScriptService>>,
 ) -> Router {
-    router_full(role, pipeline, scripts, None)
+    router_full(pipeline, scripts, None)
 }
 
-/// 公共端口的完整路由。`query_api` 是公开查询 API 与看板端点的路由（[`crate::query_api::router`]），
-/// 只在 api / all 角色有值；没有匹配的 `/api/*` 返回 JSON 的 404（计入 `rivu_api_requests_total`）。
+/// 公共端口的完整路由：给了哪个组件就挂哪组路由。`pipeline`：`POST /api/event`；`scripts`：站点脚本；
+/// `query_api`：公开查询 API 与看板端点（[`crate::query_api::router`]）。没有匹配的 `/api/*` 返回 JSON 的 404
+/// （计入 `rivu_api_requests_total`）。
 pub fn router_full(
-    role: Role,
     pipeline: Option<Arc<Pipeline>>,
     scripts: Option<Arc<ScriptService>>,
     query_api: Option<Router>,
 ) -> Router {
     let mut router = Router::new();
-    if role.serves_collector()
-        && let Some(scripts) = scripts
-    {
+    if let Some(scripts) = scripts {
         router = router.merge(script::router(scripts));
     }
-    if role.serves_collector() {
+    if pipeline.is_some() {
         let collector = Router::new()
             .route(
                 "/api/event",
@@ -81,17 +76,13 @@ pub fn router_full(
             .with_state(pipeline);
         router = router.merge(collector);
     }
-    if role.serves_api() {
-        if let Some(query_api) = query_api {
-            // 具体路径优先于下面的 `/api/{*rest}` 通配
-            router = router.merge(query_api);
-        }
-        let rest = Router::new().route("/api/{*rest}", any(api_not_found));
-        router = router.merge(query_api::count_requests(rest, query_api::ROUTE_NOT_FOUND));
+    if let Some(query_api) = query_api {
+        // 具体路径优先于下面的 `/api/{*rest}` 通配
+        router = router.merge(query_api);
     }
-    router
+    let rest = Router::new().route("/api/{*rest}", any(api_not_found));
+    router.merge(query_api::count_requests(rest, query_api::ROUTE_NOT_FOUND))
 }
-
 /// 所有响应共有的头（§6.1「所有响应」）。
 fn with_common_headers(mut resp: Response) -> Response {
     let h = resp.headers_mut();
@@ -158,7 +149,7 @@ async fn event(
     req: Request,
 ) -> Response {
     let Some(pipeline) = pipeline else {
-        // collector 角色总会带管线；走到这里说明装配出了问题。
+        // 只有带管线时才挂这条路由；走到这里说明装配出了问题。
         tracing::error!("collector 路由没有接入管线");
         return empty(StatusCode::INTERNAL_SERVER_ERROR);
     };
@@ -326,7 +317,7 @@ mod tests {
     async fn post_event(p: &Arc<Pipeline>, body: &[u8]) -> Resp {
         let len = format!("Content-Length: {}", body.len());
         send(
-            router(Role::Collector, Some(Arc::clone(p))),
+            router(Some(Arc::clone(p))),
             "POST",
             "/api/event",
             &["Content-Type: text/plain;charset=UTF-8", BROWSER_UA, &len],
@@ -356,7 +347,7 @@ mod tests {
         let body = pageview_body(KEY, "example.test");
         let len = format!("Content-Length: {}", body.len());
         let r = send(
-            router(Role::Collector, Some(Arc::clone(&p))),
+            router(Some(Arc::clone(&p))),
             "POST",
             "/api/event",
             &[
@@ -421,7 +412,7 @@ mod tests {
         let (p, _w, _rx) = collector(10);
         // 只声明、不发送：服务端看到 Content-Length 就回 413，不会等待请求体
         let r = send(
-            router(Role::Collector, Some(p)),
+            router(Some(p)),
             "POST",
             "/api/event",
             &["Content-Length: 8193"],
@@ -457,7 +448,7 @@ mod tests {
         chunked.extend_from_slice(&big);
         chunked.extend_from_slice(b"\r\n0\r\n\r\n");
         let r = send(
-            router(Role::Collector, Some(p)),
+            router(Some(p)),
             "POST",
             "/api/event",
             &["Transfer-Encoding: chunked"],
@@ -488,7 +479,7 @@ mod tests {
     #[tokio::test]
     async fn options_is_a_204_preflight() {
         let (p, _w, _rx) = collector(1);
-        let r = request(router(Role::Collector, Some(p)), "OPTIONS", "/api/event").await;
+        let r = request(router(Some(p)), "OPTIONS", "/api/event").await;
         assert_eq!(r.status, 204);
         assert_eq!(
             r.header("access-control-allow-methods"),
@@ -506,12 +497,7 @@ mod tests {
     async fn other_methods_are_405_with_allow() {
         let (p, _w, _rx) = collector(1);
         for method in ["GET", "PUT", "DELETE", "HEAD"] {
-            let r = request(
-                router(Role::Collector, Some(Arc::clone(&p))),
-                method,
-                "/api/event",
-            )
-            .await;
+            let r = request(router(Some(Arc::clone(&p))), method, "/api/event").await;
             assert_eq!(r.status, 405, "{method}");
             assert_eq!(r.header("allow"), Some("POST, OPTIONS"), "{method}");
             assert_common_headers(&r);
@@ -521,29 +507,22 @@ mod tests {
     #[tokio::test]
     async fn collector_serves_event_endpoint_only() {
         let (p, _w, _rx) = collector(1);
-        let r = request(
-            router(Role::Collector, Some(Arc::clone(&p))),
-            "GET",
-            "/api/stats",
-        )
-        .await;
+        let r = request(router(Some(Arc::clone(&p))), "GET", "/api/stats").await;
         assert_eq!(r.status, 404);
-        let r = request(router(Role::Collector, Some(p)), "GET", "/").await;
+        let r = request(router(Some(p)), "GET", "/").await;
         assert_eq!(r.status, 404);
     }
 
     #[tokio::test]
-    async fn api_serves_api_prefix_only() {
-        let r = request(router(Role::Api, None), "GET", "/api/stats/overview").await;
+    async fn without_a_pipeline_api_paths_are_json_404() {
+        let r = request(router(None), "GET", "/api/stats/overview").await;
         assert_eq!(r.status, 404);
         assert!(r.body.contains("\"error\":\"not_found\""), "{}", r.body);
-        let r = request(router(Role::Api, None), "POST", "/api/event").await;
-        // api 角色没有 /api/event 的专用路由，会落到 /api/* 的通配上
+        let r = request(router(None), "POST", "/api/event").await;
         assert_eq!(r.status, 404);
-        let r = request(router(Role::Api, None), "GET", "/other").await;
+        let r = request(router(None), "GET", "/other").await;
         assert_eq!(r.status, 404);
     }
-
     /// 一个占位的查询 API 路由：只验证它与 404 通配的优先关系，真实实现的测试在 `query_api.rs`。
     fn stub_query_api() -> Router {
         Router::new()
@@ -556,47 +535,32 @@ mod tests {
 
     #[tokio::test]
     async fn query_api_routes_take_precedence_over_the_404_wildcard() {
-        for role in [Role::Api, Role::All] {
+        for with_pipeline in [false, true] {
             let (p, _w, _rx) = collector(1);
-            let pipeline = (role == Role::All).then_some(p);
-            let app = || router_full(role, pipeline.clone(), None, Some(stub_query_api()));
+            let pipeline = with_pipeline.then_some(p);
+            let app = || router_full(pipeline.clone(), None, Some(stub_query_api()));
             let r = request(app(), "POST", "/api/v1/query").await;
-            assert_eq!((r.status, r.body.as_str()), (200, "query"), "{role:?}");
+            assert_eq!((r.status, r.body.as_str()), (200, "query"));
             let r = request(app(), "GET", "/api/v1/query/schema.json").await;
-            assert_eq!((r.status, r.body.as_str()), (200, "schema"), "{role:?}");
+            assert_eq!((r.status, r.body.as_str()), (200, "schema"));
             // 其余 /api/* 是 JSON 的 404，包括 v1 下的其他路径
             for path in ["/api/v1/other", "/api/v1/query/", "/api/stats"] {
                 let r = request(app(), "POST", path).await;
-                assert_eq!(r.status, 404, "{role:?} {path}");
-                assert!(r.body.contains("not_found"), "{role:?} {path}");
+                assert_eq!(r.status, 404, "{path}");
+                assert!(r.body.contains("not_found"), "{path}");
             }
             assert_eq!(request(app(), "GET", "/other").await.status, 404);
         }
-        // collector 角色不提供查询 API，即使传了也不挂载
-        let (p, _w, _rx) = collector(1);
-        let r = request(
-            router_full(Role::Collector, Some(p), None, Some(stub_query_api())),
-            "POST",
-            "/api/v1/query",
-        )
-        .await;
-        assert_eq!(r.status, 404);
     }
-
     #[tokio::test]
-    async fn all_serves_both() {
+    async fn event_route_and_api_wildcard_coexist() {
         let (p, _w, _rx) = collector(1);
         let r = post_event(&p, &pageview_body(KEY, "example.test")).await;
         assert_eq!(r.status, 202);
-        let r = request(
-            router(Role::All, Some(Arc::clone(&p))),
-            "GET",
-            "/api/anything",
-        )
-        .await;
+        let r = request(router(Some(Arc::clone(&p))), "GET", "/api/anything").await;
         assert_eq!(r.status, 404);
-        // all 角色的 /api/event 走 collector 的专用路由，不是通配
-        let r = request(router(Role::All, Some(p)), "OPTIONS", "/api/event").await;
+        // /api/event 走专用路由，不是通配
+        let r = request(router(Some(p)), "OPTIONS", "/api/event").await;
         assert_eq!(r.status, 204);
     }
 }

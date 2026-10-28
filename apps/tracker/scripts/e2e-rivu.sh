@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 真实浏览器 -> 真实运行的 rivu -> ClickHouse -> `rivu query` 的端到端测试（Linux）。
 #
-# 在仓库根目录的 WSL 构建镜像里依次：构建 tracker -> 构建 rivu -> migrate -> 为每个内核建站 -> 后台启动 `rivu all`
+# 在仓库根目录的 WSL 构建镜像里依次：构建 tracker -> 构建 rivu -> migrate -> 为每个内核建站 -> 后台启动 `rivu serve`
 # -> 等 /readyz -> 跑 Playwright（apps/tracker/test/e2e-rivu）-> 停 rivu（trap 保证清理）。
 #
 # 需要 PostgreSQL 和 ClickHouse（dev 的 compose：127.0.0.1:5432 / :8123）和 .env.example 里的变量（先加载进环境）。
@@ -61,7 +61,7 @@ echo "==> 构建 rivu"
 cargo build -p rivu
 RIVU="$ROOT/target/debug/rivu"
 
-# rivu all 的运行环境：端口避开常用的 8080/9090；站点快照 1 秒重载；写缓冲 200 ms 刷一次；
+# rivu serve 的运行环境：端口避开常用的 8080/9090；站点快照 1 秒重载；写缓冲 200 ms 刷一次；
 # core.js 从刚构建的 dist/ 读；GeoIP 库用仓库里的 MaxMind 官方测试库（手工放置、不刷新），避免后台去下载 DB-IP。
 export RIVU_LISTEN_ADDR="127.0.0.1:${PORT}"
 export RIVU_INTERNAL_ADDR="127.0.0.1:${INTERNAL_PORT}"
@@ -90,8 +90,8 @@ for engine in chromium firefox webkit; do
   export "RIVU_E2E_SITE_$(printf '%s' "$engine" | tr '[:lower:]' '[:upper:]')=$key"
 done
 
-echo "==> 后台启动 rivu all"
-"$RIVU" all >"$WORK/rivu.log" 2>&1 &
+echo "==> 后台启动 rivu serve"
+"$RIVU" serve >"$WORK/rivu.log" 2>&1 &
 RIVU_PID=$!
 
 echo "==> 等待 /readyz"

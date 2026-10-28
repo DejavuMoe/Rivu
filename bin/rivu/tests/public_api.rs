@@ -1,5 +1,5 @@
 //! 公开查询 API（`POST /api/v1/query`、`GET /api/v1/query/schema.json`）的端到端测试：
-//! 真实的 PostgreSQL 与 ClickHouse，真实的本地 TCP 端口，路由由 `public::router_full` 装配（与 `rivu all` 同一条路径）。
+//! 真实的 PostgreSQL 与 ClickHouse，真实的本地 TCP 端口，路由由 `public::router_full` 装配（与 `rivu serve` 同一条路径）。
 //!
 //! 缺少环境变量时跳过并打印原因（同 `e2e_lite.rs`）：
 //!   RIVU_TEST_DATABASE_URL     有 DDL 与写权限的 PostgreSQL 连接串（rivu_migrator）
@@ -124,7 +124,7 @@ fn api_config(env: &TestEnv) -> Config {
             reader.password.expose().to_owned(),
         ),
     ];
-    Config::from_env(Role::Api, &Env::from_pairs(pairs)).expect("测试配置")
+    Config::from_env(Role::Admin, &Env::from_pairs(pairs)).expect("测试配置")
 }
 
 fn unique(prefix: &str) -> String {
@@ -368,7 +368,7 @@ struct Server {
     reader: Client,
 }
 
-/// 起一个只含公开查询 API 的 api 角色路由（与 `rivu all` 同一条 `router_full` 路径），固定「现在」。
+/// 起一个只含公开查询 API 的路由（与 `rivu serve` 同一条 `router_full` 路径），固定「现在」。
 async fn start_server(env: &TestEnv, pg: &PgPool) -> Server {
     let config = api_config(env);
     let guard = api_auth::build_guard(&config, pg.clone());
@@ -389,12 +389,7 @@ async fn start_server(env: &TestEnv, pg: &PgPool) -> Server {
         config.query_timeouts.api_secs,
     )
     .with_clock(move || now);
-    let app = public::router_full(
-        Role::Api,
-        None,
-        None,
-        Some(query_api::router(Arc::new(api))),
-    );
+    let app = public::router_full(None, None, Some(query_api::router(Arc::new(api))));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {

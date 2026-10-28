@@ -16,56 +16,30 @@ use std::time::Duration;
 
 use crate::telemetry::check_level;
 
-/// 子命令对应的角色。不同角色要求的变量不同。
+/// 子命令对应的配置要求。不同子命令要求的变量不同。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
-    Collector,
-    Worker,
-    Api,
+    /// `rivu serve`：采集、查询 API、看板与后台任务，需要全部账号与密钥。
+    Serve,
+    /// `rivu migrate`：只需要 migrator 账号。
     Migrate,
-    All,
+    /// 管理命令（`site`、`user`、`apikey`、`query` 等）：PostgreSQL 应用账号与 ClickHouse reader。
+    Admin,
 }
 
 impl Role {
     pub fn as_str(self) -> &'static str {
         match self {
-            Role::Collector => "collector",
-            Role::Worker => "worker",
-            Role::Api => "api",
+            Role::Serve => "serve",
             Role::Migrate => "migrate",
-            Role::All => "all",
+            Role::Admin => "admin",
         }
     }
 
-    /// 是否挂载 collector 的公共路由（`POST /api/event`）。
-    pub fn serves_collector(self) -> bool {
-        matches!(self, Role::Collector | Role::All)
-    }
-
-    /// 是否挂载 api 的公共路由（`/api/*`）。
-    pub fn serves_api(self) -> bool {
-        matches!(self, Role::Api | Role::All)
-    }
-
-    /// 是否运行后台任务（`salts_rotate`、`geoip_refresh`）：worker、all。
-    pub fn runs_jobs(self) -> bool {
-        matches!(self, Role::Worker | Role::All)
-    }
-
-    fn needs_ch_writer(self) -> bool {
-        matches!(self, Role::Collector | Role::Worker | Role::All)
-    }
-
     fn needs_ch_reader(self) -> bool {
-        matches!(self, Role::Api | Role::All)
-    }
-
-    fn needs_ch_maintainer(self) -> bool {
-        // 启用 jobs 的进程：worker、all
-        matches!(self, Role::Worker | Role::All)
+        matches!(self, Role::Serve | Role::Admin)
     }
 }
-
 /// 敏感字符串：Debug 输出被遮蔽，避免凭据进入日志。
 #[derive(Clone, PartialEq, Eq)]
 pub struct Secret(String);
@@ -542,12 +516,12 @@ pub struct Config {
     pub site_cache_refresh: Duration,
     /// `RIVU_SITE_RESTORE_DAYS`：站点软删除后的恢复窗口（天）；`0` 表示下一轮 `ch_delete_batch` 就清除统计数据。
     pub site_restore_days: u32,
-    /// `RIVU_STATS_DELETE_INTERVAL_SECS`：`ch_delete_batch`（统计数据删除）的检查周期，worker / all 运行。
+    /// `RIVU_STATS_DELETE_INTERVAL_SECS`：`ch_delete_batch`（统计数据删除）的检查周期。
     pub stats_delete_interval: Duration,
     /// `RIVU_RETENTION_DAYS`：原始数据（`events`、`sessions`）保留的本地日数上限，站点可以设得更短；
     /// 由 `retention_purge` 删除，日汇总层不受影响。
     pub retention_days: u32,
-    /// `RIVU_ROLLUP_INTERVAL_SECS`：`rollup_build` 的周期，worker / all 运行。
+    /// `RIVU_ROLLUP_INTERVAL_SECS`：`rollup_build` 的周期。
     pub rollup_interval: Duration,
     /// `RIVU_ROLLUP_MIN_ROWS`：查询区间里已构建的天的事件数不少于它、且查询兼容时由日汇总层回答；`0` 表示只要兼容就用。
     pub rollup_min_rows: u64,
@@ -569,12 +543,12 @@ pub struct Config {
     pub setup_token: Option<Secret>,
     /// `RIVU_VISITOR_PEPPER`：访客密钥，与每天的盐一起派生 `visitor_id` 的哈希 key；至少 32 个字符。
     /// 只放在环境变量或文件里，不进数据库，所以数据库导出加上盐也无法枚举 IP 还原访客（`privacy.md`）。
-    /// 所有 collector 必须用同一个值；更换或丢失只会让当天的访客 ID 断开一次。collector、all 必填，其余角色为 `None`。
+    /// 更换或丢失只会让当天的访客 ID 断开一次。`serve` 必填，其余子命令为 `None`。
     pub visitor_pepper: Option<Secret>,
     /// `RIVU_TRACKER_DIR`：tracker 构建产物目录（`core.js`、`meta.json`），启动时读入并缓存。
     /// 默认 `apps/tracker/dist`（相对进程工作目录）；生产镜像把 CI 构建的 `dist/` 放进该目录。
     pub tracker_dir: PathBuf,
-    /// `RIVU_DASHBOARD_DIR`：看板的静态文件目录（api / all 角色启动时读入内存，见 `bin/rivu/src/dashboard.rs`）。
+    /// `RIVU_DASHBOARD_DIR`：看板的静态文件目录（`serve` 启动时读入内存，见 `bin/rivu/src/dashboard.rs`）。
     /// 默认 `apps/dashboard/build`；生产镜像把看板的构建产物放进该目录。
     pub dashboard_dir: PathBuf,
     /// GeoIP 数据源、刷新与署名（`migrate` 不校验，取默认值）。
@@ -639,9 +613,9 @@ impl Config {
         }
 
         let ch_migrator = l.account("RIVU_CH_MIGRATOR", role == Role::Migrate);
-        let ch_writer = l.account("RIVU_CH_WRITER", role.needs_ch_writer());
+        let ch_writer = l.account("RIVU_CH_WRITER", role == Role::Serve);
         let ch_reader = l.account("RIVU_CH_READER", role.needs_ch_reader());
-        let ch_maintainer = l.account("RIVU_CH_MAINTAINER", role.needs_ch_maintainer());
+        let ch_maintainer = l.account("RIVU_CH_MAINTAINER", role == Role::Serve);
 
         let listen_addr = l.parse_or(
             "RIVU_LISTEN_ADDR",
@@ -832,7 +806,7 @@ impl Config {
                 .push("RIVU_SETUP_TOKEN 至少 16 个字符（它挡住的是新实例被抢注）".into());
         }
         let setup_token = setup_token.map(Secret);
-        let visitor_pepper = if role.serves_collector() {
+        let visitor_pepper = if role == Role::Serve {
             l.required("RIVU_VISITOR_PEPPER")
         } else {
             None
@@ -1265,7 +1239,7 @@ mod tests {
 
     #[test]
     fn defaults_apply() {
-        let cfg = Config::from_env(Role::All, &Env::from_pairs(base_pairs())).unwrap();
+        let cfg = Config::from_env(Role::Serve, &Env::from_pairs(base_pairs())).unwrap();
         assert_eq!(cfg.ch_database, "rivu");
         assert_eq!(cfg.listen_addr, "127.0.0.1:8080".parse().unwrap());
         assert_eq!(cfg.internal_addr, "127.0.0.1:9090".parse().unwrap());
@@ -1299,7 +1273,7 @@ mod tests {
         for (k, v) in extra {
             env.vars.insert((*k).into(), (*v).into());
         }
-        Config::from_env(Role::All, &env)
+        Config::from_env(Role::Serve, &env)
     }
 
     #[test]
@@ -1539,15 +1513,6 @@ mod tests {
     }
 
     #[test]
-    fn only_worker_and_all_run_jobs() {
-        assert!(Role::All.runs_jobs());
-        assert!(Role::Worker.runs_jobs());
-        assert!(!Role::Collector.runs_jobs());
-        assert!(!Role::Api.runs_jobs());
-        assert!(!Role::Migrate.runs_jobs());
-    }
-
-    #[test]
     fn file_variant_is_read_and_trimmed() {
         let path = temp_file("pw", "  s3cret\n\n");
         let mut pairs = base_pairs();
@@ -1557,21 +1522,21 @@ mod tests {
             "RIVU_CH_WRITER_PASSWORD_FILE".into(),
             path.to_string_lossy().into_owned(),
         );
-        let cfg = Config::from_env(Role::Collector, &env).unwrap();
+        let cfg = Config::from_env(Role::Serve, &env).unwrap();
         assert_eq!(cfg.ch_writer.unwrap().password.expose(), "s3cret");
         let _ = std::fs::remove_file(path);
     }
 
     #[test]
-    fn visitor_pepper_is_required_for_collectors_and_validated() {
+    fn visitor_pepper_is_required_for_serve_and_validated() {
         let pepper = TEST_PEPPER;
         let cfg = with_env(&[]).unwrap();
         assert_eq!(cfg.visitor_pepper.unwrap().expose(), pepper);
 
         let mut pairs = base_pairs();
         pairs.retain(|(k, _)| *k != "RIVU_VISITOR_PEPPER");
-        for role in [Role::Collector, Role::All] {
-            let err = Config::from_env(role, &Env::from_pairs(pairs.clone())).unwrap_err();
+        {
+            let err = Config::from_env(Role::Serve, &Env::from_pairs(pairs.clone())).unwrap_err();
             assert!(
                 err.problems
                     .iter()
@@ -1579,7 +1544,7 @@ mod tests {
                 "{err}"
             );
         }
-        for role in [Role::Api, Role::Worker, Role::Migrate] {
+        for role in [Role::Admin, Role::Migrate] {
             let cfg = Config::from_env(role, &Env::from_pairs(pairs.clone())).unwrap();
             assert!(cfg.visitor_pepper.is_none());
         }
@@ -1590,7 +1555,7 @@ mod tests {
             "RIVU_VISITOR_PEPPER_FILE".into(),
             path.to_string_lossy().into_owned(),
         );
-        let cfg = Config::from_env(Role::Collector, &env).unwrap();
+        let cfg = Config::from_env(Role::Serve, &env).unwrap();
         assert_eq!(cfg.visitor_pepper.unwrap().expose(), pepper);
         let _ = std::fs::remove_file(path);
 
@@ -1608,7 +1573,7 @@ mod tests {
             "RIVU_CH_WRITER_PASSWORD_FILE".into(),
             path.to_string_lossy().into_owned(),
         );
-        let err = Config::from_env(Role::Collector, &env).unwrap_err();
+        let err = Config::from_env(Role::Serve, &env).unwrap_err();
         assert!(
             err.problems
                 .iter()
@@ -1627,7 +1592,7 @@ mod tests {
             "RIVU_DATABASE_URL_FILE".into(),
             "/definitely/not/here".into(),
         );
-        let err = Config::from_env(Role::Collector, &env).unwrap_err();
+        let err = Config::from_env(Role::Serve, &env).unwrap_err();
         assert_eq!(err.problems.len(), 1, "{err}");
         assert!(err.problems[0].contains("RIVU_DATABASE_URL_FILE"));
     }
@@ -1639,7 +1604,7 @@ mod tests {
             ("RIVU_LOG_FORMAT", "xml"),
             ("RIVU_TRUSTED_PROXIES", "10.0.0.0/8, 10.0.0.0/99, nope"),
         ]);
-        let err = Config::from_env(Role::All, &env).unwrap_err();
+        let err = Config::from_env(Role::Serve, &env).unwrap_err();
         let text = err.to_string();
         for needle in [
             "RIVU_DATABASE_URL 必填",
@@ -1667,15 +1632,22 @@ mod tests {
             ("RIVU_CH_MIGRATOR_PASSWORD", "m"),
         ]);
         assert!(Config::from_env(Role::Migrate, &env).is_ok());
-        // 同样的环境对 api 角色不够：缺 reader
-        let err = Config::from_env(Role::Api, &env).unwrap_err();
-        assert!(err.to_string().contains("RIVU_CH_READER_USER"));
-        // collector 需要 writer，不需要 reader / maintainer
-        let err = Config::from_env(Role::Collector, &env).unwrap_err();
+        // 管理命令需要 reader，不需要 writer / maintainer
+        let err = Config::from_env(Role::Admin, &env).unwrap_err();
         let text = err.to_string();
-        assert!(text.contains("RIVU_CH_WRITER_USER"));
-        assert!(!text.contains("RIVU_CH_READER_USER"));
+        assert!(text.contains("RIVU_CH_READER_USER"));
+        assert!(!text.contains("RIVU_CH_WRITER_USER"));
         assert!(!text.contains("RIVU_CH_MAINTAINER_USER"));
+        // serve 三个账号都要
+        let err = Config::from_env(Role::Serve, &env).unwrap_err();
+        let text = err.to_string();
+        for want in [
+            "RIVU_CH_WRITER_USER",
+            "RIVU_CH_READER_USER",
+            "RIVU_CH_MAINTAINER_USER",
+        ] {
+            assert!(text.contains(want), "{want}");
+        }
     }
 
     #[test]
@@ -1687,7 +1659,7 @@ mod tests {
         );
         let cfg = Config::from_env(Role::Migrate, &env).unwrap();
         assert!(cfg.database_url.expose().contains("mig:"));
-        let cfg = Config::from_env(Role::Collector, &env).unwrap();
+        let cfg = Config::from_env(Role::Serve, &env).unwrap();
         assert!(cfg.database_url.expose().contains("u:p@"));
     }
 
@@ -1711,13 +1683,13 @@ mod tests {
         env.vars.insert("RIVU_LISTEN_ADDR".into(), String::new());
         env.vars.insert("RIVU_LISTEN_ADDR_FILE".into(), "/x".into());
         // 空值不算「同时设置」，于是读取 _FILE（不存在 -> 读取错误，而不是冲突）
-        let err = Config::from_env(Role::All, &env).unwrap_err();
+        let err = Config::from_env(Role::Serve, &env).unwrap_err();
         assert!(err.problems.iter().all(|p| !p.contains("不能同时设置")));
     }
 
     #[test]
     fn secrets_are_redacted_in_debug() {
-        let cfg = Config::from_env(Role::All, &Env::from_pairs(base_pairs())).unwrap();
+        let cfg = Config::from_env(Role::Serve, &Env::from_pairs(base_pairs())).unwrap();
         let dbg = format!("{cfg:?}");
         assert!(!dbg.contains("u:p@localhost"), "{dbg}");
         assert!(dbg.contains("redacted"));
@@ -1730,7 +1702,7 @@ mod tests {
             "RIVU_TRUSTED_PROXIES".into(),
             "172.28.0.0/24, 127.0.0.1, fd00::/8".into(),
         );
-        let cfg = Config::from_env(Role::All, &env).unwrap();
+        let cfg = Config::from_env(Role::Serve, &env).unwrap();
         assert_eq!(cfg.trusted_proxies.len(), 3);
         let net = cfg.trusted_proxies[0];
         assert!(net.contains("172.28.0.77".parse().unwrap()));
@@ -1751,7 +1723,7 @@ mod tests {
             .insert("RIVU_CLICKHOUSE_URL".into(), "ftp://x".into());
         env.vars
             .insert("RIVU_DATABASE_URL".into(), "mysql://x".into());
-        let err = Config::from_env(Role::All, &env).unwrap_err();
+        let err = Config::from_env(Role::Serve, &env).unwrap_err();
         assert_eq!(err.problems.len(), 3, "{err}");
         assert!(!err.to_string().contains("mysql://x"), "不能回显连接串");
     }
@@ -1931,7 +1903,7 @@ mod tests {
             "RIVU_GEOIP_DB_URL_FILE".into(),
             path.to_string_lossy().into_owned(),
         );
-        let cfg = Config::from_env(Role::All, &env).unwrap();
+        let cfg = Config::from_env(Role::Serve, &env).unwrap();
         let dbg = format!("{:?}", cfg.geo);
         assert!(!dbg.contains("SECRET") && !dbg.contains("pw@"), "{dbg}");
         assert_eq!(
@@ -1941,7 +1913,7 @@ mod tests {
         // 同时设置值和 _FILE 是冲突
         env.vars
             .insert("RIVU_GEOIP_DB_URL".into(), "https://x.test/a.mmdb".into());
-        let err = Config::from_env(Role::All, &env).unwrap_err();
+        let err = Config::from_env(Role::Serve, &env).unwrap_err();
         assert!(
             err.to_string()
                 .contains("RIVU_GEOIP_DB_URL 和 RIVU_GEOIP_DB_URL_FILE")
@@ -2029,7 +2001,7 @@ mod tests {
             ("RIVU_MAXMIND_LICENSE_KEY", "k"),
         ]);
         assert!(Config::from_env(Role::Migrate, &env).is_ok());
-        assert!(Config::from_env(Role::Collector, &env).is_err());
+        assert!(Config::from_env(Role::Serve, &env).is_err());
     }
 
     #[test]

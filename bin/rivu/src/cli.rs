@@ -1,4 +1,4 @@
-//! 命令行：`rivu collector | worker | api | migrate | all | site add | shield add|list|remove | apikey create|list|revoke | stats |
+//! 命令行：`rivu serve | migrate | healthcheck | site add | shield add|list|remove | apikey create|list|revoke | stats |
 //! setup | user add|disable|enable|list | org create | org member add | share create|list|revoke`。
 
 use std::path::PathBuf;
@@ -24,16 +24,10 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// 采集角色：公共端口提供 `POST /api/event`
-    Collector,
-    /// 后台角色：后台任务（盐轮换、地理库与数据中心网段刷新、统计数据删除）
-    Worker,
-    /// API 角色：公共端口提供公开查询 API、看板与看板的内部端点
-    Api,
+    /// 运行 Rivu：采集、查询 API、看板与后台任务（部署形态，一个实例）
+    Serve,
     /// 执行 PostgreSQL + ClickHouse 迁移后退出
     Migrate(MigrateArgs),
-    /// 单进程运行 collector + api + 后台任务（单机部署）
-    All,
     /// 站点管理
     Site(SiteArgs),
     /// 执行一个 QuerySpec（同 `POST /api/v1/query`，不需要 API key），打印 QueryResult JSON
@@ -409,12 +403,9 @@ pub enum MigrateAction {
 impl Command {
     fn role(&self) -> Role {
         match self {
-            Command::Collector => Role::Collector,
-            Command::Worker => Role::Worker,
-            Command::Api => Role::Api,
+            Command::Serve => Role::Serve,
             Command::Migrate(_) => Role::Migrate,
-            Command::All => Role::All,
-            // 管理命令连 PG（应用账号）和 ClickHouse（reader），按 api 角色校验配置
+            // 管理命令连 PG（应用账号）和 ClickHouse（reader）
             Command::Site(_)
             | Command::Query(_)
             | Command::Shield(_)
@@ -423,7 +414,7 @@ impl Command {
             | Command::User(_)
             | Command::Org(_)
             | Command::Share(_)
-            | Command::Healthcheck(_) => Role::Api,
+            | Command::Healthcheck(_) => Role::Admin,
         }
     }
 }
@@ -464,7 +455,8 @@ pub async fn main() -> ExitCode {
         Command::User(args) => user_cmd::user(&config, args).await,
         Command::Org(args) => user_cmd::org(&config, args).await,
         Command::Share(args) => user_cmd::share(&config, args).await,
-        _ => run::run(config).await,
+        Command::Serve => run::run(config).await,
+        Command::Healthcheck(_) => unreachable!("健康检查在加载配置之前处理"),
     };
     match result {
         Ok(code) => code,
@@ -487,13 +479,7 @@ mod tests {
 
     #[test]
     fn parses_all_subcommands() {
-        for (arg, role) in [
-            ("collector", Role::Collector),
-            ("worker", Role::Worker),
-            ("api", Role::Api),
-            ("all", Role::All),
-            ("migrate", Role::Migrate),
-        ] {
+        for (arg, role) in [("serve", Role::Serve), ("migrate", Role::Migrate)] {
             let cli = Cli::try_parse_from(["rivu", arg]).unwrap();
             assert_eq!(cli.command.role(), role);
         }
@@ -554,7 +540,7 @@ mod tests {
             panic!("不是 query");
         };
         assert_eq!(a.spec.as_deref(), Some(std::path::Path::new("q.json")));
-        assert_eq!(cli.command.role(), Role::Api);
+        assert_eq!(cli.command.role(), Role::Admin);
         // 省略 --spec：从 stdin 读
         let cli = Cli::try_parse_from(["rivu", "query"]).unwrap();
         assert!(matches!(
@@ -581,7 +567,7 @@ mod tests {
             "办公室",
         ])
         .unwrap();
-        assert_eq!(cli.command.role(), Role::Api);
+        assert_eq!(cli.command.role(), Role::Admin);
         let Command::Shield(ShieldArgs {
             action: ShieldAction::Add(a),
         }) = cli.command
@@ -668,7 +654,7 @@ mod tests {
             "90d",
         ])
         .unwrap();
-        assert_eq!(cli.command.role(), Role::Api);
+        assert_eq!(cli.command.role(), Role::Admin);
         let Command::Apikey(ApikeyArgs {
             action: ApikeyAction::Create(a),
         }) = cli.command
@@ -721,7 +707,7 @@ mod tests {
             "pw.txt",
         ])
         .unwrap();
-        assert_eq!(cli.command.role(), Role::Api);
+        assert_eq!(cli.command.role(), Role::Admin);
         let Command::Setup(a) = cli.command else {
             panic!("不是 setup");
         };

@@ -1,7 +1,7 @@
 //! `ch_monitor`：ClickHouse 的 parts、merge 与 mutation 积压（`system-design.md` §7「需要观察的指标」，
 //! `platform-and-ops.md` §10）。
 //!
-//! 进程内定时（每 [`INTERVAL`]），worker / all 运行，用 `rivu_maintainer` 账号读 `system.parts`、`system.merges`、
+//! 进程内定时（每 [`INTERVAL`]），用 `rivu_maintainer` 账号读 `system.parts`、`system.merges`、
 //! `system.mutations`（只看 Rivu 的库）。导出按表的 gauge，不带站点标签：
 //!
 //! - `rivu_ch_parts{table}`：活跃 part 数；`rivu_ch_partition_parts_max{table}`：单个分区里最多的活跃 part 数

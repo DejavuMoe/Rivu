@@ -1,6 +1,6 @@
 //! `rollup_build`：构建日汇总层（`system-design.md` §5.5、§6.4；表与口径见 [`rivu_query::rollup`]）。
 //!
-//! - 进程内定时（`RIVU_ROLLUP_INTERVAL_SECS`，默认 10 分钟），worker / all 运行，用 `rivu_maintainer` 账号。
+//! - 进程内定时（`RIVU_ROLLUP_INTERVAL_SECS`，默认 10 分钟），用 `rivu_maintainer` 账号。
 //! - 每个站点从「已构建的最后一天 + 1」（没有构建过：最早事件那天）建到「结束已超过 [`SETTLE`] 的最后一个本地日」，
 //!   一轮每站点最多 [`MAX_DAYS_PER_RUN`] 天，下一轮接着建。
 //! - 站点改了时区：先删除它全部的原生汇总行，再按新时区从头建。
