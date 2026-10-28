@@ -26,7 +26,7 @@ use std::collections::BTreeSet;
 
 use crate::plan::{Measure, Plan, VisitsForm};
 use crate::resolve::{
-    Col, GoalKind, Gran, Interval, Leaf, OrderKey, Pred, RDim, ResolvedQuery, Test,
+    Col, GoalKind, Gran, Interval, Leaf, MAX_PROP_KEYS, OrderKey, Pred, RDim, ResolvedQuery, Test,
     wildcard_to_like,
 };
 use crate::rollup::{Family, MEASURE_COLUMNS, Split, measure_column};
@@ -182,8 +182,19 @@ pub(crate) fn check_tenant_scoped(sql: &str) -> bool {
 // ------------------------------------------------------------------------------------------
 
 /// `events` 上的列表达式（用于过滤与取值）。`country_code` 是 `FixedString(2)`，`toString` 去掉尾部 NUL，
-/// 未知（`\0\0`）得到空串。入口页与退出页不在 `events` 上，由会话子查询提供。
+/// 未知（`\0\0`）得到空串。入口页与退出页不在 `events` 上，由会话子查询提供。属性是 `props[键]`，键是参数 `pk<i>`
+/// （没有这个键时取到空串，展示为 `(none)`）。
 fn ev_expr(col: Col) -> &'static str {
+    const PROPS: [&str; MAX_PROP_KEYS] = [
+        "props[{pk0:String}]",
+        "props[{pk1:String}]",
+        "props[{pk2:String}]",
+        "props[{pk3:String}]",
+        "props[{pk4:String}]",
+        "props[{pk5:String}]",
+        "props[{pk6:String}]",
+        "props[{pk7:String}]",
+    ];
     match col {
         Col::EventName => "name",
         Col::EventPage => "pathname",
@@ -208,6 +219,7 @@ fn ev_expr(col: Col) -> &'static str {
         Col::OsVersion => "os_version",
         Col::EntryPage => "s_entry_path",
         Col::ExitPage => "s_exit_path",
+        Col::Prop(i) => PROPS[usize::from(i)],
     }
 }
 
@@ -259,7 +271,9 @@ fn sess_alias(col: Col) -> Option<&'static str> {
         Col::OsVersion => "a_os_version",
         Col::EntryPage => "s_entry_path",
         Col::ExitPage => "s_exit_path",
-        Col::EventName | Col::EventPage | Col::EventHostname | Col::EventGoal => return None,
+        Col::EventName | Col::EventPage | Col::EventHostname | Col::EventGoal | Col::Prop(_) => {
+            return None;
+        }
     })
 }
 
@@ -345,6 +359,9 @@ impl<'a> Builder<'a> {
             "wk",
             ParamValue::U8(u8::try_from(q.week_start.to_monday_one_offset()).unwrap_or(1)),
         );
+        for (i, k) in q.prop_keys.iter().enumerate() {
+            params.push(&format!("pk{i}"), ParamValue::Str(k.clone()));
+        }
         Builder {
             scope,
             q,
@@ -455,7 +472,11 @@ impl<'a> Builder<'a> {
                 self.cond(&e, l)
             }
             Ctx::Sess { entry } => match l.col {
-                Col::EventName | Col::EventPage | Col::EventHostname | Col::EventGoal => {
+                Col::EventName
+                | Col::EventPage
+                | Col::EventHostname
+                | Col::EventGoal
+                | Col::Prop(_) => {
                     if entry && l.col == Col::EventPage {
                         needs.insert("s_entry_path");
                         return self.cond("s_entry_path", l);

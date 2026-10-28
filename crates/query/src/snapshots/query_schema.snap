@@ -111,7 +111,7 @@ expression: "crate::schema_json()"
           "type": "string"
         }
       ],
-      "description": "A dimension. `event:goal` groups by the site's goals (values are goal labels). `event:props:<key>` is accepted by the schema but not supported yet."
+      "description": "A dimension. `event:goal` groups by the site's goals (values are goal labels). `event:props:<key>` groups by a custom event property (events without the property are `(none)`)."
     },
     "Filter": {
       "anyOf": [
