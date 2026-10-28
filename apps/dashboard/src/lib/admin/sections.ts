@@ -50,3 +50,8 @@ export function isSectionKey(v: string | undefined): v is SectionKey {
 export function canShareLinks(s: Access): boolean {
   return sectionVisible("sharing", s);
 }
+
+/** 能导出 CSV（看板页头的「导出」入口）：有效角色 editor 起，含站点访客 editor（`export.create`）。 */
+export function canExport(s: Access): boolean {
+  return isEditor(s);
+}

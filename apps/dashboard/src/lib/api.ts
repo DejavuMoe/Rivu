@@ -338,6 +338,32 @@ export async function request<T>(method: string, path: string, opts: Options = {
 
 const base = "/api/internal";
 
+/** CSV 导出（看板当前视图）：返回 zip 与服务端给的文件名。 */
+async function exportCsv(site: number | string, body: unknown): Promise<{ blob: Blob; name: string }> {
+  let res: Response;
+  try {
+    res = await fetch(`${base}/sites/${site}/export`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/zip, application/json" },
+      credentials: "same-origin",
+      body: JSON.stringify(body),
+    });
+  } catch {
+    throw new ApiError(0, "network", "network error");
+  }
+  if (!res.ok) {
+    let d: { error?: string; message?: string } = {};
+    try {
+      d = await res.json();
+    } catch {
+      /* 非 JSON（代理错误页等），按状态码处理 */
+    }
+    throw new ApiError(res.status, d.error ?? `http_${res.status}`, d.message ?? res.statusText);
+  }
+  const name = /filename="([^"]+)"/.exec(res.headers.get("Content-Disposition") ?? "")?.[1] ?? "rivu-export.zip";
+  return { blob: await res.blob(), name };
+}
+
 /**
  * 上传 Plausible 导出的 zip（请求体是原样字节，`Content-Type: application/zip`）。用 XHR 是为了上传进度；
  * 服务端读完请求体后返回 202，导入在后台跑。
@@ -403,6 +429,7 @@ export const api = {
   imports: (site: number | string) =>
     request<{ imports: SiteImport[]; native_from: string | null }>("GET", `${base}/sites/${site}/imports`),
   uploadImport,
+  exportCsv,
   removeImport: (site: number | string, id: number) => request<void>("DELETE", `${base}/sites/${site}/imports/${id}`),
   sharedLinks: (site: number | string) => request<{ links: SharedLink[] }>("GET", `${base}/sites/${site}/shared-links`),
   createSharedLink: (site: number | string, body: { name?: string; password?: string; expires_at?: string }) =>
