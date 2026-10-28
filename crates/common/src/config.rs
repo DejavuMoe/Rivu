@@ -545,6 +545,12 @@ pub struct Config {
     /// 只放在环境变量或文件里，不进数据库，所以数据库导出加上盐也无法枚举 IP 还原访客（`privacy.md`）。
     /// 更换或丢失只会让当天的访客 ID 断开一次。`serve` 必填，其余子命令为 `None`。
     pub visitor_pepper: Option<Secret>,
+    /// `RIVU_SMTP_URL` 与 `RIVU_SMTP_FROM`：发邮件（邀请、找回密码）。不配置时邀请只给链接，找回密码不可用。
+    pub smtp: Option<SmtpConfig>,
+    /// `RIVU_SECRET_KEY`：加密两步验证的密钥（HKDF 派生 AES-256-GCM），至少 32 个字符；不配置时两步验证不可用。
+    /// `RIVU_SECRET_KEY_FALLBACK`：轮换期间的旧密钥，只用来解密。
+    pub secret_key: Option<Secret>,
+    pub secret_key_fallback: Option<Secret>,
     /// `RIVU_TRACKER_DIR`：tracker 构建产物目录（`core.js`、`meta.json`），启动时读入并缓存。
     /// 默认 `apps/tracker/dist`（相对进程工作目录）；生产镜像把 CI 构建的 `dist/` 放进该目录。
     pub tracker_dir: PathBuf,
@@ -819,6 +825,54 @@ impl Config {
             );
         }
         let visitor_pepper = visitor_pepper.map(Secret);
+        let smtp = match (l.optional("RIVU_SMTP_URL"), l.optional("RIVU_SMTP_FROM")) {
+            (None, None) => None,
+            (Some(url), Some(from)) => {
+                if !(url.starts_with("smtp://") || url.starts_with("smtps://")) {
+                    // 不回显取值（可能带密码）
+                    l.problems.push(
+                        "RIVU_SMTP_URL 要以 smtp:// 或 smtps:// 开头（STARTTLS 用 smtp://…?tls=required）".into(),
+                    );
+                }
+                if !from.contains('@') {
+                    l.problems.push(format!(
+                        "RIVU_SMTP_FROM=`{from}` 无效，写成 rivu@example.com 或 Rivu <rivu@example.com>"
+                    ));
+                }
+                Some(SmtpConfig {
+                    url: Secret(url),
+                    from,
+                })
+            }
+            (Some(_), None) => {
+                l.problems
+                    .push("设置了 RIVU_SMTP_URL 就要设置 RIVU_SMTP_FROM（发件人）".into());
+                None
+            }
+            (None, Some(_)) => {
+                l.problems
+                    .push("设置了 RIVU_SMTP_FROM 就要设置 RIVU_SMTP_URL".into());
+                None
+            }
+        };
+        let secret_key = l.optional("RIVU_SECRET_KEY");
+        let secret_key_fallback = l.optional("RIVU_SECRET_KEY_FALLBACK");
+        for (name, v) in [
+            ("RIVU_SECRET_KEY", &secret_key),
+            ("RIVU_SECRET_KEY_FALLBACK", &secret_key_fallback),
+        ] {
+            if v.as_ref().is_some_and(|k| k.chars().count() < 32) {
+                l.problems.push(format!(
+                    "{name} 至少 32 个字符（例如 `openssl rand -hex 32` 的输出）"
+                ));
+            }
+        }
+        if secret_key.is_none() && secret_key_fallback.is_some() {
+            l.problems
+                .push("RIVU_SECRET_KEY_FALLBACK 只在轮换时与 RIVU_SECRET_KEY 一起使用".into());
+        }
+        let secret_key = secret_key.map(Secret);
+        let secret_key_fallback = secret_key_fallback.map(Secret);
         let tracker_dir = PathBuf::from(
             l.optional("RIVU_TRACKER_DIR")
                 .unwrap_or_else(|| DEFAULT_TRACKER_DIR.into()),
@@ -905,12 +959,23 @@ impl Config {
             cookie_secure,
             setup_token,
             visitor_pepper,
+            smtp,
+            secret_key,
+            secret_key_fallback,
             tracker_dir,
             dashboard_dir,
             geo,
             datacenter,
         })
     }
+}
+
+/// SMTP 发信配置。`url` 交给 lettre 解析（`smtps://user:pass@host:465`、`smtp://user:pass@host:587?tls=required`）。
+#[derive(Clone, Debug)]
+pub struct SmtpConfig {
+    pub url: Secret,
+    /// 发件人：`rivu@example.com` 或 `Rivu <rivu@example.com>`。
+    pub from: String,
 }
 
 /// 一次性报告的全部配置问题。
@@ -1563,6 +1628,37 @@ mod tests {
         assert_eq!(err.problems.len(), 1, "{err}");
         assert!(err.problems[0].contains("RIVU_VISITOR_PEPPER"), "{err}");
         assert!(!err.to_string().contains("too-short"), "不回显取值：{err}");
+    }
+
+    #[test]
+    fn smtp_and_secret_key_are_optional_and_validated() {
+        let cfg = with_env(&[]).unwrap();
+        assert!(cfg.smtp.is_none() && cfg.secret_key.is_none());
+        let cfg = with_env(&[
+            ("RIVU_SMTP_URL", "smtps://u:p@mail.example.com:465"),
+            ("RIVU_SMTP_FROM", "Rivu <rivu@example.com>"),
+            ("RIVU_SECRET_KEY", &"k".repeat(32)),
+        ])
+        .unwrap();
+        assert_eq!(cfg.smtp.unwrap().from, "Rivu <rivu@example.com>");
+        assert!(cfg.secret_key.is_some());
+        for (pairs, needle) in [
+            (vec![("RIVU_SMTP_URL", "smtps://h")], "RIVU_SMTP_FROM"),
+            (vec![("RIVU_SMTP_FROM", "a@b.c")], "RIVU_SMTP_URL"),
+            (
+                vec![("RIVU_SMTP_URL", "http://h"), ("RIVU_SMTP_FROM", "a@b.c")],
+                "smtp://",
+            ),
+            (
+                vec![("RIVU_SMTP_URL", "smtp://h"), ("RIVU_SMTP_FROM", "nobody")],
+                "RIVU_SMTP_FROM",
+            ),
+            (vec![("RIVU_SECRET_KEY", "short")], "RIVU_SECRET_KEY"),
+        ] {
+            let err = with_env(&pairs).unwrap_err();
+            assert!(err.to_string().contains(needle), "{err}");
+            assert!(!err.to_string().contains("smtps://h"), "不回显取值：{err}");
+        }
     }
 
     #[test]

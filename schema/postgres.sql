@@ -41,6 +41,22 @@ TABLE auth_sessions
   CREATE INDEX auth_sessions_user ON public.auth_sessions USING btree (user_id)
   CREATE TRIGGER auth_sessions_set_updated_at BEFORE UPDATE ON public.auth_sessions FOR EACH ROW EXECUTE FUNCTION set_updated_at()
 
+TABLE auth_tokens
+  id bigint NOT NULL GENERATED ALWAYS AS IDENTITY
+  user_id bigint NOT NULL
+  kind text NOT NULL
+  token_hash bytea NOT NULL
+  expires_at timestamp with time zone NOT NULL
+  used_at timestamp with time zone
+  created_at timestamp with time zone NOT NULL DEFAULT now()
+  CONSTRAINT auth_tokens_kind_check CHECK ((kind = 'password_reset'::text))
+  CONSTRAINT auth_tokens_pkey PRIMARY KEY (id)
+  CONSTRAINT auth_tokens_token_hash_check CHECK ((octet_length(token_hash) = 32))
+  CONSTRAINT auth_tokens_user_id_fkey FOREIGN KEY (user_id) REFERENCES users(id)
+  CREATE INDEX auth_tokens_expires ON public.auth_tokens USING btree (expires_at)
+  CREATE UNIQUE INDEX auth_tokens_token ON public.auth_tokens USING btree (token_hash)
+  CREATE INDEX auth_tokens_user ON public.auth_tokens USING btree (user_id)
+
 TABLE goals
   id bigint NOT NULL GENERATED ALWAYS AS IDENTITY
   site_id bigint NOT NULL
@@ -357,6 +373,17 @@ TABLE sites
   CREATE INDEX sites_updated ON public.sites USING btree (updated_at)
   CREATE TRIGGER sites_notify_changed AFTER INSERT OR UPDATE ON public.sites FOR EACH ROW EXECUTE FUNCTION notify_site_changed('id')
   CREATE TRIGGER sites_set_updated_at BEFORE UPDATE ON public.sites FOR EACH ROW EXECUTE FUNCTION set_updated_at()
+
+TABLE user_totp
+  user_id bigint NOT NULL
+  secret_enc bytea NOT NULL
+  enabled_at timestamp with time zone
+  last_step bigint NOT NULL DEFAULT 0
+  recovery_hashes bytea[] NOT NULL DEFAULT '{}'::bytea[]
+  created_at timestamp with time zone NOT NULL DEFAULT now()
+  CONSTRAINT user_totp_pkey PRIMARY KEY (user_id)
+  CONSTRAINT user_totp_secret_enc_check CHECK ((octet_length(secret_enc) = 48))
+  CONSTRAINT user_totp_user_id_fkey FOREIGN KEY (user_id) REFERENCES users(id)
 
 TABLE users
   id bigint NOT NULL GENERATED ALWAYS AS IDENTITY

@@ -17,6 +17,7 @@ base64.workspace = true
 metrics.workspace = true
 parking_lot.workspace = true
 rand.workspace = true
+ring.workspace = true
 rivu-domain.workspace = true
 rivu-ratelimit.workspace = true
 rivu-storage-pg.workspace = true
