@@ -306,7 +306,12 @@ jobs:
             --build-arg RIVU_VERSION=0.0.0-ci \
             --build-arg RIVU_GIT_COMMIT="$RIVU_GIT_COMMIT" \
             -t "$CANDIDATE_IMAGE" .
-          docker run --rm "$CANDIDATE_IMAGE" --version
+          version="$(docker run --rm "$CANDIDATE_IMAGE" --version)"
+          printf '%s\n' "$version"
+          if [[ "$version" != *" (commit $RIVU_GIT_COMMIT)" ]]; then
+            echo "::error::Image version does not identify commit $RIVU_GIT_COMMIT"
+            exit 1
+          fi
       - name: 生产 Compose 空卷冒烟
         run: bash .github/scripts/compose-smoke.sh "$CANDIDATE_IMAGE" "$RUNNER_TEMP/rivu-compose-smoke.log"
       - name: 保存 Compose 失败日志
