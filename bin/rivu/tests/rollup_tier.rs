@@ -606,8 +606,9 @@ async fn rollup_tier_matches_the_raw_tier() {
     let keep = json!({"metrics": ["visitors", "visits", "pageviews", "bounce_rate"], "date_range": ["2026-06-01", "2026-06-21"], "dimensions": ["time:day", "visit:device"]});
     let page_filter = json!({"metrics": ["visitors"], "date_range": ["2026-06-01", "2026-06-21"], "filters": [["is", "event:page", ["/docs"]]]});
     let before = run(&reader, &site, &keep, now, false).await;
+    let mut tx = pg.begin().await.unwrap();
     rivu_storage_pg::sites::update_site(
-        &pg,
+        &mut tx,
         created.id,
         &rivu_storage_pg::sites::SitePatch {
             retention_days: Some(Some(30)),
@@ -616,6 +617,7 @@ async fn rollup_tier_matches_the_raw_tier() {
     )
     .await
     .unwrap();
+    tx.commit().await.unwrap();
     // 真实的「现在」是 2026-10 之后：这个站点 6 月的数据都过了 30 天
     let (_, deleted) = rivu_jobs::retention::run_once(&pg, &maintainer, &ch_database(), 731)
         .await
