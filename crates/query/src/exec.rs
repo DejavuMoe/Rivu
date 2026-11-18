@@ -478,12 +478,13 @@ async fn choose_tier(
         };
         return split_at(q, iv, family, from, imp_to.min(to));
     }
+    let today = cx.opts.now.to_zoned(q.tz.clone()).date();
     let (sql, params) = sql::rollup_probe_query(
         cx.scope,
         &q.tz_name,
         &from.to_string(),
         &to.to_string(),
-        false,
+        Some(today),
     );
     let rows = cx.run(&format!("{part}.tier"), &sql, &params).await?;
     let row = rows.first();
@@ -565,7 +566,8 @@ async fn first_native_rollup_ms(
         None | Some(rollup::Family::Props(_)) => return Ok(None),
         Some(_) => {}
     }
-    let (sql, params) = sql::first_native_rollup_day_query(cx.scope, &q.tz_name);
+    let today = cx.opts.now.to_zoned(q.tz.clone()).date();
+    let (sql, params) = sql::first_native_rollup_day_query(cx.scope, &q.tz_name, today);
     let rows = cx
         .run_tier("first_native_rollup_day", &sql, &params, "rollup")
         .await?;
@@ -724,19 +726,25 @@ pub async fn execute(
         imported: site.imported,
     };
     // `all` 的起点取原始事件、已完成导入与可用原生汇总中最早的时间。
-    let data_start = if matches!(spec.date_range, DateRange::All) {
+    let (base_start, data_start) = if matches!(spec.date_range, DateRange::All) {
         let first = first_event_ms(&cx).await?;
         let imported = match site.imported {
             Some((from, _)) => Some(day_start_ms(&site.timezone, from)?),
             None => None,
         };
+        let base = first.into_iter().chain(imported).min();
         let native = first_native_rollup_ms(&cx, site, &spec).await?;
-        first.into_iter().chain(imported).chain(native).min()
+        (base, base.into_iter().chain(native).min())
     } else {
-        None
+        (None, None)
     };
-    let q = ResolvedQuery::build(&spec, site, opts.now, data_start)?;
-    let plan = plan::plan(&q);
+    let mut q = ResolvedQuery::build(&spec, site, opts.now, data_start)?;
+    let mut plan = plan::plan(&q);
+    // 自动时间粒度可能仍为小时，此时原生汇总不能扩展查询范围。
+    if data_start != base_start && rollup::compatible_family(&q, &plan).is_none() {
+        q = ResolvedQuery::build(&spec, site, opts.now, base_start)?;
+        plan = plan::plan(&q);
+    }
 
     let page = (u64::from(q.limit), u64::from(q.offset));
     let main = fetch_rows(

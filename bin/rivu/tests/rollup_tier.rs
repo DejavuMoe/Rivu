@@ -700,8 +700,8 @@ async fn rollup_tier_matches_the_raw_tier() {
         mixed_all.query.resolved_date_range.start,
         after_all.query.resolved_date_range.start
     );
-    let auto = json!({"metrics": ["pageviews"], "date_range": "all", "dimensions": ["time"]});
-    let auto = run(&reader, &kept, &auto, now, true).await;
+    let auto_spec = json!({"metrics": ["pageviews"], "date_range": "all", "dimensions": ["time"]});
+    let auto = run(&reader, &kept, &auto_spec, now, true).await;
     assert_eq!(auto.query.dimensions, ["time:week"]);
     assert_eq!(
         auto.results
@@ -724,6 +724,26 @@ async fn rollup_tier_matches_the_raw_tier() {
         filtered_all.query.resolved_date_range.start,
         raw_all.query.resolved_date_range.start
     );
+
+    let future_day = date(2026, 7, 12);
+    let later = Timestamp::from_millisecond(at(&tz, date(2026, 7, 13), 12, 0, 0)).unwrap();
+    rollup::build_day(&maintainer, &scope, &kept, future_day, 1, later)
+        .await
+        .unwrap();
+    let mixed_with_future = execute(
+        &reader,
+        &scope,
+        &kept,
+        QuerySpec::parse(&all).unwrap(),
+        ExecOptions::new(15).with_now(now).with_rollup(1_000_000),
+    )
+    .await
+    .unwrap();
+    assert_eq!(pageviews(&mixed_with_future), pageviews(&mixed_all));
+    assert_eq!(mixed_with_future.meta.tiers, vec![Tier::Raw, Tier::Rollup]);
+    rollup::delete(&maintainer, &scope, Some((future_day, future_day)), true)
+        .await
+        .unwrap();
 
     // 起点只看当前时区的原生汇总，选层仍按已有的时区失配规则回退。
     let another_tz = SiteContext::new(created.id, TimeZone::UTC);
@@ -764,6 +784,17 @@ async fn rollup_tier_matches_the_raw_tier() {
     assert_eq!(
         run(&reader, &site, &s, now, true).await.meta.tiers,
         vec![Tier::Raw]
+    );
+
+    rollup::build_day(&maintainer, &scope, &kept, date(2026, 7, 9), 1, now)
+        .await
+        .unwrap();
+    let hourly = run(&reader, &kept, &auto_spec, now, true).await;
+    assert_eq!(hourly.query.dimensions, ["time:hour"]);
+    assert_eq!(hourly.meta.tiers, vec![Tier::Raw]);
+    assert_eq!(
+        hourly.query.resolved_date_range.start,
+        raw_all.query.resolved_date_range.start
     );
 
     cleanup(&admin, created.id).await;
