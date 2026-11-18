@@ -308,12 +308,14 @@ pub async fn find_query_settings(pool: &PgPool, site_id: u64) -> Result<Option<Q
 }
 
 /// 原始数据清理用：全部站点（含软删除、还没清除的）的 id、时区与站点级保留天数。
-pub async fn retention_settings(pool: &PgPool) -> Result<Vec<(u64, String, Option<i32>)>> {
+pub async fn retention_settings(
+    db: &mut sqlx::PgConnection,
+) -> Result<Vec<(u64, String, Option<i32>)>> {
     let rows = sqlx::query(
         "SELECT s.id, s.timezone, ss.retention_days
          FROM sites s LEFT JOIN site_settings ss ON ss.site_id = s.id ORDER BY s.id",
     )
-    .fetch_all(pool)
+    .fetch_all(db)
     .await
     .context("查询站点保留期失败")?;
     rows.iter()

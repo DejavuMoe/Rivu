@@ -1110,15 +1110,21 @@ async fn date_range_intent(
     to: Date,
     done: &[String],
 ) -> i64 {
+    let (start, end) =
+        rivu_query::resolve::local_dates_utc_ms(&TimeZone::get("Asia/Shanghai").unwrap(), from, to)
+            .unwrap();
     // 一条语句写入（含预置的 partitions_done），并发的 run_batch 不会看到中间状态
     sqlx::query_scalar(
-        "INSERT INTO pending_stats_deletions (site_id, scope, date_from, date_to, partitions_done)
-         VALUES ($1, 'date_range', $2::date, $3::date, $4) RETURNING id",
+        "INSERT INTO pending_stats_deletions
+            (site_id, scope, date_from, date_to, partitions_done, timezone, utc_start_ms, utc_end_ms)
+         VALUES ($1, 'date_range', $2::date, $3::date, $4, 'Asia/Shanghai', $5, $6) RETURNING id",
     )
     .bind(site_id as i64)
     .bind(from.to_string())
     .bind(to.to_string())
     .bind(done)
+    .bind(start)
+    .bind(end)
     .fetch_one(pg)
     .await
     .unwrap()

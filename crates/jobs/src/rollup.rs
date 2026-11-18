@@ -176,6 +176,12 @@ pub async fn build_site(pg: &PgPool, ch: &Client, site_id: u64) -> Result<usize>
     let Some(tz_name) = sites::lock_timezone(&mut tx, site_id, false).await? else {
         return Ok(0);
     };
+    if !stats_deletions::maintenance_fences(&mut tx, Some(site_id))
+        .await?
+        .is_empty()
+    {
+        return Ok(0);
+    }
     let now = Timestamp::now();
     let tz = TimeZone::get(&tz_name).unwrap_or(TimeZone::UTC);
     let scope = TenantScope::new(site_id);
