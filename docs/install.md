@@ -26,7 +26,7 @@ for k in RIVU_SETUP_TOKEN RIVU_VISITOR_PEPPER RIVU_SECRET_KEY RIVU_PG_MIGRATOR_P
 done
 ```
 
-生产 Compose 要求 `--env-file` 指定的文件或调用 shell 提供 `RIVU_SETUP_TOKEN`。Compose 在解析时检查非空，rivu 启动时校验至少 16 个字符。直接启动二进制时，初始化令牌仍可选。
+生产 Compose 启动 `rivu` 时要求至少 16 个字符的初始化令牌。可以在 `--env-file` 指定的文件或调用 shell 中设置 `RIVU_SETUP_TOKEN`，也可以在容器环境文件中设置 `RIVU_SETUP_TOKEN_FILE`，指向挂载到 `rivu` 容器内的令牌文件。直接运行二进制时，初始化令牌默认可选。
 
 `RIVU_VISITOR_PEPPER` 与 `RIVU_SECRET_KEY` 不在数据库里，单独备份。`RIVU_VISITOR_PEPPER` 丢失只会让当天的访客 ID 断开一次，但泄露会削弱隐私保护（`privacy.md`）；`RIVU_SECRET_KEY` 加密两步验证的密钥，丢失后开了两步验证的账号无法登录，要用 `rivu user reset-2fa --email <邮箱>` 逐个关掉。
 
@@ -71,7 +71,7 @@ done
 
 先用当前版本的 `deploy/backup.sh` 备份 PostgreSQL 与 ClickHouse，并保留旧镜像及配置。使用默认本地镜像时，可以先执行 `docker tag rivu:latest rivu:pre-upgrade` 保留回退用的标签。
 
-已有部署如果没设初始化令牌，在原有 `deploy/.env`（或实际用于 `--env-file` 的文件）中补上 `RIVU_SETUP_TOKEN`，用 `openssl rand -hex 24` 生成并填入值。若之前通过 `RIVU_SETUP_TOKEN_FILE` 提供令牌，将令牌改为直接值并移除文件变量。保留现有数据库密码和密钥。已创建的管理员无需再次初始化。使用内置 Caddy 的部署继续加上 `--profile caddy`。
+已有部署如果没设初始化令牌，用 `openssl rand -hex 24` 生成，并通过 `RIVU_SETUP_TOKEN` 或 `RIVU_SETUP_TOKEN_FILE` 提供。保留现有数据库密码和密钥。已创建的管理员无需再次初始化。使用内置 Caddy 的部署继续加上 `--profile caddy`。
 
 ```bash
 git pull && docker build -t rivu:latest . && \
