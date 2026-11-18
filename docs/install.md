@@ -100,7 +100,11 @@ docker compose -f deploy/compose.yml cp blog_example_com.zip rivu:/tmp/export.zi
 docker compose -f deploy/compose.yml exec rivu rivu import plausible --site <site_key> /tmp/export.zip
 ```
 
-导出是按天、按维度的汇总，所以导入的那段时间里，单个维度的报表（来源、页面、国家、设备、事件、属性）和趋势图都有数据，多个维度交叉筛选没有（看板会提示）。只导入站点在 Rivu 里开始收数据之前的日子；看板的导入记录（或 `rivu import list --site <site_key>`）列出每次导入；删除（或 `rivu import delete --site <site_key> --id <id>`）后可以重新导入。
+Plausible 导出的是按天和维度汇总的数据。历史导入支持趋势和单维度报表（来源、页面、国家、设备、事件、属性）。多维度交叉筛选时，看板会提示未计入导入历史。
+
+Rivu 只导入站点本地今天之前的完整历史日。如果站点已有原生数据，还会跳过第一个原生日及之后的日期。迁移当天切换前由 Plausible 记录的数据因此不会并入 Rivu。
+
+用看板的导入记录或 `rivu import list --site <site_key>` 可查看各批次的日期范围。旧版导入如果覆盖 Rivu 的原生日期，统计可能漏计或重复计数。旧批次会保留。若持有原始 ZIP，可先备份并核对重叠日期，再从看板删除该批次，或用 `rivu import delete --site <site_key> --id <id>` 删除后重新导入。
 
 ## 排障
 
