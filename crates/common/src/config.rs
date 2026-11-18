@@ -803,7 +803,13 @@ impl Config {
                 true
             }
         };
-        let setup_token = l.optional("RIVU_SETUP_TOKEN");
+        let require_setup_token =
+            role == Role::Serve && l.parse_or("RIVU_REQUIRE_SETUP_TOKEN", false, "true | false");
+        let setup_token = if require_setup_token {
+            l.required("RIVU_SETUP_TOKEN")
+        } else {
+            l.optional("RIVU_SETUP_TOKEN")
+        };
         if let Some(t) = &setup_token
             && t.chars().count() < 16
         {
@@ -1408,6 +1414,32 @@ mod tests {
                 "不回显取值：{err}"
             );
         }
+    }
+
+    #[test]
+    fn serve_can_require_a_setup_token_from_env_or_file() {
+        let required = ("RIVU_REQUIRE_SETUP_TOKEN", "true");
+        let err = with_env(&[required, ("RIVU_SETUP_TOKEN", "")]).unwrap_err();
+        assert!(
+            err.problems
+                .iter()
+                .any(|p| p.starts_with("RIVU_SETUP_TOKEN 必填")),
+            "{err}"
+        );
+
+        let token = "rivu-test-setup-token";
+        let cfg = with_env(&[required, ("RIVU_SETUP_TOKEN", token)]).unwrap();
+        assert_eq!(cfg.setup_token.unwrap().expose(), token);
+
+        let path = std::env::temp_dir().join(format!("rivu-setup-token-{}", std::process::id()));
+        std::fs::write(&path, format!("{token}\n")).unwrap();
+        let result = with_env(&[
+            required,
+            ("RIVU_SETUP_TOKEN", ""),
+            ("RIVU_SETUP_TOKEN_FILE", path.to_str().unwrap()),
+        ]);
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(result.unwrap().setup_token.unwrap().expose(), token);
     }
 
     #[test]

@@ -21,7 +21,6 @@ x-rivu-env: &rivu-env
   RIVU_CH_MAINTAINER_USER: rivu_maintainer
   RIVU_CH_MAINTAINER_PASSWORD: ${RIVU_CH_MAINTAINER_PASSWORD:?}
   RIVU_VISITOR_PEPPER: ${RIVU_VISITOR_PEPPER:?}
-  RIVU_SETUP_TOKEN: ${RIVU_SETUP_TOKEN:?set a setup token of at least 16 characters}
   RIVU_SECRET_KEY: ${RIVU_SECRET_KEY:-}
   RIVU_SECRET_KEY_FALLBACK: ${RIVU_SECRET_KEY_FALLBACK:-}
   RIVU_SMTP_URL: ${RIVU_SMTP_URL:-}
@@ -85,6 +84,8 @@ services:
       RIVU_MIGRATE_DATABASE_URL: postgres://rivu_migrator:${RIVU_PG_MIGRATOR_PASSWORD:?}@postgres:5432/rivu
       RIVU_CH_MIGRATOR_USER: rivu_migrator
       RIVU_CH_MIGRATOR_PASSWORD: ${RIVU_CH_MIGRATOR_PASSWORD:?}
+      RIVU_SETUP_TOKEN: ""
+      RIVU_SETUP_TOKEN_FILE: ""
     depends_on:
       postgres: { condition: service_healthy }
       clickhouse: { condition: service_healthy }
@@ -97,6 +98,8 @@ services:
     env_file: ${RIVU_ENV_FILE:-.env}
     environment:
       <<: *rivu-env
+      RIVU_REQUIRE_SETUP_TOKEN: "true"
+      RIVU_SETUP_TOKEN: ${RIVU_SETUP_TOKEN:-}
       # 空字符串覆盖 env_file 中的迁移凭据，rivu 配置加载器将其视为未设置。
       RIVU_PG_MIGRATOR_PASSWORD: ""
       RIVU_PG_MIGRATOR_PASSWORD_FILE: ""
