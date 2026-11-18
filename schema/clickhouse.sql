@@ -95,7 +95,8 @@ CREATE MATERIALIZED VIEW {{database}}.mv_sessions TO {{database}}.sessions
     `browser` String,
     `browser_version` String,
     `os` String,
-    `os_version` String
+    `os_version` String,
+    `first_input_ms` Int64
 )
 DEFINER = rivu_migrator SQL SECURITY DEFINER
 AS SELECT
@@ -129,7 +130,8 @@ AS SELECT
     any(browser) AS browser,
     any(browser_version) AS browser_version,
     any(os) AS os,
-    any(os_version) AS os_version
+    any(os_version) AS os_version,
+    min(toUnixTimestamp64Milli(ts)) AS first_input_ms
 FROM {{database}}.events
 GROUP BY
     site_id,
@@ -536,7 +538,8 @@ CREATE TABLE {{database}}.sessions
     `browser` SimpleAggregateFunction(any, LowCardinality(String)),
     `browser_version` SimpleAggregateFunction(any, LowCardinality(String)),
     `os` SimpleAggregateFunction(any, LowCardinality(String)),
-    `os_version` SimpleAggregateFunction(any, LowCardinality(String))
+    `os_version` SimpleAggregateFunction(any, LowCardinality(String)),
+    `first_input_ms` SimpleAggregateFunction(min, Int64) DEFAULT -9223372036854775808
 )
 ENGINE = AggregatingMergeTree
 PARTITION BY toYYYYMM(start_date)
