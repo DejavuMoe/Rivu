@@ -1,6 +1,6 @@
 // SPA 路由（规范 §4.3）。
 
-import { lastPath, track } from './pageview.ts';
+import { lastPath, track, waitingForVisibility } from './pageview.ts';
 
 /**
  * History 模式（默认）：包装 `pushState` 并监听 `popstate`。
@@ -16,7 +16,7 @@ export const route = (hash?: boolean): void => {
     return;
   }
   const nav = () => {
-    if (location.pathname != lastPath) track();
+    if (!waitingForVisibility && location.pathname != lastPath) track();
   };
   const h = history;
   const push = h.pushState;
