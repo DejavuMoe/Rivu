@@ -680,6 +680,7 @@ fn deletion_json(d: &stats_deletions::DateRangeRow) -> Value {
     json!({
         "id": d.id, "from": d.from, "to": d.to, "status": d.status,
         "created_at": d.created_at, "completed_at": d.completed_at,
+        "error_code": d.timezone_unproven.then_some(rivu_jobs::stats_delete::TIMEZONE_UNPROVEN),
     })
 }
 
@@ -719,11 +720,15 @@ async fn create_stats_deletion(
     if !rivu_jobs::stats_delete::can_erase_dates(&api.reader, c.site.id, &tz).await? {
         return Err(stats_deletion_timezone_conflict());
     }
+    let utc = rivu_query::resolve::local_dates_utc_ms(&tz, from, to)
+        .map_err(|e| DashError::Invalid(e.to_string()))?;
     let row = stats_deletions::create_date_range(
         &mut tx,
         c.site.id,
         &from.to_string(),
         &to.to_string(),
+        &timezone,
+        utc,
         Some(c.session.s.user_id),
     )
     .await?;

@@ -7,12 +7,12 @@
 //!   逐分区执行轻量删除 `DELETE FROM t IN PARTITION p WHERE site_id = … [AND 时间条件]`；维护事务内将完成的
 //!   分区记入 `partitions_done`，重试时跳过已提交的进度。
 //! - `scope='site'`：删除该站点在三张表全部分区里的行（分区列表按 `site_id` 现查）。
-//! - `scope='date_range'`：日期是站点本地日期，按站点当前时区换算成 UTC 半开区间 `[start, end)`
+//! - `scope='date_range'`：入队时按锁内读取的站点时区冻结 UTC 半开区间 `[start, end)`
 //!   （与查询引擎的整日区间同一套换算，[`rivu_query::resolve::local_dates_utc_ms`]）：
 //!   `events` 按 `ts`；`ingest_counters` 按 `minute`；`sessions` 删除**开始时间**（`started_at`）落在区间内的会话——
 //!   跨过区间边界的会话按开始时间归属，与看板「会话属于开始那天」的口径一致。
 //! - 日汇总层（`rollup_*`）：同一站点的行，`date_range` 时只删这些本地日，原生与导入的行都删。
-//!   持站点行锁复核日期标签后才开始范围擦除，并保持到同步删除完成。
+//!   持站点行锁复核时区和区间证据后才开始擦除。同步请求失败后，持久化的意图继续阻挡维护。
 //! - 失败：记 `last_error`，指数退避后重试，`MAX_ATTEMPTS` 次后置为 `failed`。
 //!
 //! 日志只带意图 id、站点 id 与分区，不带其他内容。
@@ -134,13 +134,27 @@ fn days_of(intent: &ClaimedDeletion) -> Result<Option<(Date, Date)>> {
     }
 }
 
-fn scope_of(days: Option<(Date, Date)>, tz: &TimeZone) -> Result<Scope> {
-    let Some((from, to)) = days else {
-        return Ok(Scope::Site);
+fn frozen_scope(
+    intent: &ClaimedDeletion,
+    days: (Date, Date),
+    current_timezone: Option<&str>,
+) -> Result<(Scope, TimeZone)> {
+    let (Some(zone), Some(start_ms), Some(end_ms)) =
+        (&intent.timezone, intent.utc_start_ms, intent.utc_end_ms)
+    else {
+        bail!("日期意图缺少入队时的时区或 UTC 区间");
     };
-    let (start_ms, end_ms) = rivu_query::resolve::local_dates_utc_ms(tz, from, to)
+    if Some(zone.as_str()) != current_timezone {
+        bail!("入队时区与站点当前时区不一致");
+    }
+    let tz = TimeZone::get(zone).context("入队时区无效")?;
+    let (from, to) = days;
+    let expected = rivu_query::resolve::local_dates_utc_ms(&tz, from, to)
         .map_err(|e| anyhow::anyhow!("日期换算失败：{e}"))?;
-    Ok(Scope::Range { start_ms, end_ms })
+    if from > to || expected != (start_ms, end_ms) {
+        bail!("冻结的 UTC 区间与本地日期和时区不一致");
+    }
+    Ok((Scope::Range { start_ms, end_ms }, tz))
 }
 
 /// Date labels are ambiguous until all native families have current-timezone markers.
@@ -212,24 +226,33 @@ pub async fn delete_partition(ch: &Client, site_id: u64, scope: Scope, t: Target
 /// 执行一条已领取的意图：跳过 `partitions_done` 里的分区，逐个删除并记录，全部完成后置为 `done`。
 pub async fn process(pg: &PgPool, ch: &Client, intent: &ClaimedDeletion) -> Result<Option<usize>> {
     let mut tx = sites::begin_maintenance(pg).await?;
+    stats_deletions::lock_retention(&mut tx, true).await?;
     let timezone = sites::lock_timezone(&mut tx, intent.site_id, true).await?;
     if !stats_deletions::lock_claim(&mut tx, intent).await? {
         return Ok(None);
     }
-    let days = days_of(intent)?;
-    let scope = if days.is_some() {
-        let tz = timezone
-            .as_deref()
-            .and_then(|name| TimeZone::get(name).ok());
-        let Some(tz) = tz else {
-            bail!("{TIMEZONE_UNPROVEN}: 无法确定站点的当前时区");
-        };
-        if !can_erase_dates(ch, intent.site_id, &tz).await? {
-            bail!("{TIMEZONE_UNPROVEN}: 无法确定原生汇总日期的时区");
+    let validated = match days_of(intent) {
+        Ok(None) => Ok((Scope::Site, None)),
+        Ok(Some(days)) => match frozen_scope(intent, days, timezone.as_deref()) {
+            Ok((scope, tz)) if can_erase_dates(ch, intent.site_id, &tz).await? => {
+                Ok((scope, Some(days)))
+            }
+            Ok(_) => Err(anyhow::anyhow!("无法确定原生汇总日期的时区")),
+            Err(e) => Err(e),
+        },
+        Err(e) => Err(e),
+    };
+    let (scope, days) = match validated {
+        Ok(range) => range,
+        Err(reason) => {
+            let error = format!("{TIMEZONE_UNPROVEN}: {reason:#}");
+            stats_deletions::reject_before_delete(&mut tx, intent.id, &error).await?;
+            tx.commit().await?;
+            metrics::counter!("rivu_stats_deletions_total", "scope" => intent.scope.clone(), "result" => "failed")
+                .increment(1);
+            tracing::error!(deletion_id = intent.id, site_id = intent.site_id, %error, "统计数据删除已拒绝");
+            return Ok(None);
         }
-        scope_of(days, &tz)?
-    } else {
-        Scope::Site
     };
     let result = process_locked(&mut tx, ch, intent, scope, days).await;
     // Keep the completed partition checkpoints even when a later CH delete fails.
@@ -403,42 +426,35 @@ mod tests {
     }
 
     #[test]
-    fn date_range_scope_uses_the_site_timezone() {
+    fn date_range_scope_requires_consistent_frozen_evidence() {
         let intent = ClaimedDeletion {
             id: 1,
             site_id: 7,
             scope: "date_range".into(),
             date_from: Some("2026-10-01".into()),
             date_to: Some("2026-10-01".into()),
+            timezone: Some("Asia/Shanghai".into()),
+            utc_start_ms: Some(ms("2026-09-30T16:00:00Z")),
+            utc_end_ms: Some(ms("2026-10-01T16:00:00Z")),
             partitions_done: Vec::new(),
             attempts: 1,
         };
+        let days = days_of(&intent).unwrap().unwrap();
         assert_eq!(
-            scope_of(
-                days_of(&intent).unwrap(),
-                &TimeZone::get("Asia/Shanghai").unwrap()
-            )
-            .unwrap(),
+            frozen_scope(&intent, days, Some("Asia/Shanghai"))
+                .unwrap()
+                .0,
             Scope::Range {
                 start_ms: ms("2026-09-30T16:00:00Z"),
                 end_ms: ms("2026-10-01T16:00:00Z"),
             }
         );
-        assert_eq!(
-            scope_of(days_of(&intent).unwrap(), &TimeZone::UTC).unwrap(),
-            Scope::Range {
-                start_ms: ms("2026-10-01T00:00:00Z"),
-                end_ms: ms("2026-10-02T00:00:00Z"),
-            }
-        );
-        let site = ClaimedDeletion {
-            scope: "site".into(),
+        assert!(frozen_scope(&intent, days, Some("UTC")).is_err());
+        let inconsistent = ClaimedDeletion {
+            utc_end_ms: Some(ms("2026-10-01T17:00:00Z")),
             ..intent
         };
-        assert_eq!(
-            scope_of(days_of(&site).unwrap(), &TimeZone::UTC).unwrap(),
-            Scope::Site
-        );
+        assert!(frozen_scope(&inconsistent, days, Some("Asia/Shanghai")).is_err());
     }
 
     #[test]
