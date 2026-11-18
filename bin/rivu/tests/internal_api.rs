@@ -3928,16 +3928,19 @@ async fn timed_out_erase_fences_maintenance_until_retry_completes() {
         .execute(&pg)
         .await
         .unwrap();
-    rollup::build_day(
-        &ch,
-        &scope,
-        &SiteContext::new(site.id, TimeZone::UTC),
-        erased,
-        1,
-        now,
-    )
-    .await
-    .unwrap();
+    // Give the expired rows verified coverage, so the pending erase is what protects the target.
+    for (id, day) in [(site.id, old), (site.id, erased), (other.id, old)] {
+        rollup::build_day(
+            &ch,
+            &TenantScope::new(id),
+            &SiteContext::new(id, TimeZone::UTC),
+            day,
+            1,
+            now,
+        )
+        .await
+        .unwrap();
+    }
     let date = erased.to_string();
     let queued = server
         .http
@@ -4093,7 +4096,7 @@ async fn timed_out_erase_fences_maintenance_until_retry_completes() {
         .fetch_all()
         .await
         .unwrap();
-    assert_eq!(kept_rollup, [kept.to_string()]);
+    assert_eq!(kept_rollup, [old.to_string(), kept.to_string()]);
     rollup::delete(&ch, &scope, None, false).await.unwrap();
     cleanup(&env, &[site.id, other.id]).await;
 }

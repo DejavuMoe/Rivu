@@ -226,7 +226,6 @@ pub async fn delete_partition(ch: &Client, site_id: u64, scope: Scope, t: Target
 /// 执行一条已领取的意图：跳过 `partitions_done` 里的分区，逐个删除并记录，全部完成后置为 `done`。
 pub async fn process(pg: &PgPool, ch: &Client, intent: &ClaimedDeletion) -> Result<Option<usize>> {
     let mut tx = sites::begin_maintenance(pg).await?;
-    stats_deletions::lock_retention(&mut tx, true).await?;
     let timezone = sites::lock_timezone(&mut tx, intent.site_id, true).await?;
     if !stats_deletions::lock_claim(&mut tx, intent).await? {
         return Ok(None);
