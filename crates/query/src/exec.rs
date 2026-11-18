@@ -478,12 +478,13 @@ async fn choose_tier(
         };
         return split_at(q, iv, family, from, imp_to.min(to));
     }
+    let today = cx.opts.now.to_zoned(q.tz.clone()).date();
     let (sql, params) = sql::rollup_probe_query(
         cx.scope,
         &q.tz_name,
         &from.to_string(),
         &to.to_string(),
-        false,
+        Some(today),
     );
     let rows = cx.run(&format!("{part}.tier"), &sql, &params).await?;
     let row = rows.first();
@@ -543,6 +544,39 @@ async fn first_event_ms(cx: &Ctx<'_>) -> Result<Option<i64>, QueryError> {
         return Ok(None);
     }
     Ok(row.get(1).and_then(cell_i64))
+}
+
+/// `all` 可使用原生汇总时，取当前时区最早完成的本地日。
+async fn first_native_rollup_ms(
+    cx: &Ctx<'_>,
+    site: &SiteContext,
+    spec: &QuerySpec,
+) -> Result<Option<i64>, QueryError> {
+    if cx.opts.rollup_min_rows.is_none() {
+        return Ok(None);
+    }
+    // 用三天让自动 `time` 以日粒度参与兼容判断。实际粒度和对比期由最终起点解析。
+    let mut shape = spec.clone();
+    shape.date_range = DateRange::Days(3);
+    shape.include.compare = None;
+    let Ok(q) = ResolvedQuery::build(&shape, site, cx.opts.now, None) else {
+        return Ok(None);
+    };
+    match rollup::compatible_family(&q, &plan::plan(&q)) {
+        None | Some(rollup::Family::Props(_)) => return Ok(None),
+        Some(_) => {}
+    }
+    let today = cx.opts.now.to_zoned(q.tz.clone()).date();
+    let (sql, params) = sql::first_native_rollup_day_query(cx.scope, &q.tz_name, today);
+    let rows = cx
+        .run_tier("first_native_rollup_day", &sql, &params, "rollup")
+        .await?;
+    rows.first()
+        .and_then(|r| r.first())
+        .and_then(Value::as_str)
+        .and_then(|s| s.parse().ok())
+        .map(|day| day_start_ms(&q.tz, day))
+        .transpose()
 }
 
 /// 生成主查询的 SQL 与参数，不执行（快照测试与排障用）。`all` 需要的站点最早事件时间由 `data_start_ms` 传入；
@@ -691,19 +725,26 @@ pub async fn execute(
         raw_since: raw_since(site, opts.now)?,
         imported: site.imported,
     };
-    // `all` 要先知道站点最早事件的时间；导入的数据更早时从导入的第一天算起
-    let data_start = if matches!(spec.date_range, DateRange::All) {
+    // `all` 的起点取原始事件、已完成导入与可用原生汇总中最早的时间。
+    let (base_start, data_start) = if matches!(spec.date_range, DateRange::All) {
         let first = first_event_ms(&cx).await?;
         let imported = match site.imported {
             Some((from, _)) => Some(day_start_ms(&site.timezone, from)?),
             None => None,
         };
-        first.into_iter().chain(imported).min()
+        let base = first.into_iter().chain(imported).min();
+        let native = first_native_rollup_ms(&cx, site, &spec).await?;
+        (base, base.into_iter().chain(native).min())
     } else {
-        None
+        (None, None)
     };
-    let q = ResolvedQuery::build(&spec, site, opts.now, data_start)?;
-    let plan = plan::plan(&q);
+    let mut q = ResolvedQuery::build(&spec, site, opts.now, data_start)?;
+    let mut plan = plan::plan(&q);
+    // 自动时间粒度可能仍为小时，此时原生汇总不能扩展查询范围。
+    if data_start != base_start && rollup::compatible_family(&q, &plan).is_none() {
+        q = ResolvedQuery::build(&spec, site, opts.now, base_start)?;
+        plan = plan::plan(&q);
+    }
 
     let page = (u64::from(q.limit), u64::from(q.offset));
     let main = fetch_rows(

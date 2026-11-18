@@ -397,7 +397,7 @@ pub async fn build_state(
     tz: &TimeZone,
 ) -> Result<BuildState, QueryError> {
     let tz_name = tz.iana_name().unwrap_or("UTC");
-    let (sql, params) = sql::rollup_probe_query(scope, tz_name, "1970-01-01", "1970-01-01", true);
+    let (sql, params) = sql::rollup_probe_query(scope, tz_name, "1970-01-01", "1970-01-01", None);
     let rows = fetch(client, &sql, &params).await?;
     let row = rows.first();
     let built_to = row
