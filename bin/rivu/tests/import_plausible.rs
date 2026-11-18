@@ -10,14 +10,18 @@
 use std::io::Write;
 
 use jiff::Timestamp;
+use jiff::civil::{Date, date};
 use jiff::tz::TimeZone;
 use rivu::migrate;
 use rivu_common::config::{ChAccount, Config, Env, Role, Secret};
 use rivu_query::plan::Tier;
 use rivu_query::result::QueryResult;
+use rivu_query::rollup::Family;
 use rivu_query::{ExecOptions, QuerySpec, SiteContext, TenantScope, execute};
+use rivu_storage_ch::rows::{EventRow, insert_events};
 use rivu_storage_pg::sites::NewSite;
 use serde_json::{Value, json};
+use sqlx::PgPool;
 
 fn var(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
@@ -118,26 +122,57 @@ const FILES: [(&str, &str); 11] = [
 ];
 
 fn export_zip() -> Vec<u8> {
+    export_zip_from(date(2026, 6, 1))
+}
+
+fn export_zip_from(first: Date) -> Vec<u8> {
+    let second = first.tomorrow().unwrap();
+    let third = second.tomorrow().unwrap();
     let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     let opts = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
     for (family, body) in FILES {
-        zip.start_file(format!("imported_{family}_20260601_20260603.csv"), opts)
-            .unwrap();
-        zip.write_all(body.as_bytes()).unwrap();
+        zip.start_file(
+            format!(
+                "imported_{family}_{}_{}.csv",
+                first.strftime("%Y%m%d"),
+                third.strftime("%Y%m%d")
+            ),
+            opts,
+        )
+        .unwrap();
+        let mut lines = body.lines();
+        writeln!(zip, "{}", lines.next().unwrap()).unwrap();
+        for line in lines {
+            let (day, columns) = line.split_once(',').unwrap();
+            let day = match day {
+                "\"2026-06-01\"" => first,
+                "\"2026-06-02\"" => second,
+                "\"2026-06-03\"" => third,
+                _ => panic!("未知的夹具日期：{day}"),
+            };
+            writeln!(zip, "\"{day}\",{columns}").unwrap();
+        }
     }
     zip.finish().unwrap().into_inner()
 }
 
 async fn run(reader: &clickhouse::Client, site: &SiteContext, spec: Value) -> QueryResult {
+    run_at(reader, site, spec, "2026-07-01T12:00:00Z".parse().unwrap()).await
+}
+
+async fn run_at(
+    reader: &clickhouse::Client,
+    site: &SiteContext,
+    spec: Value,
+    now: Timestamp,
+) -> QueryResult {
     execute(
         reader,
         &TenantScope::new(site.site_id),
         site,
         QuerySpec::parse(&spec).unwrap(),
-        ExecOptions::new(15)
-            .with_now("2026-07-01T12:00:00Z".parse::<Timestamp>().unwrap())
-            .with_rollup(1_000_000),
+        ExecOptions::new(15).with_now(now).with_rollup(1_000_000),
     )
     .await
     .unwrap_or_else(|e| panic!("查询失败：{e}\n{spec}"))
@@ -155,16 +190,15 @@ fn rows(r: &QueryResult) -> Vec<(String, Vec<f64>)> {
         .collect()
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn plausible_export_is_imported_into_the_rollup_tier() {
+async fn databases() -> Option<(PgPool, String)> {
     let (Some(pg_url), Some(ch_url)) = (
         var("RIVU_TEST_DATABASE_URL"),
         var("RIVU_TEST_CLICKHOUSE_URL"),
     ) else {
         println!(
-            "跳过 plausible_export_is_imported_into_the_rollup_tier：需要设置 RIVU_TEST_DATABASE_URL 和 RIVU_TEST_CLICKHOUSE_URL"
+            "需要设置 RIVU_TEST_DATABASE_URL 和 RIVU_TEST_CLICKHOUSE_URL 才能运行导入集成测试"
         );
-        return;
+        return None;
     };
     let migrator = account("migrator");
     let cfg = Config::from_env(
@@ -181,6 +215,14 @@ async fn plausible_export_is_imported_into_the_rollup_tier() {
     migrate::apply(&cfg, false).await.expect("migrate");
 
     let pg = rivu_storage_pg::connect(&pg_url, 2).await.expect("连接 PG");
+    Some((pg, ch_url))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plausible_export_is_imported_into_the_rollup_tier() {
+    let Some((pg, ch_url)) = databases().await else {
+        return;
+    };
     let created = rivu_storage_pg::sites::create_site(
         &pg,
         &NewSite {
@@ -420,4 +462,161 @@ fn empty_zip() -> Vec<u8> {
         .unwrap();
     zip.write_all(b"hi").unwrap();
     zip.finish().unwrap().into_inner()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plausible_import_keeps_today_on_the_raw_tier() {
+    let Some((pg, ch_url)) = databases().await else {
+        return;
+    };
+    let now = Timestamp::now();
+    let utc = now.to_zoned(TimeZone::UTC);
+    // 让站点本地日期与 UTC 不同，并留出至少一小时避免运行中跨午夜。
+    let tz_name = if utc.hour() < 12 {
+        "Etc/GMT+12"
+    } else {
+        "Etc/GMT-14"
+    };
+    let tz = TimeZone::get(tz_name).unwrap();
+    let today = now.to_zoned(tz.clone()).date();
+    assert_ne!(today, utc.date());
+    let yesterday = today.yesterday().unwrap();
+    let created = rivu_storage_pg::sites::create_site(
+        &pg,
+        &NewSite {
+            name: "plausible-import-cutoff",
+            timezone: tz_name,
+            hostnames: &["example.test".to_owned()],
+        },
+    )
+    .await
+    .expect("建站");
+    let site_id = created.id;
+    let maintainer = rivu_storage_ch::client(&ch_url, &account("maintainer"), Some(&ch_database()));
+    let reader = rivu_storage_ch::client(&ch_url, &account("reader"), Some(&ch_database()));
+    let writer = rivu_storage_ch::client(&ch_url, &account("writer"), Some(&ch_database()));
+    let scope = TenantScope::new(site_id);
+    let before = rivu_query::rollup::build_state(&reader, &scope, &tz)
+        .await
+        .unwrap();
+    assert_eq!((before.native_from, before.built_to), (None, None));
+
+    let import = |first| {
+        rivu_jobs::import_plausible::import_file(
+            &pg,
+            &maintainer,
+            site_id,
+            tz_name,
+            export_zip_from(first),
+            "cutoff.zip",
+            None,
+        )
+    };
+    let (id, summary) = import(yesterday).await.expect("导入昨、今、明三天");
+    insert_pageview(&writer, &reader, site_id, now).await;
+
+    let range = rivu_storage_pg::imports::completed_range(&pg, site_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut site = SiteContext::new(site_id, tz.clone());
+    site.imported = Some((range.0.parse().unwrap(), range.1.parse().unwrap()));
+    let current = run_at(
+        &reader,
+        &site,
+        json!({"metrics": ["pageviews"], "date_range": "day"}),
+        now,
+    )
+    .await;
+    assert_eq!(
+        (rows(&current)[0].1[0], current.meta.tiers),
+        (1.0, vec![Tier::Raw]),
+        "站点本地今天只计入原生 pageview"
+    );
+    let previous = run_at(
+        &reader,
+        &site,
+        json!({"metrics": ["pageviews"], "date_range": [yesterday.to_string(), yesterday.to_string()]}),
+        now,
+    )
+    .await;
+    assert_eq!(
+        (rows(&previous)[0].1[0], previous.meta.tiers),
+        (20.0, vec![Tier::Rollup])
+    );
+    assert_eq!(summary.clipped_from, Some(today));
+    assert_eq!((summary.start, summary.end), (yesterday, yesterday));
+    assert_eq!(site.imported, Some((yesterday, yesterday)));
+    for table in Family::TABLES {
+        let days = reader
+            .query(&format!(
+                "SELECT DISTINCT toString(day) FROM {table} WHERE site_id = ? AND origin = 'import' AND import_id = ?"
+            ))
+            .bind(site_id)
+            .bind(id)
+            .fetch_all::<String>()
+            .await
+            .unwrap();
+        assert_eq!(days, [yesterday.to_string()], "{table}");
+    }
+
+    let error = import(today).await.expect_err("今天起没有可导入的历史日");
+    assert_eq!(rivu_jobs::import_plausible::error_code(&error), "no_days");
+    let failed = &rivu_storage_pg::imports::list(&pg, site_id).await.unwrap()[0];
+    assert_eq!(failed.status, "failed");
+    assert_eq!(failed.error_code.as_deref(), Some("no_days"));
+    assert_eq!(
+        (&failed.start_date, &failed.end_date, failed.rows_imported),
+        (&None, &None, 0)
+    );
+
+    // 更早的原生数据仍优先。压缩包原本与已有导入重叠，截断后恰好不重叠。
+    let prior_local_time = yesterday.at(12, 0, 0, 0).to_zoned(tz).unwrap().timestamp();
+    insert_pageview(&writer, &reader, site_id, prior_local_time).await;
+    let earlier = yesterday.yesterday().unwrap();
+    let (id, summary) = import(earlier).await.expect("按已有原生日截断");
+    assert_eq!(summary.clipped_from, Some(yesterday));
+    assert_eq!((summary.start, summary.end), (earlier, earlier));
+    let saved = rivu_storage_pg::imports::get(&pg, site_id, id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (saved.start_date, saved.end_date),
+        (Some(earlier.to_string()), Some(earlier.to_string()))
+    );
+}
+
+async fn insert_pageview(
+    writer: &clickhouse::Client,
+    reader: &clickhouse::Client,
+    site_id: u64,
+    ts: Timestamp,
+) {
+    let ts = time::OffsetDateTime::from_unix_timestamp_nanos(ts.as_nanosecond()).unwrap();
+    let event_id = uuid::Uuid::now_v7();
+    let row = EventRow {
+        site_id,
+        event_id,
+        ts,
+        session_start: ts,
+        visitor_id: 1,
+        session_id: u64::try_from(ts.unix_timestamp()).unwrap(),
+        name: "pageview".into(),
+        hostname: "example.test".into(),
+        pathname: "/".into(),
+        entry_pathname: "/".into(),
+        ..EventRow::default()
+    };
+    insert_events(writer, &[row], &event_id.to_string(), false)
+        .await
+        .unwrap();
+    let count = reader
+        .query("SELECT count() FROM events WHERE site_id = ? AND name = 'pageview' AND event_id = toUUID(?)")
+        .bind(site_id)
+        .bind(event_id.to_string())
+        .fetch_one::<u64>()
+        .await
+        .unwrap();
+    assert_eq!(count, 1, "原生 pageview 已落库");
 }
