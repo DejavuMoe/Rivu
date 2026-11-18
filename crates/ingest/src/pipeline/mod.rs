@@ -13,7 +13,7 @@
 //! | 7 | UA 富化：浏览器、系统、设备类别 | — |
 //! | 8 | 来源：内部引荐传 `None`，`rivu_source::classify` 给出 `referrer_source` 与 `channel` | — |
 //! | 10 | 身份（盐缺失 `salt_missing`；前一天的盐缺失只是不算 `prev_visitor_id`） | `salt_missing` |
-//! | 11 | SessionAssigner → 组装 `EventRow` → BatchWriter（缓冲满 `dropped_overloaded`） | `no_session` `overloaded` |
+//! | 11 | 检查可续会话 → 预留 BatchWriter 缓冲 → 分配会话并组装、发送 `EventRow` | `no_session` `overloaded` |
 //!
 //! **规则与限流对 engagement 的处理**（`tracker-and-protocol.md` §6.4 第 6 行写的是 engagement 整段跳过屏蔽规则，
 //! 这里有意偏离其中一部分，见下）：
@@ -53,7 +53,7 @@ use rivu_domain::{
 use rivu_geo::GeoDb;
 use rivu_geo::datacenter::DcDb;
 use rivu_ratelimit::KeyedLimiter;
-use rivu_session::assigner::{Assignment, Incoming, SessionAssigner, SessionConfig, Stamp};
+use rivu_session::assigner::{Incoming, SessionAssigner, SessionConfig, Stamp};
 use rivu_session::identity::{Salt, local_date, routing_hash, visitor_hash};
 use rivu_source::{SourceInput, classify};
 use rivu_storage_ch::rows::EventRow;
@@ -360,9 +360,9 @@ impl Pipeline {
         let routing = routing_hash(&self.routing_secret, site_id, ip, &ctx.user_agent);
         observe(&self.stages.identity, t);
 
-        // 11. 会话分配与盖章
+        // 11. 先预留写缓冲，再更新会话与归因。
         let t = Instant::now();
-        let assigned = self.assigner.assign(&Incoming {
+        let incoming = Incoming {
             site_id,
             visitor_id,
             prev_visitor_id,
@@ -371,30 +371,28 @@ impl Pipeline {
             kind: ev.kind,
             pathname: &ev.pathname,
             attrs: &attrs,
-        });
+        };
+        let assigned = self
+            .assigner
+            .try_assign(&incoming, || self.writer.try_reserve());
         observe(&self.stages.session, t);
-        let stamp = match assigned {
-            Assignment::Stamped(stamp) => stamp,
-            Assignment::NoSession => return self.dropped(site_id, &ev, DropReason::NoSession),
+        let (stamp, permit) = match assigned {
+            Ok(Some(assigned)) => assigned,
+            Ok(None) => return self.dropped(site_id, &ev, DropReason::NoSession),
+            Err(TrySendError::Full | TrySendError::Closed) => {
+                self.dropped(site_id, &ev, DropReason::Overloaded);
+                return Outcome::Overloaded;
+            }
         };
 
         // 组装行并交给 BatchWriter
         let t = Instant::now();
-        let row = build_row(site_id, ev.clone(), &stamp, ctx.now_ms);
-        let sent = self.writer.try_send(row);
+        let script_version = ev.script_version;
+        permit.send(build_row(site_id, ev, &stamp, ctx.now_ms));
         observe(&self.stages.write, t);
-        match sent {
-            Ok(()) => {
-                self.writer
-                    .count(site_id, METRIC_ACCEPTED, ev.script_version);
-                metrics::counter!("rivu_ingest_events_total", "outcome" => "accepted").increment(1);
-                Outcome::Accepted
-            }
-            Err(TrySendError::Full | TrySendError::Closed) => {
-                self.dropped(site_id, &ev, DropReason::Overloaded);
-                Outcome::Overloaded
-            }
-        }
+        self.writer.count(site_id, METRIC_ACCEPTED, script_version);
+        metrics::counter!("rivu_ingest_events_total", "outcome" => "accepted").increment(1);
+        Outcome::Accepted
     }
 
     /// 第 5–8 步：机器人 → 地理 → UA 富化 → 来源，得到会话属性；机器人返回 `Err(DropReason::Bot)`。
@@ -975,10 +973,13 @@ mod tests {
             Outcome::Accepted
         );
         assert_eq!(
-            r.pipeline
-                .process(&pageview("/b"), ctx("203.0.113.9", "UA", t + 1000)),
+            r.pipeline.process(
+                &pageview("/lost?utm_source=lost"),
+                ctx("203.0.113.10", "UA", t + 1000),
+            ),
             Outcome::Overloaded
         );
+        let session_count = r.pipeline.assigner().len();
         assert_eq!(
             counts(&r.writer),
             BTreeMap::from([
@@ -988,6 +989,56 @@ mod tests {
         );
         assert_eq!(r.rx.try_recv().unwrap().pathname, "/a");
         assert!(r.rx.try_recv().is_err());
+        assert_eq!(
+            r.pipeline.process(
+                &pageview("/kept?utm_source=kept"),
+                ctx("203.0.113.10", "UA", t + 2000),
+            ),
+            Outcome::Accepted
+        );
+        let kept = r.rx.try_recv().unwrap();
+        assert_eq!(
+            (
+                session_count,
+                kept.entry_pathname.as_str(),
+                kept.utm_source.as_str()
+            ),
+            (1, "/kept", "kept")
+        );
+    }
+
+    #[test]
+    fn full_buffer_does_not_extend_sessions_or_reclassify_missing_sessions() {
+        let r = rig(1);
+        let t = at(date(2026, 3, 28), 12, 0);
+        let engagement =
+            json!({"v":1,"s":KEY,"n":"engagement","u":"https://example.test/a","e":1000})
+                .to_string()
+                .into_bytes();
+        assert_eq!(
+            r.pipeline
+                .process(&pageview("/a"), ctx("203.0.113.9", "UA", t)),
+            Outcome::Accepted
+        );
+        assert_eq!(
+            r.pipeline
+                .process(&engagement, ctx("203.0.113.10", "UA", t + 1000)),
+            Outcome::Dropped(DropReason::NoSession)
+        );
+        assert_eq!(
+            r.pipeline
+                .process(&engagement, ctx("203.0.113.9", "UA", t + 1000)),
+            Outcome::Overloaded
+        );
+        assert_eq!(r.pipeline.assigner().export()[0].last_seen_ms, t);
+        assert_eq!(
+            counts(&r.writer),
+            BTreeMap::from([
+                (key(SITE, "accepted"), 1),
+                (key(SITE, "dropped_no_session"), 1),
+                (key(SITE, "dropped_overloaded"), 1),
+            ])
+        );
     }
 
     #[test]
@@ -999,6 +1050,11 @@ mod tests {
             r.pipeline
                 .process(&pageview("/"), ctx("203.0.113.9", "UA", t)),
             Outcome::Overloaded
+        );
+        assert!(r.pipeline.assigner().is_empty());
+        assert_eq!(
+            counts(&r.writer),
+            BTreeMap::from([(key(SITE, "dropped_overloaded"), 1)])
         );
     }
 

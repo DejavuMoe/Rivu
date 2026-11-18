@@ -1,7 +1,7 @@
 //! BatchWriter：有界 channel 缓冲事件，按「1 s / 2 万行 / 8 MB 先到先写」组批写入 ClickHouse，
 //! 失败带稳定的去重 token 退避重试；同时在进程内聚合接入计数。设计见 `system-design.md` §4.7、§5.4。
 //!
-//! - 请求热路径只做 [`WriterHandle::try_send`]（`try_send`，满了立即返回错误，由调用方回 `503`）和
+//! - 请求热路径只做 [`WriterHandle::try_reserve`] 后入队（满了立即返回错误，由调用方回 `503`）和
 //!   [`WriterHandle::count`]（一次加锁的累加）；
 //! - 写入任务单独运行；一批正在重试时不再从 channel 取数，channel 逐渐变满，背压自然传到 `503`；
 //! - token = `{node_id}:{batch_seq}`，`node_id` 每次进程启动随机生成，所以重启后 token 不会和旧进程的撞车；
@@ -129,7 +129,7 @@ pub fn random_node_id() -> String {
     format!("{:016x}", rand::random::<u64>())
 }
 
-/// `try_send` 失败的原因。两种情况调用方都应回 `503`。
+/// 缓冲无法接收一行的原因。两种情况调用方都应回 `503`。
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum TrySendError {
     #[error("写缓冲已满")]
@@ -148,7 +148,13 @@ pub struct WriterHandle {
 impl WriterHandle {
     /// 把一行放进缓冲。满了立即返回 [`TrySendError::Full`]，不等待。
     pub fn try_send(&self, row: EventRow) -> Result<(), TrySendError> {
-        self.tx.try_send(row).map_err(|e| match e {
+        self.try_reserve()?.send(row);
+        Ok(())
+    }
+
+    /// 立即预留一个缓冲槽。未发送就丢弃凭证会归还容量，关停排空时仍接收已预留的行。
+    pub fn try_reserve(&self) -> Result<mpsc::Permit<'_, EventRow>, TrySendError> {
+        self.tx.try_reserve().map_err(|e| match e {
             mpsc::error::TrySendError::Full(_) => TrySendError::Full,
             mpsc::error::TrySendError::Closed(_) => TrySendError::Closed,
         })
@@ -165,7 +171,7 @@ impl WriterHandle {
         self.counters.add(site_id, metric, script_version, at_secs);
     }
 
-    /// 缓冲里还没取走的行数。
+    /// 已占用的缓冲槽数，包括已预留但还没发送的槽。
     pub fn queued(&self) -> usize {
         self.tx.max_capacity() - self.tx.capacity()
     }
@@ -724,6 +730,28 @@ mod tests {
         assert_eq!(c[0].0, "node:c1");
         assert_eq!(c[0].1.len(), 1);
         assert_eq!(c[0].1[0].value, 1);
+    }
+
+    #[test]
+    fn reserved_capacity_is_released_or_drained_on_close() {
+        let (h, mut rx) = WriterHandle::detached(1);
+        let permit = h.try_reserve().unwrap();
+        assert_eq!(h.try_send(row(1)), Err(TrySendError::Full));
+        drop(permit);
+
+        let permit = h.try_reserve().unwrap();
+        rx.close();
+        assert_eq!(h.try_send(row(2)), Err(TrySendError::Closed));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        permit.send(row(3));
+        assert_eq!(rx.try_recv().unwrap().visitor_id, 3);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
     }
 
     #[tokio::test(start_paused = true)]
