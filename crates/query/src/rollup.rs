@@ -26,6 +26,8 @@
 //! 过滤只涉及这些维度本身（这样每一行对应的正是汇总表里的若干行之和，不会把同一访客在不同取值下的计数加起来）；
 //! 没有事件级过滤（`event:*`，它们在会话指标上是「存在」语义，汇总表回答不了）；没有 `percentage`、`conversion_rate`。
 
+use std::time::Duration;
+
 use clickhouse::Client;
 use jiff::Timestamp;
 use jiff::civil::Date;
@@ -777,17 +779,22 @@ fn rowbinary_date(d: Date) -> Result<u16, QueryError> {
 
 async fn write_rows<T>(client: &Client, table: &str, rows: Vec<T>) -> Result<(), QueryError>
 where
-    T: for<'a> clickhouse::Row<Value<'a> = T> + serde::Serialize,
+    T: for<'a> clickhouse::Row<Value<'a> = T> + serde::Serialize + 'static,
 {
     let mut insert = client
         .insert::<T>(table)
         .await
         .map_err(QueryError::internal)?
-        .with_setting("async_insert", "0");
+        .with_setting("async_insert", "0")
+        .with_timeouts(Some(Duration::from_secs(60)), Some(Duration::from_secs(60)));
     for row in &rows {
         insert.write(row).await.map_err(QueryError::internal)?;
     }
-    insert.end().await.map_err(QueryError::internal)
+    // Keep polling the driver's timeout if the import stops waiting for this response.
+    tokio::spawn(insert.end())
+        .await
+        .map_err(QueryError::internal)?
+        .map_err(QueryError::internal)
 }
 
 /// 把导入的行写进一张汇总表（`origin = 'import'`，`import_id`，`version = 1`，一次 RowBinary 写入）。
@@ -847,13 +854,17 @@ pub async fn delete_import(
     let mut params = Params::default();
     params.push("site", ParamValue::U64(scope.site_id()));
     params.push("imp", ParamValue::U64(import_id));
-    for table in Family::TABLES {
-        let sql = format!(
-            "DELETE FROM {table} WHERE site_id = {{site:UInt64}} AND origin = 'import' AND import_id = {{imp:UInt64}}"
-        );
-        execute(client, &sql, &params).await?;
-    }
-    Ok(())
+    tokio::time::timeout(Duration::from_secs(120), async {
+        for table in Family::TABLES {
+            let sql = format!(
+                "DELETE FROM {table} WHERE site_id = {{site:UInt64}} AND origin = 'import' AND import_id = {{imp:UInt64}}"
+            );
+            execute(client, &sql, &params).await?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(QueryError::internal)?
 }
 
 #[cfg(test)]
