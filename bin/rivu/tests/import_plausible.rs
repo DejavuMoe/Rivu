@@ -453,6 +453,7 @@ async fn plausible_export_is_imported_into_the_rollup_tier() {
     }
 
     // A cancelled handoff releases the lock even when the ordinary pool has just one slot.
+    let pg_url = var("RIVU_TEST_DATABASE_URL").unwrap();
     let one = rivu_storage_pg::connect(&pg_url, 1).await.unwrap();
     let pending = rivu_jobs::import_plausible::start(&one, created.id, "cancelled.zip", None)
         .await
@@ -526,7 +527,6 @@ async fn plausible_import_keeps_today_on_the_raw_tier() {
             &pg,
             &maintainer,
             site_id,
-            tz_name,
             export_zip_from(first),
             "cutoff.zip",
             None,
@@ -597,10 +597,12 @@ async fn plausible_import_keeps_today_on_the_raw_tier() {
     let (id, summary) = import(earlier).await.expect("按已有原生日截断");
     assert_eq!(summary.clipped_from, Some(yesterday));
     assert_eq!((summary.start, summary.end), (earlier, earlier));
-    let saved = rivu_storage_pg::imports::get(&pg, site_id, id)
+    let saved = rivu_storage_pg::imports::list(&pg, site_id)
         .await
         .unwrap()
-        .unwrap();
+        .into_iter()
+        .find(|row| row.id == id)
+        .expect("导入记录已保存");
     assert_eq!(
         (saved.start_date, saved.end_date),
         (Some(earlier.to_string()), Some(earlier.to_string()))
