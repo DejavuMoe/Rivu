@@ -1289,6 +1289,17 @@ pub(crate) fn rollup_probe_query(
     (sql, params)
 }
 
+/// 站点当前时区最早完成的原生汇总日（`rollup_site` 最后写入）。
+pub(crate) fn first_native_rollup_day_query(scope: &TenantScope, tz: &str) -> (String, Params) {
+    let mut params = Params::default();
+    params.push("site", ParamValue::U64(scope.site_id()));
+    params.push("tz", ParamValue::Str(tz.to_owned()));
+    let sql = "SELECT toString(minOrNull(day)) FROM rollup_site FINAL \
+               WHERE site_id = {site:UInt64} AND origin = 'native' AND tz = {tz:String}"
+        .to_owned();
+    (sql, params)
+}
+
 /// `percentage` 的分母：同样的区间与过滤、无维度的访客总数。
 pub(crate) fn total_visitors_query(
     scope: &TenantScope,
