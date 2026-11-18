@@ -107,6 +107,7 @@ fn render(sql: &str, params: &Params) -> String {
         let shown = match v {
             ParamValue::StrArray(a) => format!("{a:?}"),
             ParamValue::U32Array(a) => format!("{a:?}"),
+            ParamValue::U64Array(a) => format!("{a:?}"),
             ParamValue::Str(x) | ParamValue::Date(x) => format!("{x:?}"),
             ParamValue::U8(x) => x.to_string(),
             ParamValue::U64(x) => x.to_string(),
@@ -418,6 +419,7 @@ fn sql_comparison_query_is_constrained_by_main_rows() {
         &MainSqlOptions {
             interval: q.compare.unwrap(),
             split: None,
+            completed_import_ids: &[],
             constraint: Some(&cons),
             total_visitors: None,
             limit: 2,

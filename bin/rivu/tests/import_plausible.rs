@@ -16,7 +16,7 @@ use rivu::migrate;
 use rivu_common::config::{ChAccount, Config, Env, Role, Secret};
 use rivu_query::plan::Tier;
 use rivu_query::result::QueryResult;
-use rivu_query::rollup::Family;
+use rivu_query::rollup::{self, Family, ImportRow, Measures};
 use rivu_query::{ExecOptions, QuerySpec, SiteContext, TenantScope, execute};
 use rivu_storage_ch::rows::{EventRow, insert_events};
 use rivu_storage_pg::sites::NewSite;
@@ -252,12 +252,46 @@ async fn plausible_export_is_imported_into_the_rollup_tier() {
         ("2026-06-01".to_owned(), "2026-06-03".to_owned())
     );
     assert_eq!(summary.clipped_from, None);
-    let range = rivu_storage_pg::imports::completed_range(&pg, created.id)
+    let completed = rivu_storage_pg::imports::completed_imports(&pg, created.id)
         .await
-        .unwrap()
         .unwrap();
+    let range = completed.range.unwrap();
     let mut site = SiteContext::new(created.id, TimeZone::UTC);
     site.imported = Some((range.0.parse().unwrap(), range.1.parse().unwrap()));
+    assert_eq!(completed.ids, [id as u64]);
+    site.completed_import_ids = completed.ids;
+
+    // An import with no PG row can still have visible ClickHouse parts.
+    let scope = TenantScope::new(created.id);
+    let measures = Measures {
+        events: 20,
+        pageviews: 20,
+        ..Measures::default()
+    };
+    for (table, day, dims) in [
+        ("rollup_events", date(2026, 6, 1), vec!["pageview"]),
+        (
+            "rollup_props",
+            date(2026, 6, 1),
+            vec!["url", "https://a.test/"],
+        ),
+        ("rollup_site", date(2026, 6, 4), vec![]),
+    ] {
+        rollup::insert_import(
+            &maintainer,
+            &scope,
+            table,
+            "UTC",
+            u64::MAX,
+            &[ImportRow {
+                day,
+                dims: dims.into_iter().map(str::to_owned).collect(),
+                m: measures,
+            }],
+        )
+        .await
+        .unwrap();
+    }
 
     // ---- 合计与各维度族 ---------------------------------------------------------------------
     let all = json!(["2026-06-01", "2026-06-03"]);
@@ -387,6 +421,37 @@ async fn plausible_export_is_imported_into_the_rollup_tier() {
         [("url", 5), ("plan", 2)]
     );
 
+    let writer = rivu_storage_ch::client(&ch_url, &account("writer"), Some(&ch_database()));
+    insert_pageview(
+        &writer,
+        &reader,
+        created.id,
+        "2026-06-04T12:00:00Z".parse().unwrap(),
+    )
+    .await;
+    let mixed = run(
+        &reader,
+        &site,
+        json!({"metrics": ["events"], "date_range": ["2026-06-01", "2026-06-04"], "dimensions": ["event:name"]}),
+    )
+    .await;
+    assert_eq!(rows(&mixed)[0], ("pageview".to_owned(), vec![43.0]));
+    assert_eq!(mixed.meta.tiers, vec![Tier::Raw, Tier::Rollup]);
+    let compared = run(
+        &reader,
+        &site,
+        json!({
+            "metrics": ["events"], "date_range": ["2026-06-04", "2026-06-06"],
+            "dimensions": ["event:name"], "include": {"compare": "previous_period"}
+        }),
+    )
+    .await;
+    assert_eq!(rows(&compared), vec![("pageview".to_owned(), vec![1.0])]);
+    assert_eq!(
+        compared.results[0].comparison.as_ref().unwrap().metrics[0].as_f64(),
+        42.0
+    );
+
     // ---- 重复导入被拒绝；删除 ------------------------------------------------------------------
     let again = rivu_jobs::import_plausible::import_file(
         &pg,
@@ -426,6 +491,7 @@ async fn plausible_export_is_imported_into_the_rollup_tier() {
         None
     );
     site.imported = None;
+    site.completed_import_ids.clear();
     let gone = run(
         &reader,
         &site,
@@ -535,12 +601,13 @@ async fn plausible_import_keeps_today_on_the_raw_tier() {
     let (id, summary) = import(yesterday).await.expect("导入昨、今、明三天");
     insert_pageview(&writer, &reader, site_id, now).await;
 
-    let range = rivu_storage_pg::imports::completed_range(&pg, site_id)
+    let completed = rivu_storage_pg::imports::completed_imports(&pg, site_id)
         .await
-        .unwrap()
         .unwrap();
+    let range = completed.range.unwrap();
     let mut site = SiteContext::new(site_id, tz.clone());
     site.imported = Some((range.0.parse().unwrap(), range.1.parse().unwrap()));
+    site.completed_import_ids = completed.ids;
     let current = run_at(
         &reader,
         &site,
