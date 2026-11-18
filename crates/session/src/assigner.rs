@@ -7,6 +7,7 @@
 //! - 过期按「分片内事件时间水位 − timeout」清扫，不用墙钟（实时处理与积压重放都正确）。
 
 use std::collections::{BTreeMap, HashMap};
+use std::convert::Infallible;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -243,37 +244,37 @@ impl Shard {
         id
     }
 
-    fn assign(
+    fn try_assign<P, E>(
         &mut self,
         cfg: &SessionConfig,
         cap: usize,
         empty: &Arc<str>,
         ev: &Incoming<'_>,
         partition: u8,
-    ) -> Assignment {
-        self.watermark = self.watermark.max(ev.ts_ms);
-
+        reserve: impl FnOnce() -> Result<P, E>,
+    ) -> Result<Option<(Stamp, P)>, E> {
         let live = self.lookup(ev).filter(|(sid, _)| {
             self.sessions
                 .get(sid)
                 .is_some_and(|s| s.accepts(ev.ts_ms, cfg))
         });
+        if live.is_none() && ev.kind == EventKind::Engagement {
+            self.watermark = self.watermark.max(ev.ts_ms);
+            self.stats.no_session += 1;
+            return Ok(None);
+        }
+
+        let permit = reserve()?;
+        self.watermark = self.watermark.max(ev.ts_ms);
         let (sid, via_prev) = match live {
             Some(hit) => hit,
-            None => {
-                // 没有可续的会话（没找到，或找到了但已超时 / 超过 7 天）。
-                if ev.kind == EventKind::Engagement {
-                    self.stats.no_session += 1;
-                    return Assignment::NoSession;
-                }
-                (self.open(cap, ev, empty), false)
-            }
+            None => (self.open(cap, ev, empty), false),
         };
 
         let Some(s) = self.sessions.get_mut(&sid) else {
             // 刚查到或刚插入，不会缺；保守地当作没有会话。
             self.stats.no_session += 1;
-            return Assignment::NoSession;
+            return Ok(None);
         };
         s.last_seen = s.last_seen.max(ev.ts_ms);
         if ev.kind == EventKind::Pageview && !s.has_entry {
@@ -304,7 +305,7 @@ impl Shard {
         }
         self.lru.remove(&old_tick);
         self.lru.insert(self.next_tick, sid);
-        Assignment::Stamped(stamp)
+        Ok(Some((stamp, permit)))
     }
 
     /// 放回一个会话。会话已满、id 重复或没有 key 时跳过，返回是否放回。
@@ -420,10 +421,28 @@ impl SessionAssigner {
 
     /// 查找或开会话、续期、盖章。
     pub fn assign(&self, ev: &Incoming<'_>) -> Assignment {
+        match self.try_assign(ev, || Ok::<_, Infallible>(())).unwrap() {
+            Some((stamp, ())) => Assignment::Stamped(stamp),
+            None => Assignment::NoSession,
+        }
+    }
+
+    /// 只在预留成功后更新会话，并返回盖章和预留凭证。
+    /// `reserve` 在分片锁内调用，不能阻塞。无法续会话的 engagement 直接返回 `Ok(None)`。
+    pub fn try_assign<P, E>(
+        &self,
+        ev: &Incoming<'_>,
+        reserve: impl FnOnce() -> Result<P, E>,
+    ) -> Result<Option<(Stamp, P)>, E> {
         let shard = (ev.routing % SHARDS as u64) as usize;
-        self.shards[shard]
-            .lock()
-            .assign(&self.cfg, self.shard_cap, &self.empty, ev, shard as u8)
+        self.shards[shard].lock().try_assign(
+            &self.cfg,
+            self.shard_cap,
+            &self.empty,
+            ev,
+            shard as u8,
+            reserve,
+        )
     }
 
     /// 按各分片「事件时间水位 − timeout」清扫过期会话，返回移除的会话数（纯事件时间，测试与重放用）。
