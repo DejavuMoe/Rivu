@@ -424,7 +424,7 @@ struct Server {
     reader: Client,
 }
 
-async fn start(env: &TestEnv, pg: &PgPool, config: &Config, limits: DashLimits) -> Server {
+async fn start(env: &TestEnv, pg: &PgPool, config: &Config, limits: Option<DashLimits>) -> Server {
     init_logging();
     let geo = Arc::new(GeoDb::with_manual_attribution(
         Some("MaxMind test database"),
@@ -435,10 +435,12 @@ async fn start(env: &TestEnv, pg: &PgPool, config: &Config, limits: DashLimits) 
     assert!(geo.reload_if_changed(&mmdb).expect("加载测试库"));
     let reader = rivu_storage_ch::client(&env.ch_url, &account("reader"), Some(&ch_database()));
     let now: Timestamp = NOW.parse().unwrap();
-    let dash = DashApi::new(config, pg.clone(), reader.clone(), Some(Arc::clone(&geo)))
+    let mut dash = DashApi::new(config, pg.clone(), reader.clone(), Some(Arc::clone(&geo)))
         .expect("装配内部端点")
-        .with_limits(limits)
         .with_clock(move || now);
+    if let Some(limits) = limits {
+        dash = dash.with_limits(limits);
+    }
     let app = public::router_full(None, None, Some(dash_api::router(Arc::new(dash))));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -770,7 +772,7 @@ async fn setup_runs_once_and_needs_the_token() {
         &env,
         &iso.pool,
         &config(&env, &[("RIVU_SETUP_TOKEN", SETUP_TOKEN)]),
-        loose(),
+        Some(loose()),
     )
     .await;
     let http = &server.http;
@@ -922,7 +924,7 @@ async fn setup_without_a_configured_token_needs_none_and_concurrent_attempts_cre
     };
     migrate_once(&env).await;
     let iso = isolated(&env).await;
-    let server = start(&env, &iso.pool, &config(&env, &[]), loose()).await;
+    let server = start(&env, &iso.pool, &config(&env, &[]), Some(loose())).await;
     let mut tasks = Vec::new();
     for i in 0..8 {
         let http = server.http.clone();
@@ -968,7 +970,7 @@ async fn setup_attempts_are_rate_limited_per_ip() {
         &env,
         &iso.pool,
         &config(&env, &[("RIVU_SETUP_TOKEN", SETUP_TOKEN)]),
-        DashLimits::default(),
+        None,
     )
     .await;
     let attempt = |ip: &'static str| {
@@ -1003,7 +1005,7 @@ async fn session_lifecycle() {
     };
     migrate_once(&env).await;
     let pg = rivu_storage_pg::connect(&env.pg_url, 6).await.unwrap();
-    let server = start(&env, &pg, &config(&env, &[]), loose()).await;
+    let server = start(&env, &pg, &config(&env, &[]), Some(loose())).await;
     let http = &server.http;
     let org = make_org(&pg).await;
     let user = make_user(&pg, Some((&org, "editor"))).await;
@@ -1396,7 +1398,7 @@ async fn disabled_or_deleted_users_lose_their_sessions_immediately() {
     };
     migrate_once(&env).await;
     let pg = rivu_storage_pg::connect(&env.pg_url, 4).await.unwrap();
-    let server = start(&env, &pg, &config(&env, &[]), loose()).await;
+    let server = start(&env, &pg, &config(&env, &[]), Some(loose())).await;
     let http = &server.http;
     let org = make_org(&pg).await;
     let user = make_user(&pg, Some((&org, "owner"))).await;
@@ -1529,7 +1531,7 @@ async fn csrf_rejects_cross_origin_and_non_json_state_changing_requests() {
     };
     migrate_once(&env).await;
     let pg = rivu_storage_pg::connect(&env.pg_url, 4).await.unwrap();
-    let server = start(&env, &pg, &config(&env, &[]), loose()).await;
+    let server = start(&env, &pg, &config(&env, &[]), Some(loose())).await;
     let http = &server.http;
     let org = make_org(&pg).await;
     let user = make_user(&pg, Some((&org, "owner"))).await;
@@ -1683,7 +1685,7 @@ async fn login_is_rate_limited_per_ip_and_per_account() {
     };
     migrate_once(&env).await;
     let pg = rivu_storage_pg::connect(&env.pg_url, 4).await.unwrap();
-    let server = start(&env, &pg, &config(&env, &[]), DashLimits::default()).await;
+    let server = start(&env, &pg, &config(&env, &[]), None).await;
     let http = &server.http;
     let org = make_org(&pg).await;
     let victim = make_user(&pg, Some((&org, "owner"))).await;
@@ -1794,7 +1796,7 @@ async fn login_failure_alerts_count_but_never_block() {
         global_fail_alert: 6,
         ..loose()
     };
-    let server = start(&env, &pg, &config(&env, &[]), limits).await;
+    let server = start(&env, &pg, &config(&env, &[]), Some(limits)).await;
     let http = &server.http;
     let org = make_org(&pg).await;
     let victim = make_user(&pg, Some((&org, "owner"))).await;
@@ -1857,7 +1859,7 @@ async fn session_queries_equal_direct_execution_and_site_access_is_uniform() {
     };
     migrate_once(&env).await;
     let pg = rivu_storage_pg::connect(&env.pg_url, 6).await.unwrap();
-    let server = start(&env, &pg, &config(&env, &[]), loose()).await;
+    let server = start(&env, &pg, &config(&env, &[]), Some(loose())).await;
     let http = &server.http;
 
     let org_a = make_org(&pg).await;
@@ -2443,7 +2445,7 @@ async fn shared_links_passwords_expiry_revocation_scope_and_segments() {
     };
     migrate_once(&env).await;
     let pg = rivu_storage_pg::connect(&env.pg_url, 6).await.unwrap();
-    let server = start(&env, &pg, &config(&env, &[]), loose()).await;
+    let server = start(&env, &pg, &config(&env, &[]), Some(loose())).await;
     let http = &server.http;
 
     let org = make_org(&pg).await;
@@ -2992,21 +2994,6 @@ async fn shared_links_passwords_expiry_revocation_scope_and_segments() {
     cleanup(&env, &[site.id, other_site.id]).await;
 }
 
-/// 反复发请求直到出现 429（至多 20 次）；返回那个 429 响应。
-async fn until_429<F, Fut>(mut send: F) -> Resp
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Resp>,
-{
-    for _ in 0..20 {
-        let r = send().await;
-        if r.status == 429 {
-            return r;
-        }
-    }
-    panic!("连续 20 次请求都没有被限流");
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn public_and_shared_access_is_rate_limited() {
     let Some(env) = test_env("public_rate_limit") else {
@@ -3014,13 +3001,12 @@ async fn public_and_shared_access_is_rate_limited() {
     };
     migrate_once(&env).await;
     let pg = rivu_storage_pg::connect(&env.pg_url, 6).await.unwrap();
-    // 补充速率压到 1 次/分钟（突发仍是默认的 60）：默认的 300 次/分钟每 0.2 秒补一个令牌，并行跑、ClickHouse 慢的时候
-    // 每个查询都比 0.2 秒长，令牌刚好被补回，永远等不到 429。默认值本身由 rivu-common 的配置测试覆盖
+    // 生产装配将默认突发 60 限制为每分钟配额 1：初始只有一个令牌，每分钟补一个。
     let server = start(
         &env,
         &pg,
         &config(&env, &[("RIVU_PUBLIC_VIEW_RATE_PER_MIN", "1")]),
-        DashLimits::default(),
+        None,
     )
     .await;
     let http = &server.http;
@@ -3030,20 +3016,16 @@ async fn public_and_shared_access_is_rate_limited() {
     let private = make_site(&pg, &org, false).await;
     let spec = json!({"metrics": ["visitors"], "date_range": "day"});
 
-    // 公开看板：按 (IP, 站点)，突发 60（默认 300 次/分钟），之后 429 + Retry-After；另一个 IP、另一个站点各有自己的桶
-    // 突发用只读库的入口信息来耗（快，补充的令牌可以忽略）；入口、查询与实时共用同一个 (IP, 站点) 桶
+    // 公开看板入口、查询与实时共用一个 (IP, 站点) 桶。
     let info_path = format!("/api/internal/public/{}", public.key);
-    for i in 0..60 {
-        let r = http.get(&info_path).ip("192.0.2.10").send().await;
-        assert_eq!(r.status, 200, "第 {i} 次：{}", r.body);
-    }
-    // 60 个令牌耗尽后，下一个请求就该 429（每分钟才补 1 个；until_429 只是兜住恰好补回的那一个）
-    let r = until_429(|| {
-        http.post(&query_path(public.id), &spec)
-            .ip("192.0.2.10")
-            .send()
-    })
-    .await;
+    let r = http.get(&info_path).ip("192.0.2.10").send().await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let r = http
+        .post(&query_path(public.id), &spec)
+        .ip("192.0.2.10")
+        .send()
+        .await;
+    assert_eq!(r.status, 429, "{}", r.body);
     assert_eq!(
         http.get(&realtime_path(public.id))
             .ip("192.0.2.10")
@@ -3110,17 +3092,15 @@ async fn public_and_shared_access_is_rate_limited() {
         .await
         .unwrap();
     let link_info = format!("/api/internal/shared/{}", link.slug);
-    for i in 0..60 {
-        let r = http.get(&link_info).ip("192.0.2.20").send().await;
-        assert_eq!(r.status, 200, "第 {i} 次：{}", r.body);
-    }
-    let r = until_429(|| {
-        http.post(&query_path(private.id), &spec)
-            .share(&link.slug)
-            .ip("192.0.2.20")
-            .send()
-    })
-    .await;
+    let r = http.get(&link_info).ip("192.0.2.20").send().await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let r = http
+        .post(&query_path(private.id), &spec)
+        .share(&link.slug)
+        .ip("192.0.2.20")
+        .send()
+        .await;
+    assert_eq!(r.status, 429, "{}", r.body);
     assert!(r.header("retry-after").is_some());
     assert_eq!(
         http.post(&query_path(private.id), &spec)
@@ -3142,25 +3122,15 @@ async fn public_and_shared_access_is_rate_limited() {
         "另一个链接有自己的桶"
     );
     // 乱猜 slug 也要消耗配额（限流在查库之前）
-    let guess = "g".repeat(43);
-    for _ in 0..60 {
-        assert_eq!(
-            http.get(&format!("/api/internal/shared/{guess}"))
-                .ip("192.0.2.30")
-                .send()
-                .await
-                .status,
-            404
-        );
+    let missing = format!("/api/internal/shared/{}", "g".repeat(43));
+    for status in [404, 429] {
+        let r = http.get(&missing).ip("192.0.2.30").send().await;
+        assert_eq!(r.status, status, "{}", r.body);
     }
-    until_429(|| {
-        http.get(&format!("/api/internal/shared/{guess}"))
-            .ip("192.0.2.30")
-            .send()
-    })
-    .await;
 
-    // 共享链接的密码尝试：5 次 / 分钟（按 IP 加链接），超限后连正确的密码也 429
+    // 密码端点也消耗共享访问桶。用默认访问配额，才能单独验证密码桶的 5 次 / 分钟。
+    let password_server = start(&env, &pg, &config(&env, &[]), None).await;
+    let http = &password_server.http;
     let locked = user_cmd::issue_link(&pg, &private.key, Some("link password 123"), None)
         .await
         .unwrap();
@@ -3201,7 +3171,7 @@ async fn cookie_attributes_in_https_mode() {
         &env,
         &pg,
         &config(&env, &[("RIVU_BASE_URL", origin)]),
-        loose(),
+        Some(loose()),
     )
     .await;
     let http = &server.http;
@@ -3294,7 +3264,7 @@ async fn cookie_attributes_in_https_mode() {
             &env,
             &[("RIVU_BASE_URL", origin), ("RIVU_COOKIE_SECURE", "off")],
         ),
-        loose(),
+        Some(loose()),
     )
     .await;
     let r = login(&server.http, &user.email, PASSWORD, "203.0.113.1").await;
@@ -3371,7 +3341,7 @@ async fn secrets_never_reach_the_logs_and_metrics_are_recorded() {
         &env,
         &iso.pool,
         &config(&env, &[("RIVU_SETUP_TOKEN", SETUP_TOKEN)]),
-        loose(),
+        Some(loose()),
     )
     .await;
     let http = &server.http;
@@ -3574,7 +3544,7 @@ async fn unknown_accounts_cost_as_much_as_wrong_passwords() {
     };
     migrate_once(&env).await;
     let pg = rivu_storage_pg::connect(&env.pg_url, 4).await.unwrap();
-    let server = start(&env, &pg, &config(&env, &[]), loose()).await;
+    let server = start(&env, &pg, &config(&env, &[]), Some(loose())).await;
     let http = &server.http;
     let org = make_org(&pg).await;
     let user = make_user(&pg, Some((&org, "owner"))).await;
@@ -3700,7 +3670,7 @@ async fn site_admin_create_and_settings() {
     migrate_once(&env).await;
     let pg = rivu_storage_pg::connect(&env.pg_url, 6).await.unwrap();
     let cfg = config(&env, &[]);
-    let server = start(&env, &pg, &cfg, loose()).await;
+    let server = start(&env, &pg, &cfg, Some(loose())).await;
     let http = &server.http;
     let c = cast(&pg, http).await;
     let org_id = c.org.id;
@@ -4339,7 +4309,7 @@ async fn site_admin_shield_and_shared_links() {
     migrate_once(&env).await;
     let pg = rivu_storage_pg::connect(&env.pg_url, 6).await.unwrap();
     let cfg = config(&env, &[("RIVU_SHIELD_MAX_RULES_PER_SITE", "4")]);
-    let server = start(&env, &pg, &cfg, loose()).await;
+    let server = start(&env, &pg, &cfg, Some(loose())).await;
     let http = &server.http;
     let c = cast(&pg, http).await;
     let site = make_site(&pg, &c.org, false).await;
@@ -4778,7 +4748,7 @@ async fn site_admin_delete_site_and_csrf() {
     };
     migrate_once(&env).await;
     let pg = rivu_storage_pg::connect(&env.pg_url, 6).await.unwrap();
-    let server = start(&env, &pg, &config(&env, &[]), loose()).await;
+    let server = start(&env, &pg, &config(&env, &[]), Some(loose())).await;
     let http = &server.http;
     let c = cast(&pg, http).await;
 
@@ -5112,7 +5082,7 @@ async fn goals_crud_permissions_and_goal_queries() {
     };
     migrate_once(&env).await;
     let pg = rivu_storage_pg::connect(&env.pg_url, 6).await.unwrap();
-    let server = start(&env, &pg, &config(&env, &[]), loose()).await;
+    let server = start(&env, &pg, &config(&env, &[]), Some(loose())).await;
     let http = &server.http;
     let c = cast(&pg, http).await;
     let site = make_site(&pg, &c.org, false).await;
