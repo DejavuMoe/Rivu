@@ -14,6 +14,7 @@ use clickhouse::Client;
 use jiff::civil::Date;
 use jiff::tz::TimeZone;
 use jiff::{Timestamp, ToSpan};
+use rivu_storage_pg::{sites, stats_deletions};
 use sqlx::PgPool;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -114,9 +115,15 @@ pub fn action_for(partition: u32, c: &Cutoffs) -> Result<Action> {
     })
 }
 
-const EXPIRED: &str = "fromUnixTimestamp64Milli(transform(site_id, {ids:Array(UInt64)}, {cuts:Array(Int64)}, {dflt:Int64}), 'UTC')";
+const EXPIRED: &str = "fromUnixTimestamp64Milli(transform(site_id, {ids:Array(UInt64)}, {cuts:Array(Int64)}, {dflt:Int64}), 'UTC') AND site_id NOT IN {fenced:Array(UInt64)}";
 
-async fn purge_table(ch: &Client, database: &str, table: Table, c: &Cutoffs) -> Result<(u64, u64)> {
+async fn purge_table(
+    ch: &Client,
+    database: &str,
+    table: Table,
+    c: &Cutoffs,
+    fenced: &[u64],
+) -> Result<(u64, u64)> {
     let parts: Vec<String> = ch
         .query("SELECT DISTINCT partition FROM system.parts WHERE database = ? AND table = ? AND active ORDER BY partition")
         .bind(database)
@@ -133,7 +140,7 @@ async fn purge_table(ch: &Client, database: &str, table: Table, c: &Cutoffs) -> 
         };
         match action_for(partition, c)? {
             Action::Keep => {}
-            Action::Drop => {
+            Action::Drop if fenced.is_empty() => {
                 // 分区值是本模块从系统表读出并解析过的整数
                 ch.query(&format!(
                     "ALTER TABLE {} DROP PARTITION {partition}",
@@ -147,7 +154,7 @@ async fn purge_table(ch: &Client, database: &str, table: Table, c: &Cutoffs) -> 
                 tracing::info!(table = table.name, partition, "过期分区已删除");
                 dropped += 1;
             }
-            Action::Delete => {
+            Action::Drop | Action::Delete => {
                 let col = table.time_column;
                 let exists: Vec<u8> = ch
                     .query(&format!(
@@ -157,6 +164,7 @@ async fn purge_table(ch: &Client, database: &str, table: Table, c: &Cutoffs) -> 
                     .param("ids", &ids)
                     .param("cuts", &cuts)
                     .param("dflt", c.default_ms)
+                    .param("fenced", fenced)
                     .fetch_all()
                     .await
                     .with_context(|| format!("检查 {}:{partition} 的过期行失败", table.name))?;
@@ -170,6 +178,7 @@ async fn purge_table(ch: &Client, database: &str, table: Table, c: &Cutoffs) -> 
                 .param("ids", &ids)
                 .param("cuts", &cuts)
                 .param("dflt", c.default_ms)
+                .param("fenced", fenced)
                 .execute()
                 .await
                 .with_context(|| format!("删除 {}:{partition} 的过期行失败", table.name))?;
@@ -190,15 +199,20 @@ pub async fn run_once(
     database: &str,
     global_days: u32,
 ) -> Result<(u64, u64)> {
-    let sites = rivu_storage_pg::sites::retention_settings(pg).await?;
+    let mut tx = sites::begin_maintenance(pg).await?;
+    stats_deletions::lock_retention(&mut tx, false).await?;
+    let sites = sites::retention_settings(&mut tx).await?;
+    let fenced = stats_deletions::maintenance_fences(&mut tx, None).await?;
     let c = cutoffs(global_days, &sites, Timestamp::now())?;
+    let ch = ch.clone().with_setting("lightweight_deletes_sync", "2");
     let (mut dropped, mut deleted) = (0, 0);
     // events 与 sessions；ingest_counters 有自己的表级 TTL
     for table in TABLES.into_iter().filter(|t| t.name != "ingest_counters") {
-        let (d, l) = purge_table(ch, database, table, &c).await?;
+        let (d, l) = purge_table(&ch, database, table, &c, &fenced).await?;
         dropped += d;
         deleted += l;
     }
+    tx.commit().await?;
     Ok((dropped, deleted))
 }
 

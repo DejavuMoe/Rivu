@@ -2,7 +2,7 @@
 //! `scope='site'` 的意图（`not_before` = 删除时刻 + 恢复窗口），恢复站点时把它置为 `cancelled`；
 //! 按日期范围删除写入 `scope='date_range'` 的意图（`not_before = now()`）。
 //! 执行在 `rivu-jobs` 的 `ch_delete_batch`：领取到期意图（`FOR UPDATE SKIP LOCKED`），逐分区删除并记入
-//! `partitions_done`，崩溃后从断点继续。
+//! `partitions_done`，重试时跳过已提交的进度。
 //!
 //! 日期一律以 `YYYY-MM-DD` 文本进出（站点本地日期；本 crate 不让 sqlx 依赖 jiff）。
 
@@ -12,7 +12,7 @@ use sqlx::{PgPool, Row};
 use crate::sites::SiteOwner;
 
 /// 领取后的租约：`not_before` 推到「现在 + 租约」，别的进程在租约内不会再领取同一条；
-/// 每完成一个分区续一次（[`mark_partition_done`]）。进程崩溃后租约到期，任意进程从断点续跑。
+/// 每完成一个分区续一次（[`mark_partition_done`]）。进程崩溃后租约到期，任意进程从已提交的进度续跑。
 pub const CLAIM_LEASE_SECS: i64 = 3600;
 
 /// 失败多少次后置为 `failed`（不再自动重试）。
@@ -197,6 +197,7 @@ pub struct DateRangeRow {
     pub status: String,
     pub created_at: String,
     pub completed_at: Option<String>,
+    pub timezone_unproven: bool,
 }
 
 /// 日期范围意图的列（`concat!` 里用，保持 `&'static str`）。
@@ -207,7 +208,7 @@ macro_rules! date_range_columns {
             ts_sec!("created_at"),
             " AS created_at, ",
             ts_sec!("completed_at"),
-            " AS completed_at"
+            " AS completed_at, COALESCE(starts_with(last_error, 'stats_deletion_timezone_unproven:'), false) AS timezone_unproven"
         )
     };
 }
@@ -220,31 +221,95 @@ fn date_range_row(r: &sqlx::postgres::PgRow) -> Result<DateRangeRow> {
         status: r.try_get("status")?,
         created_at: r.try_get("created_at")?,
         completed_at: r.try_get("completed_at")?,
+        timezone_unproven: r.try_get("timezone_unproven")?,
     })
 }
 
 /// 写入一条 `scope='date_range'` 的意图（`not_before = now()`，下一轮 `ch_delete_batch` 执行）。
-/// 日期由调用方校验（`from <= to`，PG 的 CHECK 兜底）。
+/// 调用方持站点行锁，校验本地日期并按锁内读取的时区冻结 UTC 半开区间。
 pub async fn create_date_range(
-    pool: &PgPool,
+    db: &mut sqlx::PgConnection,
     site_id: u64,
     from: &str,
     to: &str,
+    timezone: &str,
+    utc: (i64, i64),
     requested_by: Option<i64>,
 ) -> Result<DateRangeRow> {
     let row = sqlx::query(concat!(
-        "INSERT INTO pending_stats_deletions (site_id, scope, date_from, date_to, requested_by)
-         VALUES ($1, 'date_range', $2::date, $3::date, $4) RETURNING ",
+        "INSERT INTO pending_stats_deletions
+            (site_id, scope, date_from, date_to, timezone, utc_start_ms, utc_end_ms, requested_by)
+         VALUES ($1, 'date_range', $2::date, $3::date, $4, $5, $6, $7) RETURNING ",
         date_range_columns!()
     ))
     .bind(id_i64(site_id)?)
     .bind(from)
     .bind(to)
+    .bind(timezone)
+    .bind(utc.0)
+    .bind(utc.1)
     .bind(requested_by)
-    .fetch_one(pool)
+    .fetch_one(db)
     .await
     .context("写入日期范围删除意图失败")?;
     date_range_row(&row)
+}
+
+/// Check under the site row lock. An unfinished intent can still delete input, and
+/// a completed erase near the rebuild range can have removed inputs for adjacent days.
+pub async fn blocks_timezone_change(
+    db: &mut sqlx::PgConnection,
+    site_id: u64,
+    rebuild_since: Option<String>,
+) -> Result<bool> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM pending_stats_deletions
+             WHERE site_id = $1 AND status <> 'cancelled' AND NOT rejected_before_write
+               AND (status <> 'done' OR
+                    ($2::text IS NOT NULL AND (scope = 'site' OR date_to >= $2::text::date)))
+         )",
+    )
+    .bind(id_i64(site_id)?)
+    .bind(rebuild_since)
+    .fetch_one(db)
+    .await
+    .context("检查影响时区变更的统计删除意图失败")
+}
+
+// Retention mutates whole partitions across sites. Serialize its fence snapshot and
+// writes with erase submission, including for sites created after the snapshot.
+pub async fn lock_retention(db: &mut sqlx::PgConnection, erasing: bool) -> Result<()> {
+    let lock = if erasing {
+        "SELECT pg_advisory_xact_lock_shared(hashtext('rivu:retention-stats-delete'))"
+    } else {
+        "SELECT pg_advisory_xact_lock(hashtext('rivu:retention-stats-delete'))"
+    };
+    sqlx::query(lock)
+        .execute(db)
+        .await
+        .context("锁定保留期清理")?;
+    Ok(())
+}
+
+/// A claim is committed before any ClickHouse write. Even an exhausted or
+/// disconnected attempt can have submitted a mutation without a checkpoint.
+pub async fn maintenance_fences(
+    db: &mut sqlx::PgConnection,
+    site_id: Option<u64>,
+) -> Result<Vec<u64>> {
+    let rows: Vec<i64> = sqlx::query_scalar(
+        "SELECT DISTINCT site_id FROM pending_stats_deletions
+         WHERE ($1::bigint IS NULL OR site_id = $1)
+           AND status IN ('running', 'failed') AND NOT rejected_before_write",
+    )
+    .bind(site_id.map(id_i64).transpose()?)
+    .fetch_all(db)
+    .await
+    .context("查询未决统计删除意图失败")?;
+    rows.into_iter()
+        .map(|id| u64::try_from(id).context("site_id 为负数"))
+        .collect()
 }
 
 /// 站点最近的日期范围删除意图，新的在前（最多 `limit` 条）。
@@ -281,8 +346,9 @@ pub struct ClaimedDeletion {
     pub scope: String,
     pub date_from: Option<String>,
     pub date_to: Option<String>,
-    /// 站点当前的时区（站点行永不硬删除；查不到时为空，调用方按 UTC 处理）。
     pub timezone: Option<String>,
+    pub utc_start_ms: Option<i64>,
+    pub utc_end_ms: Option<i64>,
     pub partitions_done: Vec<String>,
     /// 含本次领取。
     pub attempts: i32,
@@ -295,7 +361,7 @@ pub async fn claim_due(pool: &PgPool, limit: i64) -> Result<Vec<ClaimedDeletion>
     let rows = sqlx::query(
         "WITH claimed AS (
              UPDATE pending_stats_deletions p
-                SET status = 'running', attempts = p.attempts + 1,
+                SET status = 'running', attempts = p.attempts + 1, rejected_before_write = false,
                     not_before = now() + make_interval(secs => $2)
               WHERE p.id IN (
                     SELECT id FROM pending_stats_deletions
@@ -303,12 +369,13 @@ pub async fn claim_due(pool: &PgPool, limit: i64) -> Result<Vec<ClaimedDeletion>
                      ORDER BY not_before, id
                      LIMIT $1
                      FOR UPDATE SKIP LOCKED)
-             RETURNING p.id, p.site_id, p.scope, p.date_from, p.date_to, p.partitions_done, p.attempts)
+             RETURNING p.id, p.site_id, p.scope, p.date_from, p.date_to,
+                       p.timezone, p.utc_start_ms, p.utc_end_ms, p.partitions_done, p.attempts)
          SELECT c.id, c.site_id, c.scope,
                 to_char(c.date_from, 'YYYY-MM-DD') AS date_from,
                 to_char(c.date_to, 'YYYY-MM-DD') AS date_to,
-                s.timezone, c.partitions_done, c.attempts
-           FROM claimed c LEFT JOIN sites s ON s.id = c.site_id
+                c.timezone, c.utc_start_ms, c.utc_end_ms, c.partitions_done, c.attempts
+           FROM claimed c
           ORDER BY c.id",
     )
     .bind(limit)
@@ -326,6 +393,8 @@ pub async fn claim_due(pool: &PgPool, limit: i64) -> Result<Vec<ClaimedDeletion>
                 date_from: r.try_get("date_from")?,
                 date_to: r.try_get("date_to")?,
                 timezone: r.try_get("timezone")?,
+                utc_start_ms: r.try_get("utc_start_ms")?,
+                utc_end_ms: r.try_get("utc_end_ms")?,
                 partitions_done: r.try_get("partitions_done")?,
                 attempts: r.try_get("attempts")?,
             })
@@ -333,35 +402,69 @@ pub async fn claim_due(pool: &PgPool, limit: i64) -> Result<Vec<ClaimedDeletion>
         .collect()
 }
 
+/// Lock the active claim after locking the site. Superseded claims must not delete.
+pub async fn lock_claim(db: &mut sqlx::PgConnection, intent: &ClaimedDeletion) -> Result<bool> {
+    let id: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM pending_stats_deletions
+         WHERE id = $1 AND attempts = $2 AND status = 'running' FOR UPDATE",
+    )
+    .bind(intent.id)
+    .bind(intent.attempts)
+    .fetch_optional(db)
+    .await
+    .context("锁定统计数据删除意图失败")?;
+    Ok(id.is_some())
+}
+
 /// 记一个已完成的分区（幂等）并续租约。
-pub async fn mark_partition_done(pool: &PgPool, id: i64, partition: &str) -> Result<()> {
+pub async fn mark_partition_done(
+    db: &mut sqlx::PgConnection,
+    id: i64,
+    partition: &str,
+) -> Result<()> {
     sqlx::query(
         "UPDATE pending_stats_deletions
             SET partitions_done = CASE WHEN $2 = ANY(partitions_done) THEN partitions_done
                                        ELSE array_append(partitions_done, $2) END,
-                not_before = now() + make_interval(secs => $3)
+                not_before = clock_timestamp() + make_interval(secs => $3)
           WHERE id = $1 AND status = 'running'",
     )
     .bind(id)
     .bind(partition)
     .bind(CLAIM_LEASE_SECS as f64)
-    .execute(pool)
+    .execute(db)
     .await
     .context("记录已完成分区失败")?;
     Ok(())
 }
 
 /// 全部分区完成：`done` + `completed_at`。
-pub async fn mark_done(pool: &PgPool, id: i64) -> Result<()> {
+pub async fn mark_done(db: &mut sqlx::PgConnection, id: i64) -> Result<()> {
     sqlx::query(
         "UPDATE pending_stats_deletions
-            SET status = 'done', completed_at = now(), last_error = NULL
+            SET status = 'done', completed_at = clock_timestamp(), last_error = NULL
           WHERE id = $1 AND status = 'running'",
     )
     .bind(id)
-    .execute(pool)
+    .execute(db)
     .await
     .context("标记删除意图完成失败")?;
+    Ok(())
+}
+
+/// Stop retrying ambiguous dates. Prior attempts may already have sent a mutation.
+pub async fn reject_before_delete(db: &mut sqlx::PgConnection, id: i64, error: &str) -> Result<()> {
+    sqlx::query(
+        "UPDATE pending_stats_deletions
+            SET status = 'failed', completed_at = clock_timestamp(), last_error = $2,
+                rejected_before_write = attempts = 1 AND cardinality(partitions_done) = 0
+          WHERE id = $1 AND status = 'running'",
+    )
+    .bind(id)
+    .bind(error)
+    .execute(db)
+    .await
+    .context("记录日期范围无法验证失败")?;
     Ok(())
 }
 
@@ -384,12 +487,13 @@ pub async fn mark_attempt_failed(
                 status = CASE WHEN $3 THEN 'failed' ELSE status END,
                 completed_at = CASE WHEN $3 THEN now() ELSE completed_at END,
                 not_before = CASE WHEN $3 THEN not_before ELSE now() + make_interval(secs => $4) END
-          WHERE id = $1 AND status = 'running'",
+          WHERE id = $1 AND status = 'running' AND attempts = $5",
     )
     .bind(id)
     .bind(&error)
     .bind(failed)
     .bind(backoff_secs as f64)
+    .bind(attempts)
     .execute(pool)
     .await
     .context("记录删除失败失败")?;

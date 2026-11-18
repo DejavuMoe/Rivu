@@ -155,7 +155,7 @@ pub(crate) fn check_tenant_scoped(sql: &str) -> bool {
         return false;
     }
     let mut tables: Vec<&str> = vec!["events", "sessions", "ingest_counters"];
-    tables.extend(Family::ALL.iter().map(|f| f.table()));
+    tables.extend(Family::TABLES);
     for table in tables {
         let needle = format!("FROM {table}");
         let mut rest = sql;
@@ -352,7 +352,10 @@ impl<'a> Builder<'a> {
         // 会话最长 7 天（§4.6、§10 Q7）：区间内活跃的会话开始于区间起点的 7 天之前以内。
         params.push(
             "s_from",
-            ParamValue::Date(utc_date_minus_days(iv.start_ms, 7)),
+            ParamValue::Date(utc_date_minus_days(
+                iv.start_ms,
+                crate::rollup::SESSION_LOOKBACK_DAYS,
+            )),
         );
         params.push("tz", ParamValue::Str(q.tz_name.clone()));
         params.push(
@@ -1275,16 +1278,16 @@ pub(crate) fn rollup_probe_query(
     params.push("from_day", ParamValue::Date(from.to_owned()));
     params.push("to_day", ParamValue::Date(to.to_owned()));
     // 构建任务只看原生行。查询时，未结束的原生日不能覆盖原始数据，导入日仍按导入时的时区归日。
-    let origin = match today {
-        None => " AND origin = 'native'",
+    let (origin, marker_tz) = match today {
+        None => (" AND origin = 'native'", ", argMin(tz, day)"),
         Some(today) => {
             params.push("today", ParamValue::Date(today.to_string()));
-            " AND (origin = 'import' OR day < {today:Date})"
+            (" AND (origin = 'import' OR day < {today:Date})", "")
         }
     };
     let sql = format!(
         "SELECT toString(maxOrNull(day)), countIf(origin = 'native' AND tz != {{tz:String}}), \
-         sumIf(events, day >= {{from_day:Date}} AND day <= {{to_day:Date}}), toString(minOrNull(day)) \
+         sumIf(events, day >= {{from_day:Date}} AND day <= {{to_day:Date}}), toString(minOrNull(day)){marker_tz} \
          FROM rollup_site FINAL WHERE site_id = {{site:UInt64}}{origin}"
     );
     (sql, params)
