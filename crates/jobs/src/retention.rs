@@ -3,7 +3,8 @@
 //! - 每个站点保留最近 N 个本地日（含今天）：N = 站点的 `site_settings.retention_days`，没有设置时取
 //!   `RIVU_RETENTION_DAYS`（默认 731）；站点设置不会超过全局值。截止时刻是站点时区里「今天 − (N − 1)」的 00:00。
 //! - 从首个已验证的本地日到下一未覆盖日，原生标记给出 UTC 半开区间。`events` 按 `ts`、
-//!   `sessions` 按 `started_at` 与策略取交集，会话上界还需减去生产最长会话时长。
+//!   `sessions` 按 `started_at` 与策略取交集，会话上界还需减去生产最长会话时长，
+//!   且物理状态行的最早输入必须已知且不早于已验证区间。
 //! - 仅轻量删除符合站点和时间条件的过期行。软删除、无法锁定或验证的站点保留 raw。`ingest_counters` 有独立 TTL。
 //! - 进程内定时（每 [`INTERVAL`]），`rivu_maintainer` 账号；重复执行没有副作用。
 
@@ -113,8 +114,16 @@ async fn purge_table(
     let (policy_ids, policy_cuts): (Vec<_>, Vec<_>) = policy.sites.iter().copied().unzip();
     let (mut deleted, mut blocked) = (0, 0);
     let ms = format!("toUnixTimestamp64Milli({})", table.time_column);
+    let session_lower = if table.name == "sessions" {
+        format!(
+            " AND first_input_ms != {} AND first_input_ms >= {PROVEN_START}",
+            i64::MIN
+        )
+    } else {
+        String::new()
+    };
     let eligible = format!(
-        "has({{ids:Array(UInt64)}}, site_id) AND {ms} >= {PROVEN_START} AND {ms} < {PROVEN_END}"
+        "has({{ids:Array(UInt64)}}, site_id) AND {ms} >= {PROVEN_START} AND {ms} < {PROVEN_END}{session_lower}"
     );
     let max_cutoff = policy.max();
     for p in parts {
@@ -216,7 +225,7 @@ async fn proven_range(
 /// 一轮清理，返回执行了轻量删除的分区数。
 pub async fn run_once(pg: &PgPool, ch: &Client, database: &str, global_days: u32) -> Result<u64> {
     // 站点设置在清理期间固定，ClickHouse writer 仍可写入。
-    let mut tx = pg.begin().await?;
+    let mut tx = rivu_storage_pg::sites::begin_maintenance(pg).await?;
     let sites = rivu_storage_pg::sites::lock_retention_sites(&mut tx).await?;
     let now = Timestamp::now();
     let settings = sites
