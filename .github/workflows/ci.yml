@@ -171,7 +171,7 @@ jobs:
       - name: 单元测试（node:test）
         run: node --test "test/unit/*.test.ts"
       - name: 安装 Playwright 浏览器（chromium firefox webkit）
-        run: pnpm exec playwright install --with-deps chromium firefox webkit
+        run: bash ../../.github/scripts/install-playwright.sh
       - name: 浏览器测试（chromium / firefox / webkit）
         run: pnpm exec playwright test
       - name: 类型检查
@@ -264,7 +264,7 @@ jobs:
         run: |
           cd apps/tracker
           pnpm install --frozen-lockfile
-          pnpm exec playwright install --with-deps chromium firefox webkit
+          bash ../../.github/scripts/install-playwright.sh
       - name: 真实浏览器端到端
         run: RIVU_E2E_SKIP_INSTALL=1 bash apps/tracker/scripts/e2e-rivu.sh
       - name: 保存实服务 Playwright 报告
