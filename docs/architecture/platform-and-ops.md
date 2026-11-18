@@ -402,7 +402,7 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 | `RIVU_INGEST_RATE_LIMIT_PER_MIN` | `300000`（范围 0–100000000） | 站点没有自己的 `ingest_rate_limit_per_min` 时的每站每分钟事件数，300000 即 5000/s 的系统峰值目标（`system-design.md` §7）；`0` 表示不限流；站点设置优先（`system-design.md` §4.2） |
 | `RIVU_QUERY_TIMEOUT_SECS`、`RIVU_API_QUERY_TIMEOUT_SECS`、`RIVU_PUBLIC_QUERY_TIMEOUT_SECS` | `10`、`20`、`5` | 看板、公开 API、公开看板与共享链接各一档（取值 1–300）；须不大于 reader 配额上限（第 8 节） |
 | `RIVU_SHIELD_MAX_RULES_PER_SITE` | `500`（范围 1–100000） | 每站屏蔽规则上限，添加时在事务内锁站点行后计数（§3.3） |
-| `RIVU_REGISTRATION`、`RIVU_SETUP_TOKEN` | `invite_only`；可选 | 注册策略；首次 `/setup` 令牌 |
+| `RIVU_REGISTRATION`、`RIVU_SETUP_TOKEN` | `invite_only`；直接启动可选，生产 Compose 必填 | 注册策略；首次 `/setup` 令牌（至少 16 个字符） |
 | `RIVU_VISITOR_PEPPER` | `serve` 必填（至少 32 个字符） | 访客密钥，与每天的盐派生 `visitor_hash` 的 key，不进数据库（`system-design.md` §4.5、`docs/privacy.md`）；不要和 PG 备份放在一起 |
 | `RIVU_LOG_FORMAT`、`RIVU_LOG_LEVEL` | `json`、`info` | `json` \| `pretty` |
 | `RIVU_METRICS` | `on` | 内部口 `/metrics` 开关（Plausible 默认关，04§0#6） |
@@ -437,11 +437,11 @@ PG 与 ClickHouse 迁移共用一个版本序列（14 位时间戳），分别�
 | 乱序 | 待执行版本小于任一已应用版本时默认报错；分支合并造成的乱序需 `--allow-out-of-order` |
 | 并发 | 持 `pg_advisory_lock('rivu:migrate')`，两个 `migrate` 不会同时跑 |
 | 原子性 | PG 迁移与记录同一事务；ClickHouse 无事务，**每个 CH 迁移必须幂等**（`IF NOT EXISTS`、可重复 `ALTER`），崩溃于「应用后、记录前」时重跑安全；CH 文件按行尾的 `;` 拆成多条语句逐条执行 |
-| 只前进 | 无 down 迁移；回滚靠 expand/contract 或恢复备份（Plausible 有 `rollback.sh`，04§7.2；跨库 down 无法保证一致，故不提供） |
+| 只前进 | 跨迁移版本回退需恢复与目标版本匹配的 PG 和 ClickHouse 备份 |
 | 启动时机 | 不自动迁移，由 compose 一次性服务执行（04§0#7）；其他进程比对 `schema_migrations` 最高版本与自身 `REQUIRED_SCHEMA_VERSION`，不足则 `/readyz` 失败并给出原因 |
-| 命令 | `rivu migrate`；`rivu migrate status`（对应 04§7.2 `pending-migrations.sh`）；`rivu migrate --plan`（仅打印）。`migrate` 先 `CREATE DATABASE IF NOT EXISTS`（CH），PG 库由容器环境变量创建（对应 `createdb.sh`） |
+| 命令 | `rivu migrate` 应用迁移，`rivu migrate status` 列出状态。`migrate` 先 `CREATE DATABASE IF NOT EXISTS`（CH），PG 库由容器环境变量创建（对应 `createdb.sh`） |
 
-**滚动升级兼容（expand/contract）**：版本 N 的迁移必须兼容 N−1 的二进制：先加列/表，下个发布才删旧列/表，同一次发布不得同时删除与改写。这样滚动重启期间新旧二进制可共存，expand 阶段的代码回滚是安全的。
+**升级兼容（expand/contract）**：版本 N 的迁移必须兼容仍在运行的 N−1 二进制：先加列/表，下个发布才删旧列/表，同一次发布不得同时删除与改写。Compose 启动时仍会执行 `migrate`，旧版本的迁移器会拒绝它不认识的迁移记录。
 
 **CI 校验 schema 快照**（修正 Plausible `structure.sql` 停在 2024-09、迁移已到 2026-10 且 CE/EE 分叉的问题，04§0#1、04§1.1、04§9.6）：
 1. CI 拉起与生产同版本的 PG 与 ClickHouse，执行 `rivu migrate`（测试 `bin/rivu/tests/schema_snapshot.rs` 先执行迁移）。
@@ -505,11 +505,11 @@ Plausible 自定义指标覆盖缓存命中、ingest buffer 入队与丢弃、�
 ### 11.3 版本升级流程
 | 步骤 | 动作 | 失败时 |
 |---|---|---|
-| 0 | 阅读发布说明；`rivu migrate --plan` 预览；确认是否含 contract（破坏性）迁移 | 含 contract 迁移则必须先备份并通知维护窗口 |
+| 0 | 阅读发布说明，确认是否含 contract（破坏性）迁移 | 含 contract 迁移时安排维护窗口 |
 | 1 | **备份**：`deploy/backup.sh`，确认成功并记录备份目录 | 备份失败则中止 |
 | 2 | `docker compose pull` | — |
 | 3 | **migrate**：`docker compose run --rm migrate`；其他服务依赖它 `service_completed_successfully` | 失败则停止，旧版本继续运行（迁移兼容旧二进制） |
-| 4 | **重启**：`docker compose up -d`（`rivu` 重启期间代理按 `lb_try_duration` / `proxy_next_upstream` 排队，通常无丢失） | 回滚镜像 tag 重启，仅在只做了 expand 迁移时安全；否则按 11.2 恢复 |
+| 4 | **重启**：`docker compose up -d`（`rivu` 重启期间代理按 `lb_try_duration` / `proxy_next_upstream` 重试） | 跨迁移版本回退按 [安装说明](../install.md#升级) 恢复匹配的备份 |
 | 5 | **验证**：`rivu_build_info`、`schema_version`；`accepted` 速率恢复、`dropped` 无异常 | — |
 
 ## 12. 对 Plausible 的取舍
