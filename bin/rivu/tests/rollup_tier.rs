@@ -30,6 +30,7 @@ use rivu_query::plan::Tier;
 use rivu_query::result::{MetricValue, QueryResult};
 use rivu_query::rollup;
 use rivu_query::{ExecOptions, QuerySpec, SiteContext, TenantScope, execute};
+use rivu_storage_ch::rows::{EventRow, insert_events};
 use rivu_storage_pg::sites::NewSite;
 use rivu_ua::UaParser;
 use rivu_writer::{BatchWriter, ChSink, WriterOptions};
@@ -606,6 +607,10 @@ async fn rollup_tier_matches_the_raw_tier() {
     let keep = json!({"metrics": ["visitors", "visits", "pageviews", "bounce_rate"], "date_range": ["2026-06-01", "2026-06-21"], "dimensions": ["time:day", "visit:device"]});
     let page_filter = json!({"metrics": ["visitors"], "date_range": ["2026-06-01", "2026-06-21"], "filters": [["is", "event:page", ["/docs"]]]});
     let before = run(&reader, &site, &keep, now, false).await;
+    let all = json!({"metrics": ["pageviews"], "date_range": "all"});
+    let before_all = run(&reader, &site, &all, now, false).await;
+    let pageviews = |r: &QueryResult| r.results[0].metrics[0].as_f64();
+    assert!(pageviews(&before_all) > 0.0);
     rivu_storage_pg::sites::update_site(
         &pg,
         created.id,
@@ -645,6 +650,21 @@ async fn rollup_tier_matches_the_raw_tier() {
     if let Some(m) = diff(&got, &before) {
         panic!("保留期之外由汇总层回答的结果与删除前的原始层不一致：{m}");
     }
+    let covered = json!({"metrics": ["pageviews"], "date_range": ["2026-05-28", "2026-07-01"]});
+    let explicit = run(&reader, &kept, &covered, now, true).await;
+    assert_eq!(explicit.meta.tiers, vec![Tier::Rollup]);
+    assert_eq!(pageviews(&explicit), pageviews(&before_all));
+    let after_all = run(&reader, &kept, &all, now, true).await;
+    assert_eq!(
+        pageviews(&after_all),
+        pageviews(&explicit),
+        "清理后 all 丢掉了旧汇总的浏览量"
+    );
+    assert!(after_all.meta.tiers.contains(&Tier::Rollup));
+    assert_eq!(
+        after_all.query.resolved_date_range.start,
+        "2026-05-28T00:00:00+08:00"
+    );
     // 不兼容的查询：那些天没有数据，带警告
     let got = run(&reader, &kept, &page_filter, now, true).await;
     assert!(
@@ -655,6 +675,75 @@ async fn rollup_tier_matches_the_raw_tier() {
         "{:?}",
         got.meta.warnings
     );
+
+    // 上海的今天刚开始时，UTC 仍是前一天。
+    let ts = time::OffsetDateTime::from_unix_timestamp(at(&tz, date(2026, 7, 10), 0, 30, 0) / 1000)
+        .unwrap();
+    insert_events(
+        &admin,
+        &[EventRow {
+            site_id: created.id,
+            ts,
+            session_start: ts,
+            name: "pageview".into(),
+            ..EventRow::default()
+        }],
+        "rollup-tier-today",
+        false,
+    )
+    .await
+    .unwrap();
+    let mixed_all = run(&reader, &kept, &all, now, true).await;
+    assert_eq!(mixed_all.meta.tiers, vec![Tier::Raw, Tier::Rollup]);
+    assert_eq!(pageviews(&mixed_all), pageviews(&before_all) + 1.0);
+    assert_eq!(
+        mixed_all.query.resolved_date_range.start,
+        after_all.query.resolved_date_range.start
+    );
+    let auto = json!({"metrics": ["pageviews"], "date_range": "all", "dimensions": ["time"]});
+    let auto = run(&reader, &kept, &auto, now, true).await;
+    assert_eq!(auto.query.dimensions, ["time:week"]);
+    assert_eq!(
+        auto.results
+            .iter()
+            .map(|r| r.metrics[0].as_f64())
+            .sum::<f64>(),
+        pageviews(&mixed_all)
+    );
+    let raw_all = run(&reader, &kept, &all, now, false).await;
+    assert_eq!(pageviews(&raw_all), 1.0);
+    assert_eq!(
+        raw_all.query.resolved_date_range.start,
+        "2026-07-10T00:00:00+08:00"
+    );
+    let mut filtered_all = page_filter.clone();
+    filtered_all["date_range"] = json!("all");
+    let filtered_all = run(&reader, &kept, &filtered_all, now, true).await;
+    assert_eq!(filtered_all.meta.tiers, vec![Tier::Raw]);
+    assert_eq!(
+        filtered_all.query.resolved_date_range.start,
+        raw_all.query.resolved_date_range.start
+    );
+
+    // 起点只看当前时区的原生汇总，选层仍按已有的时区失配规则回退。
+    let another_tz = SiteContext::new(created.id, TimeZone::UTC);
+    rollup::build_day(&maintainer, &scope, &another_tz, date(2026, 5, 27), 1, now)
+        .await
+        .unwrap();
+    let stale = run(&reader, &kept, &all, now, true).await;
+    assert_eq!(
+        stale.query.resolved_date_range.start,
+        after_all.query.resolved_date_range.start
+    );
+    assert_eq!(stale.meta.tiers, vec![Tier::Raw]);
+    assert!(
+        stale
+            .meta
+            .warnings
+            .iter()
+            .any(|w| w.code == "range_beyond_raw_retention")
+    );
+
     // ---- 删除汇总行之后回到原始层 ---------------------------------------------------------------
     rollup::delete(
         &maintainer,
