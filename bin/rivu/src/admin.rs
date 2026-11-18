@@ -188,16 +188,9 @@ pub async fn import(config: &Config, action: ImportAction) -> Result<ExitCode> {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "export.zip".to_owned());
             let zip = std::fs::read(&file).with_context(|| format!("打不开 {}", file.display()))?;
-            let (id, s) = rivu_jobs::import_plausible::import_file(
-                &pool,
-                &ch,
-                site.id,
-                &site.timezone,
-                zip,
-                &name,
-                None,
-            )
-            .await?;
+            let (id, s) =
+                rivu_jobs::import_plausible::import_file(&pool, &ch, site.id, zip, &name, None)
+                    .await?;
             println!("import_id: {id}");
             println!("dates: {} – {}", s.start, s.end);
             println!("rows: {}", s.rows);

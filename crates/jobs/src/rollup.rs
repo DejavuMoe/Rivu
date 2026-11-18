@@ -17,7 +17,7 @@ use jiff::{Timestamp, ToSpan};
 use rivu_common::config::MIN_RETENTION_DAYS;
 use rivu_query::rollup::{self, BuildState};
 use rivu_query::{SiteContext, TenantScope};
-use rivu_storage_pg::{sites, stats_deletions};
+use rivu_storage_pg::{imports, sites, stats_deletions};
 use sqlx::{PgConnection, PgPool};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -61,18 +61,19 @@ pub fn days_to_build(state: &BuildState, last: Date) -> Vec<Date> {
 }
 
 pub const TIMEZONE_REBUILD_UNPROVEN: &str = "timezone_rebuild_unproven";
+pub const TIMEZONE_IMPORT_CONFLICT: &str = "timezone_import_conflict";
 
 /// Called under the site row lock before changing its timezone in PostgreSQL.
-pub async fn can_change_timezone(
+pub async fn timezone_change_conflict(
     db: &mut PgConnection,
     ch: &Client,
     site_id: u64,
     current: &str,
     next: &str,
     now: Timestamp,
-) -> Result<bool> {
+) -> Result<Option<&'static str>> {
     let Ok(old_tz) = TimeZone::get(current) else {
-        return Ok(false);
+        return Ok(Some(TIMEZONE_REBUILD_UNPROVEN));
     };
     let new_tz = TimeZone::get(next).context("新站点时区无效")?;
     let scope = TenantScope::new(site_id);
@@ -81,19 +82,19 @@ pub async fn can_change_timezone(
         .map_err(|e| anyhow::anyhow!("读取构建进度失败：{e}"))?;
     // An earlier rebuild may have deleted some families and left its marker for retry.
     if state.tz_changed {
-        return Ok(false);
+        return Ok(Some(TIMEZONE_REBUILD_UNPROVEN));
     }
-    can_rebuild(db, ch, &scope, &new_tz, now, &state).await
+    rebuild_conflict(db, ch, &scope, &new_tz, now, &state).await
 }
 
-async fn can_rebuild(
+async fn rebuild_conflict(
     db: &mut PgConnection,
     ch: &Client,
     scope: &TenantScope,
     tz: &TimeZone,
     now: Timestamp,
     state: &BuildState,
-) -> Result<bool> {
+) -> Result<Option<&'static str>> {
     let first = rollup::first_native_day(ch, scope)
         .await
         .map_err(|e| anyhow::anyhow!("读取原生汇总边界失败：{e}"))?;
@@ -102,18 +103,18 @@ async fn can_rebuild(
         let (Some((marker_day, marker_tz)), Some(raw), Some(raw_ms)) =
             (&state.first_marker, state.first_day, state.first_event_ms)
         else {
-            return Ok(false);
+            return Ok(Some(TIMEZONE_REBUILD_UNPROVEN));
         };
         if *marker_day != first {
-            return Ok(false);
+            return Ok(Some(TIMEZONE_REBUILD_UNPROVEN));
         }
         let Ok(old_tz) = TimeZone::get(marker_tz) else {
-            return Ok(false);
+            return Ok(Some(TIMEZONE_REBUILD_UNPROVEN));
         };
         let (_, old_end) = rivu_query::resolve::local_dates_utc_ms(&old_tz, first, first)
             .map_err(|e| anyhow::anyhow!("换算旧汇总日期失败：{e}"))?;
         if raw_ms >= old_end {
-            return Ok(false);
+            return Ok(Some(TIMEZONE_REBUILD_UNPROVEN));
         }
 
         // Family rows have no timezone. Bound every IANA offset (including transitions).
@@ -134,7 +135,7 @@ async fn can_rebuild(
         let retained = Duration::from_secs(u64::from(MIN_RETENTION_DAYS - 2) * 86_400);
         let latest_cutoff = now.checked_sub(retained)?.checked_add(OFFSET * 2)?;
         if session_day.to_zoned(TimeZone::UTC)?.timestamp() < latest_cutoff {
-            return Ok(false);
+            return Ok(Some(TIMEZONE_REBUILD_UNPROVEN));
         }
         // Rebuild starts at the first raw event. Allow for its session scan and the
         // timezone in which any earlier explicit erase was requested.
@@ -146,13 +147,33 @@ async fn can_rebuild(
     } else {
         None
     };
-    Ok(!stats_deletions::blocks_timezone_change(db, scope.site_id(), rebuild_since).await?)
+    if stats_deletions::blocks_timezone_change(db, scope.site_id(), rebuild_since).await? {
+        return Ok(Some(TIMEZONE_REBUILD_UNPROVEN));
+    }
+    // The rebuild starts at the first raw event in the target timezone.
+    if import_blocks_build(db, scope.site_id(), tz, state.first_event_ms).await? {
+        return Ok(Some(TIMEZONE_IMPORT_CONFLICT));
+    }
+    Ok(None)
+}
+
+async fn import_blocks_build(
+    db: &mut PgConnection,
+    site_id: u64,
+    tz: &TimeZone,
+    first_event_ms: Option<i64>,
+) -> Result<bool> {
+    let native_from = first_event_ms
+        .map(Timestamp::from_millisecond)
+        .transpose()?
+        .map(|ts| ts.to_zoned(tz.clone()).date().to_string());
+    imports::blocks_timezone_change(db, site_id, native_from).await
 }
 
 /// 构建一个站点，返回这一轮构建的天数。
 pub async fn build_site(pg: &PgPool, ch: &Client, site_id: u64) -> Result<usize> {
-    let mut tx = pg.begin().await?;
-    let Some(tz_name) = sites::lock_timezone(&mut tx, site_id).await? else {
+    let mut tx = sites::begin_maintenance(pg).await?;
+    let Some(tz_name) = sites::lock_timezone(&mut tx, site_id, false).await? else {
         return Ok(0);
     };
     let now = Timestamp::now();
@@ -162,8 +183,8 @@ pub async fn build_site(pg: &PgPool, ch: &Client, site_id: u64) -> Result<usize>
         .await
         .map_err(|e| anyhow::anyhow!("读取构建进度失败：{e}"))?;
     if state.tz_changed {
-        if !can_rebuild(&mut tx, ch, &scope, &tz, now, &state).await? {
-            anyhow::bail!("{TIMEZONE_REBUILD_UNPROVEN}: 无法证明原始层覆盖旧时区汇总");
+        if let Some(code) = rebuild_conflict(&mut tx, ch, &scope, &tz, now, &state).await? {
+            anyhow::bail!("{code}: 无法安全重建旧时区汇总");
         }
         rollup::delete(ch, &scope, None, true)
             .await
@@ -171,6 +192,13 @@ pub async fn build_site(pg: &PgPool, ch: &Client, site_id: u64) -> Result<usize>
         tracing::info!(site_id, timezone = tz_name, "站点时区已变更，汇总层重建");
     }
     let days = days_to_build(&state, last_buildable(&tz, now)?);
+    if !state.tz_changed
+        && state.built_to.is_none()
+        && !days.is_empty()
+        && import_blocks_build(&mut tx, site_id, &tz, state.first_event_ms).await?
+    {
+        anyhow::bail!("{TIMEZONE_IMPORT_CONFLICT}: 导入与首次原生汇总冲突");
+    }
     let site = SiteContext::new(site_id, tz);
     let version = u64::try_from(now.as_millisecond()).unwrap_or(0);
     for day in &days {

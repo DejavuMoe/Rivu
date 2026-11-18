@@ -112,9 +112,6 @@ async fn create_import(
         .authorize_admin(&headers, &site, Action::SiteSettingsWrite, true)
         .await?;
     let ch = maintainer(&api)?.clone();
-    let view = sites::admin_view(&api.pg, c.site.id)
-        .await?
-        .ok_or(DashError::NotFound)?;
     let zip = query_api::read_body(req, IMPORT_BODY_MAX)
         .await
         .map_err(|f| DashError::Fail(f, 0))?;
@@ -124,8 +121,12 @@ async fn create_import(
         ));
     }
     let file_name = clean_file_name(file_name.as_deref());
+    let mut tx = api.pg.begin().await.map_err(anyhow::Error::from)?;
+    let timezone = sites::lock_timezone(&mut tx, c.site.id, false)
+        .await?
+        .ok_or(DashError::NotFound)?;
     let Some(id) = imports::create(
-        &api.pg,
+        &mut tx,
         c.site.id,
         "plausible_csv",
         &file_name,
@@ -138,6 +139,7 @@ async fn create_import(
             "another import for this site is still running".into(),
         ));
     };
+    tx.commit().await.map_err(anyhow::Error::from)?;
     tracing::info!(
         user_id = c.session.s.user_id,
         site_id = c.site.id,
@@ -147,15 +149,9 @@ async fn create_import(
     );
     let (pg, cache, site_id) = (api.pg.clone(), api.cache.clone(), c.site.id);
     tokio::spawn(async move {
-        let res = rivu_jobs::import_plausible::execute(
-            &pg,
-            &ch,
-            id,
-            site_id,
-            &view.timezone,
-            zip.to_vec(),
-        )
-        .await;
+        let res =
+            rivu_jobs::import_plausible::execute(&pg, &ch, id, site_id, &timezone, zip.to_vec())
+                .await;
         if res.is_ok()
             && let Some(cache) = cache
         {
