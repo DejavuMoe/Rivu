@@ -344,7 +344,7 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 | `auth_sessions_cleanup` | cron | 每小时 | 删除过期/撤销行，可重复 |
 | `invitations_expire` | cron | 每日 | 删除过期邀请（04§3.2 `CleanInvitations`） |
 | `ch_delete_batch` | 进程启动 + 定时；日期范围删除请求写入后立即唤醒 | 每 `RIVU_STATS_DELETE_INTERVAL_SECS`（默认 5 分钟） | 进程内定时器（`crates/jobs/src/stats_delete.rs`），不经任务队列。领取 `pending_stats_deletions`（`status IN ('pending','running') AND not_before <= now()`，`FOR UPDATE SKIP LOCKED`），置 `running`、`attempts+1`，并把 `not_before` 推后 1 小时作为租约（每完成一个分区续租），多进程不会同时处理同一条，崩溃后租约到期由任意进程续跑。用 `rivu_maintainer` 账号对 `events`、`sessions`、`ingest_counters` 逐分区执行 `DELETE FROM t IN PARTITION p WHERE site_id = … [AND 时间条件]`：`scope='site'` 删除该站点全部分区（分区按 `site_id` 现查）；`scope='date_range'` 的日期是站点本地日期，按站点当前时区换算成 UTC 半开区间（与查询引擎的整日区间同一套换算），`events` 按 `ts`、`ingest_counters` 按 `minute`，`sessions` 删除**开始时间**落在区间内的会话（跨边界的会话按开始时间归属）；`rollup_*` 按站点（与本地日）一并删除。完成的分区记入 `partitions_done`（`表:YYYYMM`），续跑时跳过；重复删除无副作用。全部完成置 `done` + `completed_at`；失败记 `last_error`，保持 `running` 并退避（5 分钟起翻倍、上限 6 小时），第 8 次失败置 `failed`。指标 `rivu_stats_deletions_total{scope,result}`、`rivu_stats_delete_partitions_total{table}`。Plausible 为每周批处理（04§3.2 `ClickhouseCleanSites`），Rivu 缩短周期以满足删除请求时效 |
-| `retention_purge` | 进程启动 + 定时 | 每小时 | 进程内定时器（`crates/jobs/src/retention.rs`），`rivu_maintainer` 账号。每个站点的截止时刻是站点时区里「今天 − (N − 1)」的 00:00（N = 站点 `retention_days` 或 `RIVU_RETENTION_DAYS`，取小）；PG 里已没有的站点按全局保留期、UTC 再提前一天。`events`、`sessions` 的每个月分区：整月早于所有截止时刻 → `ALTER TABLE … DROP PARTITION`；与截止时刻交叠 → 先查是否有过期行，有才执行 `DELETE FROM t IN PARTITION p WHERE 时间列 < transform(site_id, 站点, 截止, 默认)`；重复执行无副作用。指标 `rivu_retention_partitions_total{table,action}` |
+| `retention_purge` | 进程启动 + 定时 | 每小时 | 每个站点的目标截止时刻是站点时区里「今天 − (N − 1)」的 00:00（N = 站点 `retention_days` 或 `RIVU_RETENTION_DAYS`，取小）。清理前校验当前时区的逐日原生汇总标记与会话最后活动日。分区中的行全部通过检查且整月过期时整分区删除，否则仅轻量删除符合条件的行。指标 `rivu_retention_partitions_total{table,action}` 和 `rivu_retention_blocked_rows{table}`。详见下文。 |
 | `rollup_build` | 进程启动 + 定时 | 每 `RIVU_ROLLUP_INTERVAL_SECS`（默认 10 分钟） | 进程内定时器（`crates/jobs/src/rollup.rs`），`rivu_maintainer` 账号。每个站点从已构建的最后一天 + 1（首次：最早事件那天）建到结束超过 2 小时的最后一个本地日，一轮每站点至多 92 天；每天按族写入、`rollup_site` 最后写（「已构建」标记）。重复构建同一天幂等（`ReplacingMergeTree(version)`），多进程同时运行安全。站点改时区时先删除它全部原生汇总行再重建。今天不进汇总层，由原始层回答（`system-design.md` §5.5、§6.4）。指标 `rivu_rollup_days_built_total`、`rivu_rollup_failures_total` |
 | `site_delete_schedule` | 无 | — | 不需要单独的任务：删除站点的同一事务里直接插入 `scope='site'` 意图，`not_before = 删除时刻 + RIVU_SITE_RESTORE_DAYS`，到期由 `ch_delete_batch` 领取；恢复站点把意图置为 `cancelled`。部分唯一索引保证一个站点只有一条未取消的站点意图 |
 | `geoip_refresh` | 进程启动（无本地副本时立即执行）+ 定时 | 每 `RIVU_GEOIP_REFRESH_INTERVAL`（默认 24h；`0` 表示不定期刷新）。有本地副本时，第一次检查在 meta 最近检查时间加一个周期（带抖动），已过期则立即 | 来源按优先级选择：`RIVU_GEOIP_DB_URL` > `RIVU_MAXMIND_LICENSE_KEY` > DB-IP Lite（默认），所以默认配置下也会运行。条件 GET（ETag / Last-Modified）；服务器没有校验头就整文件下载，按解压后 mmdb 的 SHA-256 判断是否替换；临时文件校验后原子 rename；失败保留上一份有效副本并退避重试。没有 meta 的文件：默认来源不刷新，配置了 URL 或 key 则立即下载（`system-design.md` §10 Q28）。进程内定时器（同 `salts_rotate`），不经任务队列；临时文件校验后原子替换，下载成功后直接热加载，另外每小时检查 mtime（手工替换文件时生效，§10 Q25）。细节见 `system-design.md` §4.4（04§4.2 `MAXMIND_*`；Plausible 在构建时下载库） |
@@ -355,6 +355,10 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 | `jobs_reaper`、`jobs_prune` | cron | 每分钟 / 每日 | 租约回收；清理历史 |
 | `email_report`（第 4 阶段） | cron 调度 + 逐站入队 | 每小时调度 | `unique_key = report:{site}:{period}`，`max_attempts = 1`（04§3.2 `ScheduleEmailReports`/`SendEmailReport`） |
 | `spike_notify`（第 4 阶段） | cron | 每 15 分钟 | 以站点最近发送时间去重（04§3.2 `TrafficChangeNotifier`，用途为推断） |
+
+`retention_purge` 通过 PG 站点行锁固定设置，逐站读取过期 raw 的范围和原生 `rollup_site` 标记，再检查候选 ClickHouse 分区。扫描增加数据库读取量，清理期间对已锁站点的设置更新可能等待。软删除站点、正在擦除或擦除失败的站点、缺少站点元数据的行和未获锁的站点跳过自动清理。未知 ID 仍以全局保留期的 UTC 截止再提前一天估算逾期。显式擦除按自身意图与恢复期限执行。
+
+标记不足时，任务保留受阻的 raw，日志记录缺失日和积压，`rivu_retention_blocked_rows{table}` 计最近一轮检查发现的过期受阻物理行。任务可用 `build_day` 每轮补一个已结束至少两小时的缺标记日，前提是尚存的 raw 能覆盖事件及七天 UTC 会话回看窗口，且该窗口无已执行的日期擦除。旧版按时间前缀清理留下的边界、无输入证据的缺口和持续故障可能让积压长期存在。补建只能使用仍保有的输入，并受日汇总既有的迟到写入近似限制。
 
 ## 7. 配置
 规则：
@@ -378,7 +382,7 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 | `RIVU_BUFFER_CHANNEL_CAPACITY` | `200000` | 有界 channel，满则 503 背压；不得小于 `RIVU_BUFFER_MAX_ROWS` |
 | `RIVU_CH_INGEST_POOL_SIZE` | `5` | 写入连接数（04§4.2 `CLICKHOUSE_INGEST_POOL_SIZE`） |
 | `RIVU_VISIT_SESSION_TIMEOUT` | `30m` | 访问会话超时（区别于登录会话）。会话最长 7 天，固定不可配置：查询回溯 7 天依赖它（`system-design.md` §4.6、§6.5） |
-| `RIVU_RETENTION_DAYS` | `731`；`30`–`36500` | 原始数据（`events`、`sessions`）保留的本地日数上限（默认连续两个自然年，含一个闰年），站点可以在 30 天到这个值之间调小；`retention_purge` 每小时删除过期数据，日汇总层不受影响。日均千万级事件的部署建议调低（`system-design.md` §5.6、§7） |
+| `RIVU_RETENTION_DAYS` | `731`；`30`–`36500` | 原始数据（`events`、`sessions`）的目标保留本地日数（默认连续两个自然年，含一个闰年），站点可以在 30 天到这个值之间调小。`retention_purge` 每小时清理已有安全汇总覆盖的过期数据，覆盖不足时可超期保留。日均千万级事件的部署建议调低（`system-design.md` §5.6、§7） |
 | `RIVU_SITE_RESTORE_DAYS` | `7`；`0`–`365` | 站点删除后的恢复窗口（天）：删除时写入的站点删除意图 `not_before = 删除时刻 + 该值`，窗口内可恢复，过后 `ch_delete_batch` 清除统计数据；`0` 表示下一轮就清除 |
 | `RIVU_STATS_DELETE_INTERVAL_SECS` | `300`；`10`–`86400` | `ch_delete_batch` 检查到期删除意图的周期 |
 | `RIVU_ROLLUP_INTERVAL_SECS` | `600`；`60`–`86400` | `rollup_build`（日汇总层构建）的周期 |
