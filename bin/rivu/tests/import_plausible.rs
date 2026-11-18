@@ -472,7 +472,7 @@ async fn plausible_import_keeps_today_on_the_raw_tier() {
     let now = Timestamp::now();
     let utc = now.to_zoned(TimeZone::UTC);
     // 让站点本地日期与 UTC 不同，并留出至少一小时避免运行中跨午夜。
-    let tz_name = if utc.hour() < 12 {
+    let tz_name = if utc.hour() < 11 {
         "Etc/GMT+12"
     } else {
         "Etc/GMT-14"
