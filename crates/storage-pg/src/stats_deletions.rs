@@ -277,21 +277,6 @@ pub async fn blocks_timezone_change(
     .context("检查影响时区变更的统计删除意图失败")
 }
 
-// Retention mutates whole partitions across sites. Serialize its fence snapshot and
-// writes with erase submission, including for sites created after the snapshot.
-pub async fn lock_retention(db: &mut sqlx::PgConnection, erasing: bool) -> Result<()> {
-    let lock = if erasing {
-        "SELECT pg_advisory_xact_lock_shared(hashtext('rivu:retention-stats-delete'))"
-    } else {
-        "SELECT pg_advisory_xact_lock(hashtext('rivu:retention-stats-delete'))"
-    };
-    sqlx::query(lock)
-        .execute(db)
-        .await
-        .context("锁定保留期清理")?;
-    Ok(())
-}
-
 /// A claim is committed before any ClickHouse write. Even an exhausted or
 /// disconnected attempt can have submitted a mutation without a checkpoint.
 pub async fn maintenance_fences(
