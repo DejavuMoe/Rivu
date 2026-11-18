@@ -14,7 +14,7 @@
 //! | `imported_custom_events` | `rollup_events` | 按事件名相加，跳过 `engagement` |
 //! | `imported_custom_props` | `rollup_props` | |
 //!
-//! 时长从秒换成毫秒。只写站点自己的数据开始之前的天（同一天两边都有会重复计数）；与已完成的导入重叠时拒绝。
+//! 时长从秒换成毫秒。只写早于站点本地今天和首个原生日的完整历史日；与已完成的导入重叠时拒绝。
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -22,6 +22,7 @@ use std::io::{Cursor, Read};
 
 use anyhow::{Context, Result};
 use clickhouse::Client;
+use jiff::Timestamp;
 use jiff::civil::Date;
 use jiff::tz::TimeZone;
 use rivu_query::TenantScope;
@@ -35,7 +36,7 @@ pub struct Summary {
     pub end: Date,
     /// 写入的汇总行数（各表合计）。
     pub rows: u64,
-    /// 因为站点自己的数据已经开始而跳过的天（`None`：没有跳过）。
+    /// 日期截断的排他上界（`None`：没有 CSV 行因此跳过）。
     pub clipped_from: Option<Date>,
 }
 
@@ -242,7 +243,7 @@ fn put(agg: &mut Agg, day: Date, dims: Vec<String>, m: Measures) {
 /// 把 CSV 换成各表的行。`keep(day)` 决定这一天要不要。
 fn transform(
     files: &BTreeMap<String, Csv>,
-    keep: &dyn Fn(Date) -> bool,
+    keep: &mut dyn FnMut(Date) -> bool,
 ) -> Result<BTreeMap<&'static str, Agg>> {
     let mut out: BTreeMap<&'static str, Agg> = BTreeMap::new();
     let mut custom_events_per_day: BTreeMap<Date, u64> = BTreeMap::new();
@@ -496,7 +497,7 @@ fn transform(
     Ok(out)
 }
 
-/// 执行一次导入：读 zip、按站点自己的数据截断、写进汇总层。`import_id` 是 `site_imports.id`（调用方先建记录，
+/// 执行一次导入：读 zip、截断到可导入的完整历史日、写进汇总层。`import_id` 是 `site_imports.id`（调用方先建记录，
 /// 成功后记为完成；失败时调用方删除已写入的行）。`ch` 用 `rivu_maintainer` 账号（汇总表的 INSERT）。
 pub async fn run(
     pg: &PgPool,
@@ -510,16 +511,25 @@ pub async fn run(
         .await
         .context("读取 zip 的任务异常退出")??;
 
-    // 站点自己的数据从哪天开始：那天及之后不导入（同一天两边都有会重复计数）
     let tz = TimeZone::get(tz_name).unwrap_or(TimeZone::UTC);
+    // 空站也不能导入本地今天，否则当天开始采集后，汇总行会挡住原始数据。
+    let today = Timestamp::now().to_zoned(tz.clone()).date();
     let scope = TenantScope::new(site_id);
     let state = rollup::build_state(ch, &scope, &tz)
         .await
         .map_err(|e| anyhow::anyhow!("读取站点数据范围失败：{e}"))?;
-    let native_from = state.native_from;
-    let keep = |d: Date| native_from.is_none_or(|n| d < n);
+    let cutoff = state.native_from.map_or(today, |d| d.min(today));
 
-    let tables = transform(&files, &keep).map_err(|e| failure("invalid_csv", format!("{e:#}")))?;
+    let mut clipped_from = None;
+    let tables = transform(&files, &mut |day| {
+        if day < cutoff {
+            true
+        } else {
+            clipped_from = Some(cutoff);
+            false
+        }
+    })
+    .map_err(|e| failure("invalid_csv", format!("{e:#}")))?;
     let site_days: Vec<Date> = tables
         .get("rollup_site")
         .map(|a| a.keys().map(|(d, _)| *d).collect())
@@ -527,12 +537,7 @@ pub async fn run(
     let (Some(start), Some(end)) = (site_days.first().copied(), site_days.last().copied()) else {
         return Err(failure(
             "no_days",
-            match native_from {
-                Some(d) => format!(
-                    "导出里没有 {d}（站点自己的数据开始的那天）之前的数据，没有可以导入的天"
-                ),
-                None => "导出里没有数据".to_owned(),
-            },
+            format!("导出里没有早于 {cutoff}（站点本地日期）的完整历史日"),
         ));
     };
     if let Some(other) =
@@ -544,14 +549,6 @@ pub async fn run(
             format!("与已有的导入 #{other} 的日期重叠（{start} – {end}），先删除那次导入"),
         ));
     }
-    let clipped_from = native_from.filter(|n| {
-        files["visitors"]
-            .rows
-            .iter()
-            .filter_map(|r| files["visitors"].day(r).ok())
-            .any(|d| d >= *n)
-    });
-
     let mut rows = 0u64;
     // rollup_site 最后写：与构建任务一致，它的行是「这一天有数据」的标记
     let order = tables

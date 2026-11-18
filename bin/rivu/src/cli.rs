@@ -410,7 +410,12 @@ pub struct ImportArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum ImportAction {
-    /// 导入 Plausible 的数据导出（站点设置 → Imports & Exports → Export 得到的 zip），写进日汇总层
+    /// 从 Plausible ZIP 导入完整历史日到日汇总层
+    ///
+    /// 在 Plausible 的站点设置 → Imports & Exports → Export 获取 ZIP。
+    ///
+    /// 按站点时区，只导入今天之前的数据。已有 Rivu 原生数据时，还须早于首个原生日。
+    /// 迁移当天切换前产生的 Plausible 汇总不会并入 Rivu。
     Plausible {
         /// 站点的 site_key
         #[arg(long)]
