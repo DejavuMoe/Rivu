@@ -4,14 +4,15 @@
 //!   会立即唤醒一次（[`StatsDeleteKick`]）。多个进程同时运行是安全的：领取用 `FOR UPDATE SKIP LOCKED`，
 //!   领取后 `not_before` 作为租约（见 `rivu_storage_pg::stats_deletions::claim_due`）。
 //! - ClickHouse 侧用 `rivu_maintainer` 账号（`ALTER DELETE` 权限）对 `events`、`sessions`、`ingest_counters`
-//!   逐分区执行轻量删除 `DELETE FROM t IN PARTITION p WHERE site_id = … [AND 时间条件]`；每完成一个分区记入
-//!   `partitions_done`，崩溃后跳过已完成的分区继续；重复执行同一条删除没有副作用（幂等）。
+//!   逐分区执行轻量删除 `DELETE FROM t IN PARTITION p WHERE site_id = … [AND 时间条件]`；维护事务内将完成的
+//!   分区记入 `partitions_done`，重试时跳过已提交的进度。
 //! - `scope='site'`：删除该站点在三张表全部分区里的行（分区列表按 `site_id` 现查）。
 //! - `scope='date_range'`：日期是站点本地日期，按站点当前时区换算成 UTC 半开区间 `[start, end)`
 //!   （与查询引擎的整日区间同一套换算，[`rivu_query::resolve::local_dates_utc_ms`]）：
 //!   `events` 按 `ts`；`ingest_counters` 按 `minute`；`sessions` 删除**开始时间**（`started_at`）落在区间内的会话——
 //!   跨过区间边界的会话按开始时间归属，与看板「会话属于开始那天」的口径一致。
 //! - 日汇总层（`rollup_*`）：同一站点的行，`date_range` 时只删这些本地日，原生与导入的行都删。
+//!   持站点行锁复核日期标签后才开始范围擦除，并保持到同步删除完成。
 //! - 失败：记 `last_error`，指数退避后重试，`MAX_ATTEMPTS` 次后置为 `failed`。
 //!
 //! 日志只带意图 id、站点 id 与分区，不带其他内容。
@@ -25,13 +26,17 @@ use jiff::civil::Date;
 use jiff::tz::TimeZone;
 use jiff::{Timestamp, ToSpan};
 use rivu_query::QueryCache;
+use rivu_query::{TenantScope, rollup};
+use rivu_storage_pg::sites;
 use rivu_storage_pg::stats_deletions::{self, ClaimedDeletion};
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
 
 /// 一轮最多领取的意图条数（领完再领，直到没有到期的）。
 const CLAIM_BATCH: i64 = 4;
+
+pub const TIMEZONE_UNPROVEN: &str = "stats_deletion_timezone_unproven";
 
 /// 看板写入日期范围意图后唤醒 `ch_delete_batch`。
 pub type StatsDeleteKick = Arc<Notify>;
@@ -114,27 +119,39 @@ pub fn months_between(start_ms: i64, end_ms: i64) -> Result<Vec<u32>> {
     Ok(out)
 }
 
-/// 意图的删除范围：`date_range` 按站点时区（查不到或无效时按 UTC）换算成 UTC 区间。
-pub fn scope_of(intent: &ClaimedDeletion) -> Result<Scope> {
+fn days_of(intent: &ClaimedDeletion) -> Result<Option<(Date, Date)>> {
     match intent.scope.as_str() {
-        "site" => Ok(Scope::Site),
+        "site" => Ok(None),
         "date_range" => {
             let (Some(from), Some(to)) = (&intent.date_from, &intent.date_to) else {
                 bail!("date_range 意图缺少日期");
             };
             let from: Date = from.parse().context("date_from 无效")?;
             let to: Date = to.parse().context("date_to 无效")?;
-            let tz = intent
-                .timezone
-                .as_deref()
-                .and_then(|n| TimeZone::get(n).ok())
-                .unwrap_or(TimeZone::UTC);
-            let (start_ms, end_ms) = rivu_query::resolve::local_dates_utc_ms(&tz, from, to)
-                .map_err(|e| anyhow::anyhow!("日期换算失败：{e}"))?;
-            Ok(Scope::Range { start_ms, end_ms })
+            Ok(Some((from, to)))
         }
         other => bail!("未知的删除范围 `{other}`"),
     }
+}
+
+fn scope_of(days: Option<(Date, Date)>, tz: &TimeZone) -> Result<Scope> {
+    let Some((from, to)) = days else {
+        return Ok(Scope::Site);
+    };
+    let (start_ms, end_ms) = rivu_query::resolve::local_dates_utc_ms(tz, from, to)
+        .map_err(|e| anyhow::anyhow!("日期换算失败：{e}"))?;
+    Ok(Scope::Range { start_ms, end_ms })
+}
+
+/// Date labels are ambiguous until all native families have current-timezone markers.
+pub async fn can_erase_dates(ch: &Client, site_id: u64, tz: &TimeZone) -> Result<bool> {
+    rollup::native_days_match_timezone(
+        ch,
+        &TenantScope::new(site_id),
+        tz.iana_name().unwrap_or("UTC"),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("核验汇总日期的时区失败：{e}"))
 }
 
 /// 要删除的分区：整个站点按 `site_id` 现查各表的分区；日期范围按月份推算（三张表相同）。
@@ -193,8 +210,40 @@ pub async fn delete_partition(ch: &Client, site_id: u64, scope: Scope, t: Target
 }
 
 /// 执行一条已领取的意图：跳过 `partitions_done` 里的分区，逐个删除并记录，全部完成后置为 `done`。
-pub async fn process(pg: &PgPool, ch: &Client, intent: &ClaimedDeletion) -> Result<usize> {
-    let scope = scope_of(intent)?;
+pub async fn process(pg: &PgPool, ch: &Client, intent: &ClaimedDeletion) -> Result<Option<usize>> {
+    let mut tx = sites::begin_maintenance(pg).await?;
+    let timezone = sites::lock_timezone(&mut tx, intent.site_id, true).await?;
+    if !stats_deletions::lock_claim(&mut tx, intent).await? {
+        return Ok(None);
+    }
+    let days = days_of(intent)?;
+    let scope = if days.is_some() {
+        let tz = timezone
+            .as_deref()
+            .and_then(|name| TimeZone::get(name).ok());
+        let Some(tz) = tz else {
+            bail!("{TIMEZONE_UNPROVEN}: 无法确定站点的当前时区");
+        };
+        if !can_erase_dates(ch, intent.site_id, &tz).await? {
+            bail!("{TIMEZONE_UNPROVEN}: 无法确定原生汇总日期的时区");
+        }
+        scope_of(days, &tz)?
+    } else {
+        Scope::Site
+    };
+    let result = process_locked(&mut tx, ch, intent, scope, days).await;
+    // Keep the completed partition checkpoints even when a later CH delete fails.
+    tx.commit().await?;
+    result.map(Some)
+}
+
+async fn process_locked(
+    db: &mut PgConnection,
+    ch: &Client,
+    intent: &ClaimedDeletion,
+    scope: Scope,
+    days: Option<(Date, Date)>,
+) -> Result<usize> {
     let targets = plan(ch, intent.site_id, scope).await?;
     let mut deleted = 0;
     for t in targets {
@@ -203,7 +252,7 @@ pub async fn process(pg: &PgPool, ch: &Client, intent: &ClaimedDeletion) -> Resu
             continue;
         }
         delete_partition(ch, intent.site_id, scope, t).await?;
-        stats_deletions::mark_partition_done(pg, intent.id, &key).await?;
+        stats_deletions::mark_partition_done(db, intent.id, &key).await?;
         metrics::counter!("rivu_stats_delete_partitions_total", "table" => t.table.name)
             .increment(1);
         tracing::info!(
@@ -215,22 +264,10 @@ pub async fn process(pg: &PgPool, ch: &Client, intent: &ClaimedDeletion) -> Resu
         deleted += 1;
     }
     // 日汇总层：按本地日删除（汇总表很小，不分区逐个记录；删除幂等，失败时整条意图重试）
-    let days = match (intent.scope.as_str(), &intent.date_from, &intent.date_to) {
-        ("date_range", Some(f), Some(t)) => Some((
-            f.parse::<Date>().context("date_from 无效")?,
-            t.parse::<Date>().context("date_to 无效")?,
-        )),
-        _ => None,
-    };
-    rivu_query::rollup::delete(
-        ch,
-        &rivu_query::TenantScope::new(intent.site_id),
-        days,
-        false,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("删除汇总行失败：{e}"))?;
-    stats_deletions::mark_done(pg, intent.id).await?;
+    rollup::delete(ch, &TenantScope::new(intent.site_id), days, false)
+        .await
+        .map_err(|e| anyhow::anyhow!("删除汇总行失败：{e}"))?;
+    stats_deletions::mark_done(db, intent.id).await?;
     Ok(deleted)
 }
 
@@ -256,7 +293,8 @@ pub async fn run_batch_with_cache(
             handled += 1;
             let scope = intent.scope.clone();
             match process(pg, ch, intent).await {
-                Ok(partitions) => {
+                Ok(None) => {}
+                Ok(Some(partitions)) => {
                     if let Some(c) = cache {
                         c.invalidate_site(intent.site_id);
                     }
@@ -372,24 +410,22 @@ mod tests {
             scope: "date_range".into(),
             date_from: Some("2026-10-01".into()),
             date_to: Some("2026-10-01".into()),
-            timezone: Some("Asia/Shanghai".into()),
             partitions_done: Vec::new(),
             attempts: 1,
         };
         assert_eq!(
-            scope_of(&intent).unwrap(),
+            scope_of(
+                days_of(&intent).unwrap(),
+                &TimeZone::get("Asia/Shanghai").unwrap()
+            )
+            .unwrap(),
             Scope::Range {
                 start_ms: ms("2026-09-30T16:00:00Z"),
                 end_ms: ms("2026-10-01T16:00:00Z"),
             }
         );
-        // 时区查不到：按 UTC
-        let utc = ClaimedDeletion {
-            timezone: None,
-            ..intent.clone()
-        };
         assert_eq!(
-            scope_of(&utc).unwrap(),
+            scope_of(days_of(&intent).unwrap(), &TimeZone::UTC).unwrap(),
             Scope::Range {
                 start_ms: ms("2026-10-01T00:00:00Z"),
                 end_ms: ms("2026-10-02T00:00:00Z"),
@@ -399,7 +435,10 @@ mod tests {
             scope: "site".into(),
             ..intent
         };
-        assert_eq!(scope_of(&site).unwrap(), Scope::Site);
+        assert_eq!(
+            scope_of(days_of(&site).unwrap(), &TimeZone::UTC).unwrap(),
+            Scope::Site
+        );
     }
 
     #[test]

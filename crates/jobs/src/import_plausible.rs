@@ -586,15 +586,20 @@ pub async fn import_file(
     pg: &PgPool,
     ch: &Client,
     site_id: u64,
-    tz_name: &str,
     zip: Vec<u8>,
     file_name: &str,
     imported_by: Option<i64>,
 ) -> Result<(i64, Summary)> {
-    let id = rivu_storage_pg::imports::create(pg, site_id, "plausible_csv", file_name, imported_by)
+    let mut tx = pg.begin().await?;
+    let timezone = rivu_storage_pg::sites::lock_timezone(&mut tx, site_id, false)
         .await?
-        .context("这个站点已有进行中的导入")?;
-    execute(pg, ch, id, site_id, tz_name, zip)
+        .context("找不到未删除的站点")?;
+    let id =
+        rivu_storage_pg::imports::create(&mut tx, site_id, "plausible_csv", file_name, imported_by)
+            .await?
+            .context("这个站点已有进行中的导入")?;
+    tx.commit().await?;
+    execute(pg, ch, id, site_id, &timezone, zip)
         .await
         .map(|s| (id, s))
 }

@@ -2,7 +2,7 @@
 //! `scope='site'` 的意图（`not_before` = 删除时刻 + 恢复窗口），恢复站点时把它置为 `cancelled`；
 //! 按日期范围删除写入 `scope='date_range'` 的意图（`not_before = now()`）。
 //! 执行在 `rivu-jobs` 的 `ch_delete_batch`：领取到期意图（`FOR UPDATE SKIP LOCKED`），逐分区删除并记入
-//! `partitions_done`，崩溃后从断点继续。
+//! `partitions_done`，重试时跳过已提交的进度。
 //!
 //! 日期一律以 `YYYY-MM-DD` 文本进出（站点本地日期；本 crate 不让 sqlx 依赖 jiff）。
 
@@ -12,7 +12,7 @@ use sqlx::{PgPool, Row};
 use crate::sites::SiteOwner;
 
 /// 领取后的租约：`not_before` 推到「现在 + 租约」，别的进程在租约内不会再领取同一条；
-/// 每完成一个分区续一次（[`mark_partition_done`]）。进程崩溃后租约到期，任意进程从断点续跑。
+/// 每完成一个分区续一次（[`mark_partition_done`]）。进程崩溃后租约到期，任意进程从已提交的进度续跑。
 pub const CLAIM_LEASE_SECS: i64 = 3600;
 
 /// 失败多少次后置为 `failed`（不再自动重试）。
@@ -303,8 +303,6 @@ pub struct ClaimedDeletion {
     pub scope: String,
     pub date_from: Option<String>,
     pub date_to: Option<String>,
-    /// 站点当前的时区（站点行永不硬删除；查不到时为空，调用方按 UTC 处理）。
-    pub timezone: Option<String>,
     pub partitions_done: Vec<String>,
     /// 含本次领取。
     pub attempts: i32,
@@ -329,8 +327,8 @@ pub async fn claim_due(pool: &PgPool, limit: i64) -> Result<Vec<ClaimedDeletion>
          SELECT c.id, c.site_id, c.scope,
                 to_char(c.date_from, 'YYYY-MM-DD') AS date_from,
                 to_char(c.date_to, 'YYYY-MM-DD') AS date_to,
-                s.timezone, c.partitions_done, c.attempts
-           FROM claimed c LEFT JOIN sites s ON s.id = c.site_id
+                c.partitions_done, c.attempts
+           FROM claimed c
           ORDER BY c.id",
     )
     .bind(limit)
@@ -347,7 +345,6 @@ pub async fn claim_due(pool: &PgPool, limit: i64) -> Result<Vec<ClaimedDeletion>
                 scope: r.try_get("scope")?,
                 date_from: r.try_get("date_from")?,
                 date_to: r.try_get("date_to")?,
-                timezone: r.try_get("timezone")?,
                 partitions_done: r.try_get("partitions_done")?,
                 attempts: r.try_get("attempts")?,
             })
@@ -355,33 +352,51 @@ pub async fn claim_due(pool: &PgPool, limit: i64) -> Result<Vec<ClaimedDeletion>
         .collect()
 }
 
+/// Lock the active claim after locking the site. Superseded claims must not delete.
+pub async fn lock_claim(db: &mut sqlx::PgConnection, intent: &ClaimedDeletion) -> Result<bool> {
+    let id: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM pending_stats_deletions
+         WHERE id = $1 AND attempts = $2 AND status = 'running' FOR UPDATE",
+    )
+    .bind(intent.id)
+    .bind(intent.attempts)
+    .fetch_optional(db)
+    .await
+    .context("锁定统计数据删除意图失败")?;
+    Ok(id.is_some())
+}
+
 /// 记一个已完成的分区（幂等）并续租约。
-pub async fn mark_partition_done(pool: &PgPool, id: i64, partition: &str) -> Result<()> {
+pub async fn mark_partition_done(
+    db: &mut sqlx::PgConnection,
+    id: i64,
+    partition: &str,
+) -> Result<()> {
     sqlx::query(
         "UPDATE pending_stats_deletions
             SET partitions_done = CASE WHEN $2 = ANY(partitions_done) THEN partitions_done
                                        ELSE array_append(partitions_done, $2) END,
-                not_before = now() + make_interval(secs => $3)
+                not_before = clock_timestamp() + make_interval(secs => $3)
           WHERE id = $1 AND status = 'running'",
     )
     .bind(id)
     .bind(partition)
     .bind(CLAIM_LEASE_SECS as f64)
-    .execute(pool)
+    .execute(db)
     .await
     .context("记录已完成分区失败")?;
     Ok(())
 }
 
 /// 全部分区完成：`done` + `completed_at`。
-pub async fn mark_done(pool: &PgPool, id: i64) -> Result<()> {
+pub async fn mark_done(db: &mut sqlx::PgConnection, id: i64) -> Result<()> {
     sqlx::query(
         "UPDATE pending_stats_deletions
-            SET status = 'done', completed_at = now(), last_error = NULL
+            SET status = 'done', completed_at = clock_timestamp(), last_error = NULL
           WHERE id = $1 AND status = 'running'",
     )
     .bind(id)
-    .execute(pool)
+    .execute(db)
     .await
     .context("标记删除意图完成失败")?;
     Ok(())
@@ -406,12 +421,13 @@ pub async fn mark_attempt_failed(
                 status = CASE WHEN $3 THEN 'failed' ELSE status END,
                 completed_at = CASE WHEN $3 THEN now() ELSE completed_at END,
                 not_before = CASE WHEN $3 THEN not_before ELSE now() + make_interval(secs => $4) END
-          WHERE id = $1 AND status = 'running'",
+          WHERE id = $1 AND status = 'running' AND attempts = $5",
     )
     .bind(id)
     .bind(&error)
     .bind(failed)
     .bind(backoff_secs as f64)
+    .bind(attempts)
     .execute(pool)
     .await
     .context("记录删除失败失败")?;
