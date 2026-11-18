@@ -590,17 +590,37 @@ pub struct SitePatch<'a> {
     pub retention_days: Option<Option<i32>>,
 }
 
-/// 锁住站点行，读最新时区。调用方在同一事务内检查汇总、写设置或构建汇总。
+/// 维护任务在同步等待 ClickHouse 时，PG 会话处于事务内空闲状态。
+pub async fn begin_maintenance(pool: &PgPool) -> Result<Transaction<'static, Postgres>> {
+    let mut tx = pool
+        .begin_with("BEGIN ISOLATION LEVEL READ COMMITTED")
+        .await?;
+    // set_config(..., true) is SET LOCAL. Older PG versions lack transaction_timeout.
+    sqlx::query(
+        "SELECT set_config(name, '0', true) FROM pg_settings
+         WHERE name IN ('idle_in_transaction_session_timeout', 'transaction_timeout')",
+    )
+    .execute(&mut *tx)
+    .await
+    .context("设置站点维护事务超时失败")?;
+    Ok(tx)
+}
+
+/// 锁住站点行，读最新时区。软删除站点的擦除也使用这把锁。
 pub async fn lock_timezone(
     tx: &mut Transaction<'_, Postgres>,
     site_id: u64,
+    include_deleted: bool,
 ) -> Result<Option<String>> {
     let id = i64::try_from(site_id).context("site_id 超出范围")?;
-    sqlx::query_scalar("SELECT timezone FROM sites WHERE id = $1 AND deleted_at IS NULL FOR UPDATE")
-        .bind(id)
-        .fetch_optional(&mut **tx)
-        .await
-        .context("锁定站点时区失败")
+    sqlx::query_scalar(
+        "SELECT timezone FROM sites WHERE id = $1 AND ($2 OR deleted_at IS NULL) FOR UPDATE",
+    )
+    .bind(id)
+    .bind(include_deleted)
+    .fetch_optional(&mut **tx)
+    .await
+    .context("锁定站点时区失败")
 }
 
 /// 在调用方事务里更新 `sites` 与 `site_settings`（没有 settings 行时先补一行）；站点不存在或已软删除返回 `false`。

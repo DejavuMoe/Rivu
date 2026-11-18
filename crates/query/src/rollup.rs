@@ -481,6 +481,36 @@ pub async fn first_native_day(
     }
 }
 
+/// Families only store a day label. Require a matching site marker for every native day.
+pub async fn native_days_match_timezone(
+    client: &Client,
+    scope: &TenantScope,
+    timezone: &str,
+) -> Result<bool, QueryError> {
+    let mut checks = vec![
+        "SELECT day FROM rollup_site WHERE site_id = {site:UInt64}
+         AND origin = 'native' AND tz != {tz:String} LIMIT 1"
+            .to_owned(),
+    ];
+    for table in Family::TABLES.into_iter().filter(|&t| t != "rollup_site") {
+        checks.push(format!(
+            "SELECT day FROM {table} WHERE site_id = {{site:UInt64}} AND origin = 'native'
+             AND day NOT IN (SELECT day FROM rollup_site WHERE site_id = {{site:UInt64}}
+                             AND origin = 'native' AND tz = {{tz:String}}) LIMIT 1"
+        ));
+    }
+    let union = checks
+        .into_iter()
+        .map(|s| format!("({s})"))
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ");
+    let sql = format!("SELECT day FROM ({union}) LIMIT 1");
+    let mut params = Params::default();
+    params.push("site", ParamValue::U64(scope.site_id()));
+    params.push("tz", ParamValue::Str(timezone.to_owned()));
+    Ok(fetch(client, &sql, &params).await?.is_empty())
+}
+
 /// 构建一个站点的一个本地日：各族依次写入，`site` 最后写（它的行是「这一天已构建」的标记）。
 /// 重复构建同一天是安全的：同键的行按 `version` 取最新。
 pub async fn build_day(
@@ -518,9 +548,9 @@ pub async fn delete(
         params.push("to_day", ParamValue::Date(to.to_string()));
         cond.push_str(" AND day >= {from_day:Date} AND day <= {to_day:Date}");
     }
-    // 重建时旧时区标记必须留到其余族删除确认；显式擦除仍先撤销「已构建」。
+    // 重建和范围擦除重试仍需时区凭据，最后删除标记。
     let mut order = Family::TABLES;
-    if !native_only {
+    if !native_only && days.is_none() {
         order.rotate_right(1);
     }
     let client = client.clone().with_setting("lightweight_deletes_sync", "2");

@@ -452,13 +452,17 @@ async fn patch_site(
         geo_level: body.geo_level.as_deref(),
         retention_days: retention,
     };
-    let mut tx = api.pg.begin().await.map_err(anyhow::Error::from)?;
+    let mut tx = api
+        .pg
+        .begin_with("BEGIN ISOLATION LEVEL READ COMMITTED")
+        .await
+        .map_err(anyhow::Error::from)?;
     if let Some(next) = patch.timezone {
-        let current = sites::lock_timezone(&mut tx, c.site.id)
+        let current = sites::lock_timezone(&mut tx, c.site.id, false)
             .await?
             .ok_or(DashError::NotFound)?;
         if current != next
-            && !rivu_jobs::rollup::can_change_timezone(
+            && let Some(code) = rivu_jobs::rollup::timezone_change_conflict(
                 &mut tx,
                 &api.reader,
                 c.site.id,
@@ -469,8 +473,12 @@ async fn patch_site(
             .await?
         {
             return Err(DashError::Conflict(
-                rivu_jobs::rollup::TIMEZONE_REBUILD_UNPROVEN,
-                "the timezone cannot be changed because the native rollup rebuild is unproven or a statistics deletion affects it".into(),
+                code,
+                if code == rivu_jobs::rollup::TIMEZONE_IMPORT_CONFLICT {
+                    "the timezone cannot be changed while an import is running or imported dates overlap the native data in the requested timezone"
+                } else {
+                    "the timezone cannot be changed because the native rollup rebuild is unproven or a statistics deletion affects it"
+                }.into(),
             ));
         }
     }
@@ -693,20 +701,23 @@ async fn create_stats_deletion(
         .await?;
     let body: StatsDeletionBody = read_json(req, AUTH_BODY_MAX).await?;
     let mut tx = api.pg.begin().await.map_err(anyhow::Error::from)?;
-    let timezone = sites::lock_timezone(&mut tx, c.site.id)
+    let timezone = sites::lock_timezone(&mut tx, c.site.id, false)
         .await?
         .ok_or(DashError::NotFound)?;
     let view = sites::admin_view(&mut *tx, c.site.id)
         .await?
         .ok_or(DashError::NotFound)?;
-    let tz = TimeZone::get(&timezone).unwrap_or(TimeZone::UTC);
-    let today = (api.clock)().to_zoned(tz).date();
+    let tz = TimeZone::get(&timezone).map_err(|_| stats_deletion_timezone_conflict())?;
+    let today = (api.clock)().to_zoned(tz.clone()).date();
     let (from, to) = validate_stats_range(body.from.trim(), body.to.trim(), today)
         .map_err(|m| DashError::Invalid(m.into()))?;
     if body.confirm != view.name {
         return Err(DashError::Invalid(
             "the confirm value must exactly match the site name".into(),
         ));
+    }
+    if !rivu_jobs::stats_delete::can_erase_dates(&api.reader, c.site.id, &tz).await? {
+        return Err(stats_deletion_timezone_conflict());
     }
     let row = stats_deletions::create_date_range(
         &mut tx,
@@ -732,6 +743,13 @@ async fn create_stats_deletion(
         StatusCode::CREATED,
         json!({"deletion": deletion_json(&row)}),
     ))
+}
+
+fn stats_deletion_timezone_conflict() -> DashError {
+    DashError::Conflict(
+        rivu_jobs::stats_delete::TIMEZONE_UNPROVEN,
+        "the date range cannot be erased until the timezone of the native rollups is known to match the site".into(),
+    )
 }
 
 async fn list_stats_deletions(
