@@ -202,7 +202,9 @@ pub async fn import(config: &Config, action: ImportAction) -> Result<ExitCode> {
             println!("dates: {} – {}", s.start, s.end);
             println!("rows: {}", s.rows);
             if let Some(d) = s.clipped_from {
-                println!("skipped: {d} 及之后（站点自己的数据从这天开始）");
+                println!(
+                    "skipped: {d} 及之后（按站点时区，只导入早于今天和首个 Rivu 原生日的完整历史日。迁移当天切换前产生的 Plausible 汇总不会并入 Rivu。）"
+                );
             }
         }
         ImportAction::List { .. } => {

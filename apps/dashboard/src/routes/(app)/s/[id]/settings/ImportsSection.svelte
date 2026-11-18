@@ -151,7 +151,10 @@
   <div class="intro">
     <p>{t("set.imp.how")}</p>
     {#if rows}
-      <p class="muted">{nativeFrom ? t("set.imp.before", { d: nativeFrom }) : t("set.imp.beforeEmpty")}</p>
+      <p class="muted">
+        {nativeFrom ? t("set.imp.before", { d: nativeFrom }) : t("set.imp.beforeEmpty")}
+        {t("set.imp.cutover")}
+      </p>
     {/if}
   </div>
 
