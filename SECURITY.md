@@ -2,7 +2,7 @@
 
 ## 报告漏洞
 
-请不要在公开的问题列表里报告安全漏洞。发邮件到 **security@rivu.dev**（发布前请维护者改成实际的地址），写明：
+请在 GitHub 安全公告页面点击 **Report a vulnerability**，向维护者提交私密报告。报告请附上以下信息。 [Rivu 安全公告](https://github.com/DejavuMoe/Rivu/security/advisories)
 
 - 受影响的版本与部署方式；
 - 复现步骤或概念验证；
