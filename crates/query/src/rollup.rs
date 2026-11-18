@@ -26,6 +26,8 @@
 //! 过滤只涉及这些维度本身（这样每一行对应的正是汇总表里的若干行之和，不会把同一访客在不同取值下的计数加起来）；
 //! 没有事件级过滤（`event:*`，它们在会话指标上是「存在」语义，汇总表回答不了）；没有 `percentage`、`conversion_rate`。
 
+use std::time::Duration;
+
 use clickhouse::Client;
 use jiff::Timestamp;
 use jiff::civil::Date;
@@ -38,6 +40,9 @@ use crate::plan::{self, Measure, Plan, VisitsForm};
 use crate::resolve::{Col, Gran, Pred, RDim, ResolvedQuery, SiteContext, local_date};
 use crate::spec::{Metric, QuerySpec};
 use crate::sql::{self, ParamValue, Params, TenantScope};
+
+/// The raw session scan includes this many UTC dates before the start of the interval.
+pub const SESSION_LOOKBACK_DAYS: i64 = 7;
 
 /// 一个维度族（一张汇总表）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -382,10 +387,13 @@ async fn execute(client: &Client, sql: &str, params: &Params) -> Result<(), Quer
 pub struct BuildState {
     /// 已构建（`rollup_site` 有行）的最后一个本地日。
     pub built_to: Option<Date>,
-    /// 有按别的时区构建的行：站点改过时区，要全部删除重建。
+    /// 有按别的时区构建的行；删除重建前必须另行检查 raw 覆盖。
     pub tz_changed: bool,
     /// 站点最早事件的本地日（没有事件为 `None`）。
     pub first_day: Option<Date>,
+    pub first_event_ms: Option<i64>,
+    /// Oldest completed native day and the timezone recorded when it was built.
+    pub first_marker: Option<(Date, String)>,
     /// 站点自己的数据从哪天开始：最早事件与最早的原生汇总行中较早的一天（保留期删掉旧事件后，
     /// 汇总行还在）。导入只写这天之前的日子。
     pub native_from: Option<Date>,
@@ -408,6 +416,11 @@ pub async fn build_state(
         .and_then(|r| r.get(3))
         .and_then(serde_json::Value::as_str)
         .and_then(|s| s.parse().ok());
+    let first_marker = first_built.zip(
+        row.and_then(|r| r.get(4))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+    );
     let tz_changed = row
         .and_then(|r| r.get(1))
         .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok()))
@@ -438,8 +451,66 @@ pub async fn build_state(
         built_to,
         tz_changed,
         first_day,
+        first_event_ms: first_ms,
+        first_marker,
         native_from,
     })
+}
+
+/// Earliest native day, including rows left behind by a failed family build or delete.
+pub async fn first_native_day(
+    client: &Client,
+    scope: &TenantScope,
+) -> Result<Option<Date>, QueryError> {
+    let per_family = Family::TABLES
+        .map(|table| {
+            format!(
+                "(SELECT day FROM {table} WHERE site_id = {{site:UInt64}} AND origin = 'native' \
+                  ORDER BY day LIMIT 1)"
+            )
+        })
+        .join(" UNION ALL ");
+    let sql = format!("SELECT toString(minOrNull(day)) FROM ({per_family})");
+    let mut params = Params::default();
+    params.push("site", ParamValue::U64(scope.site_id()));
+    let rows = fetch(client, &sql, &params).await?;
+    match rows.first().and_then(|row| row.first()) {
+        Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(day)) => day.parse().map(Some).map_err(QueryError::internal),
+        _ => Err(QueryError::internal(anyhow::anyhow!(
+            "invalid first native day response"
+        ))),
+    }
+}
+
+/// Families only store a day label. Require a matching site marker for every native day.
+pub async fn native_days_match_timezone(
+    client: &Client,
+    scope: &TenantScope,
+    timezone: &str,
+) -> Result<bool, QueryError> {
+    let mut checks = vec![
+        "SELECT day FROM rollup_site WHERE site_id = {site:UInt64}
+         AND origin = 'native' AND tz != {tz:String} LIMIT 1"
+            .to_owned(),
+    ];
+    for table in Family::TABLES.into_iter().filter(|&t| t != "rollup_site") {
+        checks.push(format!(
+            "SELECT day FROM {table} WHERE site_id = {{site:UInt64}} AND origin = 'native'
+             AND day NOT IN (SELECT day FROM rollup_site WHERE site_id = {{site:UInt64}}
+                             AND origin = 'native' AND tz = {{tz:String}}) LIMIT 1"
+        ));
+    }
+    let union = checks
+        .into_iter()
+        .map(|s| format!("({s})"))
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ");
+    let sql = format!("SELECT day FROM ({union}) LIMIT 1");
+    let mut params = Params::default();
+    params.push("site", ParamValue::U64(scope.site_id()));
+    params.push("tz", ParamValue::Str(timezone.to_owned()));
+    Ok(fetch(client, &sql, &params).await?.is_empty())
 }
 
 /// 构建一个站点的一个本地日：各族依次写入，`site` 最后写（它的行是「这一天已构建」的标记）。
@@ -452,9 +523,10 @@ pub async fn build_day(
     version: u64,
     now: Timestamp,
 ) -> Result<(), QueryError> {
+    let client = client.clone().with_setting("async_insert", "0");
     for family in Family::ALL {
         let (sql, params) = build_query(scope, site, family, day, version, now)?;
-        execute(client, &sql, &params).await?;
+        execute(&client, &sql, &params).await?;
     }
     Ok(())
 }
@@ -478,12 +550,15 @@ pub async fn delete(
         params.push("to_day", ParamValue::Date(to.to_string()));
         cond.push_str(" AND day >= {from_day:Date} AND day <= {to_day:Date}");
     }
-    // site 先删：中途失败时这些天不再算「已构建」
-    let order = std::iter::once("rollup_site")
-        .chain(Family::TABLES.into_iter().filter(|t| *t != "rollup_site"));
+    // 重建和范围擦除重试仍需时区凭据，最后删除标记。
+    let mut order = Family::TABLES;
+    if !native_only && days.is_none() {
+        order.rotate_right(1);
+    }
+    let client = client.clone().with_setting("lightweight_deletes_sync", "2");
     for table in order {
         let sql = format!("DELETE FROM {table} WHERE site_id = {{site:UInt64}}{cond}");
-        execute(client, &sql, &params).await?;
+        execute(&client, &sql, &params).await?;
     }
     Ok(())
 }
@@ -704,17 +779,22 @@ fn rowbinary_date(d: Date) -> Result<u16, QueryError> {
 
 async fn write_rows<T>(client: &Client, table: &str, rows: Vec<T>) -> Result<(), QueryError>
 where
-    T: for<'a> clickhouse::Row<Value<'a> = T> + serde::Serialize,
+    T: for<'a> clickhouse::Row<Value<'a> = T> + serde::Serialize + 'static,
 {
     let mut insert = client
         .insert::<T>(table)
         .await
         .map_err(QueryError::internal)?
-        .with_setting("async_insert", "0");
+        .with_setting("async_insert", "0")
+        .with_timeouts(Some(Duration::from_secs(60)), Some(Duration::from_secs(60)));
     for row in &rows {
         insert.write(row).await.map_err(QueryError::internal)?;
     }
-    insert.end().await.map_err(QueryError::internal)
+    // Keep polling the driver's timeout if the import stops waiting for this response.
+    tokio::spawn(insert.end())
+        .await
+        .map_err(QueryError::internal)?
+        .map_err(QueryError::internal)
 }
 
 /// 把导入的行写进一张汇总表（`origin = 'import'`，`import_id`，`version = 1`，一次 RowBinary 写入）。
@@ -766,6 +846,7 @@ pub async fn insert_import(
     }
 }
 /// 删除一次导入写入的全部汇总行（各表的 `origin = 'import' AND import_id = …`）。幂等。
+/// 只清理已落表的行；已经被 ClickHouse 接收的 INSERT 仍可能稍后落表。
 pub async fn delete_import(
     client: &Client,
     scope: &TenantScope,
@@ -774,13 +855,18 @@ pub async fn delete_import(
     let mut params = Params::default();
     params.push("site", ParamValue::U64(scope.site_id()));
     params.push("imp", ParamValue::U64(import_id));
-    for table in Family::TABLES {
-        let sql = format!(
-            "DELETE FROM {table} WHERE site_id = {{site:UInt64}} AND origin = 'import' AND import_id = {{imp:UInt64}}"
-        );
-        execute(client, &sql, &params).await?;
-    }
-    Ok(())
+    let client = client.clone().with_setting("lightweight_deletes_sync", "2");
+    tokio::time::timeout(Duration::from_secs(120), async {
+        for table in Family::TABLES {
+            let sql = format!(
+                "DELETE FROM {table} WHERE site_id = {{site:UInt64}} AND origin = 'import' AND import_id = {{imp:UInt64}}"
+            );
+            execute(&client, &sql, &params).await?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(QueryError::internal)?
 }
 
 #[cfg(test)]
