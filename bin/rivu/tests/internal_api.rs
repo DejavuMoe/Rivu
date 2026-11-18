@@ -707,6 +707,7 @@ async fn direct(server: &Server, site: &Site, spec: &Value) -> String {
         goals: Vec::new(),
         retention_days: None,
         imported: None,
+        completed_import_ids: Vec::new(),
     };
     let result = execute(
         &server.reader,

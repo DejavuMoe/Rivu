@@ -171,7 +171,7 @@ async fn delete_import(
         .await?;
     let id: i64 = id.parse().map_err(|_| DashError::NotFound)?;
     let mut tx = sites::begin_maintenance(&api.pg).await?;
-    let completed = match imports::claim_delete(&mut tx, c.site.id, id).await? {
+    match imports::claim_delete(&mut tx, c.site.id, id).await? {
         DeleteClaim::Missing => return Err(DashError::NotFound),
         DeleteClaim::Running => {
             return Err(DashError::Conflict(
@@ -179,17 +179,15 @@ async fn delete_import(
                 "the import is still running".into(),
             ));
         }
-        DeleteClaim::Ready { completed } => completed,
-    };
-    if completed {
-        let import_id = u64::try_from(id).map_err(|_| DashError::NotFound)?;
-        rivu_query::rollup::delete_import(maintainer(&api)?, &TenantScope::new(c.site.id), import_id)
-            .await
-            .map_err(|e| {
-                tracing::error!(site_id = c.site.id, import_id = id, error = %e, "删除导入的汇总行失败");
-                DashError::Internal
-            })?;
+        DeleteClaim::Ready => {}
     }
+    let import_id = u64::try_from(id).map_err(|_| DashError::NotFound)?;
+    rivu_query::rollup::delete_import(maintainer(&api)?, &TenantScope::new(c.site.id), import_id)
+        .await
+        .map_err(|e| {
+            tracing::error!(site_id = c.site.id, import_id = id, error = %e, "删除导入的汇总行失败");
+            DashError::Internal
+        })?;
     if !imports::delete(&mut *tx, c.site.id, id).await? {
         return Err(DashError::Internal);
     }

@@ -110,14 +110,13 @@ impl Deadline {
 struct Ctx<'a> {
     reader: &'a Client,
     scope: &'a TenantScope,
+    site: &'a SiteContext,
     opts: &'a ExecOptions,
     deadline: Deadline,
     /// 实际用到的层（`meta.tiers`）。
     tiers: std::sync::Mutex<BTreeSet<Tier>>,
     /// 原始数据里最早的完整本地日（保留期，见 [`SiteContext::retention_days`]）；`None` 不限。
     raw_since: Option<jiff::civil::Date>,
-    /// 已完成的导入覆盖的本地日期（[`SiteContext::imported`]）。
-    imported: Option<(jiff::civil::Date, jiff::civil::Date)>,
 }
 
 /// 每条查询的 `log_comment`（JSON，只含 id 与固定标签）：调用方的额外字段在前，保留字段 `route`、`site`、`part`、`tier` 覆盖同名项。
@@ -184,6 +183,7 @@ pub(crate) fn bind(mut q: clickhouse::query::Query, params: &Params) -> clickhou
             ParamValue::Str(s) | ParamValue::Date(s) => q.param(name, s.as_str()),
             ParamValue::StrArray(a) => q.param(name, a),
             ParamValue::U32Array(a) => q.param(name, a),
+            ParamValue::U64Array(a) => q.param(name, a),
         };
     }
     q
@@ -425,6 +425,7 @@ async fn fetch_rows(
     let opts = MainSqlOptions {
         interval: raw_iv,
         split,
+        completed_import_ids: &cx.site.completed_import_ids,
         constraint,
         total_visitors,
         limit: page.0,
@@ -470,7 +471,7 @@ async fn choose_tier(
         return raw;
     };
     // 导入的天只在汇总层里（导入写的是汇总行），与保留期之前的天一样：不看行数阈值
-    let imported = cx.imported.filter(|(a, b)| *a <= to && *b >= from);
+    let imported = cx.site.imported.filter(|(a, b)| *a <= to && *b >= from);
     // 属性族只有导入的数据：汇总层只回答导入的天，之后的天走原始层
     if let rollup::Family::Props(_) = family {
         let Some((_, imp_to)) = imported else {
@@ -484,7 +485,7 @@ async fn choose_tier(
         &q.tz_name,
         &from.to_string(),
         &to.to_string(),
-        Some(today),
+        Some((today, &cx.site.completed_import_ids)),
     );
     let rows = cx.run(&format!("{part}.tier"), &sql, &params).await?;
     let row = rows.first();
@@ -593,6 +594,7 @@ pub fn explain(
     let opts = MainSqlOptions {
         interval: q.interval,
         split: None,
+        completed_import_ids: &[],
         constraint: None,
         total_visitors: plan.needs_total.then_some(0),
         limit: u64::from(q.limit),
@@ -644,11 +646,11 @@ pub async fn property_keys(
     let cx = Ctx {
         reader,
         scope,
+        site,
         opts: &opts,
         deadline: Deadline::new(opts.timeout_secs),
         tiers: Default::default(),
         raw_since: None,
-        imported: None,
     };
     let data_start = if matches!(spec.date_range, DateRange::All) {
         let first = first_event_ms(&cx).await?;
@@ -676,6 +678,7 @@ pub async fn property_keys(
             &from.max(imp_from).to_string(),
             &to.min(imp_to).to_string(),
             MAX_LISTED_PROPERTY_KEYS,
+            &site.completed_import_ids,
         );
         rows.extend(cx.run("property_keys.imported", &sql, &params).await?);
     }
@@ -719,11 +722,11 @@ pub async fn execute(
     let cx = Ctx {
         reader,
         scope,
+        site,
         opts: &opts,
         deadline: Deadline::new(opts.timeout_secs),
         tiers: Default::default(),
         raw_since: raw_since(site, opts.now)?,
-        imported: site.imported,
     };
     // `all` 的起点取原始事件、已完成导入与可用原生汇总中最早的时间。
     let (base_start, data_start) = if matches!(spec.date_range, DateRange::All) {
