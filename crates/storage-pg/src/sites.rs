@@ -307,25 +307,42 @@ pub async fn find_query_settings(pool: &PgPool, site_id: u64) -> Result<Option<Q
     .transpose()
 }
 
-/// 原始数据清理用：全部站点（含软删除、还没清除的）的 id、时区与站点级保留天数。
-pub async fn retention_settings(pool: &PgPool) -> Result<Vec<(u64, String, Option<i32>)>> {
+pub struct RetentionSite {
+    pub id: i64,
+    pub timezone: String,
+    pub retention_days: Option<i32>,
+    pub paused: bool,
+}
+
+/// 锁住本轮能处理的站点，直到 ClickHouse 清理结束。软删除、恢复、修改设置和外键引用的新擦除意图会与行锁互斥。
+pub async fn lock_retention_sites(conn: &mut sqlx::PgConnection) -> Result<Vec<RetentionSite>> {
+    let ids: Vec<i64> =
+        sqlx::query_scalar("SELECT id FROM sites ORDER BY id FOR UPDATE SKIP LOCKED")
+            .fetch_all(&mut *conn)
+            .await
+            .context("锁定清理站点失败")?;
+    // 锁定后再读设置与擦除意图，使用同一事务的新快照。
     let rows = sqlx::query(
-        "SELECT s.id, s.timezone, ss.retention_days
-         FROM sites s LEFT JOIN site_settings ss ON ss.site_id = s.id ORDER BY s.id",
+        "SELECT s.id, s.timezone, ss.retention_days,
+                s.deleted_at IS NOT NULL OR EXISTS (
+                    SELECT 1 FROM pending_stats_deletions p WHERE p.site_id = s.id
+                      AND p.status IN ('pending', 'running', 'failed')
+                ) AS paused
+         FROM sites s LEFT JOIN site_settings ss ON ss.site_id = s.id WHERE s.id = ANY($1)",
     )
-    .fetch_all(pool)
+    .bind(ids)
+    .try_map(|row| {
+        Ok(RetentionSite {
+            id: row.try_get("id")?,
+            timezone: row.try_get("timezone")?,
+            retention_days: row.try_get("retention_days")?,
+            paused: row.try_get("paused")?,
+        })
+    })
+    .fetch_all(conn)
     .await
     .context("查询站点保留期失败")?;
-    rows.iter()
-        .map(|r| {
-            let id: i64 = r.try_get("id")?;
-            Ok((
-                u64::try_from(id).context("sites.id 为负数")?,
-                r.try_get("timezone")?,
-                r.try_get("retention_days")?,
-            ))
-        })
-        .collect()
+    Ok(rows)
 }
 
 /// 新站点的参数。

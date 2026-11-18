@@ -16,9 +16,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clickhouse::Client;
-use jiff::Timestamp;
 use jiff::civil::{Date, date};
 use jiff::tz::TimeZone;
+use jiff::{Timestamp, ToSpan};
 use rand::rngs::StdRng;
 use rand::seq::IndexedRandom;
 use rand::{Rng, SeedableRng};
@@ -414,6 +414,161 @@ async fn cleanup(migrator: &Client, site_id: u64) {
     }
 }
 
+async fn retention_waits_for_native_days(pg: &sqlx::PgPool, ch: &Client, writer: &Client) {
+    let now = Timestamp::now();
+    let first = now
+        .to_zoned(TimeZone::UTC)
+        .date()
+        .first_of_month()
+        .checked_sub(3.months())
+        .unwrap();
+    let gap = first.tomorrow().unwrap();
+    let later = gap.tomorrow().unwrap();
+    let repairable = first.checked_add(10.days()).unwrap();
+    let last = repairable.tomorrow().unwrap();
+    let mut ids = Vec::new();
+    for name in ["retention-prefix", "retention-drop", "retention-restore"] {
+        ids.push(
+            rivu_storage_pg::sites::create_site(
+                pg,
+                &NewSite {
+                    name,
+                    timezone: "UTC",
+                    hostnames: &[format!("{name}.test")],
+                },
+            )
+            .await
+            .unwrap()
+            .id,
+        );
+    }
+    let [a, b, restored] = ids.try_into().unwrap();
+    let unknown = u64::MAX;
+    for (id, ts, start, session) in [
+        (a, first, first, 1_u64),
+        (a, gap, first, 1),
+        (a, later, later, 2),
+        (a, repairable, repairable, 3),
+        (a, last, last, 4),
+        (b, first, first, 1),
+        (b, first.yesterday().unwrap(), first.yesterday().unwrap(), 2),
+        (restored, first, first, 1),
+        (unknown, first, first, 1),
+    ] {
+        writer.query("INSERT INTO events (site_id, ts, name, session_id, session_start, visitor_id) VALUES (?, ?, 'pageview', ?, ?, ?)")
+            .bind(id).bind(format!("{ts} 12:00:00")).bind(session)
+            .bind(format!("{start} 12:00:00")).bind(session)
+            .with_setting("async_insert", "0").execute().await.unwrap();
+    }
+
+    async fn rows(ch: &Client, table: &str, site_id: u64) -> u64 {
+        let agg = if table == "sessions" {
+            "uniqExact(session_id)"
+        } else {
+            "count()"
+        };
+        ch.query(&format!("SELECT {agg} FROM {table} WHERE site_id = ?"))
+            .bind(site_id)
+            .fetch_one()
+            .await
+            .unwrap()
+    }
+    async fn build(ch: &Client, site_id: u64, day: Date, now: Timestamp) {
+        rollup::build_day(
+            ch,
+            &TenantScope::new(site_id),
+            &SiteContext::new(site_id, TimeZone::UTC),
+            day,
+            1,
+            now,
+        )
+        .await
+        .unwrap();
+    }
+    let database = ch_database();
+    let purge = || rivu_jobs::retention::run_once(pg, ch, &database, 30);
+    assert_eq!(purge().await.unwrap(), (0, 0), "未汇总的整月分区须保留");
+    assert_eq!(rows(ch, "events", a).await, 5);
+    assert_eq!(rows(ch, "sessions", a).await, 4);
+
+    // 同分区的站点只能分别推进，另一个全覆盖的月份仍可快速删除。
+    for day in [first, first.yesterday().unwrap()] {
+        build(ch, b, day, now).await;
+    }
+    build(ch, restored, first, now).await;
+    assert!(
+        rivu_storage_pg::stats_deletions::soft_delete_site(pg, restored, None, 7)
+            .await
+            .unwrap()
+    );
+    let mut day = first;
+    while day <= last {
+        if day != gap && day != repairable {
+            build(ch, a, day, now).await;
+        }
+        day = day.tomorrow().unwrap();
+    }
+    for (table, origin) in [("rollup_site", "import"), ("rollup_pages", "native")] {
+        ch.query(&format!(
+            "INSERT INTO {table} (site_id, day, origin, import_id) VALUES (?, ?, ?, ?)"
+        ))
+        .bind(a)
+        .bind(gap.to_string())
+        .bind(origin)
+        .bind(u64::from(origin == "import"))
+        .execute()
+        .await
+        .unwrap();
+    }
+
+    let (dropped, deleted) = purge().await.unwrap();
+    assert_eq!((dropped, deleted), (2, 2));
+    assert_eq!(rows(ch, "events", a).await, 4, "缺一天时更晚的标记不能推进");
+    assert_eq!(rows(ch, "sessions", a).await, 4, "跨日会话的后一天尚未汇总");
+    assert_eq!(rows(ch, "events", b).await, 0);
+    assert_eq!(rows(ch, "sessions", b).await, 0);
+    assert_eq!(rows(ch, "events", restored).await, 1);
+    assert_eq!(rows(ch, "sessions", restored).await, 1);
+    assert_eq!(rows(ch, "events", unknown).await, 1);
+    assert_eq!(rows(ch, "sessions", unknown).await, 1);
+
+    build(ch, a, gap, now).await;
+    purge().await.unwrap();
+    assert_eq!(rows(ch, "events", a).await, 0);
+    assert_eq!(rows(ch, "sessions", a).await, 0);
+    let recovered_events: u64 = ch.query("SELECT events FROM rollup_site FINAL WHERE site_id = ? AND day = ? AND origin = 'native' AND tz = 'UTC'")
+        .bind(a).bind(repairable.to_string()).fetch_one().await.unwrap();
+    assert_eq!(recovered_events, 1, "补建使用仍保留的 raw");
+    assert_eq!(purge().await.unwrap(), (0, 0));
+    assert_eq!(
+        rivu_storage_pg::stats_deletions::restore_site(pg, restored)
+            .await
+            .unwrap(),
+        rivu_storage_pg::stats_deletions::RestoreOutcome::Restored
+    );
+    let mut lock = pg.begin().await.unwrap();
+    sqlx::query("SELECT id FROM sites WHERE id = $1 FOR UPDATE")
+        .bind(i64::try_from(restored).unwrap())
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    assert_eq!(purge().await.unwrap(), (0, 0));
+    assert_eq!(rows(ch, "events", restored).await, 1);
+    lock.rollback().await.unwrap();
+    purge().await.unwrap();
+    assert_eq!(rows(ch, "events", restored).await, 0);
+    assert_eq!(rows(ch, "sessions", restored).await, 0);
+    for id in [a, b, restored, unknown] {
+        for table in ["events", "sessions"] {
+            ch.query(&format!("DELETE FROM {table} WHERE site_id = ?"))
+                .bind(id)
+                .execute()
+                .await
+                .unwrap();
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rollup_tier_matches_the_raw_tier() {
     let (Some(pg_url), Some(ch_url)) = (
@@ -441,6 +596,11 @@ async fn rollup_tier_matches_the_raw_tier() {
 
     // ---- 站点、盐、管线 ----------------------------------------------------------------------
     let pg = rivu_storage_pg::connect(&pg_url, 4).await.expect("连接 PG");
+    let retention_ch =
+        rivu_storage_ch::client(&ch_url, &account("maintainer"), Some(&ch_database()));
+    let retention_writer =
+        rivu_storage_ch::client(&ch_url, &account("writer"), Some(&ch_database()));
+    retention_waits_for_native_days(&pg, &retention_ch, &retention_writer).await;
     let created = rivu_storage_pg::sites::create_site(
         &pg,
         &NewSite {
