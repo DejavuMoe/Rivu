@@ -32,7 +32,7 @@
 - [x] 生产 compose：rivu + PostgreSQL + ClickHouse，可选内置 Caddy；nginx 与 Caddy 反向代理示例
 - [x] 安装、升级、备份文档（`docs/install.md`）
 - [x] 发布流程：CHANGELOG、`release.yml`（推送 v* 标签时构建并推送镜像；尚未在真实 runner 上跑过）
-- [x] CONTRIBUTING、SECURITY（报告邮箱待维护者确定）、issue 模板；CI 依赖审计与镜像构建检查
+- [x] CONTRIBUTING、SECURITY（GitHub 私密漏洞报告）、issue 模板；CI 依赖审计与镜像构建检查
 - [ ] 常驻实例跑满 7 天已知答案探针（P1 最后一项验收）
 
 ## P2 性能
