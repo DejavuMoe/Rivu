@@ -19,8 +19,8 @@ export function compact(n: number, lang: Lang): string {
 }
 
 function trim(x: number) {
-  const s = x >= 100 ? x.toFixed(0) : x >= 10 ? x.toFixed(1) : x.toFixed(2);
-  return s.replace(/\.?0+$/, "");
+  if (x >= 100) return x.toFixed(0);
+  return x.toFixed(x >= 10 ? 1 : 2).replace(/\.?0+$/, "");
 }
 
 export function full(n: number, lang: Lang): string {
