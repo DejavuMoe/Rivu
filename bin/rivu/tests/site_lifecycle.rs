@@ -765,15 +765,31 @@ async fn plausible_imports_over_http() {
     assert_eq!(list["imports"], json!([]));
     assert_eq!(list["native_from"], Value::Null, "站点还没有数据");
 
-    // 上传：202，后台导入完成
-    let v = expect(
-        &http
-            .upload(&upload, visitors_zip())
-            .cookie(&w.admin.cookie)
-            .send()
-            .await,
-        202,
+    // A timezone change that already holds the site lock wins over import registration.
+    let mut tx = pg.begin().await.unwrap();
+    assert!(
+        rivu_storage_pg::sites::lock_timezone(&mut tx, site, false)
+            .await
+            .unwrap()
+            .is_some()
     );
+    sqlx::query("UPDATE sites SET timezone = 'Asia/Taipei' WHERE id = $1")
+        .bind(site as i64)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let request = http
+        .upload(&upload, visitors_zip())
+        .cookie(&w.admin.cookie)
+        .send();
+    tokio::pin!(request);
+    let waiting = tokio::time::timeout(Duration::from_millis(150), &mut request).await;
+    tx.commit().await.unwrap();
+    assert!(
+        waiting.is_err(),
+        "upload completed before the timezone transaction committed"
+    );
+    let v = expect(&request.await, 202);
     assert_eq!(v["import"]["status"], "importing");
     assert_eq!(v["import"]["file_name"], "blog_export.zip", "路径部分去掉");
     let id = v["import"]["id"].as_i64().unwrap();
@@ -783,6 +799,15 @@ async fn plausible_imports_over_http() {
     assert_eq!(done["end_date"], "2026-06-03");
     assert_eq!(done["imported_by"], "Test User");
     assert_eq!(done["error_code"], Value::Null);
+    let timezone: String =
+        rivu_storage_ch::client(&env.ch_url, &account("reader"), Some(&ch_database()))
+            .query("SELECT tz FROM rollup_site FINAL WHERE site_id = ? AND import_id = ? LIMIT 1")
+            .bind(site)
+            .bind(id as u64)
+            .fetch_one()
+            .await
+            .unwrap();
+    assert_eq!(timezone, "Asia/Taipei");
 
     // 失败带代码：不是 zip、日期与已有导入重叠
     for (body, code) in [
@@ -818,10 +843,29 @@ async fn plausible_imports_over_http() {
     );
 
     // 一个站点同时只有一个进行中的导入；进行中的不能删
-    let running = rivu_storage_pg::imports::create(&pg, site, "plausible_csv", "x.zip", None)
-        .await
-        .unwrap()
-        .expect("建记录");
+    let running = rivu_storage_pg::imports::create(
+        &mut pg.acquire().await.unwrap(),
+        site,
+        "plausible_csv",
+        "x.zip",
+        None,
+    )
+    .await
+    .unwrap()
+    .expect("建记录");
+    expect_err(
+        &http
+            .json_rb(
+                "PATCH",
+                &format!("/api/internal/sites/{site}"),
+                &json!({"timezone": "UTC"}),
+            )
+            .cookie(&w.admin.cookie)
+            .send()
+            .await,
+        409,
+        "timezone_import_conflict",
+    );
     expect_err(
         &http
             .upload(&upload, visitors_zip())
@@ -1066,15 +1110,21 @@ async fn date_range_intent(
     to: Date,
     done: &[String],
 ) -> i64 {
+    let (start, end) =
+        rivu_query::resolve::local_dates_utc_ms(&TimeZone::get("Asia/Shanghai").unwrap(), from, to)
+            .unwrap();
     // 一条语句写入（含预置的 partitions_done），并发的 run_batch 不会看到中间状态
     sqlx::query_scalar(
-        "INSERT INTO pending_stats_deletions (site_id, scope, date_from, date_to, partitions_done)
-         VALUES ($1, 'date_range', $2::date, $3::date, $4) RETURNING id",
+        "INSERT INTO pending_stats_deletions
+            (site_id, scope, date_from, date_to, partitions_done, timezone, utc_start_ms, utc_end_ms)
+         VALUES ($1, 'date_range', $2::date, $3::date, $4, 'Asia/Shanghai', $5, $6) RETURNING id",
     )
     .bind(site_id as i64)
     .bind(from.to_string())
     .bind(to.to_string())
     .bind(done)
+    .bind(start)
+    .bind(end)
     .fetch_one(pg)
     .await
     .unwrap()

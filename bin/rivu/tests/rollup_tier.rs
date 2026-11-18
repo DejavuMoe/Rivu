@@ -611,8 +611,9 @@ async fn rollup_tier_matches_the_raw_tier() {
     let before_all = run(&reader, &site, &all, now, false).await;
     let pageviews = |r: &QueryResult| r.results[0].metrics[0].as_f64();
     assert!(pageviews(&before_all) > 0.0);
+    let mut tx = pg.begin().await.unwrap();
     rivu_storage_pg::sites::update_site(
-        &pg,
+        &mut tx,
         created.id,
         &rivu_storage_pg::sites::SitePatch {
             retention_days: Some(Some(30)),
@@ -621,6 +622,7 @@ async fn rollup_tier_matches_the_raw_tier() {
     )
     .await
     .unwrap();
+    tx.commit().await.unwrap();
     // 真实的「现在」是 2026-10 之后：这个站点 6 月的数据都过了 30 天
     let (_, deleted) = rivu_jobs::retention::run_once(&pg, &maintainer, &ch_database(), 731)
         .await

@@ -2,7 +2,7 @@
 //! 这里只记录来源、状态与实际写入的日期范围；状态为 `completed` 的导入才参与查询。
 
 use anyhow::{Context, Result};
-use sqlx::{PgPool, Row};
+use sqlx::{PgConnection, PgPool, Row};
 
 fn id_i64(id: u64) -> Result<i64> {
     i64::try_from(id).context("id 超出范围")
@@ -61,9 +61,9 @@ fn import_row(r: &sqlx::postgres::PgRow) -> Result<ImportRow> {
 }
 
 /// 开始一次导入（状态 `importing`），返回记录 id（也是 ClickHouse 里的 `import_id`）；
-/// 站点已有进行中的导入时返回 `None`。
+/// 站点已有进行中的导入时返回 `None`。调用方先锁站点行并读取本次导入使用的时区。
 pub async fn create(
-    pool: &PgPool,
+    db: &mut PgConnection,
     site_id: u64,
     source: &str,
     file_name: &str,
@@ -77,9 +77,28 @@ pub async fn create(
     .bind(source)
     .bind(file_name)
     .bind(imported_by)
-    .fetch_optional(pool)
+    .fetch_optional(db)
     .await
     .context("写入导入记录失败")
+}
+
+/// 同一个 PG 快照里检查尚未完成的导入和已完成导入的最后一天。
+pub async fn blocks_timezone_change(
+    db: &mut PgConnection,
+    site_id: u64,
+    native_from: Option<String>,
+) -> Result<bool> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM site_imports WHERE site_id = $1 AND
+               (status = 'importing' OR (status = 'completed' AND end_date >= $2::text::date))
+         )",
+    )
+    .bind(id_i64(site_id)?)
+    .bind(native_from)
+    .fetch_one(db)
+    .await
+    .context("检查导入与目标时区的原生数据是否重叠失败")
 }
 
 /// 导入完成：记下实际写入的日期范围与行数。
