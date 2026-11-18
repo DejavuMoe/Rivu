@@ -1267,19 +1267,20 @@ pub(crate) fn rollup_probe_query(
     tz: &str,
     from: &str,
     to: &str,
-    native_only: bool,
+    today: Option<jiff::civil::Date>,
 ) -> (String, Params) {
     let mut params = Params::default();
     params.push("site", ParamValue::U64(scope.site_id()));
     params.push("tz", ParamValue::Str(tz.to_owned()));
     params.push("from_day", ParamValue::Date(from.to_owned()));
     params.push("to_day", ParamValue::Date(to.to_owned()));
-    // 已构建的最后一天：构建任务只看原生行；选层把导入的天也算上（它们只在汇总层里）。
-    // 时区不同只看原生行：导入的行按导入时的时区归日，不随站点改时区重建
-    let origin = if native_only {
-        " AND origin = 'native'"
-    } else {
-        ""
+    // 构建任务只看原生行。查询时，未结束的原生日不能覆盖原始数据，导入日仍按导入时的时区归日。
+    let origin = match today {
+        None => " AND origin = 'native'",
+        Some(today) => {
+            params.push("today", ParamValue::Date(today.to_string()));
+            " AND (origin = 'import' OR day < {today:Date})"
+        }
     };
     let sql = format!(
         "SELECT toString(maxOrNull(day)), countIf(origin = 'native' AND tz != {{tz:String}}), \
@@ -1290,12 +1291,18 @@ pub(crate) fn rollup_probe_query(
 }
 
 /// 站点当前时区最早完成的原生汇总日（`rollup_site` 最后写入）。
-pub(crate) fn first_native_rollup_day_query(scope: &TenantScope, tz: &str) -> (String, Params) {
+pub(crate) fn first_native_rollup_day_query(
+    scope: &TenantScope,
+    tz: &str,
+    today: jiff::civil::Date,
+) -> (String, Params) {
     let mut params = Params::default();
     params.push("site", ParamValue::U64(scope.site_id()));
     params.push("tz", ParamValue::Str(tz.to_owned()));
+    params.push("today", ParamValue::Date(today.to_string()));
     let sql = "SELECT toString(minOrNull(day)) FROM rollup_site FINAL \
-               WHERE site_id = {site:UInt64} AND origin = 'native' AND tz = {tz:String}"
+               WHERE site_id = {site:UInt64} AND origin = 'native' AND tz = {tz:String} \
+               AND day < {today:Date}"
         .to_owned();
     (sql, params)
 }
