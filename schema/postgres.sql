@@ -180,7 +180,12 @@ TABLE pending_stats_deletions
   requested_by bigint
   created_at timestamp with time zone NOT NULL DEFAULT now()
   updated_at timestamp with time zone NOT NULL DEFAULT now()
+  timezone text
+  utc_start_ms bigint
+  utc_end_ms bigint
+  rejected_before_write boolean NOT NULL DEFAULT false
   CONSTRAINT pending_stats_deletions_check CHECK (((scope = 'site'::text) OR ((date_from IS NOT NULL) AND (date_to >= date_from))))
+  CONSTRAINT pending_stats_deletions_frozen_range CHECK ((((timezone IS NULL) AND (utc_start_ms IS NULL) AND (utc_end_ms IS NULL)) OR ((scope = 'date_range'::text) AND (timezone IS NOT NULL) AND (utc_start_ms IS NOT NULL) AND (utc_end_ms IS NOT NULL) AND (utc_start_ms <= utc_end_ms))))
   CONSTRAINT pending_stats_deletions_pkey PRIMARY KEY (id)
   CONSTRAINT pending_stats_deletions_requested_by_fkey FOREIGN KEY (requested_by) REFERENCES users(id) ON DELETE SET NULL
   CONSTRAINT pending_stats_deletions_scope_check CHECK ((scope = ANY (ARRAY['site'::text, 'date_range'::text])))

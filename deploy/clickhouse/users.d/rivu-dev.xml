@@ -66,6 +66,8 @@
             <quota>default</quota>
             <grants>
                 <query>GRANT CREATE, ALTER, DROP, TRUNCATE, INSERT, SELECT, SHOW ON rivu.*</query>
+                <!-- 双库测试暂停汇总页表的 mutation，验证维护事务等待期间仍持有站点行锁。 -->
+                <query>GRANT SYSTEM MERGES ON rivu.rollup_pages</query>
             </grants>
         </rivu_migrator>
 
