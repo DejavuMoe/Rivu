@@ -20,8 +20,9 @@ use axum::response::Response;
 use axum::routing::{delete, get};
 use jiff::tz::TimeZone;
 use rivu_auth::scope::Action;
+use rivu_jobs::import_plausible;
 use rivu_query::TenantScope;
-use rivu_storage_pg::imports::{self, ImportRow};
+use rivu_storage_pg::imports::{self, DeleteClaim, ImportRow};
 use rivu_storage_pg::sites;
 use serde_json::{Value, json};
 
@@ -121,25 +122,22 @@ async fn create_import(
         ));
     }
     let file_name = clean_file_name(file_name.as_deref());
-    let mut tx = api.pg.begin().await.map_err(anyhow::Error::from)?;
-    let timezone = sites::lock_timezone(&mut tx, c.site.id, false)
-        .await?
-        .ok_or(DashError::NotFound)?;
-    let Some(id) = imports::create(
-        &mut tx,
-        c.site.id,
-        "plausible_csv",
-        &file_name,
-        Some(c.session.s.user_id),
-    )
-    .await?
-    else {
-        return Err(DashError::Conflict(
-            "import_running",
-            "another import for this site is still running".into(),
-        ));
-    };
-    tx.commit().await.map_err(anyhow::Error::from)?;
+    let import =
+        match import_plausible::start(&api.pg, c.site.id, &file_name, Some(c.session.s.user_id))
+            .await
+        {
+            Ok(Some(import)) => import,
+            Ok(None) => return Err(DashError::NotFound),
+            Err(e) if import_plausible::error_code(&e) == "import_running" => {
+                return Err(DashError::Conflict(
+                    "import_running",
+                    "another import for this site is still running".into(),
+                ));
+            }
+            Err(e) => return Err(e.into()),
+        };
+    let id = import.row().id;
+    let row = import_json(import.row());
     tracing::info!(
         user_id = c.session.s.user_id,
         site_id = c.site.id,
@@ -147,26 +145,20 @@ async fn create_import(
         bytes = zip.len(),
         "开始导入 Plausible 导出"
     );
-    let (pg, cache, site_id) = (api.pg.clone(), api.cache.clone(), c.site.id);
+    let (cache, site_id) = (api.cache.clone(), c.site.id);
     tokio::spawn(async move {
-        let res =
-            rivu_jobs::import_plausible::execute(&pg, &ch, id, site_id, &timezone, zip.to_vec())
-                .await;
-        if res.is_ok()
-            && let Some(cache) = cache
-        {
-            cache.invalidate_site(site_id);
+        match import.execute(&ch, zip.to_vec()).await {
+            Ok(_) => {
+                if let Some(cache) = cache {
+                    cache.invalidate_site(site_id);
+                }
+            }
+            Err(e) => {
+                tracing::debug!(site_id, import_id = id, error = %format!("{e:#}"), "后台导入退出")
+            }
         }
     });
-    let row = imports::get(&api.pg, c.site.id, id)
-        .await?
-        .ok_or(DashError::Internal)?;
-    Ok(done(
-        &api,
-        &c,
-        StatusCode::ACCEPTED,
-        json!({"import": import_json(&row)}),
-    ))
+    Ok(done(&api, &c, StatusCode::ACCEPTED, json!({"import": row})))
 }
 
 async fn delete_import(
@@ -178,16 +170,18 @@ async fn delete_import(
         .authorize_admin(req.headers(), &site, Action::SiteSettingsWrite, true)
         .await?;
     let id: i64 = id.parse().map_err(|_| DashError::NotFound)?;
-    let row = imports::get(&api.pg, c.site.id, id)
-        .await?
-        .ok_or(DashError::NotFound)?;
-    if row.status == "importing" {
-        return Err(DashError::Conflict(
-            "import_running",
-            "the import is still running".into(),
-        ));
-    }
-    if row.status == "completed" {
+    let mut tx = sites::begin_maintenance(&api.pg).await?;
+    let completed = match imports::claim_delete(&mut tx, c.site.id, id).await? {
+        DeleteClaim::Missing => return Err(DashError::NotFound),
+        DeleteClaim::Running => {
+            return Err(DashError::Conflict(
+                "import_running",
+                "the import is still running".into(),
+            ));
+        }
+        DeleteClaim::Ready { completed } => completed,
+    };
+    if completed {
         let import_id = u64::try_from(id).map_err(|_| DashError::NotFound)?;
         rivu_query::rollup::delete_import(maintainer(&api)?, &TenantScope::new(c.site.id), import_id)
             .await
@@ -196,7 +190,10 @@ async fn delete_import(
                 DashError::Internal
             })?;
     }
-    imports::delete(&api.pg, c.site.id, id).await?;
+    if !imports::delete(&mut *tx, c.site.id, id).await? {
+        return Err(DashError::Internal);
+    }
+    tx.commit().await.map_err(anyhow::Error::from)?;
     if let Some(cache) = &api.cache {
         cache.invalidate_site(c.site.id);
     }

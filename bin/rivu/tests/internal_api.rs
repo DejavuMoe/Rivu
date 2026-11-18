@@ -3876,17 +3876,10 @@ async fn timezone_rebuild_rejects_import_overlap() {
         .unwrap();
         zip.finish().unwrap().into_inner()
     };
-    let import_id: i64 = sqlx::query_scalar(
-        "INSERT INTO site_imports (site_id, source, file_name)
-         VALUES ($1, 'plausible_csv', 'export.zip') RETURNING id",
-    )
-    .bind(site.id as i64)
-    .fetch_one(&pg)
-    .await
-    .unwrap();
-    let summary = rivu_jobs::import_plausible::execute(&pg, &ch, import_id, site.id, "UTC", zip)
-        .await
-        .unwrap();
+    let (_, summary) =
+        rivu_jobs::import_plausible::import_file(&pg, &ch, site.id, zip, "export.zip", None)
+            .await
+            .unwrap();
     assert_eq!((summary.start, summary.end), (import_day, import_day));
     let pageviews = |day: Date| {
         let day = day.to_string();
