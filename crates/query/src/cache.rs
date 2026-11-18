@@ -1,7 +1,7 @@
 //! 结果缓存（`system-design.md` §6.9）：进程内的 moka，看板与公开 API 共用。
 //!
 //! 键是这些内容的哈希：站点 id、请求（`QuerySpec` 的规范 JSON）、影响结果的站点配置（时区、周起始日、目标、
-//! 地理库的署名与能力）、站点的数据代数，以及「现在」所在的时间桶。配置直接进键，所以改目标、改时区立即生效，
+//! 地理库的署名与能力）、已完成的导入、站点的数据代数，以及「现在」所在的时间桶。配置直接进键，所以改目标、改时区立即生效，
 //! 不需要版本号；删除统计数据之后调用 [`QueryCache::invalidate_site`] 让代数加一，旧结果不再命中。
 //!
 //! 时间桶的长度按请求的范围：`realtime` 3 s；`day`、`24h` 10 s；含今天的范围 60 s；已结束的历史范围 10 min。
@@ -69,6 +69,8 @@ impl QueryCache {
         format!("{:?}", site.goals).hash(&mut h);
         format!("{:?}", site.geo_attribution).hash(&mut h);
         format!("{:?}", site.geo_capability).hash(&mut h);
+        site.imported.hash(&mut h);
+        site.completed_import_ids.hash(&mut h);
         let bucket = bucket_len(site, spec, now).as_millis() as i64;
         bucket.hash(&mut h);
         now.as_millisecond().div_euclid(bucket).hash(&mut h);
@@ -161,6 +163,17 @@ mod tests {
         let mut tz = site();
         tz.timezone = TimeZone::UTC;
         assert_ne!(cache.key(&tz, &s, t0), k, "时区进键");
+        let mut imported = site();
+        let day = t0.to_zoned(imported.timezone.clone()).date();
+        imported.imported = Some((day, day));
+        imported.completed_import_ids = vec![1];
+        let before = cache.key(&imported, &s, t0);
+        imported.completed_import_ids = vec![2];
+        assert_ne!(
+            cache.key(&imported, &s, t0),
+            before,
+            "同日期的新批次改变缓存键"
+        );
         cache.invalidate_site(7);
         assert_ne!(cache.key(&site(), &s, t0), k, "删除数据后代数加一");
         let mut other_site = site();

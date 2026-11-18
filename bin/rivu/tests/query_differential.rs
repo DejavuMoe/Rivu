@@ -1279,6 +1279,7 @@ impl Harness {
             goals: goal_defs(),
             retention_days: None,
             imported: None,
+            completed_import_ids: Vec::new(),
         };
         let got = execute(
             &self.reader,
