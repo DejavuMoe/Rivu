@@ -23,6 +23,7 @@ use jiff::tz::TimeZone;
 use rivu_auth::password::validate_password;
 use rivu_auth::scope::{Action, OrgRole, allowed};
 use rivu_auth::session;
+use rivu_common::config::MIN_RETENTION_DAYS;
 use rivu_geo::GeoCapability;
 use rivu_ingest::shield::{RuleAction, RuleType, normalize_value};
 use rivu_storage_pg::access::{self, SiteRef, UserSiteRoles, VisibleSite};
@@ -427,10 +428,12 @@ async fn patch_site(
     let retention = match body.retention_days {
         None => None,
         Some(None) => Some(None),
-        Some(Some(n)) if (30..=i64::from(global)).contains(&n) => Some(Some(n as i32)),
+        Some(Some(n)) if (i64::from(MIN_RETENTION_DAYS)..=i64::from(global)).contains(&n) => {
+            Some(Some(n as i32))
+        }
         Some(Some(_)) => {
             return Err(DashError::Invalid(format!(
-                "the retention_days must be between 30 and {global}, or null for the instance default"
+                "the retention_days must be between {MIN_RETENTION_DAYS} and {global}, or null for the instance default"
             )));
         }
     };
@@ -449,9 +452,32 @@ async fn patch_site(
         geo_level: body.geo_level.as_deref(),
         retention_days: retention,
     };
-    if !sites::update_site(&api.pg, c.site.id, &patch).await? {
+    let mut tx = api.pg.begin().await.map_err(anyhow::Error::from)?;
+    if let Some(next) = patch.timezone {
+        let current = sites::lock_timezone(&mut tx, c.site.id)
+            .await?
+            .ok_or(DashError::NotFound)?;
+        if current != next
+            && !rivu_jobs::rollup::can_change_timezone(
+                &mut tx,
+                &api.reader,
+                c.site.id,
+                &current,
+                next,
+                (api.clock)(),
+            )
+            .await?
+        {
+            return Err(DashError::Conflict(
+                rivu_jobs::rollup::TIMEZONE_REBUILD_UNPROVEN,
+                "the timezone cannot be changed because the native rollup rebuild is unproven or a statistics deletion affects it".into(),
+            ));
+        }
+    }
+    if !sites::update_site(&mut tx, c.site.id, &patch).await? {
         return Err(DashError::NotFound);
     }
+    tx.commit().await.map_err(anyhow::Error::from)?;
     tracing::info!(
         user_id = c.session.s.user_id,
         site_id = c.site.id,
@@ -666,10 +692,14 @@ async fn create_stats_deletion(
         .authorize_admin(&headers, &site, Action::StatsDelete, true)
         .await?;
     let body: StatsDeletionBody = read_json(req, AUTH_BODY_MAX).await?;
-    let view = sites::admin_view(&api.pg, c.site.id)
+    let mut tx = api.pg.begin().await.map_err(anyhow::Error::from)?;
+    let timezone = sites::lock_timezone(&mut tx, c.site.id)
         .await?
         .ok_or(DashError::NotFound)?;
-    let tz = TimeZone::get(&view.timezone).unwrap_or(TimeZone::UTC);
+    let view = sites::admin_view(&mut *tx, c.site.id)
+        .await?
+        .ok_or(DashError::NotFound)?;
+    let tz = TimeZone::get(&timezone).unwrap_or(TimeZone::UTC);
     let today = (api.clock)().to_zoned(tz).date();
     let (from, to) = validate_stats_range(body.from.trim(), body.to.trim(), today)
         .map_err(|m| DashError::Invalid(m.into()))?;
@@ -679,13 +709,14 @@ async fn create_stats_deletion(
         ));
     }
     let row = stats_deletions::create_date_range(
-        &api.pg,
+        &mut tx,
         c.site.id,
         &from.to_string(),
         &to.to_string(),
         Some(c.session.s.user_id),
     )
     .await?;
+    tx.commit().await.map_err(anyhow::Error::from)?;
     if let Some(kick) = &api.stats_delete_kick {
         kick.notify_one();
     }
