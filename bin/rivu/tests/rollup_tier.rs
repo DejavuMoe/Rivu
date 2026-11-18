@@ -418,11 +418,12 @@ async fn retention_waits_for_native_days(
     pg: &sqlx::PgPool,
     ch: &Client,
     writer: &Client,
+    pg_url: &str,
     ch_url: &str,
 ) {
     async fn write(writer: &Client, id: u64, ts: &str, start: &str, session: u64) {
-        writer.query("INSERT INTO events (site_id, ts, name, session_id, session_start, visitor_id) VALUES (?, ?, 'pageview', ?, ?, ?)")
-            .bind(id).bind(ts).bind(session).bind(start).bind(session)
+        writer.query("INSERT INTO events (site_id, ts, name, session_id, session_start, visitor_id, pathname) VALUES (?, ?, 'pageview', ?, ?, ?, ?)")
+            .bind(id).bind(ts).bind(session).bind(start).bind(session).bind(ts)
             .with_setting("async_insert", "0")
             .with_setting("insert_deduplication_token", uuid::Uuid::new_v4().to_string())
             .execute().await.unwrap();
@@ -467,6 +468,7 @@ async fn retention_waits_for_native_days(
         "retention-rolling",
         "retention-restore",
         "retention-old-tz",
+        "retention-lock",
     ] {
         ids.push(
             rivu_storage_pg::sites::create_site(
@@ -482,8 +484,8 @@ async fn retention_waits_for_native_days(
             .id,
         );
     }
-    let [gap, race, rolling, restored, old_tz] = ids.try_into().unwrap();
-    let unknown = u64::MAX;
+    let [gap, race, rolling, restored, old_tz, lock_site] = ids.try_into().unwrap();
+    let unknown = u64::MAX - gap;
     let database = ch_database();
     let purge = || rivu_jobs::retention::run_once(pg, ch, &database, 30);
     let aug = |day| date(2026, 8, day);
@@ -529,6 +531,9 @@ async fn retention_waits_for_native_days(
     let edge = "2026-08-06 00:00:00";
     write(writer, race, edge, edge, 2).await;
     write(writer, race, "2026-08-12 23:50:00", edge, 2).await;
+    let just_inside = "2026-08-05 23:59:59.999";
+    write(writer, race, just_inside, just_inside, 8).await;
+    write(writer, race, "2026-08-12 23:59:59.999", just_inside, 8).await;
     for day in 2..=12 {
         build(ch, race, TimeZone::UTC, aug(day), now).await;
     }
@@ -568,25 +573,88 @@ async fn retention_waits_for_native_days(
             .unwrap()
     );
 
+    let short_timeout_pg = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .after_connect(|conn, _| {
+            Box::pin(async move {
+                sqlx::query(
+                    "SELECT set_config(name, '2s', false) FROM pg_settings
+                     WHERE name IN ('idle_in_transaction_session_timeout', 'transaction_timeout')",
+                )
+                .execute(conn)
+                .await?;
+                Ok(())
+            })
+        })
+        .connect(pg_url)
+        .await
+        .unwrap();
     let (proxy, server, gate) = retention_insert_barrier(ch_url).await;
     let gated = rivu_storage_ch::client(&proxy, &account("maintainer"), Some(&database));
-    tokio::time::timeout(Duration::from_secs(60), async {
+    let before = "2026-08-01 23:59:59.999";
+    let (still_locked, gated_result) = tokio::time::timeout(Duration::from_secs(60), async {
         let insert = async {
             gate.0.notified().await;
-            let before = "2026-08-01 23:59:59.999";
             let after = "2026-08-13 00:00:00";
             write(writer, race, before, before, 3).await;
             write(writer, race, after, after, 4).await;
             write(writer, race, after, edge, 2).await;
+            // A−1ms 仍沿用 A 开始的会话，分别测试单独、分批和同批输入。
+            write(writer, race, before, cross, 5).await;
+            write(writer, race, cross, cross, 6).await;
+            write(writer, race, before, cross, 6).await;
+            writer.query(
+                "INSERT INTO events (site_id, ts, name, session_id, session_start, visitor_id) VALUES
+                    (?, ?, 'pageview', 7, ?, 7), (?, ?, 'pageview', 7, ?, 7)",
+            )
+            .bind(race).bind(cross).bind(cross).bind(race).bind(before).bind(cross)
+            .with_setting("async_insert", "0")
+            .with_setting("insert_deduplication_token", uuid::Uuid::new_v4().to_string())
+            .execute().await.unwrap();
+
+            let update = sqlx::query("UPDATE sites SET timezone = $1 WHERE id = $2")
+                .bind(TZ)
+                .bind(i64::try_from(lock_site).unwrap())
+                .execute(pg);
+            tokio::pin!(update);
+            let pending = tokio::time::timeout(Duration::from_millis(2600), &mut update).await;
             gate.1.notify_one();
+            match pending {
+                Ok(result) => {
+                    assert_eq!(result.unwrap().rows_affected(), 1);
+                    false
+                }
+                Err(_) => {
+                    assert_eq!(update.await.unwrap().rows_affected(), 1);
+                    true
+                }
+            }
         };
-        let purge = rivu_jobs::retention::run_once(pg, &gated, &database, 30);
-        let (_, result) = tokio::join!(insert, purge);
-        result.unwrap()
+        let purge = rivu_jobs::retention::run_once(&short_timeout_pg, &gated, &database, 30);
+        tokio::join!(insert, purge)
     })
     .await
     .expect("purge 必须在证明后到达插入屏障");
     server.abort();
+    let split = raw(ch, race, 6).await;
+    let split_entry: String = ch
+        .query("SELECT tupleElement(argMinIfMerge(entry_page), 2) FROM sessions WHERE site_id = ? AND session_id = 6")
+        .bind(race)
+        .fetch_one()
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            raw(ch, race, 5).await,
+            (split.0, (1..=2).contains(&split.1)),
+            raw(ch, race, 7).await,
+            split_entry.as_str(),
+            still_locked,
+        ),
+        ((1, 1), (1, true), (1, 2), before, true),
+        "A−1ms 的单独、分批、同批输入必须保留会话贡献，改时区必须等清理提交"
+    );
+    gated_result.unwrap();
 
     let native_markers: u64 = ch.query("SELECT count() FROM rollup_site FINAL WHERE site_id = ? AND day = '2026-08-11' AND origin = 'native' AND import_id = 0")
         .bind(gap).fetch_one().await.unwrap();
@@ -605,6 +673,7 @@ async fn retention_waits_for_native_days(
     );
     assert_eq!(raw(ch, gap, 2).await, (0, 0), "缺口前已覆盖的活动可清理");
     assert_eq!(raw(ch, race, 1).await, (0, 0), "已覆盖的跨日会话可清理");
+    assert_eq!(raw(ch, race, 8).await, (0, 0), "B−D−1ms 可清理");
     assert_eq!(
         raw(ch, rolling, 1).await,
         (1, 0),
@@ -736,7 +805,7 @@ async fn rollup_tier_matches_the_raw_tier() {
         rivu_storage_ch::client(&ch_url, &account("maintainer"), Some(&ch_database()));
     let retention_writer =
         rivu_storage_ch::client(&ch_url, &account("writer"), Some(&ch_database()));
-    retention_waits_for_native_days(&pg, &retention_ch, &retention_writer, &ch_url).await;
+    retention_waits_for_native_days(&pg, &retention_ch, &retention_writer, &pg_url, &ch_url).await;
     let created = rivu_storage_pg::sites::create_site(
         &pg,
         &NewSite {
