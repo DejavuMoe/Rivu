@@ -15,10 +15,12 @@ Rivu 是开源、自托管的网站分析系统（Plausible 的替代品）：�
 | 会话 | 进程内分片的 SessionAssigner；关停时写快照，启动时从快照或 ClickHouse 预热 |
 | 查询 | 统一查询内核 `rivu-query`（`QuerySpec`：12 个指标、维度、过滤树、日期范围、时间序列、对比期、目标）；公开 API `POST /api/v1/query`（API key、按组织限流）与 `GET /api/v1/query/schema.json`；命令行 `rivu query` |
 | 看板（`apps/dashboard`） | 登录与首次初始化、站点列表、统计看板、安装与安装验证、站点设置（主机名、采集、脚本功能、隐私、屏蔽规则、目标、共享、危险操作）、接入诊断、成员与邀请、API key、账号与登录会话、共享链接与公开看板 |
+| 数据迁移与导出 | 从 Plausible 导入历史汇总数据、将统计视图导出为 CSV ZIP，支持看板和 CLI |
+| 邮件 | 配置 SMTP 后发送成员邀请与密码重置邮件 |
 | 后台任务 | 盐轮换、GeoIP 与数据中心网段刷新、站点与日期范围的统计数据删除 |
 | 运维 | 单个二进制：`rivu serve` 运行实例，`rivu migrate` 执行迁移；PG 与 ClickHouse 迁移共用版本序列，带冻结校验与 schema 快照；内部端口 `/healthz` `/readyz` `/metrics` |
 
-尚未实现的部分（导入导出、邮件、Plausible 兼容端点等）与进度见 [`docs/roadmap.md`](docs/roadmap.md)。
+Plausible 协议兼容端点、定期报告邮件等后续计划见 [`docs/roadmap.md`](docs/roadmap.md)。
 
 ## 目录结构
 
@@ -45,7 +47,7 @@ rivu/
 
 ## 开发快速开始
 
-前置：Rust（版本由 `rust-toolchain.toml` 决定）、Docker。下面的命令都在仓库根目录执行。
+需要 Rust（版本由 `rust-toolchain.toml` 决定）、Docker 和 Docker Compose v2、Node.js 24+、pnpm 12.5.1。下面的命令都在仓库根目录执行。
 
 ### 1. 启动依赖
 
@@ -72,14 +74,41 @@ bash / zsh：
 set -a; source .env.example; set +a
 ```
 
-每个变量都支持 `<NAME>_FILE` 形式（从文件读取，去掉首尾空白），同时设置两者会报错；生产里的密码与访客密钥应该走这种形式（Docker secrets）。
+二进制按 `<NAME>` 或 `<NAME>_FILE` 读取配置，文件内容会去掉首尾空白。两者同时给出非空值会报错。生产 Compose 的配置方式见[安装说明](docs/install.md)。
 
-### 3. 迁移与运行
+### 3. 构建看板与采集脚本
+
+```
+pnpm --dir apps/tracker install --frozen-lockfile
+pnpm --dir apps/tracker build
+pnpm --dir apps/dashboard install --frozen-lockfile
+pnpm --dir apps/dashboard build
+```
+
+从仓库根目录运行 `rivu serve` 时，会读取 `apps/tracker/dist` 与 `apps/dashboard/build`。
+
+### 4. 迁移与运行
 
 ```
 cargo run -p rivu -- migrate          # 应用全部迁移；再执行一次输出「没有待执行的迁移」
 cargo run -p rivu -- migrate status   # 列出每个版本的状态
-cargo run -p rivu -- setup --email you@example.com --org-name Acme --password-file pw.txt   # 首个用户与组织
+```
+
+用 CLI 创建首个用户与组织。将至少 12 个字符的密码写入仅自己可读的文件，用 `--password-file` 读取。
+
+```
+cargo run -p rivu -- setup --email you@example.com --org-name Acme --password-file pw.txt
+```
+
+在 bash 或 zsh 中也可以重定向标准输入，让 CLI 读取第一行。
+
+```bash
+cargo run -p rivu -- setup --email you@example.com --org-name Acme --password-stdin < pw.txt
+```
+
+初始化后启动服务，打开 `http://127.0.0.1:8080`。
+
+```
 cargo run -p rivu -- serve
 ```
 
@@ -107,7 +136,7 @@ curl -i http://127.0.0.1:8080/api/v1/query/schema.json     # 无需 key
 
 内部端口 `127.0.0.1:9090`：`/healthz`、`/metrics`，以及逐项 JSON 的 `/readyz`（PG 与 ClickHouse 可连、schema 版本达到编译期最高版本，以及站点快照与盐已加载）。
 
-### 4. 测试
+### 5. 测试
 
 ```
 cargo fmt --check
@@ -126,7 +155,7 @@ SQL 与 JSON Schema 的 insta 快照在 `crates/query/src/snapshots/`（`INSTA_U
 
 采集脚本的单元测试、Playwright（chromium / firefox / webkit）与体积预算见 [`apps/tracker/README.md`](apps/tracker/README.md)。`apps/tracker/scripts/e2e-rivu.sh` 用真实浏览器对真实运行的 `rivu serve` 做一组已知动作，再用 `rivu query` 断言数字完全一致。
 
-### 5. 清理
+### 6. 清理
 
 ```
 docker compose -f deploy/compose.dev.yml down       # 停止容器，保留数据卷

@@ -10,12 +10,14 @@ Rivu 以单实例方式部署：一个 `rivu` 进程加 PostgreSQL 与 ClickHous
 ## 安装
 
 ```bash
-git clone <仓库地址> rivu && cd rivu
-docker build -t rivu:latest .              # 或者在 deploy/.env 里把 RIVU_IMAGE 设为发布的镜像
+git clone https://github.com/DejavuMoe/Rivu.git rivu && cd rivu
+docker build -t rivu:latest .
 cp deploy/.env.example deploy/.env
 ```
 
-编辑 `deploy/.env`：填写 `RIVU_DOMAIN`，为每个密码与密钥生成随机值：
+目前 GHCR 尚无可拉取的发布标签，直接使用上面构建的 `rivu:latest`。
+
+在 `deploy/.env` 填写 `RIVU_DOMAIN`，再用下面的命令为新部署的密码、密钥和初始化令牌生成随机值。
 
 ```bash
 for k in RIVU_SETUP_TOKEN RIVU_VISITOR_PEPPER RIVU_SECRET_KEY RIVU_PG_MIGRATOR_PASSWORD RIVU_PG_APP_PASSWORD \
@@ -24,9 +26,11 @@ for k in RIVU_SETUP_TOKEN RIVU_VISITOR_PEPPER RIVU_SECRET_KEY RIVU_PG_MIGRATOR_P
 done
 ```
 
+生产 Compose 启动 `rivu` 时要求至少 16 个字符的初始化令牌。可以在 `--env-file` 指定的文件或调用 shell 中设置 `RIVU_SETUP_TOKEN`，也可以在容器环境文件中设置 `RIVU_SETUP_TOKEN_FILE`，指向挂载到 `rivu` 容器内的令牌文件。直接运行二进制时，初始化令牌默认可选。
+
 `RIVU_VISITOR_PEPPER` 与 `RIVU_SECRET_KEY` 不在数据库里，单独备份。`RIVU_VISITOR_PEPPER` 丢失只会让当天的访客 ID 断开一次，但泄露会削弱隐私保护（`privacy.md`）；`RIVU_SECRET_KEY` 加密两步验证的密钥，丢失后开了两步验证的账号无法登录，要用 `rivu user reset-2fa --email <邮箱>` 逐个关掉。
 
-要发邮件（邀请、找回密码），在 `deploy/.env` 里填 `RIVU_SMTP_URL` 与 `RIVU_SMTP_FROM`，启动后用 `docker compose -f deploy/compose.yml exec rivu rivu mail test --to <你的邮箱>` 检查。不配置时邀请只给链接，登录页没有「忘记密码」。
+要发邮件（邀请、找回密码），在 `deploy/.env` 里填 `RIVU_SMTP_URL` 与 `RIVU_SMTP_FROM`，启动后用 `docker compose -f deploy/compose.yml --env-file deploy/.env exec rivu rivu mail test --to <你的邮箱>` 检查。不配置时邀请只给链接，登录页没有「忘记密码」。
 
 启动。选一种反向代理：
 
@@ -40,7 +44,7 @@ done
   ```
   rivu 的公共端口只绑在 `127.0.0.1:8080`。nginx 用 `deploy/nginx.conf`，Caddy 用 `deploy/Caddyfile`（把 `RIVU_UPSTREAM` 换成 `127.0.0.1:8080`）。
 
-第一次启动时，`migrate` 服务先建表，然后 `rivu` 启动并在后台下载 GeoIP 库（约 60 MB，下载完之前访客的国家为空）。用 `docker compose -f deploy/compose.yml ps` 等 `rivu` 变成 `healthy`。
+第一次启动时，`migrate` 服务先建表，然后 `rivu` 启动并在后台下载 GeoIP 库（约 60 MB，下载完之前访客的国家为空）。用 `docker compose -f deploy/compose.yml --env-file deploy/.env ps` 查看 `rivu` 是否已变成 `healthy`。
 
 打开 `https://<域名>/setup`，填 `RIVU_SETUP_TOKEN` 创建第一个账号；之后在看板里添加站点，按「安装」页把脚本放进网站。
 
@@ -54,7 +58,7 @@ done
 
 ## 可选功能
 
-在 `deploy/.env` 里加上对应变量，再执行一次 `docker compose ... up -d`：compose 会把 `deploy/.env` 里的变量都传给 rivu。完整的变量表见 `architecture/platform-and-ops.md` §7。
+在 `deploy/.env` 里加上对应变量，再执行一次上面的启动命令。`--env-file` 用于 Compose 变量插值。可在该文件或调用 shell 中设置 `RIVU_ENV_FILE` 来替换容器加载的环境文件，相对路径以 `deploy/` 为基准。Compose 的 `environment` 优先于容器的环境文件，常驻 `rivu` 的迁移账号变量及其 `*_FILE` 路径会被覆盖为空。对于可选设置，二进制仍可读取对应的 `*_FILE`，前提是直接值为空或未设置，且文件已挂载到相应容器并可读。完整的变量表见 `architecture/platform-and-ops.md` §7。
 
 | 功能 | 变量 |
 |---|---|
@@ -65,12 +69,18 @@ done
 
 ## 升级
 
+先用当前版本的 `deploy/backup.sh` 备份 PostgreSQL 与 ClickHouse，并保留旧镜像及配置。使用默认本地镜像时，可以先执行 `docker tag rivu:latest rivu:pre-upgrade` 保留回退用的标签。
+
+已有部署如果没设初始化令牌，用 `openssl rand -hex 24` 生成，并通过 `RIVU_SETUP_TOKEN` 或 `RIVU_SETUP_TOKEN_FILE` 提供。保留现有数据库密码和密钥。已创建的管理员无需再次初始化。使用内置 Caddy 的部署继续加上 `--profile caddy`。
+
 ```bash
-git pull && docker build -t rivu:latest .     # 或改 RIVU_IMAGE 的版本
-docker compose -f deploy/compose.yml --env-file deploy/.env up -d
+git pull && docker build -t rivu:latest . && \
+  docker compose -f deploy/compose.yml --env-file deploy/.env up -d
 ```
 
-`migrate` 每次都会先跑，只应用新的迁移；成功后才重启 `rivu`。重启的几秒内，反向代理会重试采集请求（Caddy 的 `lb_try_duration`、nginx 的 `proxy_next_upstream`），通常不丢事件。迁移只增加结构、不删除，可以回退到上一个镜像版本；例外会写在 CHANGELOG 里。
+若使用自定义镜像标签，构建时用该标签，并让 `RIVU_IMAGE` 指向同一镜像。
+
+`migrate` 先应用待执行的迁移，成功后才启动新版本的 `rivu`。跨迁移版本回退时，用目标版本的镜像和配置，将与该版本匹配的 PostgreSQL 与 ClickHouse 备份恢复到空的数据库卷。旧镜像的 `migrate` 会拒绝数据库中它不认识的迁移记录。恢复点之后写入的数据不会随备份恢复。
 
 ## 备份与恢复
 
@@ -96,14 +106,14 @@ deploy/restore.sh /srv/rivu-backups/rivu-20261028T020000Z --yes
 在 Plausible（CE 或云服务）的站点设置 → Imports & Exports → Export 导出数据，得到一个 zip。在 Rivu 里建好同一个站点（时区相同），然后在看板的「站点设置 → 导入」把 zip 拖进去（最大 128 MB），或者用命令行：
 
 ```bash
-docker compose -f deploy/compose.yml cp blog_example_com.zip rivu:/tmp/export.zip
-docker compose -f deploy/compose.yml exec rivu rivu import plausible --site <site_key> /tmp/export.zip
+docker compose -f deploy/compose.yml --env-file deploy/.env cp blog_example_com.zip rivu:/tmp/export.zip
+docker compose -f deploy/compose.yml --env-file deploy/.env exec rivu rivu import plausible --site <site_key> /tmp/export.zip
 ```
 
 导出是按天、按维度的汇总，所以导入的那段时间里，单个维度的报表（来源、页面、国家、设备、事件、属性）和趋势图都有数据，多个维度交叉筛选没有（看板会提示）。只导入站点在 Rivu 里开始收数据之前的日子；看板的导入记录（或 `rivu import list --site <site_key>`）列出每次导入；删除（或 `rivu import delete --site <site_key> --id <id>`）后可以重新导入。
 
 ## 排障
 
-- `docker compose -f deploy/compose.yml logs rivu`：结构化日志（JSON）。
-- `docker compose -f deploy/compose.yml exec rivu rivu healthcheck`：就绪检查；失败时打印原因。
+- `docker compose -f deploy/compose.yml --env-file deploy/.env logs rivu`：结构化日志（JSON）。
+- `docker compose -f deploy/compose.yml --env-file deploy/.env exec rivu rivu healthcheck`：就绪检查；失败时打印原因。
 - 看板的「接入诊断」页：每个站点接受与丢弃的事件数，按原因分开。
