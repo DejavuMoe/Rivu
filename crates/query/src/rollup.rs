@@ -846,6 +846,7 @@ pub async fn insert_import(
     }
 }
 /// 删除一次导入写入的全部汇总行（各表的 `origin = 'import' AND import_id = …`）。幂等。
+/// 只清理已落表的行；已经被 ClickHouse 接收的 INSERT 仍可能稍后落表。
 pub async fn delete_import(
     client: &Client,
     scope: &TenantScope,
@@ -854,12 +855,13 @@ pub async fn delete_import(
     let mut params = Params::default();
     params.push("site", ParamValue::U64(scope.site_id()));
     params.push("imp", ParamValue::U64(import_id));
+    let client = client.clone().with_setting("lightweight_deletes_sync", "2");
     tokio::time::timeout(Duration::from_secs(120), async {
         for table in Family::TABLES {
             let sql = format!(
                 "DELETE FROM {table} WHERE site_id = {{site:UInt64}} AND origin = 'import' AND import_id = {{imp:UInt64}}"
             );
-            execute(client, &sql, &params).await?;
+            execute(&client, &sql, &params).await?;
         }
         Ok(())
     })
