@@ -258,6 +258,8 @@ pub const DEFAULT_STATS_DELETE_INTERVAL_SECS: u64 = 300;
 
 /// `RIVU_RETENTION_DAYS` 的默认值：原始数据保留 731 天（连续两个自然年，含一个闰年，支持同比）。
 pub const DEFAULT_RETENTION_DAYS: u32 = 731;
+/// Minimum raw retention accepted by both instance and site settings.
+pub const MIN_RETENTION_DAYS: u32 = 30;
 
 /// `RIVU_ROLLUP_INTERVAL_SECS` 的默认值：`rollup_build`（日汇总层构建）的周期。
 pub const DEFAULT_ROLLUP_INTERVAL_SECS: u64 = 600;
@@ -763,8 +765,11 @@ impl Config {
             DEFAULT_STATS_DELETE_INTERVAL_SECS,
             10..=86_400,
         );
-        let retention_days =
-            l.parse_in_range("RIVU_RETENTION_DAYS", DEFAULT_RETENTION_DAYS, 30..=36_500);
+        let retention_days = l.parse_in_range(
+            "RIVU_RETENTION_DAYS",
+            DEFAULT_RETENTION_DAYS,
+            MIN_RETENTION_DAYS..=36_500,
+        );
         let rollup_interval_secs = l.parse_in_range(
             "RIVU_ROLLUP_INTERVAL_SECS",
             DEFAULT_ROLLUP_INTERVAL_SECS,

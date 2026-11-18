@@ -182,6 +182,7 @@ pub async fn delete_partition(ch: &Client, site_id: u64, scope: Scope, t: Target
             " AND {col} >= fromUnixTimestamp64Milli({{start:Int64}}, 'UTC') AND {col} < fromUnixTimestamp64Milli({{end:Int64}}, 'UTC')"
         ));
     }
+    let ch = ch.clone().with_setting("lightweight_deletes_sync", "2");
     let mut q = ch.query(&sql).param("site", site_id);
     if let Scope::Range { start_ms, end_ms } = scope {
         q = q.param("start", start_ms).param("end", end_ms);

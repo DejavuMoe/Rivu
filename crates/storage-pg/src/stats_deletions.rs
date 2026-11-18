@@ -226,7 +226,7 @@ fn date_range_row(r: &sqlx::postgres::PgRow) -> Result<DateRangeRow> {
 /// 写入一条 `scope='date_range'` 的意图（`not_before = now()`，下一轮 `ch_delete_batch` 执行）。
 /// 日期由调用方校验（`from <= to`，PG 的 CHECK 兜底）。
 pub async fn create_date_range(
-    pool: &PgPool,
+    db: &mut sqlx::PgConnection,
     site_id: u64,
     from: &str,
     to: &str,
@@ -241,10 +241,32 @@ pub async fn create_date_range(
     .bind(from)
     .bind(to)
     .bind(requested_by)
-    .fetch_one(pool)
+    .fetch_one(db)
     .await
     .context("写入日期范围删除意图失败")?;
     date_range_row(&row)
+}
+
+/// Check under the site row lock. An unfinished intent can still delete input, and
+/// a completed erase near the rebuild range can have removed inputs for adjacent days.
+pub async fn blocks_timezone_change(
+    db: &mut sqlx::PgConnection,
+    site_id: u64,
+    rebuild_since: Option<String>,
+) -> Result<bool> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM pending_stats_deletions
+             WHERE site_id = $1 AND status <> 'cancelled'
+               AND (status <> 'done' OR
+                    ($2::text IS NOT NULL AND (scope = 'site' OR date_to >= $2::text::date)))
+         )",
+    )
+    .bind(id_i64(site_id)?)
+    .bind(rebuild_since)
+    .fetch_one(db)
+    .await
+    .context("检查影响时区变更的统计删除意图失败")
 }
 
 /// 站点最近的日期范围删除意图，新的在前（最多 `limit` 条）。

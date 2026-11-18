@@ -24,9 +24,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use clickhouse::Client;
-use jiff::Timestamp;
 use jiff::civil::{Date, Weekday, date};
 use jiff::tz::TimeZone;
+use jiff::{Timestamp, ToSpan};
 use rivu::dash_api::{self, DashApi, DashLimits};
 use rivu::{migrate, public, user_cmd};
 use rivu_auth::password::hash_blocking;
@@ -34,6 +34,7 @@ use rivu_common::config::{BufferConfig, ChAccount, Config, Env, Role, Secret};
 use rivu_common::migration::{self, Store};
 use rivu_geo::GeoDb;
 use rivu_ingest::pipeline::{Outcome, Pipeline, RequestCtx, SaltCache, SiteSnapshot};
+use rivu_query::rollup;
 use rivu_query::{ExecOptions, QuerySpec, SiteContext, TenantScope, execute};
 use rivu_storage_pg::sites::NewSite;
 use rivu_ua::UaParser;
@@ -425,6 +426,16 @@ struct Server {
 }
 
 async fn start(env: &TestEnv, pg: &PgPool, config: &Config, limits: Option<DashLimits>) -> Server {
+    start_at(env, pg, config, limits, NOW.parse().unwrap()).await
+}
+
+async fn start_at(
+    env: &TestEnv,
+    pg: &PgPool,
+    config: &Config,
+    limits: Option<DashLimits>,
+    now: Timestamp,
+) -> Server {
     init_logging();
     let geo = Arc::new(GeoDb::with_manual_attribution(
         Some("MaxMind test database"),
@@ -434,7 +445,6 @@ async fn start(env: &TestEnv, pg: &PgPool, config: &Config, limits: Option<DashL
         .join("../../crates/geo/tests/data/test-data/GeoIP2-City-Test.mmdb");
     assert!(geo.reload_if_changed(&mmdb).expect("加载测试库"));
     let reader = rivu_storage_ch::client(&env.ch_url, &account("reader"), Some(&ch_database()));
-    let now: Timestamp = NOW.parse().unwrap();
     let mut dash = DashApi::new(config, pg.clone(), reader.clone(), Some(Arc::clone(&geo)))
         .expect("装配内部端点")
         .with_clock(move || now);
@@ -3660,6 +3670,283 @@ async fn create_site_via_api(http: &Http, cookie: &str, org_id: i64, body: &Valu
         .cookie(cookie)
         .send()
         .await
+}
+
+async fn add_rollup_event(ch: &Client, site_id: u64, day: Date) {
+    ch.query(
+        "INSERT INTO events
+         (site_id, ts, event_id, name, visitor_id, session_id, session_start,
+          hostname, pathname, entry_pathname)
+         SELECT ?, fromUnixTimestamp64Milli(?, 'UTC'), generateUUIDv4(), 'pageview', 1, 1,
+                fromUnixTimestamp64Milli(?, 'UTC'), 'example.test', '/rollup', '/rollup'",
+    )
+    .bind(site_id)
+    .bind(at(day, 23, 30, 0))
+    .bind(at(day, 23, 30, 0))
+    .execute()
+    .await
+    .unwrap();
+}
+
+async fn rollup_rows(ch: &Client, site_id: u64) -> Vec<u64> {
+    let mut counts = Vec::new();
+    for table in rollup::Family::TABLES {
+        counts.push(
+            ch.query(&format!(
+                "SELECT count() FROM {table} WHERE site_id = ? AND origin = 'native'"
+            ))
+            .bind(site_id)
+            .fetch_one()
+            .await
+            .unwrap(),
+        );
+    }
+    counts
+}
+
+#[tokio::test]
+async fn site_admin_timezone_preserves_native_history() {
+    use rivu_jobs::rollup::{TIMEZONE_REBUILD_UNPROVEN, build_site};
+
+    let Some(env) = test_env("site_admin_timezone_preserves_native_history") else {
+        return;
+    };
+    migrate_once(&env).await;
+    let pg = rivu_storage_pg::connect(&env.pg_url, 6).await.unwrap();
+    let now = Timestamp::now();
+    let today = now.to_zoned(TimeZone::UTC).date();
+    let cfg = config(&env, &[("RIVU_ROLLUP_MIN_ROWS", "0")]);
+    let server = start_at(&env, &pg, &cfg, Some(loose()), now).await;
+    let http = &server.http;
+    let org = make_org(&pg).await;
+    let owner = make_user(&pg, Some((&org, "owner"))).await;
+    let cookie = login_cookie(http, &owner.email).await;
+    let admin = rivu_storage_ch::client(&env.ch_url, &account("migrator"), Some(&ch_database()));
+    let ch = rivu_storage_ch::client(&env.ch_url, &account("maintainer"), Some(&ch_database()));
+    let sync_ch = ch.clone().with_setting("lightweight_deletes_sync", "2");
+    let patch = |id, body: Value| http.patch(&site_path(id, ""), &body).cookie(&cookie).send();
+    let query = |id, day: Date| {
+        let day = day.to_string();
+        http.post(
+            &query_path(id),
+            &json!({"metrics": ["pageviews", "visits"], "date_range": [day, day]}),
+        )
+        .cookie(&cookie)
+        .send()
+    };
+
+    let archive = make_site(&pg, &org, false).await;
+    let archive_scope = TenantScope::new(archive.id);
+    let oldest = today.checked_sub(40.days()).unwrap();
+    let kept = today.checked_sub(3.days()).unwrap();
+    add_rollup_event(&admin, archive.id, oldest).await;
+    add_rollup_event(&admin, archive.id, kept).await;
+    rollup::build_day(
+        &ch,
+        &archive_scope,
+        &SiteContext::new(archive.id, TimeZone::UTC),
+        oldest,
+        1,
+        now,
+    )
+    .await
+    .unwrap();
+    let old_query = expect(&query(archive.id, oldest).await, 200);
+    assert_eq!(old_query["results"][0]["metrics"], json!([1, 1]));
+    assert_eq!(old_query["meta"]["tiers"], json!(["rollup"]));
+    let native = rollup_rows(&server.reader, archive.id).await;
+
+    for (day, raw_left) in [(oldest, 1u64), (kept, 0u64)] {
+        for (table, col) in [("events", "ts"), ("sessions", "started_at")] {
+            sync_ch
+                .query(&format!(
+                    "DELETE FROM {table} WHERE site_id = ? AND toDate({col}) = toDate(?)"
+                ))
+                .bind(archive.id)
+                .bind(day.to_string())
+                .execute()
+                .await
+                .unwrap();
+            let count: u64 = server
+                .reader
+                .query(&format!("SELECT count() FROM {table} WHERE site_id = ?"))
+                .bind(archive.id)
+                .fetch_one()
+                .await
+                .unwrap();
+            assert_eq!(count, raw_left, "{table}");
+        }
+        expect_err(
+            &patch(
+                archive.id,
+                json!({"timezone": "Asia/Taipei", "name": "must not commit", "week_starts_on": 0}),
+            )
+            .await,
+            409,
+            TIMEZONE_REBUILD_UNPROVEN,
+        );
+        let view = rivu_storage_pg::sites::admin_view(&pg, archive.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(view.timezone, "UTC");
+        assert_eq!(view.name, "internal-api-e2e");
+        assert_eq!(view.week_starts_on, 1);
+        let response = expect(&query(archive.id, oldest).await, 200);
+        assert_eq!(response["results"], old_query["results"]);
+        assert_eq!(response["meta"]["tiers"], old_query["meta"]["tiers"]);
+    }
+    expect(
+        &patch(archive.id, json!({"timezone": "UTC", "week_starts_on": 0})).await,
+        200,
+    );
+    expect(&patch(archive.id, json!({"name": "new name"})).await, 200);
+
+    // Simulate a timezone update already committed by a legacy process.
+    sqlx::query("UPDATE sites SET timezone = 'Asia/Taipei' WHERE id = $1")
+        .bind(archive.id as i64)
+        .execute(&pg)
+        .await
+        .unwrap();
+    let err = build_site(&pg, &ch, archive.id).await.unwrap_err();
+    assert!(
+        err.to_string().contains(TIMEZONE_REBUILD_UNPROVEN),
+        "{err:#}"
+    );
+    assert_eq!(rollup_rows(&server.reader, archive.id).await, native);
+
+    let edge = make_site(&pg, &org, false).await;
+    let day = today.checked_sub(24.days()).unwrap();
+    add_rollup_event(&admin, edge.id, day).await;
+    rollup::build_day(
+        &ch,
+        &TenantScope::new(edge.id),
+        &SiteContext::new(edge.id, TimeZone::UTC),
+        day,
+        1,
+        now,
+    )
+    .await
+    .unwrap();
+    // Events for this day are still within 30 days. The session scan reaches further back.
+    expect_err(
+        &patch(edge.id, json!({"timezone": "Asia/Taipei"})).await,
+        409,
+        TIMEZONE_REBUILD_UNPROVEN,
+    );
+
+    let recent = make_site(&pg, &org, false).await;
+    let scope = TenantScope::new(recent.id);
+    for (table, dims) in [
+        ("rollup_site", vec![]),
+        ("rollup_pages", vec!["/imported".into()]),
+    ] {
+        rollup::insert_import(
+            &ch,
+            &scope,
+            table,
+            "UTC",
+            1,
+            &[rollup::ImportRow {
+                day: oldest,
+                dims,
+                m: rollup::Measures {
+                    pageviews: 17,
+                    ..Default::default()
+                },
+            }],
+        )
+        .await
+        .unwrap();
+    }
+    // Import-only sites may change timezone.
+    expect(
+        &patch(recent.id, json!({"timezone": "Europe/London"})).await,
+        200,
+    );
+    expect(&patch(recent.id, json!({"timezone": "UTC"})).await, 200);
+    add_rollup_event(&admin, recent.id, kept).await;
+    assert!(build_site(&pg, &ch, recent.id).await.unwrap() > 0);
+    assert_eq!(
+        expect(&query(recent.id, kept).await, 200)["results"][0]["metrics"],
+        json!([1, 1])
+    );
+    expect(
+        &patch(recent.id, json!({"timezone": "Asia/Taipei"})).await,
+        200,
+    );
+
+    let new_tz = TimeZone::get("Asia/Taipei").unwrap();
+    // Recreate a partial family cleanup, and fail the next attempt with a read-only client.
+    sync_ch
+        .query("DELETE FROM rollup_pages WHERE site_id = ? AND origin = 'native'")
+        .bind(recent.id)
+        .execute()
+        .await
+        .unwrap();
+    assert!(build_site(&pg, &server.reader, recent.id).await.is_err());
+    assert!(
+        rollup::build_state(&server.reader, &scope, &new_tz)
+            .await
+            .unwrap()
+            .tz_changed
+    );
+    expect_err(
+        &patch(recent.id, json!({"timezone": "UTC"})).await,
+        409,
+        TIMEZONE_REBUILD_UNPROVEN,
+    );
+    let async_default = ch.clone().with_setting("lightweight_deletes_sync", "0");
+    assert!(build_site(&pg, &async_default, recent.id).await.unwrap() > 0);
+    assert!(
+        !rollup::build_state(&server.reader, &scope, &new_tz)
+            .await
+            .unwrap()
+            .tz_changed
+    );
+    let shifted = expect(&query(recent.id, kept.tomorrow().unwrap()).await, 200);
+    assert_eq!(shifted["results"][0]["metrics"], json!([1, 1]));
+    assert_eq!(shifted["meta"]["tiers"], json!(["rollup"]));
+    for table in ["rollup_site", "rollup_pages"] {
+        let pages: u64 = server.reader
+            .query(&format!("SELECT sum(pageviews) FROM {table} FINAL WHERE site_id = ? AND origin = 'import' AND import_id = 1 AND day = toDate(?)"))
+            .bind(recent.id)
+            .bind(oldest.to_string())
+            .fetch_one()
+            .await
+            .unwrap();
+        assert_eq!(pages, 17, "{table}");
+    }
+
+    let erase_day = kept.tomorrow().unwrap().to_string();
+    expect(
+        &http
+            .post(
+                &site_path(recent.id, "/stats-deletions"),
+                &json!({"from": erase_day, "to": erase_day, "confirm": "internal-api-e2e"}),
+            )
+            .cookie(&cookie)
+            .send()
+            .await,
+        201,
+    );
+    expect_err(
+        &patch(recent.id, json!({"timezone": "UTC"})).await,
+        409,
+        TIMEZONE_REBUILD_UNPROVEN,
+    );
+    sqlx::query("DELETE FROM pending_stats_deletions WHERE site_id = $1")
+        .bind(recent.id as i64)
+        .execute(&pg)
+        .await
+        .unwrap();
+
+    for id in [archive.id, edge.id, recent.id] {
+        rollup::delete(&ch, &TenantScope::new(id), None, false)
+            .await
+            .unwrap();
+    }
+    cleanup(&env, &[archive.id, edge.id, recent.id]).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
