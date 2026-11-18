@@ -414,20 +414,60 @@ async fn cleanup(migrator: &Client, site_id: u64) {
     }
 }
 
-async fn retention_waits_for_native_days(pg: &sqlx::PgPool, ch: &Client, writer: &Client) {
-    let now = Timestamp::now();
-    let first = now
-        .to_zoned(TimeZone::UTC)
-        .date()
-        .first_of_month()
-        .checked_sub(3.months())
+async fn retention_waits_for_native_days(
+    pg: &sqlx::PgPool,
+    ch: &Client,
+    writer: &Client,
+    ch_url: &str,
+) {
+    async fn write(writer: &Client, id: u64, ts: &str, start: &str, session: u64) {
+        writer.query("INSERT INTO events (site_id, ts, name, session_id, session_start, visitor_id) VALUES (?, ?, 'pageview', ?, ?, ?)")
+            .bind(id).bind(ts).bind(session).bind(start).bind(session)
+            .with_setting("async_insert", "0")
+            .with_setting("insert_deduplication_token", uuid::Uuid::new_v4().to_string())
+            .execute().await.unwrap();
+    }
+
+    async fn raw(ch: &Client, site: u64, session: u64) -> (u64, u64) {
+        let count = ch
+            .query("SELECT count() FROM events WHERE site_id = ? AND session_id = ?")
+            .bind(site)
+            .bind(session)
+            .fetch_one()
+            .await
+            .unwrap();
+        let pageviews = ch
+            .query("SELECT sum(pageviews) FROM sessions WHERE site_id = ? AND session_id = ?")
+            .bind(site)
+            .bind(session)
+            .fetch_one()
+            .await
+            .unwrap();
+        (count, pageviews)
+    }
+
+    async fn build(ch: &Client, site_id: u64, tz: TimeZone, day: Date, now: Timestamp) {
+        rollup::build_day(
+            ch,
+            &TenantScope::new(site_id),
+            &SiteContext::new(site_id, tz),
+            day,
+            1,
+            now,
+        )
+        .await
         .unwrap();
-    let gap = first.tomorrow().unwrap();
-    let later = gap.tomorrow().unwrap();
-    let repairable = first.checked_add(10.days()).unwrap();
-    let last = repairable.tomorrow().unwrap();
+    }
+
+    let now = Timestamp::now();
     let mut ids = Vec::new();
-    for name in ["retention-prefix", "retention-drop", "retention-restore"] {
+    for name in [
+        "retention-gap",
+        "retention-race",
+        "retention-rolling",
+        "retention-restore",
+        "retention-old-tz",
+    ] {
         ids.push(
             rivu_storage_pg::sites::create_site(
                 pg,
@@ -442,104 +482,139 @@ async fn retention_waits_for_native_days(pg: &sqlx::PgPool, ch: &Client, writer:
             .id,
         );
     }
-    let [a, b, restored] = ids.try_into().unwrap();
+    let [gap, race, rolling, restored, old_tz] = ids.try_into().unwrap();
     let unknown = u64::MAX;
-    for (id, ts, start, session) in [
-        (a, first, first, 1_u64),
-        (a, gap, first, 1),
-        (a, later, later, 2),
-        (a, repairable, repairable, 3),
-        (a, last, last, 4),
-        (b, first, first, 1),
-        (b, first.yesterday().unwrap(), first.yesterday().unwrap(), 2),
-        (restored, first, first, 1),
-        (unknown, first, first, 1),
-    ] {
-        writer.query("INSERT INTO events (site_id, ts, name, session_id, session_start, visitor_id) VALUES (?, ?, 'pageview', ?, ?, ?)")
-            .bind(id).bind(format!("{ts} 12:00:00")).bind(session)
-            .bind(format!("{start} 12:00:00")).bind(session)
-            .with_setting("async_insert", "0").execute().await.unwrap();
-    }
-
-    async fn rows(ch: &Client, table: &str, site_id: u64) -> u64 {
-        let agg = if table == "sessions" {
-            "uniqExact(session_id)"
-        } else {
-            "count()"
-        };
-        ch.query(&format!("SELECT {agg} FROM {table} WHERE site_id = ?"))
-            .bind(site_id)
-            .fetch_one()
-            .await
-            .unwrap()
-    }
-    async fn build(ch: &Client, site_id: u64, day: Date, now: Timestamp) {
-        rollup::build_day(
-            ch,
-            &TenantScope::new(site_id),
-            &SiteContext::new(site_id, TimeZone::UTC),
-            day,
-            1,
-            now,
-        )
-        .await
-        .unwrap();
-    }
     let database = ch_database();
     let purge = || rivu_jobs::retention::run_once(pg, ch, &database, 30);
-    assert_eq!(purge().await.unwrap(), (0, 0), "未汇总的整月分区须保留");
-    assert_eq!(rows(ch, "events", a).await, 5);
-    assert_eq!(rows(ch, "sessions", a).await, 4);
+    let aug = |day| date(2026, 8, day);
 
-    // 同分区的站点只能分别推进，另一个全覆盖的月份仍可快速删除。
-    for day in [first, first.yesterday().unwrap()] {
-        build(ch, b, day, now).await;
+    // 8/11 曾有两个事件，模拟维度族已经写完但站点标记丢失，且只剩部分输入。
+    let gap_ts = "2026-08-11 12:00:00";
+    write(writer, gap, gap_ts, gap_ts, 1).await;
+    write(writer, gap, "2026-08-11 12:05:00", gap_ts, 1).await;
+    build(ch, gap, TimeZone::UTC, aug(11), now).await;
+    for table in ["events", "sessions", "rollup_site"] {
+        ch.query(&format!("DELETE FROM {table} WHERE site_id = ?"))
+            .bind(gap)
+            .with_setting("lightweight_deletes_sync", "1")
+            .execute()
+            .await
+            .unwrap();
     }
-    build(ch, restored, first, now).await;
+    for day in (1..=10).chain([12]) {
+        build(ch, gap, TimeZone::UTC, aug(day), now).await;
+    }
+    ch.query("INSERT INTO rollup_site (site_id, day, origin, import_id, tz) VALUES (?, '2026-08-11', 'import', 1, 'UTC')")
+        .bind(gap).execute().await.unwrap();
+    let older = "2026-08-01 00:00:00";
+    write(writer, gap, older, older, 2).await;
+    write(writer, gap, gap_ts, gap_ts, 1).await;
+    let later = "2026-08-12 12:00:00";
+    write(writer, gap, later, later, 3).await;
+    let event_total = || async {
+        ch.query("SELECT sum(events) FROM rollup_events FINAL WHERE site_id = ? AND day = '2026-08-11' AND origin = 'native'")
+            .bind(gap).fetch_one::<u64>().await.unwrap()
+    };
+    assert_eq!(event_total().await, 2);
+    assert_eq!(
+        raw(ch, gap, 1).await,
+        (1, 1),
+        "重放只恢复了 8/11 的一条输入"
+    );
+
+    // 覆盖 [8/02, 8/13)，中间包括无事件日。会话边界是 8/06 00:00:00（含上限的七天 lifetime）。
+    let cross = "2026-08-02 00:00:00";
+    write(writer, race, cross, cross, 1).await;
+    write(writer, race, "2026-08-03 00:00:00", cross, 1).await;
+    let edge = "2026-08-06 00:00:00";
+    write(writer, race, edge, edge, 2).await;
+    write(writer, race, "2026-08-12 23:50:00", edge, 2).await;
+    for day in 2..=12 {
+        build(ch, race, TimeZone::UTC, aug(day), now).await;
+    }
+    let empty: (u64, u64) = ch.query("SELECT count(), sum(events) FROM rollup_site FINAL WHERE site_id = ? AND day = '2026-08-04' AND origin = 'native' AND import_id = 0 AND tz = 'UTC'")
+        .bind(race).fetch_one().await.unwrap();
+    assert_eq!(empty, (1, 0), "空日仍有完成标记");
+
+    let today = now.to_zoned(TimeZone::UTC).date();
+    let cutoff = today.checked_sub(29.days()).unwrap();
+    let expiring = cutoff.yesterday().unwrap();
+    let start = format!("{expiring} 23:59:59.999");
+    let at_cutoff = format!("{cutoff} 00:00:00");
+    write(writer, rolling, &start, &start, 1).await;
+    write(writer, rolling, &at_cutoff, &start, 1).await;
+    write(writer, rolling, &at_cutoff, &at_cutoff, 2).await;
+    for offset in 0..=7 {
+        build(
+            ch,
+            rolling,
+            TimeZone::UTC,
+            expiring.checked_add(offset.days()).unwrap(),
+            now,
+        )
+        .await;
+    }
+    write(writer, restored, older, older, 1).await;
+    write(writer, old_tz, older, older, 1).await;
+    write(writer, unknown, older, older, 1).await;
+    for offset in 0..=7 {
+        let day = aug(1).checked_add(offset.days()).unwrap();
+        build(ch, restored, TimeZone::UTC, day, now).await;
+        build(ch, old_tz, TimeZone::get(TZ).unwrap(), day, now).await;
+    }
     assert!(
         rivu_storage_pg::stats_deletions::soft_delete_site(pg, restored, None, 7)
             .await
             .unwrap()
     );
-    let mut day = first;
-    while day <= last {
-        if day != gap && day != repairable {
-            build(ch, a, day, now).await;
-        }
-        day = day.tomorrow().unwrap();
-    }
-    for (table, origin) in [("rollup_site", "import"), ("rollup_pages", "native")] {
-        ch.query(&format!(
-            "INSERT INTO {table} (site_id, day, origin, import_id) VALUES (?, ?, ?, ?)"
-        ))
-        .bind(a)
-        .bind(gap.to_string())
-        .bind(origin)
-        .bind(u64::from(origin == "import"))
-        .execute()
-        .await
-        .unwrap();
-    }
 
-    let (dropped, deleted) = purge().await.unwrap();
-    assert_eq!((dropped, deleted), (2, 2));
-    assert_eq!(rows(ch, "events", a).await, 4, "缺一天时更晚的标记不能推进");
-    assert_eq!(rows(ch, "sessions", a).await, 4, "跨日会话的后一天尚未汇总");
-    assert_eq!(rows(ch, "events", b).await, 0);
-    assert_eq!(rows(ch, "sessions", b).await, 0);
-    assert_eq!(rows(ch, "events", restored).await, 1);
-    assert_eq!(rows(ch, "sessions", restored).await, 1);
-    assert_eq!(rows(ch, "events", unknown).await, 1);
-    assert_eq!(rows(ch, "sessions", unknown).await, 1);
+    let (proxy, server, gate) = retention_insert_barrier(ch_url).await;
+    let gated = rivu_storage_ch::client(&proxy, &account("maintainer"), Some(&database));
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let insert = async {
+            gate.0.notified().await;
+            let before = "2026-08-01 23:59:59.999";
+            let after = "2026-08-13 00:00:00";
+            write(writer, race, before, before, 3).await;
+            write(writer, race, after, after, 4).await;
+            write(writer, race, after, edge, 2).await;
+            gate.1.notify_one();
+        };
+        let purge = rivu_jobs::retention::run_once(pg, &gated, &database, 30);
+        let (_, result) = tokio::join!(insert, purge);
+        result.unwrap()
+    })
+    .await
+    .expect("purge 必须在证明后到达插入屏障");
+    server.abort();
 
-    build(ch, a, gap, now).await;
-    purge().await.unwrap();
-    assert_eq!(rows(ch, "events", a).await, 0);
-    assert_eq!(rows(ch, "sessions", a).await, 0);
-    let recovered_events: u64 = ch.query("SELECT events FROM rollup_site FINAL WHERE site_id = ? AND day = ? AND origin = 'native' AND tz = 'UTC'")
-        .bind(a).bind(repairable.to_string()).fetch_one().await.unwrap();
-    assert_eq!(recovered_events, 1, "补建使用仍保留的 raw");
-    assert_eq!(purge().await.unwrap(), (0, 0));
+    let native_markers: u64 = ch.query("SELECT count() FROM rollup_site FINAL WHERE site_id = ? AND day = '2026-08-11' AND origin = 'native' AND import_id = 0")
+        .bind(gap).fetch_one().await.unwrap();
+    assert_eq!(
+        (
+            event_total().await,
+            native_markers,
+            raw(ch, gap, 1).await,
+            raw(ch, gap, 3).await,
+            raw(ch, race, 3).await,
+            raw(ch, race, 4).await,
+            raw(ch, race, 2).await
+        ),
+        (2, 0, (1, 1), (1, 1), (1, 1), (1, 1), (1, 3)),
+        "依次检查 8/11 维度计数 / 标记 / raw、缺口后的 raw、证明范围之前 / 之后的晚写、跨上界会话"
+    );
+    assert_eq!(raw(ch, gap, 2).await, (0, 0), "缺口前已覆盖的活动可清理");
+    assert_eq!(raw(ch, race, 1).await, (0, 0), "已覆盖的跨日会话可清理");
+    assert_eq!(
+        raw(ch, rolling, 1).await,
+        (1, 0),
+        "正常滚动时逾期会话可按期清理"
+    );
+    assert_eq!(raw(ch, rolling, 2).await, (1, 1), "保留策略上界为排他端点");
+    assert_eq!(raw(ch, old_tz, 1).await, (1, 1));
+    assert_eq!(raw(ch, unknown, 1).await, (1, 1));
+    assert_eq!(raw(ch, restored, 1).await, (1, 1));
+    assert_eq!(purge().await.unwrap(), 0, "重复清理幂等");
     assert_eq!(
         rivu_storage_pg::stats_deletions::restore_site(pg, restored)
             .await
@@ -552,21 +627,82 @@ async fn retention_waits_for_native_days(pg: &sqlx::PgPool, ch: &Client, writer:
         .execute(&mut *lock)
         .await
         .unwrap();
-    assert_eq!(purge().await.unwrap(), (0, 0));
-    assert_eq!(rows(ch, "events", restored).await, 1);
+    assert_eq!(purge().await.unwrap(), 0);
+    assert_eq!(raw(ch, restored, 1).await, (1, 1));
     lock.rollback().await.unwrap();
     purge().await.unwrap();
-    assert_eq!(rows(ch, "events", restored).await, 0);
-    assert_eq!(rows(ch, "sessions", restored).await, 0);
-    for id in [a, b, restored, unknown] {
+    assert_eq!(raw(ch, restored, 1).await, (0, 0));
+    for id in [gap, race, rolling, restored, old_tz, unknown] {
         for table in ["events", "sessions"] {
             ch.query(&format!("DELETE FROM {table} WHERE site_id = ?"))
                 .bind(id)
+                .with_setting("lightweight_deletes_sync", "1")
                 .execute()
                 .await
                 .unwrap();
         }
     }
+}
+
+// 第一张表列分区时，各站点的证明已读完，删除尚未开始。代理仅暂停 maintainer 请求。
+async fn retention_insert_barrier(
+    ch_url: &str,
+) -> (
+    String,
+    tokio::task::JoinHandle<()>,
+    Arc<(tokio::sync::Notify, tokio::sync::Notify)>,
+) {
+    use axum::extract::Request;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use tokio::sync::Notify;
+
+    let gate = Arc::new((Notify::new(), Notify::new()));
+    let upstream = url::Url::parse(ch_url).unwrap();
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let http = reqwest::Client::builder().no_proxy().build().unwrap();
+    let router = axum::Router::new().fallback({
+        let gate = gate.clone();
+        move |request: Request| {
+            let (gate, mut upstream, http) = (gate.clone(), upstream.clone(), http.clone());
+            async move {
+                let (parts, body) = request.into_parts();
+                let (Some(user), Some(key)) = (
+                    parts.headers.get("x-clickhouse-user"),
+                    parts.headers.get("x-clickhouse-key"),
+                ) else {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                };
+                upstream.set_query(parts.uri.query());
+                let body = axum::body::to_bytes(body, 1024 * 1024).await.unwrap();
+                let at_barrier =
+                    |sql: &str| sql.contains("FROM system.parts") && sql.contains("'events'");
+                if at_barrier(&String::from_utf8_lossy(&body))
+                    || upstream
+                        .query_pairs()
+                        .any(|(k, v)| k == "query" && at_barrier(&v))
+                {
+                    gate.0.notify_one();
+                    gate.1.notified().await;
+                }
+                let mut upstream_request = http
+                    .request(parts.method, upstream)
+                    .header("x-clickhouse-user", user)
+                    .header("x-clickhouse-key", key)
+                    .body(body);
+                if let Some(content_type) = parts.headers.get(axum::http::header::CONTENT_TYPE) {
+                    upstream_request =
+                        upstream_request.header(axum::http::header::CONTENT_TYPE, content_type);
+                }
+                let response = upstream_request.send().await.unwrap();
+                (response.status(), response.bytes().await.unwrap()).into_response()
+            }
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    (format!("http://{addr}"), server, gate)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -600,7 +736,7 @@ async fn rollup_tier_matches_the_raw_tier() {
         rivu_storage_ch::client(&ch_url, &account("maintainer"), Some(&ch_database()));
     let retention_writer =
         rivu_storage_ch::client(&ch_url, &account("writer"), Some(&ch_database()));
-    retention_waits_for_native_days(&pg, &retention_ch, &retention_writer).await;
+    retention_waits_for_native_days(&pg, &retention_ch, &retention_writer, &ch_url).await;
     let created = rivu_storage_pg::sites::create_site(
         &pg,
         &NewSite {
@@ -777,7 +913,7 @@ async fn rollup_tier_matches_the_raw_tier() {
     .await
     .unwrap();
     // 真实的「现在」是 2026-10 之后：这个站点 6 月的数据都过了 30 天
-    let (_, deleted) = rivu_jobs::retention::run_once(&pg, &maintainer, &ch_database(), 731)
+    let deleted = rivu_jobs::retention::run_once(&pg, &maintainer, &ch_database(), 731)
         .await
         .unwrap();
     assert!(deleted > 0, "应当有分区执行了删除");

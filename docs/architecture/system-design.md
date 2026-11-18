@@ -649,7 +649,7 @@ TTL minute + INTERVAL 90 DAY DELETE;
 
 | 操作 | 实现 |
 |---|---|
-| 原始数据保留 | 没有表级 TTL。保留最近 N 个本地日（含今天）：N = `site_settings.retention_days`，没有设置时取 `RIVU_RETENTION_DAYS`（默认 731，也是站点设置的上限）。`retention_purge` 每小时检查过期的 `events`（按 `ts`）与 `sessions`（按开始时间），只清理从尚存 raw 起逐日核验过 `rollup_site` 最终原生标记的前缀。会话还要覆盖最后活动所在的本地日。整月过期且所有行均可清理才 `DROP PARTITION`，否则仅轻量删除有覆盖的过期行。缺少覆盖时会超期保留并报告积压（`platform-and-ops.md` §6）。兼容查询仍按 §6.4 选层，保留任务的证明和积压指标不改变查询口径。 |
+| 原始数据保留 | 没有表级 TTL。保留最近 N 个本地日（含今天），N 取 `site_settings.retention_days` 与 `RIVU_RETENTION_DAYS`（默认 731）的较小值，缺少站点设置时取全局值。`retention_purge` 每小时逐站验证当前时区的连续本地日原生汇总标记，将覆盖区间换算成 UTC 半开区间并与保留策略取交集，轻量删除范围内的 `events.ts`。会话按 `started_at` 清理，证明上界减去七天经过时长。缺口保持未完成，超期 raw 留存并报告积压（`platform-and-ops.md` §6）。兼容查询仍按 §6.4 选层。 |
 | 删除站点 | 与 Plausible 相同（R02 §9）：在 PG 删除站点的同一事务里写入 `pending_stats_deletions`（`not_before` = 删除时刻 + 恢复窗口 `RIVU_SITE_RESTORE_DAYS`，窗口内恢复会取消它）；后台任务 `ch_delete_batch`（每 5 分钟，`platform-and-ops.md` §6）对 `events`、`sessions`、`ingest_counters` 按分区执行轻量删除（`DELETE … IN PARTITION`），`rollup_*` 同时删除（日期范围删除只删这些本地日）。按日期范围删除走同一个任务：站点本地日期按站点时区换算成 UTC 区间，`events` 按 `ts`、`ingest_counters` 按 `minute`，`sessions` 删除开始时间落在区间内的会话 |
 | 重置统计 | 真正删除数据，复用上面的删除意图机制。Plausible 只是挪了一个起始时间指针，数据永久残留（R02 §9.1） |
 | 单个访客的数据 | 系统不存在长期访客 ID，所以无法定位某个人的数据。这正是隐私设计的结果，需要写进隐私说明 |
