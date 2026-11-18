@@ -183,6 +183,7 @@ const dict = {
   "dash.timeout.body": ["请缩短时间范围或减少筛选条件。", "Try a shorter range or fewer filters."],
   "dash.geoAttribution": ["地理位置数据：DB-IP", "Geolocation by DB-IP"],
   "dash.retentionWarn": ["所选范围有一部分早于原始数据保留期，这些日子在当前筛选或分组下没有数据。", "Part of this range is older than raw-data retention; those days have no data for the current filters or breakdown."],
+  "dash.importedExcludedWarn": ["当前查询未计入导入的历史数据。", "The current query excludes imported historical data."],
   "dash.notConnected": ["未接入", "Not connected"],
   "dash.noRows": ["这个范围内没有记录", "Nothing recorded in this range"],
   "dash.exported": ["已导出", "Exported"],
