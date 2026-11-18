@@ -57,6 +57,8 @@ pub struct SiteContext {
     pub retention_days: Option<u32>,
     /// 已完成的导入覆盖的本地日期（最早的开始、最晚的结束）：这些天只在日汇总层里（导入写的是汇总行）。
     pub imported: Option<(Date, Date)>,
+    /// 与 `imported` 同一次 PG 查询取得的本站点已完成批次 ID（升序）。
+    pub completed_import_ids: Vec<u64>,
 }
 
 impl SiteContext {
@@ -72,6 +74,7 @@ impl SiteContext {
             goals: Vec::new(),
             retention_days: None,
             imported: None,
+            completed_import_ids: Vec::new(),
         }
     }
 }

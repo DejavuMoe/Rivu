@@ -184,7 +184,7 @@ pub async fn list(pool: &PgPool, site_id: u64) -> Result<Vec<ImportRow>> {
 pub enum DeleteClaim {
     Missing,
     Running,
-    Ready { completed: bool },
+    Ready,
 }
 
 /// 调用方在同一维护事务里删除汇总和记录，串行化同一条记录的删除请求。
@@ -200,9 +200,7 @@ pub async fn claim_delete(db: &mut PgConnection, site_id: u64, id: i64) -> Resul
     Ok(match status.as_deref() {
         None => DeleteClaim::Missing,
         Some("importing") => DeleteClaim::Running,
-        Some(status) => DeleteClaim::Ready {
-            completed: status == "completed",
-        },
+        Some(_) => DeleteClaim::Ready,
     })
 }
 
@@ -220,10 +218,16 @@ pub async fn delete(db: impl PgExecutor<'_>, site_id: u64, id: i64) -> Result<bo
     Ok(n > 0)
 }
 
-/// 已完成的导入覆盖的日期（最早的开始、最晚的结束，`YYYY-MM-DD`）；没有为 `None`。查询时用。
-pub async fn completed_range(pool: &PgPool, site_id: u64) -> Result<Option<(String, String)>> {
+pub struct CompletedImports {
+    pub range: Option<(String, String)>,
+    pub ids: Vec<u64>,
+}
+
+/// 同一 PG 快照里的已完成导入 ID 和覆盖范围（最早的开始、最晚的结束，`YYYY-MM-DD`）。
+pub async fn completed_imports(pool: &PgPool, site_id: u64) -> Result<CompletedImports> {
     let row = sqlx::query(
-        "SELECT to_char(min(start_date), 'YYYY-MM-DD') AS a, to_char(max(end_date), 'YYYY-MM-DD') AS b
+        "SELECT to_char(min(start_date), 'YYYY-MM-DD') AS a, to_char(max(end_date), 'YYYY-MM-DD') AS b,
+                coalesce(array_agg(id ORDER BY id), '{}'::bigint[]) AS ids
          FROM site_imports WHERE site_id = $1 AND status = 'completed'",
     )
     .bind(id_i64(site_id)?)
@@ -232,7 +236,19 @@ pub async fn completed_range(pool: &PgPool, site_id: u64) -> Result<Option<(Stri
     .context("查询导入范围失败")?;
     let a: Option<String> = row.try_get("a")?;
     let b: Option<String> = row.try_get("b")?;
-    Ok(a.zip(b))
+    let ids: Vec<i64> = row.try_get("ids")?;
+    Ok(CompletedImports {
+        range: a.zip(b),
+        ids: ids
+            .into_iter()
+            .map(u64::try_from)
+            .collect::<Result<_, _>>()?,
+    })
+}
+
+/// 已完成的导入覆盖的日期；没有为 `None`。
+pub async fn completed_range(pool: &PgPool, site_id: u64) -> Result<Option<(String, String)>> {
+    Ok(completed_imports(pool, site_id).await?.range)
 }
 
 /// 与 `[start, end]` 重叠的已完成导入（返回其中一个的 id）。同一段日期导入两次会重复计数，所以要拒绝。

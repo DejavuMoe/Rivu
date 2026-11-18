@@ -899,13 +899,35 @@ async fn plausible_imports_over_http() {
     .await
     .unwrap();
 
-    // 删除：汇总行与记录都没有了，失败的记录直接删
+    // 模拟恢复置为失败后，已接受的 INSERT 才落表。
+    let maintainer =
+        rivu_storage_ch::client(&env.ch_url, &account("maintainer"), Some(&ch_database()));
+    rivu_query::rollup::insert_import(
+        &maintainer,
+        &rivu_query::TenantScope::new(site),
+        "rollup_events",
+        "Asia/Taipei",
+        running as u64,
+        &[rivu_query::rollup::ImportRow {
+            day: "2026-06-01".parse().unwrap(),
+            dims: vec!["pageview".to_owned()],
+            m: rivu_query::rollup::Measures {
+                events: 20,
+                ..Default::default()
+            },
+        }],
+    )
+    .await
+    .unwrap();
+
+    // 删除已完成的记录，只清理属于该批次的汇总行。
     let r = http
         .delete_with(&format!("{path}/{id}"), &json!({}))
         .cookie(&w.admin.cookie)
         .send()
         .await;
     expect(&r, 204);
+    assert_eq!(imported_rows(&maintainer, "rollup_events", site).await, 1);
     assert_eq!(
         rivu_storage_pg::imports::completed_range(&pg, site)
             .await
@@ -922,6 +944,13 @@ async fn plausible_imports_over_http() {
             .await;
         expect(&r, 204);
     }
+    assert_eq!(imported_rows(&maintainer, "rollup_events", site).await, 0);
+    assert!(
+        rivu_storage_pg::imports::list(&pg, site)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     expect_err(
         &http
             .delete_with(&format!("{path}/{id}"), &json!({}))

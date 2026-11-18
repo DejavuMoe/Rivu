@@ -158,7 +158,7 @@ pub async fn export(config: &Config, args: ExportArgs) -> Result<ExitCode> {
 }
 
 /// `rivu import`：导入 Plausible 的数据导出、列出与删除导入。写汇总表用 `rivu_maintainer` 账号。
-/// 运行中的 `rivu serve` 的结果缓存最多 10 分钟后才看到导入的数据。
+/// `rivu serve` 每次查询读取已完成的导入 ID，导入或删除完成后会使用新的缓存键。
 pub async fn import(config: &Config, action: ImportAction) -> Result<ExitCode> {
     let site_key = match &action {
         ImportAction::Plausible { site, .. }
@@ -222,7 +222,7 @@ pub async fn import(config: &Config, action: ImportAction) -> Result<ExitCode> {
             match imports::claim_delete(&mut tx, site.id, id).await? {
                 DeleteClaim::Missing => bail!("站点 `{site_key}` 没有导入 #{id}"),
                 DeleteClaim::Running => bail!("import_running: 导入 #{id} 仍在进行中"),
-                DeleteClaim::Ready { .. } => {}
+                DeleteClaim::Ready => {}
             }
             let ch = maintainer()?;
             let import_id = u64::try_from(id).context("导入 id 为负数")?;
