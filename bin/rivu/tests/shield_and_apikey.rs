@@ -12,6 +12,7 @@
 //! 3. 命令行入口（`shield add|list|remove`、`apikey create|list|revoke`）的校验与副作用。
 
 use std::collections::BTreeMap;
+use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1110,6 +1111,11 @@ async fn api_key_chain_end_to_end() {
 
 // ------------------------------------------------------------------ 用例 3：命令行入口
 
+#[track_caller]
+fn assert_cli_success(result: anyhow::Result<ExitCode>) {
+    assert_eq!(result.expect("CLI command failed"), ExitCode::SUCCESS);
+}
+
 #[tokio::test]
 async fn cli_commands_validate_and_write() {
     let Some(env) = test_env("cli_commands_validate_and_write") else {
@@ -1155,15 +1161,9 @@ async fn cli_commands_validate_and_write() {
             .is_empty()
     );
     // 正常添加：写入的是规范化后的值
-    add(ShieldType::Cidr, "10.1.2.3/8", ShieldActionKind::Deny)
-        .await
-        .unwrap();
-    add(ShieldType::Country, "cn", ShieldActionKind::Deny)
-        .await
-        .unwrap();
-    add(ShieldType::Page, "/a**b", ShieldActionKind::Allow)
-        .await
-        .unwrap();
+    assert_cli_success(add(ShieldType::Cidr, "10.1.2.3/8", ShieldActionKind::Deny).await);
+    assert_cli_success(add(ShieldType::Country, "cn", ShieldActionKind::Deny).await);
+    assert_cli_success(add(ShieldType::Page, "/a**b", ShieldActionKind::Allow).await);
     let rules = rivu_storage_pg::shield::list_rules(&pg, site)
         .await
         .unwrap();
@@ -1198,35 +1198,38 @@ async fn cli_commands_validate_and_write() {
     .await
     .unwrap_err();
     assert!(format!("{e:#}").contains("找不到站点"));
-    shield_cmd::run(
-        &config,
-        ShieldAction::List(ShieldListArgs { site: key.clone() }),
-    )
-    .await
-    .unwrap();
+    assert_cli_success(
+        shield_cmd::run(
+            &config,
+            ShieldAction::List(ShieldListArgs { site: key.clone() }),
+        )
+        .await,
+    );
     // 删除：按 id、按类型加取值（取值先规范化）
-    shield_cmd::run(
-        &config,
-        ShieldAction::Remove(ShieldRemoveArgs {
-            site: key.clone(),
-            id: None,
-            kind: Some(ShieldType::Cidr),
-            value: Some("10.200.0.0/8".into()),
-        }),
-    )
-    .await
-    .unwrap();
-    shield_cmd::run(
-        &config,
-        ShieldAction::Remove(ShieldRemoveArgs {
-            site: key.clone(),
-            id: Some(rules[1].id.clone()),
-            kind: None,
-            value: None,
-        }),
-    )
-    .await
-    .unwrap();
+    assert_cli_success(
+        shield_cmd::run(
+            &config,
+            ShieldAction::Remove(ShieldRemoveArgs {
+                site: key.clone(),
+                id: None,
+                kind: Some(ShieldType::Cidr),
+                value: Some("10.200.0.0/8".into()),
+            }),
+        )
+        .await,
+    );
+    assert_cli_success(
+        shield_cmd::run(
+            &config,
+            ShieldAction::Remove(ShieldRemoveArgs {
+                site: key.clone(),
+                id: Some(rules[1].id.clone()),
+                kind: None,
+                value: None,
+            }),
+        )
+        .await,
+    );
     let left = rivu_storage_pg::shield::list_rules(&pg, site)
         .await
         .unwrap();
@@ -1335,17 +1338,18 @@ async fn cli_commands_validate_and_write() {
         rows.iter()
             .all(|r| !r.revoked && r.key_prefix.starts_with("rivu_"))
     );
-    apikey_cmd::run(
-        &config,
-        ApikeyAction::List(ApikeyListArgs {
-            org: Some(org.slug.clone()),
-        }),
-    )
-    .await
-    .unwrap();
-    apikey_cmd::run(&config, ApikeyAction::Revoke(ApikeyRevokeArgs { id: k.id }))
-        .await
-        .unwrap();
+    assert_cli_success(
+        apikey_cmd::run(
+            &config,
+            ApikeyAction::List(ApikeyListArgs {
+                org: Some(org.slug.clone()),
+            }),
+        )
+        .await,
+    );
+    assert_cli_success(
+        apikey_cmd::run(&config, ApikeyAction::Revoke(ApikeyRevokeArgs { id: k.id })).await,
+    );
     assert!(
         apikey_cmd::run(&config, ApikeyAction::Revoke(ApikeyRevokeArgs { id: k.id }))
             .await
