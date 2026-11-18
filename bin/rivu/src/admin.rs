@@ -214,18 +214,24 @@ pub async fn import(config: &Config, action: ImportAction) -> Result<ExitCode> {
             }
         }
         ImportAction::Delete { id, .. } => {
-            if rivu_storage_pg::imports::get(&pool, site.id, id)
-                .await?
-                .is_none()
-            {
-                bail!("站点 `{site_key}` 没有导入 #{id}");
+            use rivu_storage_pg::imports::{self, DeleteClaim};
+
+            let mut tx = rivu_storage_pg::sites::begin_maintenance(&pool).await?;
+            match imports::claim_delete(&mut tx, site.id, id).await? {
+                DeleteClaim::Missing => bail!("站点 `{site_key}` 没有导入 #{id}"),
+                DeleteClaim::Running => bail!("import_running: 导入 #{id} 仍在进行中"),
+                DeleteClaim::Ready { .. } => {}
             }
             let ch = maintainer()?;
             let import_id = u64::try_from(id).context("导入 id 为负数")?;
             rivu_query::rollup::delete_import(&ch, &TenantScope::new(site.id), import_id)
                 .await
                 .map_err(|e| anyhow!("删除汇总行失败：{e}"))?;
-            rivu_storage_pg::imports::delete(&pool, site.id, id).await?;
+            anyhow::ensure!(
+                imports::delete(&mut *tx, site.id, id).await?,
+                "删除导入 #{id} 时记录状态已改变"
+            );
+            tx.commit().await?;
             println!("已删除导入 #{id}");
         }
     }

@@ -409,6 +409,29 @@ async fn plausible_export_is_imported_into_the_rollup_tier() {
         .expect_err(code);
         assert_eq!(rivu_jobs::import_plausible::error_code(&e), code);
     }
+
+    // A cancelled handoff releases the lock even when the ordinary pool has just one slot.
+    let one = rivu_storage_pg::connect(&pg_url, 1).await.unwrap();
+    let pending = rivu_jobs::import_plausible::start(&one, created.id, "cancelled.zip", None)
+        .await
+        .unwrap()
+        .unwrap();
+    let id = pending.row().id;
+    let recover = || rivu_jobs::import_plausible::recover_interrupted(&one, &maintainer);
+    assert_eq!(recover().await.unwrap(), 0);
+    drop(pending);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while recover().await.unwrap() == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("dropping the executor must release its lock");
+    let rows = rivu_storage_pg::imports::list(&one, created.id)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].id, id);
+    assert_eq!(rows[0].error_code.as_deref(), Some("interrupted"));
 }
 
 fn empty_zip() -> Vec<u8> {

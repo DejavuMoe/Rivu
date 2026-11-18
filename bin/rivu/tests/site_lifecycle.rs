@@ -278,6 +278,10 @@ impl Http {
 }
 
 async fn start(env: &TestEnv, pg: &PgPool) -> Http {
+    start_with_maintainer(env, pg, &env.ch_url).await
+}
+
+async fn start_with_maintainer(env: &TestEnv, pg: &PgPool, write_url: &str) -> Http {
     let cfg = config(env);
     let reader: Client =
         rivu_storage_ch::client(&env.ch_url, &account("reader"), Some(&ch_database()));
@@ -286,7 +290,7 @@ async fn start(env: &TestEnv, pg: &PgPool) -> Http {
         .expect("装配内部端点")
         .with_limits(loose())
         .with_maintainer(rivu_storage_ch::client(
-            &env.ch_url,
+            write_url,
             &account("maintainer"),
             Some(&ch_database()),
         ))
@@ -724,6 +728,7 @@ async fn plausible_imports_over_http() {
     let Some(env) = test_env("plausible_imports_over_http") else {
         return;
     };
+    let _serial = IMPORT_TESTS.lock().await;
     let pg = pg(&env).await;
     let http = start(&env, &pg).await;
     let w = world(&pg, &http).await;
@@ -852,7 +857,8 @@ async fn plausible_imports_over_http() {
     )
     .await
     .unwrap()
-    .expect("建记录");
+    .expect("建记录")
+    .id;
     expect_err(
         &http
             .json_rb(
@@ -884,9 +890,14 @@ async fn plausible_imports_over_http() {
         409,
         "import_running",
     );
-    rivu_storage_pg::imports::fail(&pg, running, "interrupted", "test")
-        .await
-        .unwrap();
+    rivu_storage_pg::imports::fail(
+        &mut pg.acquire().await.unwrap(),
+        running,
+        "interrupted",
+        "test",
+    )
+    .await
+    .unwrap();
 
     // 删除：汇总行与记录都没有了，失败的记录直接删
     let r = http
@@ -921,6 +932,319 @@ async fn plausible_imports_over_http() {
         "not_found",
     );
 }
+
+static IMPORT_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+struct InsertGate {
+    url: String,
+    pending: tokio::sync::oneshot::Receiver<()>,
+    release: tokio::sync::oneshot::Sender<()>,
+    _proxy: tokio::task::JoinSet<std::io::Result<()>>,
+}
+
+/// Forward to real ClickHouse, withholding only the first INSERT response after the server commits it.
+async fn gate_first_insert(env: &TestEnv) -> InsertGate {
+    let target = url::Url::parse(&env.ch_url).unwrap();
+    assert_eq!(
+        target.scheme(),
+        "http",
+        "the test proxy requires local HTTP"
+    );
+    let upstream = target.socket_addrs(|| Some(80)).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (notice, pending) = tokio::sync::oneshot::channel();
+    let (release, wait) = tokio::sync::oneshot::channel();
+    let mut proxy = tokio::task::JoinSet::new();
+    proxy.spawn(async move {
+        let mut gate = Some((notice, wait));
+        loop {
+            let (mut downstream, _) = listener.accept().await?;
+            let mut header = Vec::new();
+            loop {
+                header.push(downstream.read_u8().await?);
+                if header.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let header = std::str::from_utf8(&header).unwrap();
+            let insert = header
+                .lines()
+                .next()
+                .unwrap()
+                .contains("query=INSERT+INTO+");
+            let mut server = TcpStream::connect(upstream.as_slice()).await?;
+            for line in header.lines().take_while(|line| !line.is_empty()) {
+                if !line.to_ascii_lowercase().starts_with("connection:") {
+                    server.write_all(line.as_bytes()).await?;
+                    server.write_all(b"\r\n").await?;
+                }
+            }
+            server.write_all(b"Connection: close\r\n\r\n").await?;
+            let (mut request, mut reply) = downstream.split();
+            let (mut result, mut body) = server.split();
+            let upload = async {
+                tokio::io::copy(&mut request, &mut body).await?;
+                body.shutdown().await
+            };
+            let download = async {
+                if insert && let Some((notice, wait)) = gate.take() {
+                    let mut response = Vec::new();
+                    result.read_to_end(&mut response).await?;
+                    assert!(
+                        response.starts_with(b"HTTP/1.1 200"),
+                        "{}",
+                        String::from_utf8_lossy(&response)
+                    );
+                    let _ = notice.send(());
+                    let _ = wait.await;
+                    reply.write_all(&response).await?;
+                } else {
+                    tokio::io::copy(&mut result, &mut reply).await?;
+                }
+                reply.shutdown().await
+            };
+            tokio::pin!(upload);
+            tokio::select! {
+                result = download => result?,
+                result = &mut upload => result?,
+            }
+        }
+    });
+    InsertGate {
+        url,
+        pending,
+        release,
+        _proxy: proxy,
+    }
+}
+
+async fn wait_for_insert(gate: &mut InsertGate) {
+    tokio::time::timeout(Duration::from_secs(15), &mut gate.pending)
+        .await
+        .expect("the first real INSERT must reach ClickHouse")
+        .unwrap();
+}
+
+fn cli(env: &TestEnv, site_key: &str, action: &str) -> tokio::process::Command {
+    let maintainer = account("maintainer");
+    let reader = account("reader");
+    let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_rivu"));
+    cmd.kill_on_drop(true)
+        .args(["import", action, "--site", site_key])
+        .env("RIVU_DATABASE_URL", &env.pg_url)
+        .env("RIVU_CLICKHOUSE_URL", &env.ch_url)
+        .env("RIVU_CH_DATABASE", ch_database())
+        .env("RIVU_CH_READER_USER", reader.user)
+        .env("RIVU_CH_READER_PASSWORD", reader.password.expose())
+        .env("RIVU_CH_MAINTAINER_USER", maintainer.user)
+        .env("RIVU_CH_MAINTAINER_PASSWORD", maintainer.password.expose());
+    cmd
+}
+
+async fn cli_output(cmd: &mut tokio::process::Command) -> std::process::Output {
+    tokio::time::timeout(Duration::from_secs(15), cmd.output())
+        .await
+        .expect("CLI must exit")
+        .unwrap()
+}
+
+async fn import_row(pg: &PgPool, site: u64, status: &str) -> rivu_storage_pg::imports::ImportRow {
+    let row = rivu_storage_pg::imports::list(pg, site)
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(row.status, status, "{row:?}");
+    row
+}
+
+async fn imported_rows(ch: &Client, table: &str, site: u64) -> u64 {
+    ch.query(&format!(
+        "SELECT count() FROM {table} WHERE site_id = ? AND origin = 'import'"
+    ))
+    .bind(site)
+    .fetch_one()
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn cli_import_delete_refuses_an_active_real_zip() {
+    let Some(env) = test_env("cli_import_delete_refuses_an_active_real_zip") else {
+        return;
+    };
+    let _serial = IMPORT_TESTS.lock().await;
+    let pg = pg(&env).await;
+    let site = make_site(&pg, make_org(&pg).await.id, &unique("CLI import"), "UTC").await;
+    let key: String = sqlx::query_scalar("SELECT site_key FROM sites WHERE id = $1")
+        .bind(site as i64)
+        .fetch_one(&pg)
+        .await
+        .unwrap();
+    let ch = rivu_storage_ch::client(&env.ch_url, &account("maintainer"), Some(&ch_database()));
+    let mut gate = gate_first_insert(&env).await;
+    let proxy_env = TestEnv {
+        ch_url: gate.url.clone(),
+        ..env.clone()
+    };
+    struct ZipFile(std::path::PathBuf);
+    impl Drop for ZipFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let zip = ZipFile(std::env::temp_dir().join(format!("rivu-import-{}.zip", Uuid::new_v4())));
+    std::fs::write(&zip.0, visitors_zip()).unwrap();
+    let mut child = cli(&proxy_env, &key, "plausible")
+        .arg(&zip.0)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    tokio::select! {
+        () = wait_for_insert(&mut gate) => {},
+        status = child.wait() => {
+            assert!(status.is_ok(), "{status:?}");
+            panic!("import exited before its first insert: {:?}", child.wait_with_output().await.unwrap());
+        }
+    }
+    let id = import_row(&pg, site, "importing").await.id.to_string();
+    assert_eq!(imported_rows(&ch, "rollup_events", site).await, 3);
+    assert!(child.try_wait().unwrap().is_none());
+
+    let out = cli_output(cli(&env, &key, "delete").args(["--id", &id])).await;
+    assert!(!out.status.success(), "delete accepted a live import");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("import_running"),
+        "{out:?}"
+    );
+    assert_eq!(imported_rows(&ch, "rollup_events", site).await, 3);
+    assert_eq!(imported_rows(&ch, "rollup_site", site).await, 0);
+    assert_eq!(
+        rivu_jobs::import_plausible::recover_interrupted(&pg, &ch)
+            .await
+            .unwrap(),
+        0,
+        "recovery must also skip the live CLI"
+    );
+
+    gate.release.send(()).unwrap();
+    let out = tokio::time::timeout(Duration::from_secs(15), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(import_row(&pg, site, "completed").await.id.to_string(), id);
+    let out = cli_output(&mut cli(&env, &key, "list")).await;
+    assert!(out.status.success(), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stdout).contains(&format!("{id}\tcompleted\t")));
+    let out = cli_output(cli(&env, &key, "plausible").arg(&zip.0)).await;
+    assert!(
+        !out.status.success(),
+        "a completed import must reject a duplicate ZIP"
+    );
+    assert_eq!(
+        import_row(&pg, site, "failed").await.error_code.as_deref(),
+        Some("overlap")
+    );
+    let out = cli_output(cli(&env, &key, "delete").args(["--id", &id])).await;
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        rivu_storage_pg::imports::list(&pg, site)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(imported_rows(&ch, "rollup_events", site).await, 0);
+    assert_eq!(imported_rows(&ch, "rollup_site", site).await, 0);
+}
+
+#[tokio::test]
+async fn import_recovery_skips_live_upload_and_recovers_disconnected_owner() {
+    let Some(mut env) =
+        test_env("import_recovery_skips_live_upload_and_recovers_disconnected_owner")
+    else {
+        return;
+    };
+    let _serial = IMPORT_TESTS.lock().await;
+    let mut pg_url = url::Url::parse(&env.pg_url).unwrap();
+    pg_url.query_pairs_mut().append_pair(
+        "options",
+        "-c idle_in_transaction_session_timeout=3s -c transaction_timeout=4s",
+    );
+    // Migrate before enabling the deliberately short timeouts on the application connections.
+    migrate_once(&env).await;
+    env.pg_url = pg_url.to_string();
+    let pg = pg(&env).await;
+    let timeouts: (String, String) = sqlx::query_as(
+        "SELECT current_setting('idle_in_transaction_session_timeout'), current_setting('transaction_timeout')",
+    )
+    .fetch_one(&pg)
+    .await
+    .unwrap();
+    assert_eq!(timeouts, ("3s".into(), "4s".into()));
+    let ch = rivu_storage_ch::client(&env.ch_url, &account("maintainer"), Some(&ch_database()));
+    let mut gate = gate_first_insert(&env).await;
+    let http = start_with_maintainer(&env, &pg, &gate.url).await;
+    let org = make_org(&pg).await;
+    let admin = actor(&pg, &http, &org, "admin").await;
+    let site = make_site(&pg, org.id, &unique("Active upload"), "UTC").await;
+    let site_path = format!("/api/internal/sites/{site}");
+    let path = format!("{site_path}/imports");
+    let id = expect(
+        &http
+            .upload(&path, visitors_zip())
+            .cookie(&admin.cookie)
+            .send()
+            .await,
+        202,
+    )["import"]["id"]
+        .as_i64()
+        .unwrap();
+    wait_for_insert(&mut gate).await;
+    tokio::time::sleep(Duration::from_millis(4200)).await;
+    let recover = || rivu_jobs::import_plausible::recover_interrupted(&pg, &ch);
+    assert_eq!(recover().await.unwrap(), 0, "live upload was recovered");
+    assert_eq!(import_row(&pg, site, "importing").await.id, id);
+    assert_eq!(imported_rows(&ch, "rollup_events", site).await, 3);
+    expect_err(
+        &http
+            .json_rb("PATCH", &site_path, &json!({"timezone": "Asia/Taipei"}))
+            .cookie(&admin.cookie)
+            .send()
+            .await,
+        409,
+        "timezone_import_conflict",
+    );
+
+    let terminated: bool = sqlx::query_scalar(
+        "SELECT pg_terminate_backend(pid, 3000)
+        FROM pg_locks WHERE locktype = 'advisory' AND granted AND objsubid = 2
+          AND classid::bigint = ($1::bigint >> 32) AND objid::bigint = ($1::bigint & 4294967295)",
+    )
+    .bind(id)
+    .fetch_one(&pg)
+    .await
+    .unwrap();
+    assert!(terminated);
+    let (a, b) = tokio::try_join!(recover(), recover()).unwrap();
+    assert_eq!(a + b, 1, "only one recovery must claim the orphan");
+    assert_eq!(
+        import_row(&pg, site, "failed").await.error_code.as_deref(),
+        Some("interrupted")
+    );
+    assert_eq!(imported_rows(&ch, "rollup_events", site).await, 0);
+
+    // The delayed success cannot make the old worker write the next table or complete the PG row.
+    let _ = gate.release.send(());
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let row = settled(&http, &admin.cookie, &path, id).await;
+    assert_eq!(row["error_code"], "interrupted");
+    assert_eq!(imported_rows(&ch, "rollup_site", site).await, 0);
+    assert_eq!(recover().await.unwrap(), 0);
+}
+
 #[tokio::test]
 async fn stats_deletion_requests() {
     let Some(env) = test_env("stats_deletion_requests") else {
