@@ -17,6 +17,7 @@
 // 期望：pageviews = 5，visits = 1，visitors = 1，页面榜 /spa/y 2 次、其余各 1 次。
 // full 另外发 engagement（SPA 跳转与页面隐藏时 flush），它们都必须被接受，且不改变上面的任何数字。
 
+import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import http from 'node:http';
@@ -79,10 +80,16 @@ const SPEC_DIMS: Record<Dim, string> = {
 
 function stats(siteKey: string, day: string): Stats {
   const base = { site: siteKey, date_range: [day, day] };
-  const [visitors, visits, pageviews, bounce_rate] = query({
+  const [total] = query({
     ...base,
     metrics: ['visitors', 'visits', 'pageviews', 'bounce_rate'],
-  }).results[0].metrics;
+  }).results;
+  assert(total, '总计查询没有返回行');
+  const [visitors, visits, pageviews, bounce_rate] = total.metrics;
+  assert(
+    visitors !== undefined && visits !== undefined && pageviews !== undefined && bounce_rate !== undefined,
+    '总计查询缺少指标',
+  );
   const breakdown = {} as Record<Dim, Row[]>;
   let countryMeta: Stats['countryMeta'] = {};
   for (const dim of Object.keys(SPEC_DIMS) as Dim[]) {
@@ -95,12 +102,13 @@ function stats(siteKey: string, day: string): Stats {
       order_by: [['visitors', 'desc'], ['visits', 'desc'], ['pageviews', 'desc']],
       pagination: { limit: 10 },
     });
-    breakdown[dim] = r.results.map((row) => ({
-      value: row.dimensions[0],
-      visitors: row.metrics[0],
-      visits: row.metrics[1],
-      pageviews: row.metrics[2],
-    }));
+    breakdown[dim] = r.results.map(({ dimensions: [value], metrics: [visitors, visits, pageviews] }) => {
+      assert(
+        value !== undefined && visitors !== undefined && visits !== undefined && pageviews !== undefined,
+        `${dim} 明细缺少维度或指标`,
+      );
+      return { value, visitors, visits, pageviews };
+    });
     if (dim === 'country') countryMeta = r.meta;
   }
   return { visitors, visits, pageviews, bounce_rate, breakdown, countryMeta };
