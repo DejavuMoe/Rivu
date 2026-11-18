@@ -13,6 +13,8 @@ let cfg: Config;
 let first = true;
 /** 是否已发出过 pageview；用来保证「hidden/prerender 页面变可见」只补发一次。 */
 let sent = false;
+/** 仅在等待首次可见时阻止 History 路由，独立于 pageview 是否发送。 */
+export let waitingForVisibility = false;
 /** 上一个已发 pageview 的 `location.pathname`，供 router 去重（规范 §4.3）。 */
 export let lastPath: string | undefined;
 
@@ -51,11 +53,16 @@ export const start = (c: Config): void => {
 
   if (ready()) track();
   else {
+    waitingForVisibility = true;
     // hidden 或 prerender：首次变为可见才发。
     // `prerenderingchange` 是 Speculation Rules 预渲染的激活事件；预渲染期间 `visibilityState`
     // 为 hidden，仅靠 `visibilitychange` 可能漏报（规范 §4.2，Rivu 新增）。
     // 两个事件可能先后到达，`sent` 保证只发一次。
-    const onReady = () => ready() && !sent && track();
+    const onReady = () => {
+      if (!ready()) return;
+      waitingForVisibility = false;
+      if (!sent) track();
+    };
     d.addEventListener('visibilitychange', onReady);
     d.addEventListener('prerenderingchange', onReady);
   }
