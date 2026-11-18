@@ -238,15 +238,18 @@ pub(crate) async fn load_site_context(
         })
         .collect();
     // 导入的数据覆盖的日期：这些天只在日汇总层里
-    let imported = rivu_storage_pg::imports::completed_range(pg, site_id)
+    let completed = rivu_storage_pg::imports::completed_imports(pg, site_id)
         .await
         .map_err(|e| {
-            tracing::error!(site_id, error = %format!("{e:#}"), "读取导入范围失败");
+            tracing::error!(site_id, error = %format!("{e:#}"), "读取已完成的导入失败");
             ApiError::Internal
-        })?
+        })?;
+    let imported = completed
+        .range
         .and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?)));
     Ok(SiteContext {
         imported,
+        completed_import_ids: completed.ids,
         site_id,
         site_key: Some(site_key.to_owned()),
         timezone,

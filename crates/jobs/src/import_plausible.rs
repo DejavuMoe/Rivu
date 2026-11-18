@@ -18,7 +18,9 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::future::Future;
 use std::io::{Cursor, Read};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clickhouse::Client;
@@ -27,7 +29,8 @@ use jiff::civil::Date;
 use jiff::tz::TimeZone;
 use rivu_query::TenantScope;
 use rivu_query::rollup::{self, ImportRow, Measures};
-use sqlx::PgPool;
+use rivu_storage_pg::{imports, sites};
+use sqlx::{Connection, PgConnection, PgPool};
 
 /// 导入的结果。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,10 +43,10 @@ pub struct Summary {
     pub clipped_from: Option<Date>,
 }
 
-/// 看板能翻译的失败原因（`site_imports.error_code`）；不是它的错误记为 `internal`。
+/// 看板能翻译的失败原因。`import_running` 只用于注册冲突，其余代码用于 `site_imports.error_code`。
 #[derive(Debug)]
 pub struct Failure {
-    /// `invalid_zip` | `not_plausible` | `invalid_csv` | `no_days` | `overlap`
+    /// `import_running` | `invalid_zip` | `not_plausible` | `invalid_csv` | `no_days` | `overlap`
     pub code: &'static str,
     message: String,
 }
@@ -497,16 +500,14 @@ fn transform(
     Ok(out)
 }
 
-/// 执行一次导入：读 zip、截断到可导入的完整历史日、写进汇总层。`import_id` 是 `site_imports.id`（调用方先建记录，
-/// 成功后记为完成；失败时调用方删除已写入的行）。`ch` 用 `rivu_maintainer` 账号（汇总表的 INSERT）。
-pub async fn run(
-    pg: &PgPool,
+/// 读取 ZIP 并裁剪到可导入的完整历史日。
+async fn prepare(
+    db: &mut PgConnection,
     ch: &Client,
     site_id: u64,
     tz_name: &str,
-    import_id: u64,
     zip: Vec<u8>,
-) -> Result<Summary> {
+) -> Result<(Summary, BTreeMap<&'static str, Agg>)> {
     let files = tokio::task::spawn_blocking(move || read_zip(&zip))
         .await
         .context("读取 zip 的任务异常退出")??;
@@ -515,8 +516,8 @@ pub async fn run(
     // 空站也不能导入本地今天，否则当天开始采集后，汇总行会挡住原始数据。
     let today = Timestamp::now().to_zoned(tz.clone()).date();
     let scope = TenantScope::new(site_id);
-    let state = rollup::build_state(ch, &scope, &tz)
-        .await
+    let state = while_locked(db, rollup::build_state(ch, &scope, &tz))
+        .await?
         .map_err(|e| anyhow::anyhow!("读取站点数据范围失败：{e}"))?;
     let cutoff = state.native_from.map_or(today, |d| d.min(today));
 
@@ -541,15 +542,33 @@ pub async fn run(
         ));
     };
     if let Some(other) =
-        rivu_storage_pg::imports::overlapping(pg, site_id, &start.to_string(), &end.to_string())
-            .await?
+        imports::overlapping(db, site_id, &start.to_string(), &end.to_string()).await?
     {
         return Err(failure(
             "overlap",
             format!("与已有的导入 #{other} 的日期重叠（{start} – {end}），先删除那次导入"),
         ));
     }
-    let mut rows = 0u64;
+    let rows = tables.values().map(|table| table.len() as u64).sum();
+    Ok((
+        Summary {
+            start,
+            end,
+            rows,
+            clipped_from,
+        },
+        tables,
+    ))
+}
+
+async fn write(
+    db: &mut PgConnection,
+    ch: &Client,
+    scope: &TenantScope,
+    tz_name: &str,
+    import_id: u64,
+    tables: BTreeMap<&'static str, Agg>,
+) -> Result<Result<()>> {
     // rollup_site 最后写：与构建任务一致，它的行是「这一天有数据」的标记
     let order = tables
         .keys()
@@ -565,94 +584,182 @@ pub async fn run(
                 m: *m,
             })
             .collect();
-        rows += batch.len() as u64;
-        rollup::insert_import(ch, &scope, table, tz_name, import_id, &batch)
-            .await
-            .map_err(|e| anyhow::anyhow!("写入 {table} 失败：{e}"))?;
+        if let Err(e) = while_locked(
+            db,
+            rollup::insert_import(ch, scope, table, tz_name, import_id, &batch),
+        )
+        .await?
+        {
+            return Ok(Err(anyhow::anyhow!("写入 {table} 失败：{e}")));
+        }
     }
-    Ok(Summary {
-        start,
-        end,
-        rows,
-        clipped_from,
-    })
+    Ok(Ok(()))
 }
 
-/// 建记录并导入（见 [`execute`]）。返回记录 id 与结果。
+// A dedicated session avoids exhausting the request pool and cannot return with a session lock.
+async fn import_connection(pg: &PgPool) -> Result<PgConnection> {
+    Ok(tokio::time::timeout(
+        Duration::from_secs(3),
+        PgConnection::connect_with(&pg.connect_options()),
+    )
+    .await
+    .context("连接导入专用 PostgreSQL 会话超时")??)
+}
+
+// Detect loss of the lock session before dispatching work and while waiting for CH.
+// Dropping the HTTP future does not prove that ClickHouse cancelled an accepted request.
+async fn while_locked<T>(db: &mut PgConnection, work: impl Future<Output = T>) -> Result<T> {
+    tokio::pin!(work);
+    let deadline = tokio::time::sleep(Duration::from_secs(120));
+    tokio::pin!(deadline);
+    loop {
+        tokio::time::timeout(Duration::from_secs(3), db.ping())
+            .await
+            .context("检查导入锁会话超时")?
+            .context("导入锁会话已断开")?;
+        tokio::select! {
+            result = &mut work => return Ok(result),
+            () = &mut deadline => anyhow::bail!("等待导入的 ClickHouse 操作超时"),
+            () = tokio::time::sleep(Duration::from_secs(1)) => {},
+        }
+    }
+}
+
+/// 提交 `importing` 前取锁，锁随专用连接交给实际执行者。
+pub struct RunningImport {
+    db: PgConnection,
+    site_id: u64,
+    timezone: String,
+    row: imports::ImportRow,
+}
+
+pub async fn start(
+    pg: &PgPool,
+    site_id: u64,
+    file_name: &str,
+    imported_by: Option<i64>,
+) -> Result<Option<RunningImport>> {
+    let mut db = import_connection(pg).await?;
+    let mut tx = db
+        .begin_with("BEGIN ISOLATION LEVEL READ COMMITTED")
+        .await?;
+    let Some(timezone) = sites::lock_timezone(&mut tx, site_id, false).await? else {
+        return Ok(None);
+    };
+    let row = imports::create(&mut tx, site_id, "plausible_csv", file_name, imported_by)
+        .await?
+        .ok_or_else(|| failure("import_running", "这个站点已有进行中的导入"))?;
+    anyhow::ensure!(
+        imports::try_lock(&mut tx, row.id).await?,
+        "导入 #{} 已被锁定",
+        row.id
+    );
+    tx.commit().await?;
+    Ok(Some(RunningImport {
+        db,
+        site_id,
+        timezone,
+        row,
+    }))
+}
+
+/// 建记录并导入。返回记录 id 与结果。
 pub async fn import_file(
     pg: &PgPool,
     ch: &Client,
     site_id: u64,
-    tz_name: &str,
     zip: Vec<u8>,
     file_name: &str,
     imported_by: Option<i64>,
 ) -> Result<(i64, Summary)> {
-    let id = rivu_storage_pg::imports::create(pg, site_id, "plausible_csv", file_name, imported_by)
+    let import = start(pg, site_id, file_name, imported_by)
         .await?
-        .context("这个站点已有进行中的导入")?;
-    execute(pg, ch, id, site_id, tz_name, zip)
-        .await
-        .map(|s| (id, s))
+        .context("找不到未删除的站点")?;
+    let id = import.row.id;
+    Ok((id, import.execute(ch, zip).await?))
 }
 
-/// 对已建好的记录（`importing`）执行导入并记结果；失败时删除已写入的汇总行并把记录置为失败。
-pub async fn execute(
-    pg: &PgPool,
-    ch: &Client,
-    id: i64,
-    site_id: u64,
-    tz_name: &str,
-    zip: Vec<u8>,
-) -> Result<Summary> {
-    let import_id = u64::try_from(id).context("导入 id 为负数")?;
-    match run(pg, ch, site_id, tz_name, import_id, zip).await {
-        Ok(s) => {
-            rivu_storage_pg::imports::complete(
-                pg,
-                id,
-                &s.start.to_string(),
-                &s.end.to_string(),
-                i64::try_from(s.rows).unwrap_or(i64::MAX),
-            )
-            .await?;
-            tracing::info!(site_id, import_id = id, rows = s.rows, start = %s.start, end = %s.end, "导入完成");
-            Ok(s)
-        }
-        Err(e) => {
-            let msg = format!("{e:#}");
-            if let Err(d) = rollup::delete_import(ch, &TenantScope::new(site_id), import_id).await {
-                tracing::error!(site_id, import_id = id, error = %d, "清理失败导入的汇总行失败");
+impl RunningImport {
+    pub fn row(&self) -> &imports::ImportRow {
+        &self.row
+    }
+
+    pub async fn execute(self, ch: &Client, zip: Vec<u8>) -> Result<Summary> {
+        let Self {
+            mut db,
+            site_id,
+            timezone,
+            row,
+        } = self;
+        let id = row.id;
+        let import_id = u64::try_from(id).context("导入 id 为负数")?;
+        let scope = TenantScope::new(site_id);
+        let error = match prepare(&mut db, ch, site_id, &timezone, zip).await {
+            Ok((s, tables)) => {
+                match write(&mut db, ch, &scope, &timezone, import_id, tables).await? {
+                    Ok(()) => {
+                        imports::complete(
+                            &mut db,
+                            id,
+                            &s.start.to_string(),
+                            &s.end.to_string(),
+                            i64::try_from(s.rows).unwrap_or(i64::MAX),
+                        )
+                        .await?;
+                        tracing::info!(site_id, import_id = id, rows = s.rows, start = %s.start, end = %s.end, "导入完成");
+                        return Ok(s);
+                    }
+                    Err(e) => {
+                        while_locked(&mut db, rollup::delete_import(ch, &scope, import_id))
+                            .await?
+                            .map_err(|d| {
+                                anyhow::anyhow!("写入失败（{e:#}），清理导入 #{id} 失败：{d}")
+                            })?;
+                        e
+                    }
+                }
             }
-            rivu_storage_pg::imports::fail(pg, id, error_code(&e), &msg).await?;
-            tracing::warn!(site_id, import_id = id, error = %msg, "导入失败");
-            Err(e)
-        }
+            Err(e) => e,
+        };
+        let msg = format!("{error:#}");
+        imports::fail(&mut db, id, error_code(&error), &msg).await?;
+        tracing::warn!(site_id, import_id = id, error = %msg, "导入失败");
+        Err(error)
     }
 }
 
-/// 启动时调用：上次进程退出时还在 `importing` 的导入写到一半，删除它们的汇总行并置为失败（`interrupted`）。
+/// 启动时只清理锁已释放、重读仍为 `importing` 的导入。
 pub async fn recover_interrupted(pg: &PgPool, ch: &Client) -> Result<usize> {
-    let stale = rivu_storage_pg::imports::interrupted(pg).await?;
-    for (id, site_id) in &stale {
-        let import_id = u64::try_from(*id).context("导入 id 为负数")?;
-        rollup::delete_import(ch, &TenantScope::new(*site_id), import_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("清理中断导入 #{id} 的汇总行失败：{e}"))?;
-        rivu_storage_pg::imports::fail(
-            pg,
-            *id,
+    let mut recovered = 0;
+    for (id, site_id) in imports::interrupted(pg).await? {
+        let mut db = import_connection(pg).await?;
+        if !imports::try_lock(&mut db, id).await?
+            || !imports::is_running(&mut db, id, site_id).await?
+        {
+            continue;
+        }
+        let import_id = u64::try_from(id).context("导入 id 为负数")?;
+        while_locked(
+            &mut db,
+            rollup::delete_import(ch, &TenantScope::new(site_id), import_id),
+        )
+        .await?
+        .map_err(|e| anyhow::anyhow!("清理中断导入 #{id} 的汇总行失败：{e}"))?;
+        imports::fail(
+            &mut db,
+            id,
             "interrupted",
             "服务在导入过程中重启，导入没有完成",
         )
         .await?;
+        recovered += 1;
         tracing::warn!(
             site_id,
             import_id = id,
             "上次进程退出时导入没有完成，已清理并置为失败"
         );
     }
-    Ok(stale.len())
+    Ok(recovered)
 }
 #[cfg(test)]
 mod tests {

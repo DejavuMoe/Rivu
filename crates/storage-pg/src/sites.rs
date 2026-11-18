@@ -6,7 +6,7 @@
 use anyhow::{Context, Result, bail};
 use jiff::tz::TimeZone;
 use rand::Rng;
-use sqlx::{PgPool, Row, postgres::PgRow};
+use sqlx::{PgExecutor, PgPool, Postgres, Row, Transaction, postgres::PgRow};
 
 use crate::shield::ShieldRuleRow;
 
@@ -308,12 +308,14 @@ pub async fn find_query_settings(pool: &PgPool, site_id: u64) -> Result<Option<Q
 }
 
 /// 原始数据清理用：全部站点（含软删除、还没清除的）的 id、时区与站点级保留天数。
-pub async fn retention_settings(pool: &PgPool) -> Result<Vec<(u64, String, Option<i32>)>> {
+pub async fn retention_settings(
+    db: &mut sqlx::PgConnection,
+) -> Result<Vec<(u64, String, Option<i32>)>> {
     let rows = sqlx::query(
         "SELECT s.id, s.timezone, ss.retention_days
          FROM sites s LEFT JOIN site_settings ss ON ss.site_id = s.id ORDER BY s.id",
     )
-    .fetch_all(pool)
+    .fetch_all(db)
     .await
     .context("查询站点保留期失败")?;
     rows.iter()
@@ -534,7 +536,7 @@ pub struct SiteAdminView {
 }
 
 /// 读设置页的站点视图；站点不存在或已软删除返回 `None`。
-pub async fn admin_view(pool: &PgPool, site_id: u64) -> Result<Option<SiteAdminView>> {
+pub async fn admin_view(db: impl PgExecutor<'_>, site_id: u64) -> Result<Option<SiteAdminView>> {
     let id = i64::try_from(site_id).context("site_id 超出范围")?;
     let row = sqlx::query(concat!(
         "SELECT s.id, s.site_key, s.name, s.timezone, s.is_public, ",
@@ -550,7 +552,7 @@ pub async fn admin_view(pool: &PgPool, site_id: u64) -> Result<Option<SiteAdminV
          WHERE s.id = $1 AND s.deleted_at IS NULL"
     ))
     .bind(id)
-    .fetch_optional(pool)
+    .fetch_optional(db)
     .await
     .context("查询站点设置失败")?;
     row.map(|r| {
@@ -590,11 +592,47 @@ pub struct SitePatch<'a> {
     pub retention_days: Option<Option<i32>>,
 }
 
-/// 一个事务里更新 `sites` 与 `site_settings`（没有 settings 行时先补一行）；站点不存在或已软删除返回 `false`。
-/// `updated_at` 由触发器维护，collector 的缓存据此增量刷新。
-pub async fn update_site(pool: &PgPool, site_id: u64, patch: &SitePatch<'_>) -> Result<bool> {
+/// 维护任务在同步等待 ClickHouse 时，PG 会话处于事务内空闲状态。
+pub async fn begin_maintenance(pool: &PgPool) -> Result<Transaction<'static, Postgres>> {
+    let mut tx = pool
+        .begin_with("BEGIN ISOLATION LEVEL READ COMMITTED")
+        .await?;
+    // set_config(..., true) is SET LOCAL. Older PG versions lack transaction_timeout.
+    sqlx::query(
+        "SELECT set_config(name, '0', true) FROM pg_settings
+         WHERE name IN ('idle_in_transaction_session_timeout', 'transaction_timeout')",
+    )
+    .execute(&mut *tx)
+    .await
+    .context("设置站点维护事务超时失败")?;
+    Ok(tx)
+}
+
+/// 锁住站点行，读最新时区。软删除站点的擦除也使用这把锁。
+pub async fn lock_timezone(
+    tx: &mut Transaction<'_, Postgres>,
+    site_id: u64,
+    include_deleted: bool,
+) -> Result<Option<String>> {
     let id = i64::try_from(site_id).context("site_id 超出范围")?;
-    let mut tx = pool.begin().await.context("开启事务失败")?;
+    sqlx::query_scalar(
+        "SELECT timezone FROM sites WHERE id = $1 AND ($2 OR deleted_at IS NULL) FOR UPDATE",
+    )
+    .bind(id)
+    .bind(include_deleted)
+    .fetch_optional(&mut **tx)
+    .await
+    .context("锁定站点时区失败")
+}
+
+/// 在调用方事务里更新 `sites` 与 `site_settings`（没有 settings 行时先补一行）；站点不存在或已软删除返回 `false`。
+/// `updated_at` 由触发器维护，collector 的缓存据此增量刷新。
+pub async fn update_site(
+    tx: &mut Transaction<'_, Postgres>,
+    site_id: u64,
+    patch: &SitePatch<'_>,
+) -> Result<bool> {
+    let id = i64::try_from(site_id).context("site_id 超出范围")?;
     let touched: Option<i64> = sqlx::query_scalar(
         "UPDATE sites SET name = COALESCE($2, name), timezone = COALESCE($3, timezone),
                           is_public = COALESCE($4, is_public)
@@ -604,7 +642,7 @@ pub async fn update_site(pool: &PgPool, site_id: u64, patch: &SitePatch<'_>) -> 
     .bind(patch.name)
     .bind(patch.timezone)
     .bind(patch.is_public)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await
     .context("更新 sites 失败")?;
     if touched.is_none() {
@@ -612,7 +650,7 @@ pub async fn update_site(pool: &PgPool, site_id: u64, patch: &SitePatch<'_>) -> 
     }
     sqlx::query("INSERT INTO site_settings (site_id) VALUES ($1) ON CONFLICT (site_id) DO NOTHING")
         .bind(id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .context("补写 site_settings 失败")?;
     sqlx::query(
@@ -644,10 +682,9 @@ pub async fn update_site(pool: &PgPool, site_id: u64, patch: &SitePatch<'_>) -> 
     }))
     .bind(patch.retention_days.is_some())
     .bind(patch.retention_days.flatten())
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await
     .context("更新 site_settings 失败")?;
-    tx.commit().await.context("提交事务失败")?;
     Ok(true)
 }
 
