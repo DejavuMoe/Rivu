@@ -135,6 +135,7 @@
   let status = $state<"loading" | "ready" | Failure>("loading");
   let totals = $state<ReturnType<typeof readTotals> | null>(null);
   let series = $state<Series | null>(null);
+  let importedExcluded = $state(false);
   /** 当前范围为空时，站点是否从来没有收到过数据（决定空状态的文案与动作） */
   let neverReceived = $state(false);
   let shownKey = "";
@@ -168,6 +169,7 @@
         totals = nextTotals;
         series = readSeries(ser, metrics);
         if (pastRetention(tot) || pastRetention(ser)) beyondRetention = true;
+        importedExcluded = [tot, ser].some((res) => res.meta.warnings?.some((w) => w.code === "imported_data_excluded"));
         neverReceived = never;
         shownKey = key;
         status = "ready";
@@ -301,6 +303,9 @@
 
   {#if beyondRetention && !empty}
     <Callout tone="warn">{t("dash.retentionWarn")}</Callout>
+  {/if}
+  {#if status === "ready" && importedExcluded}
+    <Callout tone="warn">{t("dash.importedExcludedWarn")}</Callout>
   {/if}
 
   {#if empty}
