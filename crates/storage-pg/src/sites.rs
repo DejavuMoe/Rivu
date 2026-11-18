@@ -6,7 +6,7 @@
 use anyhow::{Context, Result, bail};
 use jiff::tz::TimeZone;
 use rand::Rng;
-use sqlx::{PgPool, Row, postgres::PgRow};
+use sqlx::{PgPool, Postgres, Row, Transaction, postgres::PgRow};
 
 use crate::shield::ShieldRuleRow;
 
@@ -605,6 +605,22 @@ pub struct SitePatch<'a> {
     pub geo_level: Option<&'a str>,
     /// 外层 `Some` = 要改；内层 `None` = 用全局 `RIVU_RETENTION_DAYS`。
     pub retention_days: Option<Option<i32>>,
+}
+
+/// 维护任务在同步等待 ClickHouse 时，PG 会话处于事务内空闲状态。
+pub async fn begin_maintenance(pool: &PgPool) -> Result<Transaction<'static, Postgres>> {
+    let mut tx = pool
+        .begin_with("BEGIN ISOLATION LEVEL READ COMMITTED")
+        .await?;
+    // set_config(..., true) is SET LOCAL. Older PG versions lack transaction_timeout.
+    sqlx::query(
+        "SELECT set_config(name, '0', true) FROM pg_settings
+         WHERE name IN ('idle_in_transaction_session_timeout', 'transaction_timeout')",
+    )
+    .execute(&mut *tx)
+    .await
+    .context("设置站点维护事务超时失败")?;
+    Ok(tx)
 }
 
 /// 一个事务里更新 `sites` 与 `site_settings`（没有 settings 行时先补一行）；站点不存在或已软删除返回 `false`。
