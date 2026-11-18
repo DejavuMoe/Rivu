@@ -16,9 +16,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clickhouse::Client;
-use jiff::Timestamp;
 use jiff::civil::{Date, date};
 use jiff::tz::TimeZone;
+use jiff::{Timestamp, ToSpan};
 use rand::rngs::StdRng;
 use rand::seq::IndexedRandom;
 use rand::{Rng, SeedableRng};
@@ -415,6 +415,366 @@ async fn cleanup(migrator: &Client, site_id: u64) {
     }
 }
 
+async fn retention_waits_for_native_days(
+    pg: &sqlx::PgPool,
+    ch: &Client,
+    writer: &Client,
+    pg_url: &str,
+    ch_url: &str,
+) {
+    async fn write(writer: &Client, id: u64, ts: &str, start: &str, session: u64) {
+        writer.query("INSERT INTO events (site_id, ts, name, session_id, session_start, visitor_id, pathname) VALUES (?, ?, 'pageview', ?, ?, ?, ?)")
+            .bind(id).bind(ts).bind(session).bind(start).bind(session).bind(ts)
+            .with_setting("async_insert", "0")
+            .with_setting("insert_deduplication_token", uuid::Uuid::new_v4().to_string())
+            .execute().await.unwrap();
+    }
+
+    async fn raw(ch: &Client, site: u64, session: u64) -> (u64, u64) {
+        let count = ch
+            .query("SELECT count() FROM events WHERE site_id = ? AND session_id = ?")
+            .bind(site)
+            .bind(session)
+            .fetch_one()
+            .await
+            .unwrap();
+        let pageviews = ch
+            .query("SELECT sum(pageviews) FROM sessions WHERE site_id = ? AND session_id = ?")
+            .bind(site)
+            .bind(session)
+            .fetch_one()
+            .await
+            .unwrap();
+        (count, pageviews)
+    }
+
+    async fn build(ch: &Client, site_id: u64, tz: TimeZone, day: Date, now: Timestamp) {
+        rollup::build_day(
+            ch,
+            &TenantScope::new(site_id),
+            &SiteContext::new(site_id, tz),
+            day,
+            1,
+            now,
+        )
+        .await
+        .unwrap();
+    }
+
+    let now = Timestamp::now();
+    let mut ids = Vec::new();
+    for name in [
+        "retention-gap",
+        "retention-race",
+        "retention-rolling",
+        "retention-restore",
+        "retention-old-tz",
+        "retention-lock",
+    ] {
+        ids.push(
+            rivu_storage_pg::sites::create_site(
+                pg,
+                &NewSite {
+                    name,
+                    timezone: "UTC",
+                    hostnames: &[format!("{name}.test")],
+                },
+            )
+            .await
+            .unwrap()
+            .id,
+        );
+    }
+    let [gap, race, rolling, restored, old_tz, lock_site] = ids.try_into().unwrap();
+    let unknown = u64::MAX - gap;
+    let database = ch_database();
+    let purge = || rivu_jobs::retention::run_once(pg, ch, &database, 30);
+    let aug = |day| date(2026, 8, day);
+
+    // 8/11 曾有两个事件，模拟维度族已经写完但站点标记丢失，且只剩部分输入。
+    let gap_ts = "2026-08-11 12:00:00";
+    write(writer, gap, gap_ts, gap_ts, 1).await;
+    write(writer, gap, "2026-08-11 12:05:00", gap_ts, 1).await;
+    build(ch, gap, TimeZone::UTC, aug(11), now).await;
+    for table in ["events", "sessions", "rollup_site"] {
+        ch.query(&format!("DELETE FROM {table} WHERE site_id = ?"))
+            .bind(gap)
+            .with_setting("lightweight_deletes_sync", "1")
+            .execute()
+            .await
+            .unwrap();
+    }
+    for day in (1..=10).chain([12]) {
+        build(ch, gap, TimeZone::UTC, aug(day), now).await;
+    }
+    ch.query("INSERT INTO rollup_site (site_id, day, origin, import_id, tz) VALUES (?, '2026-08-11', 'import', 1, 'UTC')")
+        .bind(gap).execute().await.unwrap();
+    let older = "2026-08-01 00:00:00";
+    write(writer, gap, older, older, 2).await;
+    write(writer, gap, gap_ts, gap_ts, 1).await;
+    let later = "2026-08-12 12:00:00";
+    write(writer, gap, later, later, 3).await;
+    let event_total = || async {
+        ch.query("SELECT sum(events) FROM rollup_events FINAL WHERE site_id = ? AND day = '2026-08-11' AND origin = 'native'")
+            .bind(gap).fetch_one::<u64>().await.unwrap()
+    };
+    assert_eq!(event_total().await, 2);
+    assert_eq!(
+        raw(ch, gap, 1).await,
+        (1, 1),
+        "重放只恢复了 8/11 的一条输入"
+    );
+
+    // 覆盖 [8/02, 8/13)，中间包括无事件日。会话边界是 8/06 00:00:00（含上限的七天 lifetime）。
+    let cross = "2026-08-02 00:00:00";
+    write(writer, race, cross, cross, 1).await;
+    write(writer, race, "2026-08-03 00:00:00", cross, 1).await;
+    let edge = "2026-08-06 00:00:00";
+    write(writer, race, edge, edge, 2).await;
+    write(writer, race, "2026-08-12 23:50:00", edge, 2).await;
+    let just_inside = "2026-08-05 23:59:59.999";
+    write(writer, race, just_inside, just_inside, 8).await;
+    write(writer, race, "2026-08-12 23:59:59.999", just_inside, 8).await;
+    for day in 2..=12 {
+        build(ch, race, TimeZone::UTC, aug(day), now).await;
+    }
+    let empty: (u64, u64) = ch.query("SELECT count(), sum(events) FROM rollup_site FINAL WHERE site_id = ? AND day = '2026-08-04' AND origin = 'native' AND import_id = 0 AND tz = 'UTC'")
+        .bind(race).fetch_one().await.unwrap();
+    assert_eq!(empty, (1, 0), "空日仍有完成标记");
+
+    let today = now.to_zoned(TimeZone::UTC).date();
+    let cutoff = today.checked_sub(29.days()).unwrap();
+    let expiring = cutoff.yesterday().unwrap();
+    let start = format!("{expiring} 23:59:59.999");
+    let at_cutoff = format!("{cutoff} 00:00:00");
+    write(writer, rolling, &start, &start, 1).await;
+    write(writer, rolling, &at_cutoff, &start, 1).await;
+    write(writer, rolling, &at_cutoff, &at_cutoff, 2).await;
+    for offset in 0..=7 {
+        build(
+            ch,
+            rolling,
+            TimeZone::UTC,
+            expiring.checked_add(offset.days()).unwrap(),
+            now,
+        )
+        .await;
+    }
+    write(writer, restored, older, older, 1).await;
+    write(writer, old_tz, older, older, 1).await;
+    write(writer, unknown, older, older, 1).await;
+    for offset in 0..=7 {
+        let day = aug(1).checked_add(offset.days()).unwrap();
+        build(ch, restored, TimeZone::UTC, day, now).await;
+        build(ch, old_tz, TimeZone::get(TZ).unwrap(), day, now).await;
+    }
+    assert!(
+        rivu_storage_pg::stats_deletions::soft_delete_site(pg, restored, None, 7)
+            .await
+            .unwrap()
+    );
+
+    let short_timeout_pg = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .after_connect(|conn, _| {
+            Box::pin(async move {
+                sqlx::query(
+                    "SELECT set_config(name, '2s', false) FROM pg_settings
+                     WHERE name IN ('idle_in_transaction_session_timeout', 'transaction_timeout')",
+                )
+                .execute(conn)
+                .await?;
+                Ok(())
+            })
+        })
+        .connect(pg_url)
+        .await
+        .unwrap();
+    let (proxy, server, gate) = retention_insert_barrier(ch_url).await;
+    let gated = rivu_storage_ch::client(&proxy, &account("maintainer"), Some(&database));
+    let before = "2026-08-01 23:59:59.999";
+    let (still_locked, gated_result) = tokio::time::timeout(Duration::from_secs(60), async {
+        let insert = async {
+            gate.0.notified().await;
+            let after = "2026-08-13 00:00:00";
+            write(writer, race, before, before, 3).await;
+            write(writer, race, after, after, 4).await;
+            write(writer, race, after, edge, 2).await;
+            // A−1ms 仍沿用 A 开始的会话，分别测试单独、分批和同批输入。
+            write(writer, race, before, cross, 5).await;
+            write(writer, race, cross, cross, 6).await;
+            write(writer, race, before, cross, 6).await;
+            writer.query(
+                "INSERT INTO events (site_id, ts, name, session_id, session_start, visitor_id) VALUES
+                    (?, ?, 'pageview', 7, ?, 7), (?, ?, 'pageview', 7, ?, 7)",
+            )
+            .bind(race).bind(cross).bind(cross).bind(race).bind(before).bind(cross)
+            .with_setting("async_insert", "0")
+            .with_setting("insert_deduplication_token", uuid::Uuid::new_v4().to_string())
+            .execute().await.unwrap();
+
+            let update = sqlx::query("UPDATE sites SET timezone = $1 WHERE id = $2")
+                .bind(TZ)
+                .bind(i64::try_from(lock_site).unwrap())
+                .execute(pg);
+            tokio::pin!(update);
+            let pending = tokio::time::timeout(Duration::from_millis(2600), &mut update).await;
+            gate.1.notify_one();
+            match pending {
+                Ok(result) => {
+                    assert_eq!(result.unwrap().rows_affected(), 1);
+                    false
+                }
+                Err(_) => {
+                    assert_eq!(update.await.unwrap().rows_affected(), 1);
+                    true
+                }
+            }
+        };
+        let purge = rivu_jobs::retention::run_once(&short_timeout_pg, &gated, &database, 30);
+        tokio::join!(insert, purge)
+    })
+    .await
+    .expect("purge 必须在证明后到达插入屏障");
+    server.abort();
+    let split = raw(ch, race, 6).await;
+    let split_entry: String = ch
+        .query("SELECT tupleElement(argMinIfMerge(entry_page), 2) FROM sessions WHERE site_id = ? AND session_id = 6")
+        .bind(race)
+        .fetch_one()
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            raw(ch, race, 5).await,
+            (split.0, (1..=2).contains(&split.1)),
+            raw(ch, race, 7).await,
+            split_entry.as_str(),
+            still_locked,
+        ),
+        ((1, 1), (1, true), (1, 2), before, true),
+        "A−1ms 的单独、分批、同批输入必须保留会话贡献，改时区必须等清理提交"
+    );
+    gated_result.unwrap();
+
+    let native_markers: u64 = ch.query("SELECT count() FROM rollup_site FINAL WHERE site_id = ? AND day = '2026-08-11' AND origin = 'native' AND import_id = 0")
+        .bind(gap).fetch_one().await.unwrap();
+    assert_eq!(
+        (
+            event_total().await,
+            native_markers,
+            raw(ch, gap, 1).await,
+            raw(ch, gap, 3).await,
+            raw(ch, race, 3).await,
+            raw(ch, race, 4).await,
+            raw(ch, race, 2).await
+        ),
+        (2, 0, (1, 1), (1, 1), (1, 1), (1, 1), (1, 3)),
+        "依次检查 8/11 维度计数 / 标记 / raw、缺口后的 raw、证明范围之前 / 之后的晚写、跨上界会话"
+    );
+    assert_eq!(raw(ch, gap, 2).await, (0, 0), "缺口前已覆盖的活动可清理");
+    assert_eq!(raw(ch, race, 1).await, (0, 0), "已覆盖的跨日会话可清理");
+    assert_eq!(raw(ch, race, 8).await, (0, 0), "B−D−1ms 可清理");
+    assert_eq!(
+        raw(ch, rolling, 1).await,
+        (1, 0),
+        "正常滚动时逾期会话可按期清理"
+    );
+    assert_eq!(raw(ch, rolling, 2).await, (1, 1), "保留策略上界为排他端点");
+    assert_eq!(raw(ch, old_tz, 1).await, (1, 1));
+    assert_eq!(raw(ch, unknown, 1).await, (1, 1));
+    assert_eq!(raw(ch, restored, 1).await, (1, 1));
+    assert_eq!(purge().await.unwrap(), 0, "重复清理幂等");
+    assert_eq!(
+        rivu_storage_pg::stats_deletions::restore_site(pg, restored)
+            .await
+            .unwrap(),
+        rivu_storage_pg::stats_deletions::RestoreOutcome::Restored
+    );
+    let mut lock = pg.begin().await.unwrap();
+    sqlx::query("SELECT id FROM sites WHERE id = $1 FOR UPDATE")
+        .bind(i64::try_from(restored).unwrap())
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    assert_eq!(purge().await.unwrap(), 0);
+    assert_eq!(raw(ch, restored, 1).await, (1, 1));
+    lock.rollback().await.unwrap();
+    purge().await.unwrap();
+    assert_eq!(raw(ch, restored, 1).await, (0, 0));
+    for id in [gap, race, rolling, restored, old_tz, unknown] {
+        for table in ["events", "sessions"] {
+            ch.query(&format!("DELETE FROM {table} WHERE site_id = ?"))
+                .bind(id)
+                .with_setting("lightweight_deletes_sync", "1")
+                .execute()
+                .await
+                .unwrap();
+        }
+    }
+}
+
+// 第一张表列分区时，各站点的证明已读完，删除尚未开始。代理仅暂停 maintainer 请求。
+async fn retention_insert_barrier(
+    ch_url: &str,
+) -> (
+    String,
+    tokio::task::JoinHandle<()>,
+    Arc<(tokio::sync::Notify, tokio::sync::Notify)>,
+) {
+    use axum::extract::Request;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use tokio::sync::Notify;
+
+    let gate = Arc::new((Notify::new(), Notify::new()));
+    let upstream = url::Url::parse(ch_url).unwrap();
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let http = reqwest::Client::builder().no_proxy().build().unwrap();
+    let router = axum::Router::new().fallback({
+        let gate = gate.clone();
+        move |request: Request| {
+            let (gate, mut upstream, http) = (gate.clone(), upstream.clone(), http.clone());
+            async move {
+                let (parts, body) = request.into_parts();
+                let (Some(user), Some(key)) = (
+                    parts.headers.get("x-clickhouse-user"),
+                    parts.headers.get("x-clickhouse-key"),
+                ) else {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                };
+                upstream.set_query(parts.uri.query());
+                let body = axum::body::to_bytes(body, 1024 * 1024).await.unwrap();
+                let at_barrier =
+                    |sql: &str| sql.contains("FROM system.parts") && sql.contains("'events'");
+                if at_barrier(&String::from_utf8_lossy(&body))
+                    || upstream
+                        .query_pairs()
+                        .any(|(k, v)| k == "query" && at_barrier(&v))
+                {
+                    gate.0.notify_one();
+                    gate.1.notified().await;
+                }
+                let mut upstream_request = http
+                    .request(parts.method, upstream)
+                    .header("x-clickhouse-user", user)
+                    .header("x-clickhouse-key", key)
+                    .body(body);
+                if let Some(content_type) = parts.headers.get(axum::http::header::CONTENT_TYPE) {
+                    upstream_request =
+                        upstream_request.header(axum::http::header::CONTENT_TYPE, content_type);
+                }
+                let response = upstream_request.send().await.unwrap();
+                (response.status(), response.bytes().await.unwrap()).into_response()
+            }
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    (format!("http://{addr}"), server, gate)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rollup_tier_matches_the_raw_tier() {
     let (Some(pg_url), Some(ch_url)) = (
@@ -442,6 +802,11 @@ async fn rollup_tier_matches_the_raw_tier() {
 
     // ---- 站点、盐、管线 ----------------------------------------------------------------------
     let pg = rivu_storage_pg::connect(&pg_url, 4).await.expect("连接 PG");
+    let retention_ch =
+        rivu_storage_ch::client(&ch_url, &account("maintainer"), Some(&ch_database()));
+    let retention_writer =
+        rivu_storage_ch::client(&ch_url, &account("writer"), Some(&ch_database()));
+    retention_waits_for_native_days(&pg, &retention_ch, &retention_writer, &pg_url, &ch_url).await;
     let created = rivu_storage_pg::sites::create_site(
         &pg,
         &NewSite {
@@ -624,7 +989,7 @@ async fn rollup_tier_matches_the_raw_tier() {
     .unwrap();
     tx.commit().await.unwrap();
     // 真实的「现在」是 2026-10 之后：这个站点 6 月的数据都过了 30 天
-    let (_, deleted) = rivu_jobs::retention::run_once(&pg, &maintainer, &ch_database(), 731)
+    let deleted = rivu_jobs::retention::run_once(&pg, &maintainer, &ch_database(), 731)
         .await
         .unwrap();
     assert!(deleted > 0, "应当有分区执行了删除");
