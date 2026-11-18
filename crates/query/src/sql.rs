@@ -60,6 +60,7 @@ pub enum ParamValue {
     Date(String),
     StrArray(Vec<String>),
     U32Array(Vec<u32>),
+    U64Array(Vec<u64>),
 }
 
 impl ParamValue {
@@ -74,6 +75,7 @@ impl ParamValue {
             ParamValue::Date(_) => "Date",
             ParamValue::StrArray(_) => "Array(String)",
             ParamValue::U32Array(_) => "Array(UInt32)",
+            ParamValue::U64Array(_) => "Array(UInt64)",
         }
     }
 }
@@ -126,6 +128,7 @@ pub(crate) struct MainSqlOptions<'a> {
     pub(crate) interval: Interval,
     /// 汇总层负责的天与族（§6.4 选层）。
     pub(crate) split: Option<Split>,
+    pub(crate) completed_import_ids: &'a [u64],
     pub(crate) constraint: Option<&'a Constraint>,
     /// `percentage` 的分母。
     pub(crate) total_visitors: Option<u64>,
@@ -146,6 +149,15 @@ fn scoped_events(_scope: &TenantScope) -> &'static str {
 
 fn scoped_sessions(_scope: &TenantScope) -> &'static str {
     "FROM sessions WHERE site_id = {site:UInt64}"
+}
+
+/// An accepted INSERT can land after recovery. PostgreSQL completion controls visibility.
+fn completed_rollups(params: &mut Params, ids: &[u64]) -> &'static str {
+    if ids.is_empty() {
+        return "0";
+    }
+    params.push("import_ids", ParamValue::U64Array(ids.to_vec()));
+    "origin = 'import' AND import_id IN {import_ids:Array(UInt64)}"
 }
 
 /// 扫描最终的 SQL 文本：每个 `FROM events` / `FROM sessions` 后面必须紧跟 `WHERE site_id = {site:UInt64}`，
@@ -932,7 +944,7 @@ impl<'a> Builder<'a> {
 
     /// 汇总层组件：`[from, rollup_to]` 这些本地日的行，按查询的维度再相加。输出与原始层组件相同的列。
     /// `FINAL` 之内只放键列上的条件（#9），过滤与对比约束放在外面。
-    fn comp_rollup(&mut self, split: &Split) -> String {
+    fn comp_rollup(&mut self, split: &Split, completed_import_ids: &[u64]) -> String {
         let f = split.family;
         let r_from = self.p(ParamValue::Date(split.from.to_string()));
         let r_to = self.p(ParamValue::Date(split.rollup_to.to_string()));
@@ -941,8 +953,10 @@ impl<'a> Builder<'a> {
             Family::Props(i) => format!(" AND key = {{pk{i}:String}}"),
             _ => String::new(),
         };
+        let imports = completed_rollups(&mut self.params, completed_import_ids);
         let scan = format!(
-            "SELECT * FROM {} FINAL WHERE site_id = {{site:UInt64}} AND day >= {r_from} AND day <= {r_to}{key}",
+            "SELECT * FROM {} FINAL WHERE site_id = {{site:UInt64}} AND day >= {r_from} AND day <= {r_to}{key} \
+             AND (origin = 'native' OR ({imports}))",
             f.table()
         );
         let q = self.q;
@@ -1195,7 +1209,7 @@ impl<'a> Builder<'a> {
             self.raw_components()
         };
         if let Some(split) = &o.split {
-            comps.push(self.comp_rollup(split));
+            comps.push(self.comp_rollup(split, o.completed_import_ids));
         }
         // 转化率：分母组件会给出没有转化的维度值（例如每个目标），有维度时只保留有转化访客的行
         let having = if self.plan.conv_base && !self.q.dims.is_empty() {
@@ -1270,7 +1284,7 @@ pub(crate) fn rollup_probe_query(
     tz: &str,
     from: &str,
     to: &str,
-    today: Option<jiff::civil::Date>,
+    report: Option<(jiff::civil::Date, &[u64])>,
 ) -> (String, Params) {
     let mut params = Params::default();
     params.push("site", ParamValue::U64(scope.site_id()));
@@ -1278,17 +1292,21 @@ pub(crate) fn rollup_probe_query(
     params.push("from_day", ParamValue::Date(from.to_owned()));
     params.push("to_day", ParamValue::Date(to.to_owned()));
     // 构建任务只看原生行。查询时，未结束的原生日不能覆盖原始数据，导入日仍按导入时的时区归日。
-    let (origin, marker_tz) = match today {
-        None => (" AND origin = 'native'", ", argMin(tz, day)"),
-        Some(today) => {
+    let (origin, marker_tz) = match report {
+        None => ("origin = 'native'".to_owned(), ", argMin(tz, day)"),
+        Some((today, ids)) => {
             params.push("today", ParamValue::Date(today.to_string()));
-            (" AND (origin = 'import' OR day < {today:Date})", "")
+            let imports = completed_rollups(&mut params, ids);
+            (
+                format!("((origin = 'native' AND day < {{today:Date}}) OR ({imports}))"),
+                "",
+            )
         }
     };
     let sql = format!(
         "SELECT toString(maxOrNull(day)), countIf(origin = 'native' AND tz != {{tz:String}}), \
          sumIf(events, day >= {{from_day:Date}} AND day <= {{to_day:Date}}), toString(minOrNull(day)){marker_tz} \
-         FROM rollup_site FINAL WHERE site_id = {{site:UInt64}}{origin}"
+         FROM rollup_site FINAL WHERE site_id = {{site:UInt64}} AND {origin}"
     );
     (sql, params)
 }
@@ -1357,17 +1375,20 @@ pub(crate) fn imported_property_keys_query(
     from: &str,
     to: &str,
     limit: u64,
+    completed_import_ids: &[u64],
 ) -> (String, Params) {
     let mut params = Params::default();
     params.push("site", ParamValue::U64(scope.site_id()));
     params.push("from_day", ParamValue::Date(from.to_owned()));
     params.push("to_day", ParamValue::Date(to.to_owned()));
     params.push("lim", ParamValue::U64(limit));
-    let sql = "SELECT key, sum(events) AS c FROM rollup_props FINAL \
-               WHERE site_id = {site:UInt64} AND origin = 'import' \
-               AND day >= {from_day:Date} AND day <= {to_day:Date} \
-               GROUP BY key ORDER BY c DESC, key ASC LIMIT {lim:UInt64}"
-        .to_owned();
+    let imports = completed_rollups(&mut params, completed_import_ids);
+    let sql = format!(
+        "SELECT key, sum(events) AS c FROM rollup_props FINAL \
+         WHERE site_id = {{site:UInt64}} AND {imports} \
+         AND day >= {{from_day:Date}} AND day <= {{to_day:Date}} \
+         GROUP BY key ORDER BY c DESC, key ASC LIMIT {{lim:UInt64}}"
+    );
     (sql, params)
 }
 
