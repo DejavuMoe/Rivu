@@ -187,6 +187,43 @@ test.describe('首个 pageview 与请求体 [§4.2、§5.1]', () => {
 });
 
 test.describe('可见性与预渲染 [§4.2]', () => {
+  for (const initial of ['hidden', 'prerender'] as const) {
+    test(`History 首次可见前不跟路由（${initial}）`, async ({ page, fx, context }) => {
+      await emulateVisibility(context, initial);
+      const referer = `${fx.siteOrigin}/other`;
+      const finalUrl = `${fx.siteOrigin}/spa/landing?x=1`;
+      await page.goto(fx.url('/spa/a'), { referer });
+      await page.evaluate(() => {
+        history.replaceState(null, '', '/spa/landing?x=1');
+        history.pushState(null, '', '/spa/b');
+      });
+      await page.evaluate(() => new Promise<void>((resolve) => {
+        addEventListener('popstate', () => resolve(), { once: true });
+        history.back();
+      }));
+      expect(page.url()).toBe(finalUrl);
+      await settle(page);
+      expect(fx.events).toHaveLength(0);
+
+      await page.evaluate(() => (window as W).__setVisibility('visible'));
+      await waitForEvents(fx, 1);
+      await settle(page);
+      expect(bodies(fx)).toHaveLength(1);
+      expect(bodies(fx)[0]).toMatchObject({ u: finalUrl, r: referer });
+
+      await page.evaluate(() => {
+        (window as W).__setVisibility('hidden');
+        history.pushState(null, '', '/spa/c');
+      });
+      await waitForEvents(fx, 2);
+      await page.evaluate(() => (window as W).__setVisibility('visible'));
+      await settle(page);
+      expect(bodies(fx)).toHaveLength(2);
+      expect(bodies(fx)[1]).toMatchObject({ u: `${fx.siteOrigin}/spa/c` });
+      expect(bodies(fx)[1]).not.toHaveProperty('r');
+    });
+  }
+
   test('hidden 页面：切到 visible 前 0 请求，之后恰好 1 个 pageview（带 r，u 为发送瞬间的 URL）', async ({ page, fx, context }) => {
     await emulateVisibility(context, 'hidden');
     await page.goto(fx.url('/plain'), { referer: fx.siteOrigin + '/other' });
