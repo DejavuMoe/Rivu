@@ -19,7 +19,8 @@ import {
   totalsSpec,
   labelDate,
 } from "../src/lib/dashboard/spec.ts";
-import { alignTo, axisLabels } from "../src/lib/dashboard/labels.ts";
+import { alignTo, axisLabels, tipLabels } from "../src/lib/dashboard/labels.ts";
+import { compact } from "../src/lib/format.ts";
 import type { QueryResult } from "../src/lib/api.ts";
 
 const now = new Date("2026-10-24T07:42:17.500Z");
@@ -121,6 +122,30 @@ test("标签按站点墙上时间解析，不做时区换算", () => {
     ["2 分钟前", "1 分钟前", "现在"],
   );
   assert.deepEqual(axisLabels(["2026-10-24T09:00:00+08:00"], "hour", "en"), ["09:00"]);
+});
+
+test("紧凑数字保留整数尾零与原有小数精度", () => {
+  assert.deepEqual(
+    [100_000, 110_000, 100_000_000, 15_500, 1_250_000, 1_200_000, 99_999].map((n) => compact(n, "en")),
+    ["100K", "110K", "100M", "15.5K", "1.25M", "1.2M", "100K"],
+  );
+  assert.deepEqual(
+    [1_000_000, 12_500, 123_000, 125_000_000, 9_999].map((n) => compact(n, "zh")),
+    ["100 万", "1.25 万", "12.3 万", "1.25 亿", "9,999"],
+  );
+});
+
+test("柏林秋季回拨：分钟前用偏移计算，提示保留站点时间", () => {
+  const labels = ["2026-10-25T02:59:00+02:00", "2026-10-25T02:00:00+01:00"];
+  assert.deepEqual(axisLabels(labels, "minute", "en"), ["-1m", "now"]);
+  assert.deepEqual(tipLabels(labels, "minute", "en"), ["02:59", "02:00"]);
+});
+
+test("柏林春季跳时：分钟前用偏移计算，提示保留站点时间", () => {
+  const labels = ["2026-03-29T01:59:00+01:00", "2026-03-29T03:00:00+02:00"];
+  assert.deepEqual(axisLabels(labels, "minute", "zh"), ["1 分钟前", "现在"]);
+  assert.deepEqual(tipLabels(labels, "minute", "zh"), ["01:59", "03:00"]);
+  assert.deepEqual(tipLabels(["2026-03-29T02:30:00+08:00"], "minute", "en"), ["02:30"]);
 });
 
 test("目标卡片的 QuerySpec、目标筛选与结果", () => {
