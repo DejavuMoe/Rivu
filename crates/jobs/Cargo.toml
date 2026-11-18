@@ -21,6 +21,7 @@ rivu-common.workspace = true
 rivu-domain.workspace = true
 rivu-geo.workspace = true
 rivu-query.workspace = true
+rivu-session.workspace = true
 rivu-source.workspace = true
 rivu-storage-pg.workspace = true
 sqlx.workspace = true

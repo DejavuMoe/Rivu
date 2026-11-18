@@ -56,7 +56,9 @@ zip.workspace = true
 
 [dev-dependencies]
 clickhouse = { workspace = true, features = ["time", "uuid"] }
+reqwest.workspace = true
 rivu-reference.workspace = true
+rustls.workspace = true
 serde_json.workspace = true
 time.workspace = true
 tower.workspace = true
