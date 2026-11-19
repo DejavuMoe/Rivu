@@ -6,16 +6,15 @@
 
 | 目录 | 是什么 | 状态 |
 |---|---|---|
-| [`rivu-svelte/`](rivu-svelte/) | **主原型**。整个看板和管理后台，可以点、可以切换角色和各种状态。用的令牌和共享组件与生产逐字节相同 | 已确认。「账号 → 邮件周报」和确认链接页于 2026-11-19 确认，按它实现 |
-| [`weekly-report/`](weekly-report/) | 周报的邮件（`email.html`）；另有一个旧流程的独立设置页（`index.html` + `verify.cjs`） | 邮件待确认；独立设置页已被主原型取代 |
+| [`rivu-svelte/`](rivu-svelte/) | **主原型**。整个看板和管理后台，可以点、可以切换角色和各种状态。用的令牌和共享组件与生产逐字节相同 | 已确认。「账号 → 邮件周报」和确认链接页于 2026-11-19 确认，已按它实现 |
+| [`weekly-report/`](weekly-report/) | 周报相关的邮件（`email.html`）：周报邮件、确认邮件，以及现行的退订页 | 待确认 |
 
-### 周报为什么有两处
+### 周报为什么分两处
 
-- **订阅入口看主原型**：`rivu-svelte` 的「账号 → 邮件周报」，以及邮件链接打开的确认页（`#/weekly-report/confirm/t0k3n`）。这是 2026-11-19 定下的做法：邮箱确认一次，之后每个站点一个开关。实现 `apps/dashboard` 时照它做。
-- **邮件看 `weekly-report/email.html`**：邮件不能用应用的样式表，只能单独做。里面的周报邮件仍然有效；确认邮件还是旧的确认码版本，实现时要改成带确认链接的版本。
-- **`weekly-report/index.html` 是旧流程**：它是早先单独做的站点设置页，要粘贴 43 个字符的确认码。它和 `verify.cjs` 里对应的验证如实反映了后台**现在**的接口，所以在后台改完之前留着做对照；后台改完后删除，并把界面契约指到主原型。
+- **订阅界面在主原型里，已经实现**：`rivu-svelte` 的「账号 → 邮件周报」，以及邮件链接打开的确认页（`#/weekly-report/confirm/t0k3n`）。邮箱确认一次，之后每个站点一个开关。生产里对应 `apps/dashboard` 的账号页和 `(auth)/weekly-report/confirm/[token]` 页。
+- **邮件单独放在 `weekly-report/email.html`**：邮件不能用应用的样式表，只能单独做。里面有周报邮件、确认邮件（邮件里是一个确认链接，点开后再点按钮才算确认）和现行退订页的样子。
+- **早先单独做的站点设置页已经删除**：它要粘贴 43 个字符的确认码，那套做法已经不存在，现在 `weekly-report/` 只剩邮件。
 
-## 怎么看
 ## 怎么看
 
 主原型构建出来是一个可以直接双击打开的 HTML 文件：
@@ -26,7 +25,7 @@ linux-task.ps1 -Mode build -Project 'D:\Forgejo\Rivu\designs\rivu-svelte' -Comma
 
 产物在构建目录的 `dist/index.html`。开发服务器和评审面板的用法见 [`rivu-svelte/README.md`](rivu-svelte/README.md)。
 
-`weekly-report/` 的两个 HTML 文件直接用浏览器打开。
+`weekly-report/email.html` 直接用浏览器打开；它的检查脚本是同目录的 `verify.cjs`。
 
 ## 流程
 
