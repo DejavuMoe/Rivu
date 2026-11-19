@@ -9,22 +9,21 @@ Rivu 以单实例方式部署：一个 `rivu` 进程加 PostgreSQL 与 ClickHous
 
 ## 安装
 
-```bash
-git clone https://github.com/DejavuMoe/Rivu.git rivu && cd rivu
-docker build -t rivu:latest .
-cp deploy/.env.example deploy/.env
-```
-
-目前 GHCR 尚无可拉取的发布标签，直接使用上面构建的 `rivu:latest`。
-
-在 `deploy/.env` 填写 `RIVU_DOMAIN`，再用下面的命令为新部署的密码、密钥和初始化令牌生成随机值。
+三条命令：取部署文件、生成配置、启动。
 
 ```bash
-for k in RIVU_SETUP_TOKEN RIVU_VISITOR_PEPPER RIVU_SECRET_KEY RIVU_PG_MIGRATOR_PASSWORD RIVU_PG_APP_PASSWORD \
-         RIVU_CH_MIGRATOR_PASSWORD RIVU_CH_WRITER_PASSWORD RIVU_CH_READER_PASSWORD RIVU_CH_MAINTAINER_PASSWORD; do
-  sed -i "s|^$k=.*|$k=$(openssl rand -hex 24)|" deploy/.env
-done
+git clone --depth 1 https://github.com/DejavuMoe/Rivu.git rivu && cd rivu
+deploy/init-env.sh stats.example.com
+docker compose -f deploy/compose.yml --env-file deploy/.env --profile caddy up -d
 ```
+
+- 第二条里的 `stats.example.com` 换成你的域名。它生成 `deploy/.env`：填好域名，给初始化令牌、两个密钥和六个数据库密码各生成一个随机值，最后把初始化令牌打印出来，创建第一个账号时要用。已经有 `deploy/.env` 时不会覆盖。
+- 第三条用 compose 自带的 Caddy 自动申请 HTTPS 证书，占用 80 和 443 端口。宿主机已经有 nginx 或 Caddy 的话，去掉 `--profile caddy`，见下面的「启动」。
+- 镜像从 `ghcr.io/dejavumoe/rivu` 拉取，不需要编译。默认用最新的稳定版。想固定版本，生成配置时加 `--image ghcr.io/dejavumoe/rivu:<版本号>`，或者改 `deploy/.env` 里的 `RIVU_IMAGE`。
+
+首个正式版本发布之前，`latest` 这个标签还不存在。想先试用，请指定候选版本：`deploy/init-env.sh <域名> --image ghcr.io/dejavumoe/rivu:0.1.0-rc.1`。
+
+想自己从源码构建镜像：在仓库根目录执行 `docker build -t rivu:latest .`，再把 `deploy/.env` 里的 `RIVU_IMAGE` 改成 `rivu:latest`。
 
 生产 Compose 启动 `rivu` 时要求至少 16 个字符的初始化令牌。可以在 `--env-file` 指定的文件或调用 shell 中设置 `RIVU_SETUP_TOKEN`，也可以在容器环境文件中设置 `RIVU_SETUP_TOKEN_FILE`，指向挂载到 `rivu` 容器内的令牌文件。直接运行二进制时，初始化令牌默认可选。
 
@@ -94,16 +93,19 @@ RIVU_GEOIP_ATTRIBUTION_URL=https://www.maxmind.com
 
 ## 升级
 
-先用当前版本的 `deploy/backup.sh` 备份 PostgreSQL 与 ClickHouse，并保留旧镜像及配置。使用默认本地镜像时，可以先执行 `docker tag rivu:latest rivu:pre-upgrade` 保留回退用的标签。
+先用当前版本的 `deploy/backup.sh` 备份 PostgreSQL 与 ClickHouse，保留现在的配置，并记下现在用的镜像版本，回退时要用。`RIVU_IMAGE` 写的是 `latest` 时，用 `docker compose -f deploy/compose.yml --env-file deploy/.env images rivu` 查看实际拉到的是哪个镜像。
 
 已有部署如果没设初始化令牌，用 `openssl rand -hex 24` 生成，并通过 `RIVU_SETUP_TOKEN` 或 `RIVU_SETUP_TOKEN_FILE` 提供。保留现有数据库密码和密钥。已创建的管理员无需再次初始化。使用内置 Caddy 的部署继续加上 `--profile caddy`。
 
 ```bash
-git pull && docker build -t rivu:latest . && \
-  docker compose -f deploy/compose.yml --env-file deploy/.env up -d
+git pull
+docker compose -f deploy/compose.yml --env-file deploy/.env pull
+docker compose -f deploy/compose.yml --env-file deploy/.env up -d
 ```
 
-若使用自定义镜像标签，构建时用该标签，并让 `RIVU_IMAGE` 指向同一镜像。
+`git pull` 更新部署文件，`pull` 拉取新镜像。固定了版本号的部署，先把 `deploy/.env` 里的 `RIVU_IMAGE` 改成新版本。
+
+自己构建镜像的部署（`RIVU_IMAGE=rivu:latest`）：把第二条换成 `docker build -t rivu:latest .`。构建前可以先执行 `docker tag rivu:latest rivu:pre-upgrade` 留一个回退用的标签。如果你的 `deploy/.env` 里没有 `RIVU_IMAGE` 这一行，补上 `RIVU_IMAGE=rivu:latest`，否则会改用发布的镜像。
 
 旧的 `RIVU_DATACENTER_FILTER`、`RIVU_DATACENTER_SOURCES` 及对应的 `*_FILE` 配置可以删掉，新版会忽略它们。云机房和 VPN 出口按正常规则采集。接入诊断仍会显示保留期内的历史机房丢弃计数。
 

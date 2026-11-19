@@ -24,21 +24,20 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+# The environment file comes from the same script operators run, so a fresh install is what gets tested.
+bash deploy/init-env.sh stats.example.test --image "$image" --out "$RIVU_ENV_FILE" >/dev/null
+# It refuses to overwrite: the secrets in an existing file belong to an existing database.
+if bash deploy/init-env.sh stats.example.test --out "$RIVU_ENV_FILE" >/dev/null 2>&1; then
+  echo "init-env.sh overwrote an existing environment file" >&2
+  exit 1
+fi
+for key in RIVU_SETUP_TOKEN RIVU_VISITOR_PEPPER RIVU_SECRET_KEY RIVU_PG_MIGRATOR_PASSWORD RIVU_PG_APP_PASSWORD \
+           RIVU_CH_MIGRATOR_PASSWORD RIVU_CH_WRITER_PASSWORD RIVU_CH_READER_PASSWORD RIVU_CH_MAINTAINER_PASSWORD; do
+  grep -Eq "^$key=[0-9a-f]{48}$" "$RIVU_ENV_FILE" || { echo "init-env.sh left $key unset" >&2; exit 1; }
+done
 # Publish the HTTP port on a free loopback port and keep the network separate from local deployments.
-cat >"$RIVU_ENV_FILE" <<EOF
-RIVU_DOMAIN=stats.example.test
-RIVU_IMAGE=$image
-RIVU_HTTP_PORT=0
-RIVU_SUBNET=172.30.241.0/24
-RIVU_SETUP_TOKEN=rivu-ci-only-setup-token
-RIVU_VISITOR_PEPPER=rivu-ci-only-visitor-pepper-00000000
-RIVU_PG_MIGRATOR_PASSWORD=ciPgMigrator
-RIVU_PG_APP_PASSWORD=ciPgApp
-RIVU_CH_MIGRATOR_PASSWORD=ciChMigrator
-RIVU_CH_WRITER_PASSWORD=ciChWriter
-RIVU_CH_READER_PASSWORD=ciChReader
-RIVU_CH_MAINTAINER_PASSWORD=ciChMaintainer
-EOF
+sed -i 's|^RIVU_HTTP_PORT=.*|RIVU_HTTP_PORT=0|' "$RIVU_ENV_FILE"
+echo 'RIVU_SUBNET=172.30.241.0/24' >>"$RIVU_ENV_FILE"
 
 "${compose[@]}" up --wait --wait-timeout 180 --pull missing
 # The production stack gates serve on the migration container. Fresh volumes must apply migrations.

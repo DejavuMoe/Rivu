@@ -1,6 +1,6 @@
 # Rivu 单机部署（默认，全功能）：rivu + PostgreSQL + ClickHouse，可选内置 Caddy。
 #
-#   cp deploy/.env.example deploy/.env      # 填写域名，并为每个密码和 setup token 生成随机值
+#   deploy/init-env.sh stats.example.com    # 生成 deploy/.env：填好域名，密码、密钥和初始化令牌都是随机值
 #   docker compose -f deploy/compose.yml --env-file deploy/.env up -d
 #
 # 只想用宿主机上已有的 nginx / Caddy：rivu 的公共端口只绑在 127.0.0.1:${RIVU_HTTP_PORT}，反向代理指过来即可
@@ -76,7 +76,7 @@ services:
 
   # 迁移：每次 up 都先跑一遍（已应用的版本会跳过），成功后 rivu 才启动
   migrate:
-    image: ${RIVU_IMAGE:-rivu:latest}
+    image: ${RIVU_IMAGE:-ghcr.io/dejavumoe/rivu:latest}
     command: ["migrate"]
     env_file: ${RIVU_ENV_FILE:-.env}
     environment:
@@ -92,7 +92,7 @@ services:
     networks: [rivu]
 
   rivu:
-    image: ${RIVU_IMAGE:-rivu:latest}
+    image: ${RIVU_IMAGE:-ghcr.io/dejavumoe/rivu:latest}
     command: ["serve"]
     restart: unless-stopped
     env_file: ${RIVU_ENV_FILE:-.env}
