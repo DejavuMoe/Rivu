@@ -214,6 +214,8 @@ extend({
   "set.imp.notZip": ["需要 Plausible 导出的 .zip 文件", "Choose the .zip file that Plausible exported"],
   "set.imp.running": ["这个站点还有导入在进行，完成后再上传", "Another import for this site is still running. Upload again when it finishes"],
   "set.imp.tooLarge": ["文件超过 128 MB", "The file is larger than 128 MB"],
+  // 生产里服务端返回 413 但不是 payload_too_large 时（反向代理先拒绝了）显示；原型没有真实的代理，不触发。
+  "set.imp.proxyLimit": ["上传超过了服务器允许的大小，请检查反向代理的上传限制。", "The upload exceeds the server's size limit. Check your reverse proxy's upload limit."],
   "set.imp.uploading": ["上传中 {p}%", "Uploading {p}%"],
   "set.imp.writing": ["正在写入", "Writing"],
   "set.imp.list": ["导入记录", "Imports"],
