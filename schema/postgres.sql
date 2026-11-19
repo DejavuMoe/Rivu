@@ -406,6 +406,30 @@ TABLE users
   CREATE UNIQUE INDEX users_email ON public.users USING btree (email) WHERE (deleted_at IS NULL)
   CREATE TRIGGER users_set_updated_at BEFORE UPDATE ON public.users FOR EACH ROW EXECUTE FUNCTION set_updated_at()
 
+TABLE weekly_report_claims
+  user_id bigint NOT NULL
+  site_id bigint NOT NULL
+  period_end timestamp with time zone NOT NULL
+  CONSTRAINT weekly_report_claims_pkey PRIMARY KEY (user_id, site_id, period_end)
+  CONSTRAINT weekly_report_claims_user_id_site_id_fkey FOREIGN KEY (user_id, site_id) REFERENCES weekly_report_subscriptions(user_id, site_id)
+
+TABLE weekly_report_subscriptions
+  user_id bigint NOT NULL
+  site_id bigint NOT NULL
+  email text
+  lang text NOT NULL
+  requested_at timestamp with time zone NOT NULL
+  code_hash bytea
+  attempts smallint NOT NULL DEFAULT 0
+  confirmed_at timestamp with time zone
+  CONSTRAINT weekly_report_subscriptions_attempts_check CHECK (((attempts >= 0) AND (attempts <= 5)))
+  CONSTRAINT weekly_report_subscriptions_code_hash_check CHECK ((octet_length(code_hash) = 32))
+  CONSTRAINT weekly_report_subscriptions_lang_check CHECK ((lang = ANY (ARRAY['zh'::text, 'en'::text])))
+  CONSTRAINT weekly_report_subscriptions_pkey PRIMARY KEY (user_id, site_id)
+  CONSTRAINT weekly_report_subscriptions_site_id_fkey FOREIGN KEY (site_id) REFERENCES sites(id)
+  CONSTRAINT weekly_report_subscriptions_user_id_fkey FOREIGN KEY (user_id) REFERENCES users(id)
+  CREATE INDEX weekly_report_active_site ON public.weekly_report_subscriptions USING btree (site_id) WHERE (confirmed_at IS NOT NULL)
+
 EXTENSION citext
 
 CREATE OR REPLACE FUNCTION public.notify_site_changed()

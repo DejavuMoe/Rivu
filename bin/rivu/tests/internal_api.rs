@@ -436,7 +436,6 @@ async fn start_at(
     limits: Option<DashLimits>,
     now: Timestamp,
 ) -> Server {
-    init_logging();
     let geo = Arc::new(GeoDb::with_manual_attribution(
         Some("MaxMind test database"),
         Some("https://github.com/maxmind/MaxMind-DB"),
@@ -451,7 +450,16 @@ async fn start_at(
     if let Some(limits) = limits {
         dash = dash.with_limits(limits);
     }
-    let app = public::router_full(None, None, Some(dash_api::router(Arc::new(dash))));
+    Server {
+        http: serve_dashboard(Arc::new(dash), &config.base_url).await,
+        geo,
+        reader,
+    }
+}
+
+async fn serve_dashboard(dash: Arc<DashApi>, origin: &str) -> Http {
+    init_logging();
+    let app = public::router_full(None, None, Some(dash_api::router(dash)));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -462,13 +470,9 @@ async fn start_at(
         .await
         .unwrap()
     });
-    Server {
-        http: Http {
-            addr,
-            origin: config.base_url.clone(),
-        },
-        geo,
-        reader,
+    Http {
+        addr,
+        origin: origin.to_owned(),
     }
 }
 
@@ -566,6 +570,478 @@ async fn login_cookie(http: &Http, email: &str) -> String {
     let r = login(http, email, PASSWORD, "203.0.113.1").await;
     assert_eq!(r.status, 200, "{}", r.body);
     r.cookie_pair("rivu_session").expect("会话 cookie")
+}
+
+async fn weekly_code(
+    http: &Http,
+    outbox: &rivu_mail::Outbox,
+    path: &str,
+    cookie: &str,
+    lang: &str,
+    email: &str,
+) -> String {
+    let response = http
+        .post(path, &json!({"lang": lang}))
+        .cookie(cookie)
+        .send()
+        .await;
+    assert_eq!(response.status, 200, "{}", response.body);
+    assert_eq!(response.json()["status"], "pending");
+    let mails = outbox.take();
+    assert_eq!(mails.len(), 1);
+    let mail = &mails[0];
+    assert_eq!(mail.to, email);
+    assert!(!mail.body.contains("internal-api-e2e"));
+    assert!(!mail.body.contains(path));
+    assert!(!mail.body.contains("http://"));
+    assert!(!mail.body.contains("https://"));
+    mail.body.lines().last().unwrap().to_owned()
+}
+
+async fn weekly_confirm(http: &Http, path: &str, cookie: &str, code: &str) -> Resp {
+    http.post(&format!("{path}/confirm"), &json!({"code": code}))
+        .cookie(cookie)
+        .send()
+        .await
+}
+
+#[tokio::test]
+async fn weekly_report_requires_account_access_csrf_and_fresh_email_proof() {
+    let Some(env) = test_env("weekly_report_subscription") else {
+        return;
+    };
+    migrate_once(&env).await;
+    let iso = isolated(&env).await;
+    let pg = &iso.pool;
+    let org = make_org(pg).await;
+    let member = make_user(pg, Some((&org, "viewer"))).await;
+    let guest = make_user(pg, None).await;
+    let site = make_site(pg, &org, true).await;
+    let other = make_site(pg, &org, false).await;
+    sqlx::query("INSERT INTO site_memberships (site_id, user_id, role) VALUES ($1, $2, 'viewer')")
+        .bind(site.id as i64)
+        .bind(guest.id)
+        .execute(pg)
+        .await
+        .unwrap();
+    let cfg = config(&env, &[]);
+    let reader = rivu_storage_ch::client(&env.ch_url, &account("reader"), Some(&ch_database()));
+    let (mailer, outbox) = rivu_mail::Mailer::memory("rivu@example.test");
+    let api = DashApi::new(&cfg, pg.clone(), reader.clone(), None)
+        .unwrap()
+        .with_mailer(mailer);
+    let http = serve_dashboard(Arc::new(api), &cfg.base_url).await;
+    let cookie = login_cookie(&http, &member.email).await;
+    let guest_cookie = login_cookie(&http, &guest.email).await;
+    let path = format!("/api/internal/sites/{}/weekly-report", site.key);
+    let other_path = format!("/api/internal/sites/{}/weekly-report", other.id);
+    let confirm_path = format!("{path}/confirm");
+    let request = json!({"lang": "en"});
+    let share = user_cmd::issue_link(pg, &site.key, None, None)
+        .await
+        .unwrap();
+    let key = rivu::apikey_cmd::issue_key(
+        pg,
+        &rivu::cli::ApikeyCreateArgs {
+            org: org.slug.clone(),
+            user: Some(member.email.clone()),
+            name: "weekly report test".into(),
+            scopes: vec!["stats:read".into()],
+            expires: None,
+        },
+    )
+    .await
+    .unwrap();
+    let bearer = format!("Bearer {}", key.plaintext);
+    for req in [
+        http.get(&path),
+        http.get(&path).header("Authorization", &bearer),
+        http.get(&path).share(&share.slug),
+        http.post(&path, &request),
+        http.post(&confirm_path, &json!({"code": "anything"})),
+        http.delete(&path),
+    ] {
+        assert_eq!(req.send().await.status, 401);
+    }
+    for req in [
+        http.post(&path, &request),
+        http.post(&confirm_path, &json!({"code": "anything"})),
+        http.delete(&path),
+    ] {
+        let rejected = req
+            .cookie(&cookie)
+            .header("Origin", "https://outside.test")
+            .send()
+            .await;
+        assert_eq!(rejected.status, 403);
+        assert_eq!(rejected.json()["error"], "csrf_rejected");
+    }
+    assert_eq!(
+        http.get(&other_path)
+            .cookie(&guest_cookie)
+            .send()
+            .await
+            .status,
+        404
+    );
+    assert_eq!(
+        http.post(
+            &path,
+            &json!({"lang":"en", "email":"elsewhere@example.test"})
+        )
+        .cookie(&cookie)
+        .send()
+        .await
+        .status,
+        400
+    );
+    let status = http.get(&path).cookie(&cookie).send().await;
+    assert_eq!(status.header("cache-control"), Some("no-store"));
+    assert_eq!(
+        status.json(),
+        json!({"available":true, "status":"off", "email":member.email,
+                                    "timezone":"UTC", "week_starts_on":1})
+    );
+    assert!(outbox.take().is_empty());
+    let code = weekly_code(&http, &outbox, &path, &cookie, "en", &member.email).await;
+    assert!(rivu_auth::session::is_well_formed(&code));
+    let hash: Vec<u8> =
+        sqlx::query_scalar("SELECT code_hash FROM weekly_report_subscriptions WHERE user_id = $1")
+            .bind(member.id)
+            .fetch_one(pg)
+            .await
+            .unwrap();
+    assert_eq!(hash, rivu_auth::session::hash_token(&code));
+    assert_eq!(
+        http.post(&other_path, &request)
+            .cookie(&cookie)
+            .send()
+            .await
+            .status,
+        429
+    );
+    assert_eq!(
+        weekly_confirm(&http, &other_path, &cookie, &code)
+            .await
+            .status,
+        400
+    );
+    let guest_code = weekly_code(&http, &outbox, &path, &guest_cookie, "zh", &guest.email).await;
+    assert_eq!(
+        weekly_confirm(&http, &path, &guest_cookie, &code)
+            .await
+            .status,
+        400
+    );
+    sqlx::query("UPDATE site_memberships SET deleted_at = now() WHERE user_id = $1")
+        .bind(guest.id)
+        .execute(pg)
+        .await
+        .unwrap();
+    assert_eq!(
+        weekly_confirm(&http, &path, &guest_cookie, &guest_code)
+            .await
+            .status,
+        404
+    );
+
+    sqlx::query(
+        "UPDATE weekly_report_subscriptions SET requested_at = now() - interval '16 minutes'
+                 WHERE user_id = $1",
+    )
+    .bind(member.id)
+    .execute(pg)
+    .await
+    .unwrap();
+    let expired = weekly_confirm(&http, &path, &cookie, &code).await;
+    assert_eq!(expired.status, 400);
+    assert_eq!(expired.json()["error"], "invalid_code");
+    let code = weekly_code(&http, &outbox, &path, &cookie, "en", &member.email).await;
+    let replacement = format!("{}@example.test", unique("replacement"));
+    sqlx::query("UPDATE users SET email = $1 WHERE id = $2")
+        .bind(&replacement)
+        .bind(member.id)
+        .execute(pg)
+        .await
+        .unwrap();
+    assert_eq!(
+        weekly_confirm(&http, &path, &cookie, &code).await.status,
+        400
+    );
+    let status = http.get(&path).cookie(&cookie).send().await.json();
+    assert_eq!(status["status"], "off");
+    assert_eq!(status["email"], replacement);
+
+    let age_request = || {
+        sqlx::query(
+            "UPDATE weekly_report_subscriptions SET requested_at = now() - interval '2 minutes'
+         WHERE user_id = $1",
+        )
+        .bind(member.id)
+        .execute(pg)
+    };
+    age_request().await.unwrap();
+    let code = weekly_code(&http, &outbox, &path, &cookie, "en", &replacement).await;
+    for _ in 0..5 {
+        assert_eq!(
+            weekly_confirm(&http, &path, &cookie, "incorrect")
+                .await
+                .status,
+            400
+        );
+    }
+    assert_eq!(
+        weekly_confirm(&http, &path, &cookie, &code).await.status,
+        400
+    );
+    assert_eq!(
+        http.get(&path).cookie(&cookie).send().await.json()["status"],
+        "off"
+    );
+    age_request().await.unwrap();
+    let code = weekly_code(&http, &outbox, &path, &cookie, "en", &replacement).await;
+    let active = weekly_confirm(&http, &path, &cookie, &code).await;
+    assert_eq!(active.status, 200, "{}", active.body);
+    assert_eq!(active.json()["status"], "active");
+    assert_eq!(
+        weekly_confirm(&http, &path, &cookie, &code).await.status,
+        400
+    );
+    assert_eq!(
+        http.post(&path, &json!({"lang":"zh"}))
+            .cookie(&cookie)
+            .send()
+            .await
+            .json()["status"],
+        "active"
+    );
+    assert!(outbox.take().is_empty());
+    let disabled = DashApi::new(&cfg, pg.clone(), reader, None).unwrap();
+    let disabled = serve_dashboard(Arc::new(disabled), &cfg.base_url).await;
+    let status = disabled.get(&path).cookie(&cookie).send().await.json();
+    assert_eq!(status["available"], false);
+    assert_eq!(status["status"], "active");
+    assert_eq!(
+        disabled
+            .post(&path, &request)
+            .cookie(&cookie)
+            .send()
+            .await
+            .status,
+        503
+    );
+    assert_eq!(
+        weekly_confirm(&disabled, &path, &cookie, &code)
+            .await
+            .status,
+        503
+    );
+    assert_eq!(
+        disabled.delete(&path).cookie(&cookie).send().await.status,
+        204
+    );
+    assert_eq!(
+        disabled.delete(&path).cookie(&cookie).send().await.status,
+        204
+    );
+    assert_eq!(
+        http.post(&path, &request)
+            .cookie(&cookie)
+            .send()
+            .await
+            .status,
+        429
+    );
+    assert_eq!(
+        http.get(&path).cookie(&cookie).send().await.json()["status"],
+        "off"
+    );
+    iso.drop().await;
+}
+
+#[tokio::test]
+async fn weekly_report_rechecks_recipients_and_claims_survive_restart() {
+    let Some(env) = test_env("weekly_report_delivery") else {
+        return;
+    };
+    migrate_once(&env).await;
+    let iso = isolated(&env).await;
+    let pg = &iso.pool;
+    sqlx::query("SELECT setval(pg_get_serial_sequence('sites', 'id'), $1, false)")
+        .bind(15_000_000_000_i64 + i64::from(rand::random::<u32>()))
+        .execute(pg)
+        .await
+        .unwrap();
+    let org = make_org(pg).await;
+    let owner = make_user(pg, Some((&org, "owner"))).await;
+    let guest = make_user(pg, None).await;
+    let revoked = make_user(pg, Some((&org, "viewer"))).await;
+    let changed = make_user(pg, Some((&org, "viewer"))).await;
+    let late = make_user(pg, Some((&org, "viewer"))).await;
+    let site = make_site(pg, &org, false).await;
+    let id = site.id as i64;
+    sqlx::query("INSERT INTO site_memberships (site_id, user_id, role) VALUES ($1, $2, 'viewer')")
+        .bind(id)
+        .bind(guest.id)
+        .execute(pg)
+        .await
+        .unwrap();
+    for (user, lang, confirmed_at) in [
+        (&owner, "en", "2026-03-10T00:00:00Z"),
+        (&guest, "zh", "2026-03-15T23:59:59Z"),
+        (&revoked, "en", "2026-03-10T00:00:00Z"),
+        (&changed, "en", "2026-03-10T00:00:00Z"),
+        (&late, "en", "2026-03-16T00:00:00Z"),
+    ] {
+        sqlx::query(
+            "INSERT INTO weekly_report_subscriptions (user_id, site_id, email, lang, requested_at, confirmed_at)
+             VALUES ($1, $2, $3, $4, now() - interval '2 minutes', $5::text::timestamptz)",
+        ).bind(user.id).bind(id).bind(&user.email).bind(lang).bind(confirmed_at)
+            .execute(pg).await.unwrap();
+    }
+    let cfg = config(&env, &[]);
+    let reader = rivu_storage_ch::client(&env.ch_url, &account("reader"), Some(&ch_database()));
+    let writer = rivu_storage_ch::writer_client(&env.ch_url, &account("writer"), &ch_database());
+    add_rollup_event(&writer, site.id, date(2026, 3, 10)).await;
+    add_rollup_event(&writer, site.id, date(2026, 3, 16)).await; // Outside the reported week.
+    let (mailer, outbox) = rivu_mail::Mailer::memory("rivu@example.test");
+    let make_api = |reader: Client, date: &'static str| {
+        DashApi::new(&cfg, pg.clone(), reader, None)
+            .unwrap()
+            .with_clock(move || date.parse().unwrap())
+    };
+    let api = Arc::new(make_api(reader.clone(), "2026-03-16T09:00:00Z").with_mailer(mailer));
+    let run = rivu::weekly_report::run_once;
+    let (bad_mailer, bad_outbox) = rivu_mail::Mailer::memory("rivu@example.test");
+    let broken = make_api(
+        Client::default().with_url("http://127.0.0.1:1"),
+        "2026-03-16T09:00:00Z",
+    )
+    .with_mailer(bad_mailer);
+    run(&broken).await.unwrap();
+    assert!(bad_outbox.take().is_empty());
+    assert_eq!(iso.count("weekly_report_claims").await, 0);
+    sqlx::query("UPDATE site_settings SET retention_days = 1 WHERE site_id = $1")
+        .bind(id)
+        .execute(pg)
+        .await
+        .unwrap();
+    run(&api).await.unwrap();
+    assert!(
+        outbox.take().is_empty(),
+        "the partial totals must not be sent"
+    );
+    assert_eq!(iso.count("weekly_report_claims").await, 0);
+    sqlx::query("UPDATE site_settings SET retention_days = NULL WHERE site_id = $1")
+        .bind(id)
+        .execute(pg)
+        .await
+        .unwrap();
+
+    // Uncommitted revocation and email change keep both users in the initial snapshot.
+    // Release them after the first two SMTP attempts prove that the totals query ran.
+    let mut edit = pg.begin().await.unwrap();
+    sqlx::query("SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE")
+        .bind(revoked.id)
+        .execute(&mut *edit)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE memberships SET deleted_at = now() WHERE user_id = $1")
+        .bind(revoked.id)
+        .execute(&mut *edit)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE users SET email = $1 WHERE id = $2")
+        .bind(format!("{}@example.test", unique("changed")))
+        .bind(changed.id)
+        .execute(&mut *edit)
+        .await
+        .unwrap();
+    let first = tokio::spawn({
+        let api = Arc::clone(&api);
+        async move { run(&api).await.unwrap() }
+    });
+    let second = tokio::spawn({
+        let api = Arc::clone(&api);
+        async move { run(&api).await.unwrap() }
+    });
+    let reports = tokio::time::timeout(Duration::from_secs(20), async {
+        let mut reports = Vec::new();
+        while reports.len() < 2 {
+            reports.extend(outbox.take());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        reports
+    })
+    .await
+    .expect("two authorized reports before releasing the revocation");
+    edit.commit().await.unwrap();
+    first.await.unwrap();
+    second.await.unwrap();
+    assert_eq!(reports.len(), 2);
+    assert!(outbox.take().is_empty());
+    assert_eq!(iso.count("weekly_report_claims").await, 2);
+    let en = reports.iter().find(|mail| mail.to == owner.email).unwrap();
+    assert!(en.body.contains("2026-03-09 to 2026-03-15 (UTC)"));
+    assert!(en.body.contains("Visitors: 1\nVisits: 1\nPageviews: 1"));
+    assert!(
+        en.body.contains(&format!("{HTTP_ORIGIN}/s/{}", site.id)),
+        "dashboard link in {:?}",
+        en.body
+    );
+    let zh = reports.iter().find(|mail| mail.to == guest.email).unwrap();
+    assert!(zh.body.contains("访客：1\n访问：1\n浏览量：1"));
+
+    let (mailer, restarted_outbox) = rivu_mail::Mailer::memory("rivu@example.test");
+    let restarted = make_api(reader.clone(), "2026-03-16T09:00:00Z").with_mailer(mailer);
+    run(&restarted).await.unwrap();
+    assert!(restarted_outbox.take().is_empty());
+    let http = serve_dashboard(Arc::new(restarted), &cfg.base_url).await;
+    let cookie = login_cookie(&http, &owner.email).await;
+    let path = format!("/api/internal/sites/{}/weekly-report", site.key);
+    assert_eq!(http.delete(&path).cookie(&cookie).send().await.status, 204);
+    let code = weekly_code(&http, &restarted_outbox, &path, &cookie, "en", &owner.email).await;
+    assert_eq!(
+        weekly_confirm(&http, &path, &cookie, &code).await.status,
+        200
+    );
+    assert_eq!(iso.count("weekly_report_claims").await, 2);
+    // Make the new opt-in eligible for this historical clock, so only the overlap fences it.
+    sqlx::query(
+        "UPDATE weekly_report_subscriptions SET confirmed_at = '2026-03-16T00:00:00Z'
+                 WHERE user_id = $1",
+    )
+    .bind(owner.id)
+    .execute(pg)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE site_settings SET week_starts_on = 2 WHERE site_id = $1")
+        .bind(id)
+        .execute(pg)
+        .await
+        .unwrap();
+    // The late recipient is unclaimed and due for the new calendar.
+    let (mailer, overlap_outbox) = rivu_mail::Mailer::memory("rivu@example.test");
+    let overlap = make_api(reader.clone(), "2026-03-17T09:00:00Z").with_mailer(mailer);
+    run(&overlap).await.unwrap();
+    let reports = overlap_outbox.take();
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].to, late.email);
+    assert_eq!(iso.count("weekly_report_claims").await, 3);
+    // A long outage yields a single new week per eligible recipient.
+    let (mailer, catchup_outbox) = rivu_mail::Mailer::memory("rivu@example.test");
+    let catchup = make_api(reader, "2026-04-30T09:00:00Z").with_mailer(mailer);
+    run(&catchup).await.unwrap();
+    let reports = catchup_outbox.take();
+    assert_eq!(reports.len(), 3);
+    assert!(
+        reports
+            .iter()
+            .all(|m| m.body.contains("2026-04-21") && m.body.contains("2026-04-27"))
+    );
+    assert_eq!(iso.count("weekly_report_claims").await, 6);
+    cleanup(&env, &[site.id]).await;
+    iso.drop().await;
 }
 
 // ------------------------------------------------------------------ 经管线写入已知事件
