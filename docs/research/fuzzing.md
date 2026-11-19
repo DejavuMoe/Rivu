@@ -106,4 +106,4 @@
 
 ## CI
 
-`.forgejo/workflows/ci.yml` 里有一个可选的 `fuzz-smoke` job（`continue-on-error: true`，不阻塞合并）：装 nightly 与 cargo-fuzz，每个目标跑 60 秒（`FUZZ_SECONDS`），崩溃输入作为 artifact 上传。它需要 runner 能装 nightly 工具链、有 C++ 编译器、能访问 crates.io，条件写在 job 上方的注释里；**尚未在真实的 Forgejo runner 上运行过**。60 秒只能抓刚引入的浅层崩溃，长跑仍然要在开发机上手工做。
+`.github/workflows/ci.yml` 里有一个可选的 `fuzz-smoke` job（`ubuntu-24.04`，`continue-on-error: true`，不阻塞合并）：装 nightly 与 cargo-fuzz，每个目标跑 60 秒（`FUZZ_SECONDS`），崩溃输入作为 `fuzz-artifacts` 上传。它已在 GitHub Actions 的 master 运行中通过。60 秒只能抓刚引入的浅层崩溃，长跑仍然要在开发机上手工做。
