@@ -28,7 +28,7 @@ Rivu 只支持单实例：会话分配依赖单写者，同一时间只能有一
 - `migrate` 是一次性服务（`command: ["migrate"]`），依赖 `postgres`、`clickhouse` 的 `service_healthy`；`rivu` 依赖 `migrate` 的 `service_completed_successfully`。迁移不随服务启动自动执行（04§0#7、04§7.2），但每次 `up` 都先跑一遍。
 - 密码与密钥来自 `deploy/.env`（`deploy/.env.example` 列出全部变量），同时以 `env_file` 传给 rivu，所以可选功能的变量写进 `deploy/.env` 即可生效。ClickHouse 账号的密码由 `deploy/prod/clickhouse/rivu.xml` 的 `from_env` 读取，PostgreSQL 的 `rivu_app` 由 `deploy/prod/postgres/01-roles.sh` 在首次初始化时创建。
 - compose 网络子网固定（默认 `172.31.250.0/24`，`RIVU_SUBNET` 可改），`RIVU_TRUSTED_PROXIES` 设为该子网：宿主机反代经端口映射进来时，对端是这个网段的网关。`stop_grace_period: 30s`，配合进程内的优雅关停（停止接收、写会话快照、flush 写缓冲）。
-- 命名卷：`pg-data`、`ch-data`、`rivu-data`（`RIVU_DATA_DIR`：GeoIP 库、数据中心网段、会话关停快照）、`caddy-data`、`caddy-config`。
+- 命名卷：`pg-data`、`ch-data`、`rivu-data`（`RIVU_DATA_DIR`：GeoIP 库、会话关停快照）、`caddy-data`、`caddy-config`。
 
 ### 1.3 反向代理
 整个站点转给 rivu：看板页面、`/js/*`、`/api/*`。示例配置：`deploy/Caddyfile`、`deploy/nginx.conf`。
@@ -411,8 +411,6 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 | `RIVU_MAXMIND_LICENSE_KEY`、`RIVU_MAXMIND_ACCOUNT_ID`、`RIVU_MAXMIND_EDITION` | 空；空；`GeoLite2-City` | 配置 key 后使用 MaxMind GeoLite2 并自动更新；优先级低于 `RIVU_GEOIP_DB_URL`。现行下载接口是 HTTP Basic（Account ID + license key），所以**设置 key 时 Account ID 必填**，缺失则配置校验报错（不回显 key）。返回 `tar.gz`，取其中的 `.mmdb`；每日下载上限 30 次（`system-design.md` §10 Q27） |
 | `RIVU_DBIP_EDITION` | `city` | 默认来源 DB-IP Lite 的版本：`city` \| `country`（CC BY 4.0，需署名）。下载的 gz 约 60 MB / 4 MB，解压后约 121 MiB / 8 MiB 读入内存；两个版本都只有国家码，没有子区划码和 GeoNames id（`system-design.md` §10 Q24） |
 | `RIVU_GEOIP_REFRESH_INTERVAL` | `24h`；下限 `1h`；`0` 关闭 | 条件 GET 的刷新周期（加 ±10% 抖动），对三种来源都生效；MaxMind 每日下载额度 30 次，不要设得太短 |
-| `RIVU_DATACENTER_FILTER` | `off` | `on` 开启数据中心网段过滤（`system-design.md` §4.4）：每天下载（`datacenter_refresh`），每 5 分钟检查文件并热加载，命中按 `datacenter_ip` 丢弃 |
-| `RIVU_DATACENTER_SOURCES` | AWS、Google Cloud、Oracle、DigitalOcean、Linode 五个公开清单 | 逗号分隔，替换默认清单；只接受 http(s) |
 | `RIVU_GEOIP_ATTRIBUTION_TEXT`、`RIVU_GEOIP_ATTRIBUTION_URL` | 空 | 自定义来源（或手工放置的文件）的署名文本和链接，看板显示、查询 API 的 `meta.geo_attribution` 返回；DB-IP 和 MaxMind 使用内置署名，不读这两个变量 |
 | `RIVU_DATA_DIR` | `/var/lib/rivu` | GeoIP、本地导出、会话关停快照（`sessions.snapshot`，`system-design.md` §4.6） |
 | `RIVU_API_RATE_PER_HOUR`、`RIVU_API_BURST` | `10000`、`60`（范围 1–100000000、1–1000000） | org 默认小时配额（`organizations.api_hourly_limit` 可覆盖）与突发令牌桶容量，实际容量为 `min(RIVU_API_BURST, 配额)`（§4.4） |
@@ -423,7 +421,7 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 | `RIVU_SHIELD_MAX_RULES_PER_SITE` | `500`（范围 1–100000） | 每站屏蔽规则上限，添加时在事务内锁站点行后计数（§3.3） |
 | `RIVU_REGISTRATION`、`RIVU_SETUP_TOKEN` | `invite_only`；直接启动可选，生产 Compose 必填 | 注册策略；首次 `/setup` 令牌（至少 16 个字符） |
 | `RIVU_VISITOR_PEPPER` | `serve` 必填（至少 32 个字符） | 访客密钥，与每天的盐派生 `visitor_hash` 的 key，不进数据库（`system-design.md` §4.5、`docs/privacy.md`）；不要和 PG 备份放在一起 |
-| `RIVU_LOG_FORMAT`、`RIVU_LOG_LEVEL` | `json`、`info` | `json` \| `pretty` |
+| `RIVU_LOG_FORMAT`、`RIVU_LOG_LEVEL` | `json`、`info` | 格式为 `json` 或 `pretty`。开发排障可提高到 `debug` 或 `trace`，见[排障](../install.md#排障) |
 | `RIVU_METRICS` | `on` | 内部口 `/metrics` 开关（Plausible 默认关，04§0#6） |
 | `RIVU_OTLP_ENDPOINT`、`RIVU_ERROR_REPORT_DSN` | 空（关闭） | OTLP 导出（同 04§4.2 `OTLP_ENDPOINT` 思路）；可选错误上报，脱敏见第 10 节 |
 | `RIVU_SMTP_HOST`、`_PORT`、`_USER`、`_PASSWORD`、`_FROM`、`_TLS` | 空；`587`；`starttls` | 未配置则邮件功能关闭（04§4.2 邮件段） |

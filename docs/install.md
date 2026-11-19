@@ -92,6 +92,8 @@ git pull && docker build -t rivu:latest . && \
 
 若使用自定义镜像标签，构建时用该标签，并让 `RIVU_IMAGE` 指向同一镜像。
 
+旧的 `RIVU_DATACENTER_FILTER`、`RIVU_DATACENTER_SOURCES` 及对应的 `*_FILE` 配置可以删掉，新版会忽略它们。云机房和 VPN 出口按正常规则采集。接入诊断仍会显示保留期内的历史机房丢弃计数。
+
 `migrate` 先应用待执行的迁移，成功后才启动新版本的 `rivu`。跨迁移版本回退时，用目标版本的镜像和配置，将与该版本匹配的 PostgreSQL 与 ClickHouse 备份恢复到空的数据库卷。旧镜像的 `migrate` 会拒绝数据库中它不认识的迁移记录。恢复点之后写入的数据不会随备份恢复。
 
 ## 备份与恢复
