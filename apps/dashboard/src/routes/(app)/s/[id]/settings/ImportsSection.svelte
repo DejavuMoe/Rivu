@@ -97,8 +97,9 @@
       if (e instanceof ApiError && e.code === "import_running") {
         error = t("set.imp.running");
         void load();
-      } else if (e instanceof ApiError && e.status === 413) error = t("set.imp.tooLarge");
-      else toast(errText(e), "bad");
+      } else if (e instanceof ApiError && e.status === 413) {
+        error = t(e.code === "payload_too_large" ? "set.imp.tooLarge" : "set.imp.proxyLimit");
+      } else toast(errText(e), "bad");
     } finally {
       uploading = null;
       if (input) input.value = "";

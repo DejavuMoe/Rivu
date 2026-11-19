@@ -214,7 +214,10 @@ fn os(s: &str) -> String {
 
 /// 来源与渠道：按 Rivu 的规则从 referrer 与 UTM 判定；认不出来源时保留 Plausible 的来源名。
 fn source_channel(source: &str, referrer: &str, utm: &rivu_domain::Utm) -> (String, String) {
+    // Plausible 仅为 Android App 引荐保留 scheme。
     let host = referrer
+        .strip_prefix("android-app://")
+        .unwrap_or(referrer)
         .split('/')
         .next()
         .filter(|h| !h.is_empty())

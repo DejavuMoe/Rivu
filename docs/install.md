@@ -51,6 +51,7 @@ done
 ## 反向代理要点
 
 - 整个站点都转给 rivu：看板页面、`/js/*` 采集脚本、`/api/*` 采集与查询。
+- 通过看板导入 Plausible ZIP 时，反向代理需允许 `/api/internal/sites/<site>/imports` 的请求体达到 128 MiB。Nginx 部署可参照 [示例配置](../deploy/nginx.conf) 更新该路由的限制。
 - 必须传 `X-Forwarded-For`。rivu 只信任 `RIVU_TRUSTED_PROXIES` 里的代理，compose 部署时已设为 compose 网络的网段。前面还有 CDN 时，代理也要信任 CDN 的网段，否则访客的国家会变成 CDN 节点所在地。
 - 不要再给页面加 `Content-Security-Policy`：看板自己的 CSP 写在 `index.html` 里，两份策略会取交集。
 - 访问日志不要记录访客 IP（示例配置已经去掉）。
