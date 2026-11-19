@@ -11,16 +11,16 @@ Rivu 是开源、自托管的网站分析系统（Plausible 的替代品）：�
 | 部分 | 内容 |
 |---|---|
 | 采集脚本（`apps/tracker`） | `core`（pageview、SPA、hash 路由、bfcache、预渲染）与 `full`（另有 engagement、手动 API、外链 / 下载 / 表单 / 标记元素的自动捕获）。不读写 Cookie 与浏览器存储 |
-| 接入（`POST /api/event`） | 协议解析、站点快照（增量刷新 + `LISTEN/NOTIFY`）、hostname 白名单、按站点限流、垃圾引荐、屏蔽规则（IP / CIDR / 国家 / 页面 / hostname）、机器人、可选的数据中心网段过滤、GeoIP、UA、来源与渠道、每日盐 + 访客密钥的访客 ID、会话分配、批量写入（带去重 token 的重试）、`ingest_counters` |
+| 接入（`POST /api/event`） | 协议解析、站点快照（增量刷新 + `LISTEN/NOTIFY`）、hostname 白名单、按站点限流、垃圾引荐、屏蔽规则（IP / CIDR / 国家 / 页面 / hostname）、机器人、GeoIP、UA、来源与渠道、每日盐 + 访客密钥的访客 ID、会话分配、批量写入（带去重 token 的重试）、`ingest_counters` |
 | 会话 | 进程内分片的 SessionAssigner；关停时写快照，启动时从快照或 ClickHouse 预热 |
-| 查询 | 统一查询内核 `rivu-query`（`QuerySpec`：12 个指标、维度、过滤树、日期范围、时间序列、对比期、目标）；公开 API `POST /api/v1/query`（API key、按组织限流）与 `GET /api/v1/query/schema.json`；命令行 `rivu query` |
+| 查询 | 统一查询内核 `rivu-query`（`QuerySpec`：指标、维度、过滤树、日期范围、时间序列、对比期、目标）；公开 API `POST /api/v1/query`（API key、按组织限流）与 `GET /api/v1/query/schema.json`；命令行 `rivu query` |
 | 看板（`apps/dashboard`） | 登录与首次初始化、站点列表、统计看板、安装与安装验证、站点设置（主机名、采集、脚本功能、隐私、屏蔽规则、目标、共享、危险操作）、接入诊断、成员与邀请、API key、账号与登录会话、共享链接与公开看板 |
 | 数据迁移与导出 | 从 Plausible 导入历史汇总数据、将统计视图导出为 CSV ZIP，支持看板和 CLI |
 | 邮件 | 配置 SMTP 后发送成员邀请与密码重置邮件 |
-| 后台任务 | 盐轮换、GeoIP 与数据中心网段刷新、站点与日期范围的统计数据删除 |
+| 后台任务 | 盐轮换、GeoIP 刷新、站点与日期范围的统计数据删除 |
 | 运维 | 单个二进制：`rivu serve` 运行实例，`rivu migrate` 执行迁移；PG 与 ClickHouse 迁移共用版本序列，带冻结校验与 schema 快照；内部端口 `/healthz` `/readyz` `/metrics` |
 
-Plausible 协议兼容端点、定期报告邮件等后续计划见 [`docs/roadmap.md`](docs/roadmap.md)。
+开发进度见 [`docs/roadmap.md`](docs/roadmap.md)。
 
 ## 目录结构
 
@@ -32,7 +32,7 @@ rivu/
 ├── bin/rivu/           # 单个二进制：角色启动、公共 / 内部端口、管理命令、迁移执行器
 ├── crates/
 │   ├── domain/ ingest/ session/ writer/      # 领域类型、接入管线、会话分配、批量写入
-│   ├── ua/ geo/ source/                      # UA 与机器人、GeoIP 与数据中心网段、来源与渠道
+│   ├── ua/ geo/ source/                      # UA 与机器人、GeoIP、来源与渠道
 │   ├── query/ reference/                     # 查询内核、独立参考实现（差分测试用）
 │   ├── auth/ ratelimit/                      # 鉴权、限流
 │   ├── storage-pg/ storage-ch/ jobs/ common/ # 两个库的访问、后台任务、配置与遥测
