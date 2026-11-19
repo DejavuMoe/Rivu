@@ -300,7 +300,7 @@ rivu('event', 'Video Play', { interactive: false })   // 发 i:false，不影响
 | `503` | 写缓冲满 | 空 | `Retry-After: <秒>`（1–10 随机抖动）；客户端不重试，供代理与监控使用 |
 | `500` | 未预期错误 | 空 | 计数 `internal_error`，不得泄露细节 |
 
-错误消息固定词表：`is required`、`must be a string`、`must be an integer`、`must be a boolean`、`must be an object`、`must be a JSON object`、`is not valid JSON`、`is too long (max N)`、`has too many keys (max 30)`、`is not supported`、`has an invalid format`、`must be a valid url`、`scheme is not allowed`、`at least one of sd or e is required`。其中请求体整体错误的键为 `body`。`has an invalid format` 用于 `s` 格式错、`n` 含控制字符、`$` 字段格式错（`a`、`c` 不符合格式）；`is not supported` 只用于 `v`（`system-design.md` §10 Q18）。
+错误消息固定词表：`is required`、`must be a string`、`must be an integer`、`must be a boolean`、`must be an object`、`must be a JSON object`、`is not valid JSON`、`is too long (max N)`、`has too many keys (max 30)`、`is not supported`、`has an invalid format`、`must be a valid url`、`scheme is not allowed`、`at least one of sd or e is required`。其中请求体整体错误的键为 `body`。`has an invalid format` 用于 `s` 格式错或 `n` 含控制字符。`is not supported` 只用于 `v`（`system-design.md` §10 Q18）。
 
 ### 6.3 CORS 与预检
 | 场景 | 行为 |
