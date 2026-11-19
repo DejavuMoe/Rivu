@@ -636,13 +636,23 @@ async fn weekly_link(
         .filter(|line| line.contains("://"))
         .collect();
     assert_eq!(links.len(), 1, "{}", mail.body);
-    let token = links[0]
-        .strip_prefix(&format!("{HTTP_ORIGIN}/weekly-report/confirm/"))
-        .expect("the link is built from RIVU_BASE_URL")
-        .to_owned();
+    // The plain-text part puts the link after its label on one line.
+    let prefix = format!("{HTTP_ORIGIN}/weekly-report/confirm/");
+    let start = links[0]
+        .find(&prefix)
+        .expect("the link is built from RIVU_BASE_URL");
+    let token = links[0][start + prefix.len()..].to_owned();
     assert!(rivu_auth::session::is_well_formed(&token));
     assert!(!mail.body.contains("internal-api-e2e"));
     assert!(!mail.body.contains("/api/"));
+    // The HTML part carries the same link and nothing else to click.
+    let html = mail.html.as_deref().expect("an HTML part");
+    assert_eq!(html.matches("href=\"").count(), 1, "{html}");
+    assert!(
+        html.contains(&format!("href=\"{prefix}{token}\"")),
+        "{html}"
+    );
+    assert!(!html.contains("internal-api-e2e"));
     (token, mail)
 }
 
@@ -817,7 +827,7 @@ async fn weekly_report_confirms_the_mailbox_once_and_switches_sites() {
     assert_eq!(
         mail.body,
         format!(
-            "Open this link to confirm that this address should receive Rivu weekly reports. The link works once and expires in 1 hour.\n\n{HTTP_ORIGIN}/weekly-report/confirm/{first}\n\nIf you didn't ask for this, you can ignore this email.\n"
+            "Confirm that Rivu weekly reports should be sent to this address.\n\nConfirm email: {HTTP_ORIGIN}/weekly-report/confirm/{first}\n\nThe link works once and expires in 1 hour.\n\nIf you didn\u{2019}t ask for this, you can ignore this email.\n"
         )
     );
     let (hash, lifetime): (Vec<u8>, f64) = sqlx::query_as(
@@ -875,7 +885,7 @@ async fn weekly_report_confirms_the_mailbox_once_and_switches_sites() {
     assert_eq!(
         mail.body,
         format!(
-            "点下面的链接，确认用这个邮箱接收 Rivu 周报。链接 1 小时内有效，只能用一次。\n\n{HTTP_ORIGIN}/weekly-report/confirm/{second}\n\n如果不是你本人操作，忽略这封邮件即可。\n"
+            "确认用这个邮箱接收 Rivu 周报。\n\n确认邮箱：{HTTP_ORIGIN}/weekly-report/confirm/{second}\n\n链接 1 小时内有效，只能用一次。\n\n如果不是你本人操作，忽略这封邮件即可。\n"
         )
     );
     gone(weekly_token(&http, "GET", &first).await);
@@ -1410,15 +1420,44 @@ async fn weekly_report_rechecks_recipients_and_claims_survive_restart() {
     assert!(outbox.take().is_empty());
     assert_eq!(iso.count("weekly_report_claims").await, 2);
     let en = reports.iter().find(|mail| mail.to == owner.email).unwrap();
-    assert!(en.body.contains("2026-03-09 to 2026-03-15 (UTC)"));
-    assert!(en.body.contains("Visitors: 1\nVisits: 1\nPageviews: 1"));
+    assert_eq!(
+        en.subject,
+        "internal-api-e2e weekly report: Mar 9 \u{2013} 15"
+    );
     assert!(
-        en.body.contains(&format!("{HTTP_ORIGIN}/s/{}", site.id)),
+        en.body
+            .starts_with("internal-api-e2e\nMar 9 \u{2013} 15, 2026 (UTC)\n\n")
+    );
+    assert!(en.body.contains("Visitors: 1\nVisits: 1\nPageviews: 1\n\n"));
+    let dashboard = format!("{HTTP_ORIGIN}/s/{}", site.id);
+    assert!(
+        en.body.contains(&format!("Open dashboard: {dashboard}\n")),
         "dashboard link in {:?}",
         en.body
     );
+    assert!(
+        en.body
+            .contains(&format!("Manage weekly report: {HTTP_ORIGIN}/account\n"))
+    );
     let zh = reports.iter().find(|mail| mail.to == guest.email).unwrap();
-    assert!(zh.body.contains("访客：1\n访问：1\n浏览量：1"));
+    assert_eq!(zh.subject, "internal-api-e2e 周报：3 月 9 日至 15 日");
+    assert!(zh.body.contains("2026 年 3 月 9 日至 15 日（UTC）\n\n"));
+    assert!(zh.body.contains("访客：1\n访问：1\n浏览量：1\n\n"));
+    // Both carry an HTML part with the same three links as the plain text.
+    for mail in [en, zh] {
+        let html = mail.html.as_deref().expect("an HTML part");
+        let unsubscribe = mail.unsubscribe_url.as_deref().unwrap();
+        assert!(mail.body.contains(unsubscribe));
+        assert_eq!(html.matches("href=\"").count(), 3, "{html}");
+        for link in [
+            dashboard.clone(),
+            format!("{HTTP_ORIGIN}/account"),
+            unsubscribe.to_owned(),
+        ] {
+            assert!(html.contains(&format!("href=\"{link}\"")), "{link}");
+        }
+        assert!(html.contains(&mail.to));
+    }
 
     let (mailer, restarted_outbox) = rivu_mail::Mailer::memory("rivu@example.test");
     let restarted = make_api(reader.clone(), "2026-03-16T09:00:00Z").with_mailer(mailer);
@@ -1453,8 +1492,13 @@ async fn weekly_report_rechecks_recipients_and_claims_survive_restart() {
     .execute(pg)
     .await
     .unwrap();
-    let response = http.post(opt_out, &json!({})).send().await;
-    assert_eq!(response.status, 200);
+    // RFC 8058 one-click: the mailbox provider POSTs a form body, with no cookie and no Origin.
+    let response = http
+        .rb("POST", opt_out, b"List-Unsubscribe=One-Click".to_vec())
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .send()
+        .await;
+    assert_eq!(response.status, 200, "{}", response.body);
     assert!(response.body.contains("You have unsubscribed"));
     assert!(!subscribed(id).await.unwrap());
     assert!(subscribed(second.id as i64).await.unwrap());
@@ -1515,7 +1559,8 @@ async fn weekly_report_rechecks_recipients_and_claims_survive_restart() {
     assert!(
         reports
             .iter()
-            .all(|m| m.body.contains("2026-04-21") && m.body.contains("2026-04-27"))
+            .all(|m| m.body.contains("Apr 21 \u{2013} 27, 2026")
+                || m.body.contains("2026 年 4 月 21 日至 27 日"))
     );
     assert_eq!(iso.count("weekly_report_claims").await, 6);
     let outcome =

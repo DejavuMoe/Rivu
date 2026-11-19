@@ -1,17 +1,21 @@
-//! 发邮件：邀请与找回密码（`RIVU_SMTP_URL`、`RIVU_SMTP_FROM`）。
+//! 发邮件：邀请、找回密码和周报（`RIVU_SMTP_URL`、`RIVU_SMTP_FROM`）。
 //!
-//! 只发纯文本：没有跟踪像素、没有远程图片，所有客户端都能正确显示。语言跟随触发它的请求
-//! （`Accept-Language` 以 `zh` 开头用中文，其余英文）。测试用 [`Mailer::memory`]，邮件存在内存里。
+//! 邀请和找回密码只发纯文本。周报的两封邮件（[`weekly_report`]）另带一个 HTML 部分，
+//! 以 `multipart/alternative` 发出，纯文本在前；HTML 也没有跟踪像素、远程图片和脚本。
+//! 语言跟随触发它的请求（`Accept-Language` 以 `zh` 开头用中文，其余英文）。
+//! 测试用 [`Mailer::memory`]，邮件存在内存里。
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use lettre::message::{
-    Mailbox,
+    Mailbox, MultiPart,
     header::{ContentType, HeaderName, HeaderValue},
 };
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
+
+pub mod weekly_report;
 
 /// 一次 SMTP 会话的超时。
 const SMTP_TIMEOUT: Duration = Duration::from_secs(20);
@@ -43,7 +47,12 @@ impl Lang {
 pub struct Mail {
     pub to: String,
     pub subject: String,
+    /// 纯文本正文。
     pub body: String,
+    /// 有它时发 `multipart/alternative`（纯文本在前，HTML 在后）；没有时只发 `text/plain`。
+    pub html: Option<String>,
+    /// 有它时带 `List-Unsubscribe: <url>` 和 `List-Unsubscribe-Post: List-Unsubscribe=One-Click`
+    /// （RFC 8058）：这个地址收到 POST 就退订，GET 只显示确认页。
     pub unsubscribe_url: Option<String>,
 }
 
@@ -127,15 +136,23 @@ impl Mailer {
         let mut msg = Message::builder()
             .from(self.from.clone())
             .to(mail.to.parse().context("收件人不是有效的邮箱地址")?)
-            .subject(mail.subject)
-            .header(ContentType::TEXT_PLAIN);
+            .subject(mail.subject);
         if let Some(url) = mail.unsubscribe_url {
-            msg = msg.raw_header(HeaderValue::new(
-                HeaderName::new_from_ascii_str("List-Unsubscribe"),
-                format!("<{url}>"),
-            ));
+            msg = msg
+                .raw_header(HeaderValue::new(
+                    HeaderName::new_from_ascii_str("List-Unsubscribe"),
+                    format!("<{url}>"),
+                ))
+                .raw_header(HeaderValue::new(
+                    HeaderName::new_from_ascii_str("List-Unsubscribe-Post"),
+                    "List-Unsubscribe=One-Click".to_owned(),
+                ));
         }
-        msg.body(mail.body).context("构造邮件失败")
+        match mail.html {
+            Some(html) => msg.multipart(MultiPart::alternative_plain_html(mail.body, html)),
+            None => msg.header(ContentType::TEXT_PLAIN).body(mail.body),
+        }
+        .context("构造邮件失败")
     }
 }
 
@@ -170,6 +187,7 @@ pub fn invitation(
         to: to.to_owned(),
         subject,
         body,
+        html: None,
         unsubscribe_url: None,
     }
 }
@@ -199,6 +217,7 @@ pub fn password_reset(lang: Lang, to: &str, link: &str, minutes: u32) -> Mail {
         to: to.to_owned(),
         subject,
         body,
+        html: None,
         unsubscribe_url: None,
     }
 }
@@ -211,6 +230,7 @@ pub fn test_mail(to: &str) -> Mail {
         body: "This is a test email from Rivu. SMTP is configured correctly.\n\
                这是 Rivu 的测试邮件，SMTP 配置正确。\n"
             .to_owned(),
+        html: None,
         unsubscribe_url: None,
     }
 }
@@ -234,6 +254,45 @@ mod tests {
             unfolded.contains(&format!("List-Unsubscribe: <{url}>\r\n")),
             "{unfolded}"
         );
+        assert!(
+            unfolded.contains("List-Unsubscribe-Post: List-Unsubscribe=One-Click\r\n"),
+            "{unfolded}"
+        );
+    }
+
+    #[test]
+    fn plain_mail_stays_text_plain() {
+        let (mailer, _) = Mailer::memory("rivu@example.test");
+        let mail = password_reset(Lang::En, "a@example.test", "https://x/reset/t", 60);
+        let message = String::from_utf8(mailer.message(mail).unwrap().formatted()).unwrap();
+        assert!(message.contains("Content-Type: text/plain; charset=utf-8\r\n"));
+        assert!(!message.contains("multipart"));
+        assert!(!message.contains("List-Unsubscribe"));
+    }
+
+    #[test]
+    fn html_mail_is_multipart_alternative_with_text_first() {
+        let (mailer, _) = Mailer::memory("rivu@example.test");
+        let mail = weekly_report::confirmation(
+            Lang::Zh,
+            "a@example.test",
+            "https://x/weekly-report/confirm/t",
+        );
+        let message = String::from_utf8(mailer.message(mail).unwrap().formatted()).unwrap();
+        let (head, parts) = message.split_once("\r\n\r\n").unwrap();
+        assert!(
+            head.contains("Content-Type: multipart/alternative;"),
+            "{head}"
+        );
+        // 确认邮件不属于任何站点，没有退订头。
+        assert!(!head.contains("List-Unsubscribe"));
+        let plain = parts
+            .find("Content-Type: text/plain; charset=utf-8")
+            .unwrap();
+        let html = parts
+            .find("Content-Type: text/html; charset=utf-8")
+            .unwrap();
+        assert!(plain < html);
     }
 
     #[test]
