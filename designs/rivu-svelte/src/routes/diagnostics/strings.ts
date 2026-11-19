@@ -21,6 +21,7 @@ extend({
   "diag.chart.partial": ["进行中，数据未完整", "In progress, incomplete"],
 
   "diag.reasons.title": ["丢弃原因", "Drop reasons"],
+  "diag.reasons.codes": ["原因代码", "Reason codes"],
   "diag.col.reason": ["原因", "Reason"],
   "diag.col.count": ["次数", "Events"],
   "diag.col.share": ["占比", "Share"],
