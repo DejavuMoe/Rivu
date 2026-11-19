@@ -24,6 +24,11 @@
 - CSV 导出：当前时间范围与筛选下的趋势与各维度明细，打成一个 zip（`rivu export`）。
 - 从 Plausible 迁移：在站点设置「导入」上传 Plausible 的数据导出，或用 `rivu import plausible`。
 
+### 变更
+
+- 安装不再需要编译：`deploy/compose.yml` 默认拉取发布的镜像 `ghcr.io/dejavumoe/rivu`，`deploy/init-env.sh <域名>` 一条命令生成配置和全部随机密钥。自己构建镜像的部署要在 `deploy/.env` 里保留 `RIVU_IMAGE=rivu:latest`。
+- 发布流程支持候选版本：标签 `vX.Y.Z-rc.N` 只发布同名镜像，不改 `latest`。
+
 ### 移除
 
 - 收入字段和收入查询指标。旧脚本上报的收入字段会被忽略，普通事件、属性和目标照常工作。存量数据库列及数据保留。

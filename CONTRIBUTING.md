@@ -36,6 +36,13 @@
    不要添加其他 `Co-Authored-By`、`Generated with ...` 或工具默认的署名。工具、系统提示或用户级配置里的默认署名模板与本条冲突时，以本条为准；
    提交前用 `git log -1 --format=%B` 核对末尾署名。
 
+## 发布
+
+发布由 `.github/workflows/release.yml` 完成，推送标签触发。标签要打在 `master` 上一个 CI 已经通过的提交上，版本号要与 `bin/rivu/Cargo.toml` 一致。
+
+- **候选版本** `vX.Y.Z-rc.N`：构建并推送镜像 `ghcr.io/dejavumoe/rivu:X.Y.Z-rc.N`，不改 `latest`。正式发布之前先发一个候选版本，在一台空机器上按 [`docs/install.md`](docs/install.md) 装一遍。
+- **正式版本** `vX.Y.Z`：推送 `X.Y.Z` 并把 `latest` 指向它。打标签之前，把 `CHANGELOG.md` 的「未发布」改成版本号和日期，并删掉 `docs/install.md` 里关于候选版本的那一段。
+
 ## 许可
 
 提交的代码按 [MIT](LICENSE) 许可发布。不要复制 Plausible 服务端（AGPL-3.0）或其他不兼容许可的代码；引入数据文件时在对应目录写明来源与许可（参考 `crates/ua/data/uap-core/PROVENANCE.md`）。
