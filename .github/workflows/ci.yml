@@ -207,6 +207,11 @@ jobs:
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24"
+      # Mechanical part of apps/dashboard/DESIGN.md: tokens only, four font sizes, hairline borders,
+      # and the prototype's tokens and shared components identical to production. Needs no dependencies.
+      - name: Design rules (dashboard and prototype)
+        working-directory: .
+        run: node tools/design-lint/check.mjs
       - name: Install pnpm
         run: npm install -g pnpm@12.5.1
       - name: Install dependencies
@@ -215,6 +220,31 @@ jobs:
         run: pnpm run check
       - name: Unit tests
         run: pnpm test
+
+  # UI prototype (designs/rivu-svelte): it is the reference for dashboard changes, so it has to keep building.
+  prototype:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: designs/rivu-svelte
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+      - name: Install pnpm
+        run: npm install -g pnpm@12.5.1
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Type check
+        run: pnpm run check
+      - name: Build the single-file prototype
+        run: pnpm run build
 
   # Real browser -> rivu -> ClickHouse -> rivu query.
   e2e-rivu:

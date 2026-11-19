@@ -6,6 +6,7 @@
 
   路由表（与正式实现的路径一致，去掉 #）：
     /login  /forgot-password  /reset-password/:token  /setup  /invite/:token   独立页
+    /weekly-report/confirm/:token                                              确认周报邮箱（邮件里的链接，独立页）
     /share/:slug  /public/:key                                                 共享链接、公开看板（独立页）
     /sites  /sites/new                                    站点列表、添加站点
     /s/:id  /s/:id/install  /s/:id/diagnostics           看板、安装、接入诊断
@@ -32,6 +33,7 @@
   import ResetPasswordPage from "./routes/auth/ResetPasswordPage.svelte";
   import SetupPage from "./routes/auth/SetupPage.svelte";
   import InvitePage from "./routes/auth/InvitePage.svelte";
+  import WeeklyConfirmPage from "./routes/auth/WeeklyConfirmPage.svelte";
   import SitesPage from "./routes/sites/SitesPage.svelte";
   import AddSitePage from "./routes/sites/AddSitePage.svelte";
   import InstallPage from "./routes/sites/InstallPage.svelte";
@@ -55,7 +57,7 @@
   const seg = $derived(route.current.seg);
   // 公开看板的路径是 /public/:key；/share/public/:key 是原型早期的写法，照样认得
   const publicKey = $derived(seg[0] === "public" ? (seg[1] ?? "") : seg[0] === "share" && seg[1] === "public" ? (seg[2] ?? "") : undefined);
-  const standalone = $derived(["login", "forgot-password", "reset-password", "setup", "share", "public", "invite"].includes(seg[0]));
+  const standalone = $derived(["login", "forgot-password", "reset-password", "setup", "share", "public", "invite", "weekly-report"].includes(seg[0]));
   const site = $derived(seg[0] === "s" ? SITES.find((s) => s.id === Number(seg[1])) : undefined);
   const failed = $derived(app.review.shell === "failed");
 
@@ -90,6 +92,8 @@
       <SetupPage />
     {:else if seg[0] === "invite"}
       <InvitePage />
+    {:else if seg[0] === "weekly-report"}
+      <WeeklyConfirmPage token={seg[1] === "confirm" ? (seg[2] ?? "") : ""} />
     {:else if publicKey !== undefined}
       <SharedPage kind="public" param={publicKey} />
     {:else}

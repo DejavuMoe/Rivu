@@ -6,7 +6,7 @@
 
 - 缺陷：写清版本（`rivu --version`）、部署方式、复现步骤、期望与实际结果。日志里不要带访客 IP、API key 或密码。
 - 安全问题不要公开提交，按 [`SECURITY.md`](SECURITY.md) 私下报告。
-- 想加功能：先开一个问题讨论，说明要解决的场景。`docs/roadmap.md` 列出了已经计划的工作。
+- 想加功能：先开一个问题讨论，说明要解决的场景。`docs/roadmap.md` 列出了已经计划的工作，`docs/product/constraints.md` 写明了哪些功能不做以及原因。
 
 ## 提交改动
 
@@ -18,10 +18,12 @@
    cargo test                                  # 加载 .env.example 后会连 dev 的 PostgreSQL / ClickHouse
    cd apps/tracker && pnpm test && pnpm size    # 改了采集脚本时
    cd apps/dashboard && pnpm test && pnpm run check   # 改了看板时
+   node tools/design-lint/check.mjs             # 改了看板或原型的界面时，在仓库根目录运行
    ```
 3. 改数据库结构：新增一个迁移文件，不修改已登记在 `migrations/checksums.lock` 里的迁移（v0.1.0 发布前例外）；
    用 `RIVU_SCHEMA_UPDATE=1 cargo test -p rivu --test schema_snapshot` 更新 `schema/` 快照。
-4. 改界面：先对照 `apps/dashboard/DESIGN.md` 的硬性规则；较大的界面改动先在 `designs/` 的原型里做并确认。
+4. 改界面：先对照 `apps/dashboard/DESIGN.md` 的硬性规则；较大的界面改动先在 `designs/` 的原型里做并确认（流程见 `designs/README.md`）。
+   令牌和共享组件（`lib/ui`、`lib/charts`）在原型和看板里各有一份，必须逐字节相同，改一边要同时改另一边。
 5. 提交说明用英文，格式 `type(scope): summary`（`feat`、`fix`、`docs`、`refactor`、`test`、`chore`）。
 6. **提交署名（对所有 AI Agent 强制）**：任何 AI Agent（Claude Code、Codex、Cursor、Copilot 等），无论实际使用的是哪个模型或工具，
    创建的每个 Git 提交都必须在提交说明末尾添加以下固定的协作者记录，并且只保留这一条 `Co-Authored-By`。

@@ -56,7 +56,7 @@
   --ease-move: cubic-bezier(0.4, 0, 0.2, 1); /* ease-in-out：指示条、抽屉这类从一处移到另一处 */
   --dur-fast: 120ms; /* 悬停的颜色变化 */
   --dur-pop: 160ms; /* 浮层、提示出现 */
-  --dur: 250ms;
+  --dur: 250ms; /* 对话框、抽屉、指示条 */
 
   /* ---------- 中性色（gray） ---------- */
   --bg-app: var(--gray-1);
