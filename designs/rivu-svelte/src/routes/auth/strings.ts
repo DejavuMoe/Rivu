@@ -88,4 +88,16 @@ extend({
   "inv.acc.create": ["创建账号并加入", "Create account and join"],
   "inv.acc.mismatch": ["当前登录的账号与邀请的邮箱不一致。", "The signed-in account doesn't match the invited email."],
   "inv.acc.needSignIn": ["请先登录后再接受邀请。", "Sign in first to accept this invitation."],
+
+  // ---- 确认周报邮箱（邮件里的链接）----
+  "wconfirm.title": ["确认接收周报", "Confirm weekly reports"],
+  "wconfirm.body": ["确认后，{email} 可以接收 Rivu 的站点周报。", "After you confirm, {email} can receive Rivu weekly site reports."],
+  "wconfirm.submit": ["确认邮箱", "Confirm email"],
+  "wconfirm.failed": ["确认失败，请稍后重试。", "Couldn't confirm. Try again shortly."],
+  "wconfirm.doneTitle": ["邮箱已确认", "Email confirmed"],
+  "wconfirm.doneBody": ["在账号页选择要订阅的站点。", "Choose the sites to subscribe to on your account page."],
+  "wconfirm.choose": ["选择站点", "Choose sites"],
+  "wconfirm.invalidTitle": ["链接已失效", "This link has expired"],
+  "wconfirm.invalidBody": ["确认链接已过期，或者已经用过。可以在账号页重新发送。", "This confirmation link has expired or was already used. You can send a new one from your account page."],
+  "wconfirm.toAccount": ["去账号页", "Go to account"],
 });

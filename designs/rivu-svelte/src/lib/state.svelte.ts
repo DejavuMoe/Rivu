@@ -34,6 +34,8 @@ interface Review {
   inviteScope: "org" | "site";
   /** 站点列表里是否有处于恢复期的已删除站点 */
   deleted: "some" | "none";
+  /** 邮件周报的确认邮件：正常发出，或 SMTP 拒收（服务端回错误，页面提示重新发送） */
+  weeklyMail: "ok" | "fails";
 }
 
 function load<T>(key: string, fallback: T, storage: "local" | "session" = "local"): T {
@@ -75,6 +77,7 @@ export const app = $state({
       invite: "new",
       inviteScope: "org",
       deleted: "some",
+      weeklyMail: "ok",
     },
     "session",
   ),

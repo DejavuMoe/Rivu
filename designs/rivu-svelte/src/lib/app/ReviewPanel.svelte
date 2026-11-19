@@ -8,6 +8,7 @@
   import Button from "../ui/Button.svelte";
   import { app, setLang, setReview, setTheme, type DataState, type Role } from "../state.svelte";
   import { navigate } from "../router.svelte";
+  import { weekly, type WeeklyEmail } from "../../routes/account/weekly.svelte";
 
   let open = $state(false);
 
@@ -28,6 +29,8 @@
     ["/org/members", "成员"],
     ["/org/api-keys", "API 密钥"],
     ["/account", "账号"],
+    ["/weekly-report/confirm/t0k3n", "周报确认链接"],
+    ["/weekly-report/confirm/expired", "周报链接失效"],
     ["/share/9f3k2m7q8w1x4z6c5v0b2n8m", "共享链接"],
     ["/share/locked-7h2x9d4k", "共享链接（要密码）"],
     ["/share/missing", "链接无效"],
@@ -215,6 +218,33 @@
           options={[
             { value: "some", label: "有" },
             { value: "none", label: "无" },
+          ]}
+        />
+      </div>
+      <div class="row">
+        <span>周报邮箱</span>
+        <Segmented
+          size="sm"
+          label="周报邮箱"
+          value={weekly.email}
+          onchange={(v: WeeklyEmail) => (weekly.email = v)}
+          options={[
+            { value: "unconfirmed", label: "未确认" },
+            { value: "pending", label: "待确认" },
+            { value: "confirmed", label: "已确认" },
+          ]}
+        />
+      </div>
+      <div class="row">
+        <span>周报确认邮件</span>
+        <Segmented
+          size="sm"
+          label="周报确认邮件"
+          value={app.review.weeklyMail}
+          onchange={(v) => setReview({ weeklyMail: v })}
+          options={[
+            { value: "ok", label: "发出" },
+            { value: "fails", label: "发送失败" },
           ]}
         />
       </div>
