@@ -417,6 +417,12 @@ pub async fn run(config: Config) -> Result<ExitCode> {
         .with_cache(Arc::clone(&query_cache)),
     );
     background.push(dash_api::spawn_maintenance(pg.clone(), bg_stop_rx.clone()));
+    if dash.mailer.is_some() {
+        background.push(crate::weekly_report::spawn(
+            Arc::clone(&dash),
+            bg_stop_rx.clone(),
+        ));
+    }
     let query_routes = query_api::router(Arc::new(
         QueryApi::new(
             guard,

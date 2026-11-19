@@ -25,3 +25,4 @@ pub mod site_admin;
 #[cfg(test)]
 mod testutil;
 pub mod user_cmd;
+pub mod weekly_report;
