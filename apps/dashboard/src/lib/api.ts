@@ -286,6 +286,23 @@ export interface TotpStatus {
   recovery_remaining: number | null;
 }
 
+/** 周报订阅的账号级状态（GET /account/weekly-report）。`available`：实例配置了邮件（SMTP）。 */
+export interface WeeklyReport {
+  available: boolean;
+  email: string;
+  email_status: "unconfirmed" | "pending" | "confirmed";
+  sites: WeeklyReportSite[];
+}
+
+export interface WeeklyReportSite {
+  id: number;
+  name: string;
+  timezone: string;
+  /** 0 为周日 */
+  week_starts_on: number;
+  subscribed: boolean;
+}
+
 export class ApiError extends Error {
   constructor(
     readonly status: number,
@@ -414,6 +431,19 @@ export const api = {
   checkPasswordReset: (token: string) => request<void>("GET", `${base}/password-reset/${encodeURIComponent(token)}`),
   resetPassword: (token: string, password: string) =>
     request<void>("POST", `${base}/password-reset/${encodeURIComponent(token)}`, { body: { password } }),
+  weeklyReport: () => request<WeeklyReport>("GET", `${base}/account/weekly-report`),
+  /** 给账号邮箱发确认邮件；429 带 Retry-After，502 mail_failed，503 mail_unavailable。已确认时只更新语言。 */
+  requestWeeklyConfirmation: (lang: "zh" | "en") =>
+    request<WeeklyReport>("POST", `${base}/account/weekly-report/confirmation`, { body: { lang } }),
+  cancelWeeklyConfirmation: () => request<void>("DELETE", `${base}/account/weekly-report/confirmation`),
+  subscribeWeekly: (site: number, lang: "zh" | "en") =>
+    request<void>("PUT", `${base}/sites/${site}/weekly-report`, { body: { lang } }),
+  unsubscribeWeekly: (site: number) => request<void>("DELETE", `${base}/sites/${site}/weekly-report`),
+  /** 确认链接页：只凭令牌授权，不需要登录。令牌无效、过期、用过一律 404。 */
+  checkWeeklyConfirm: (token: string) =>
+    request<{ email: string }>("GET", `/api/weekly-report/confirm/${encodeURIComponent(token)}`),
+  confirmWeekly: (token: string) =>
+    request<{ email: string }>("POST", `/api/weekly-report/confirm/${encodeURIComponent(token)}`),
   totpStatus: () => request<TotpStatus>("GET", `${base}/me/totp`),
   totpSetup: (password: string) =>
     request<{ secret: string; uri: string; qr_svg: string }>("POST", `${base}/me/totp/setup`, { body: { password } }),
