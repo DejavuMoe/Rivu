@@ -149,7 +149,7 @@ pub(crate) fn plan(q: &ResolvedQuery) -> Plan {
             Metric::TimeOnPage => need(&[Measure::TpMs, Measure::TpN]),
             Metric::ScrollDepth => need(&[Measure::ScSum, Measure::ScN]),
             Metric::ConversionRate => need(&[Measure::Visitors, Measure::CrBase]),
-            Metric::GroupConversionRate | Metric::TotalRevenue | Metric::AverageRevenue => {
+            Metric::GroupConversionRate => {
                 unreachable!("不支持的指标已在 resolve 阶段被拒绝")
             }
         }
@@ -225,7 +225,7 @@ pub(crate) fn metric_semantics(q: &ResolvedQuery, p: &Plan) -> BTreeMap<String, 
             Metric::TimeOnPage => "Average engagement time in seconds per session that has engagement events matching the row, computed from engagement events only.".to_owned(),
             Metric::ScrollDepth => "Average over sessions of the maximum scroll depth (0 to 100) reported by engagement events matching the row; engagement events without a scroll depth are ignored.".to_owned(),
             Metric::ConversionRate => "Visitors of the row who completed the goal (a matching non-engagement event in the range) divided by the visitors of the same range with the same filters except the event:goal filter conditions (removed from the filter tree), counted per value of the row's other dimensions (0 to 1). With dimensions, rows without converting visitors are omitted.".to_owned(),
-            Metric::GroupConversionRate | Metric::TotalRevenue | Metric::AverageRevenue => String::new(),
+            Metric::GroupConversionRate => String::new(),
         };
         if goal_dim
             && matches!(
