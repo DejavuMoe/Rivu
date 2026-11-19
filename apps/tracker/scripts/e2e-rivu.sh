@@ -58,7 +58,7 @@ echo "==> 构建 tracker（dist/core.js、dist/meta.json）"
 )
 
 echo "==> 构建 rivu"
-cargo build -p rivu
+cargo build --locked -p rivu
 RIVU="$ROOT/target/debug/rivu"
 
 # rivu serve 的运行环境：端口避开常用的 8080/9090；站点快照 1 秒重载；写缓冲 200 ms 刷一次；

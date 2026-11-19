@@ -37,7 +37,9 @@ use serde_json::json;
 use crate::error::QueryError;
 use crate::exec::bind;
 use crate::plan::{self, Measure, Plan, VisitsForm};
-use crate::resolve::{Col, Gran, Pred, RDim, ResolvedQuery, SiteContext, local_date};
+use crate::resolve::{
+    Col, Gran, Pred, RDim, ResolvedQuery, SiteContext, local_date, local_dates_utc_ms,
+};
 use crate::spec::{Metric, QuerySpec};
 use crate::sql::{self, ParamValue, Params, TenantScope};
 
@@ -527,6 +529,67 @@ pub async fn build_day(
     for family in Family::ALL {
         let (sql, params) = build_query(scope, site, family, day, version, now)?;
         execute(&client, &sql, &params).await?;
+    }
+    Ok(())
+}
+
+/// Restore missing markers only for erased days that still have no raw inputs.
+pub async fn mark_erased_days(
+    client: &Client,
+    scope: &TenantScope,
+    tz: &TimeZone,
+    from: Date,
+    to: Date,
+) -> Result<(), QueryError> {
+    if from > to {
+        return Ok(());
+    }
+    let sql = "SELECT toString(candidate)
+               FROM (
+                   SELECT addDays({from:Date}, value) AS candidate FROM (
+                       SELECT arrayJoin(range(toUInt32(dateDiff('day', {from:Date}, {to:Date}) + 1))) AS value
+                   )
+               )
+               WHERE candidate NOT IN (
+                   SELECT day FROM rollup_site WHERE site_id = {site:UInt64}
+                     AND origin = 'native' AND day BETWEEN {from:Date} AND {to:Date}
+               )";
+    let mut params = Params::default();
+    params.push("site", ParamValue::U64(scope.site_id()));
+    params.push("from", ParamValue::Date(from.to_string()));
+    params.push("to", ParamValue::Date(to.to_string()));
+    let missing = fetch(client, sql, &params).await?;
+    let client = client.clone().with_setting("async_insert", "0");
+    let insert = format!(
+        "INSERT INTO rollup_site (site_id, day, origin, import_id, version, tz)
+         WITH fromUnixTimestamp64Milli({{start:Int64}}, 'UTC') AS day_start,
+              fromUnixTimestamp64Milli({{end:Int64}}, 'UTC') AS day_end
+         SELECT {{site:UInt64}}, {{day:Date}}, 'native', 0, 1, {{tz:String}}
+         WHERE NOT EXISTS (SELECT 1 FROM events WHERE site_id = {{site:UInt64}}
+                             AND ts >= day_start AND ts < day_end)
+           AND NOT EXISTS (SELECT 1 FROM sessions WHERE site_id = {{site:UInt64}}
+                             AND start_date >= subtractDays(toDate(day_start), {SESSION_LOOKBACK_DAYS})
+                             AND ((started_at < day_end AND last_seen_at >= day_start)
+                                 OR (first_input_ms >= {{start:Int64}} AND first_input_ms < {{end:Int64}})))"
+    );
+    for row in missing {
+        let day: Date = row
+            .first()
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| QueryError::internal(anyhow::anyhow!("invalid missing rollup date")))?
+            .parse()
+            .map_err(QueryError::internal)?;
+        let (start, end) = local_dates_utc_ms(tz, day, day)?;
+        let mut params = Params::default();
+        params.push("site", ParamValue::U64(scope.site_id()));
+        params.push("day", ParamValue::Date(day.to_string()));
+        params.push(
+            "tz",
+            ParamValue::Str(tz.iana_name().unwrap_or("UTC").to_owned()),
+        );
+        params.push("start", ParamValue::I64(start));
+        params.push("end", ParamValue::I64(end));
+        execute(&client, &insert, &params).await?;
     }
     Ok(())
 }

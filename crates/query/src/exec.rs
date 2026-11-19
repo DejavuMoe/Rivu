@@ -29,9 +29,6 @@ use crate::sql::{
     check_tenant_scoped,
 };
 
-/// 对比期时间序列的行数上限（也受 `rivu_reader` 的 `max_result_rows` 限制）。
-const COMPARISON_ROW_CAP: u64 = 1_000_000;
-
 /// 执行选项。
 #[derive(Clone, Debug)]
 pub struct ExecOptions {
@@ -827,7 +824,7 @@ pub async fn execute(
                 })
             };
             let (limit, order) = if time_idx.is_some() {
-                (COMPARISON_ROW_CAP, OrderMode::TimeThenDims)
+                (page.0, OrderMode::TimeThenDims)
             } else {
                 (main.len() as u64, OrderMode::Query)
             };

@@ -13,6 +13,32 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use rivu_domain::{EventKind, SessionAttrs};
 
+/// Bound variable-size payloads separately from the count and alias limits.
+const SHARD_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+
+fn attrs_bytes(a: &SessionAttrs) -> usize {
+    [
+        &a.referrer,
+        &a.referrer_source,
+        &a.channel,
+        &a.utm_source,
+        &a.utm_medium,
+        &a.utm_campaign,
+        &a.utm_content,
+        &a.utm_term,
+        &a.click_id_param,
+        &a.region_code,
+        &a.device,
+        &a.browser,
+        &a.browser_version,
+        &a.os,
+        &a.os_version,
+    ]
+    .into_iter()
+    .map(String::capacity)
+    .sum()
+}
+
 /// 分片数（§10 Q15）。`routing % SHARDS` 同时是 [`Stamp::partition`]（写入事件的 `ingest_partition`）。
 pub const SHARDS: usize = 32;
 
@@ -90,7 +116,7 @@ pub struct AssignerStats {
     pub no_session: u64,
     /// 别名 key 已满 8 个、没能再加的次数（`session_alias_cap_hit`）。
     pub alias_cap_hit: u64,
-    /// 因 `max_sessions` 被 LRU 淘汰的会话数。
+    /// 因条数或载荷上限被 LRU 淘汰的会话数。
     pub evicted: u64,
     /// 被 [`SessionAssigner::sweep`] 清扫的会话数。
     pub expired: u64,
@@ -146,6 +172,7 @@ impl Session {
 
 struct Shard {
     sessions: HashMap<u64, Session>,
+    payload_bytes: usize,
     /// `(site_id, visitor_id)` → `session_id`。
     index: HashMap<(u64, u64), u64>,
     /// LRU 顺序：序号 → `session_id`，最小的最久未用。
@@ -170,6 +197,7 @@ impl Shard {
     fn new(seed: u64) -> Self {
         Self {
             sessions: HashMap::new(),
+            payload_bytes: 0,
             index: HashMap::new(),
             lru: BTreeMap::new(),
             next_tick: 0,
@@ -202,6 +230,7 @@ impl Shard {
         let Some(s) = self.sessions.remove(&sid) else {
             return false;
         };
+        self.payload_bytes -= attrs_bytes(&s.attrs) + s.entry.len();
         self.lru.remove(&s.tick);
         for k in &s.keys {
             // 只删仍指向本会话的项：key 若已被新会话占用，就不动它。
@@ -212,10 +241,12 @@ impl Shard {
         true
     }
 
-    fn open(&mut self, cap: usize, ev: &Incoming<'_>, empty: &Arc<str>) -> u64 {
+    fn open(&mut self, ev: &Incoming<'_>, empty: &Arc<str>) -> u64 {
         let id = self.next_session_id();
         self.next_tick += 1;
         let tick = self.next_tick;
+        let attrs = Arc::new(ev.attrs.clone());
+        self.payload_bytes += attrs_bytes(&attrs);
         self.sessions.insert(
             id,
             Session {
@@ -226,7 +257,7 @@ impl Shard {
                 last_seen: ev.ts_ms,
                 entry: Arc::clone(empty),
                 has_entry: false,
-                attrs: Arc::new(ev.attrs.clone()),
+                attrs,
                 tick,
             },
         );
@@ -234,14 +265,17 @@ impl Shard {
         self.index.insert((ev.site_id, ev.visitor_id), id);
         self.lru.insert(tick, id);
         self.stats.sessions_started += 1;
-        while self.sessions.len() > cap {
+        id
+    }
+
+    fn evict_over_budget(&mut self, cap: usize) {
+        while self.sessions.len() > cap || self.payload_bytes > SHARD_PAYLOAD_BYTES {
             let Some((_, &oldest)) = self.lru.first_key_value() else {
                 break;
             };
             self.remove_session(oldest);
             self.stats.evicted += 1;
         }
-        id
     }
 
     fn try_assign<P, E>(
@@ -268,7 +302,7 @@ impl Shard {
         self.watermark = self.watermark.max(ev.ts_ms);
         let (sid, via_prev) = match live {
             Some(hit) => hit,
-            None => (self.open(cap, ev, empty), false),
+            None => (self.open(ev, empty), false),
         };
 
         let Some(s) = self.sessions.get_mut(&sid) else {
@@ -279,6 +313,7 @@ impl Shard {
         s.last_seen = s.last_seen.max(ev.ts_ms);
         if ev.kind == EventKind::Pageview && !s.has_entry {
             s.entry = Arc::from(ev.pathname);
+            self.payload_bytes += s.entry.len();
             s.has_entry = true;
         }
         let mut new_alias = false;
@@ -305,6 +340,7 @@ impl Shard {
         }
         self.lru.remove(&old_tick);
         self.lru.insert(self.next_tick, sid);
+        self.evict_over_budget(cap);
         Ok(Some((stamp, permit)))
     }
 
@@ -329,6 +365,7 @@ impl Shard {
             Some(p) => (Arc::from(p), true),
             None => (Arc::clone(empty), false),
         };
+        self.payload_bytes += attrs_bytes(&r.attrs) + entry.len();
         self.sessions.insert(
             r.session_id,
             Session {
@@ -345,6 +382,7 @@ impl Shard {
         );
         self.lru.insert(tick, r.session_id);
         self.watermark = self.watermark.max(r.last_seen_ms);
+        self.evict_over_budget(cap);
         true
     }
 
@@ -484,11 +522,11 @@ impl SessionAssigner {
         for (i, mut list) in per_shard.into_iter().enumerate() {
             let skip = list.len().saturating_sub(self.shard_cap);
             let mut shard = self.shards[i].lock();
+            let before = shard.sessions.len();
             for r in list.drain(skip..) {
-                if shard.restore(self.shard_cap, &self.empty, r) {
-                    restored += 1;
-                }
+                shard.restore(self.shard_cap, &self.empty, r);
             }
+            restored += shard.sessions.len().saturating_sub(before);
         }
         restored
     }

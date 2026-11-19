@@ -2159,6 +2159,44 @@ async fn account_security_reset_totp_and_invitation_email() {
         .to_owned();
     let path = format!("/api/internal/password-reset/{token}");
     expect(&http.get(&path).send().await, 200);
+    let changed = http
+        .post(
+            "/api/internal/me/password",
+            &json!({"current": PASSWORD, "new": "changed before reset"}),
+        )
+        .cookie(&owner.cookie)
+        .send()
+        .await;
+    expect(&changed, 200);
+    assert_eq!(http.get(&path).send().await.status, 404);
+    assert_eq!(
+        http.post(&path, &json!({"password": "stale reset must fail"}))
+            .send()
+            .await
+            .status,
+        404
+    );
+    expect(
+        &http
+            .post(
+                "/api/internal/password-reset",
+                &json!({"email": owner.email}),
+            )
+            .send()
+            .await,
+        202,
+    );
+    let sent = mails(&http, 1).await;
+    let token = sent[0]
+        .body
+        .split("/reset-password/")
+        .nth(1)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap();
+    let path = format!("/api/internal/password-reset/{token}");
+    expect(&http.get(&path).send().await, 200);
     assert_eq!(
         http.get("/api/internal/password-reset/nope")
             .send()

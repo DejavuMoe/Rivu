@@ -45,6 +45,7 @@
   let busy = $state(false);
   let setup = $state<{ secret: string; qr_svg: string } | null>(null);
   let codes = $state<string[]>([]);
+  let copyStatus = $state<"tf.copied" | "common.copyFailed" | null>(null);
 
   function start(m: typeof mode) {
     mode = m;
@@ -52,6 +53,7 @@
     password = code = error = "";
     setup = null;
     codes = [];
+    copyStatus = null;
     open = true;
   }
 
@@ -116,9 +118,9 @@
   async function copyCodes() {
     try {
       await navigator.clipboard.writeText(codes.join("\n"));
-      toast(t("tf.copied"), "good");
+      copyStatus = "tf.copied";
     } catch {
-      toast(t("ac.failed"), "bad");
+      copyStatus = "common.copyFailed";
     }
   }
 
@@ -164,7 +166,7 @@
   {/if}
 </Card>
 
-<Dialog bind:open {title} size={mode === "enable" ? "md" : "sm"}>
+<Dialog bind:open {title} requireConfirmation={busy || step === "codes"} size={mode === "enable" ? "md" : "sm"}>
   {#key step}
     <div class="step">
       {#if step === "password"}
@@ -204,8 +206,9 @@
             {#each codes as c (c)}<li>{c}</li>{/each}
           </ol>
           <div class="code-acts">
-            <Button size="sm" icon={Copy} onclick={copyCodes}>{t("tf.copy")}</Button>
+            <Button size="sm" icon={Copy} aria-label={t("tf.copy")} onclick={copyCodes}>{t(copyStatus ?? "tf.copy")}</Button>
             <Button size="sm" icon={Download} onclick={downloadCodes}>{t("tf.download")}</Button>
+            <span class="sr-only" role="status">{copyStatus ? t(copyStatus) : ""}</span>
           </div>
         </div>
       {/if}
@@ -215,7 +218,7 @@
     {#if step === "codes"}
       <Button variant="primary" onclick={finish}>{t("tf.saved")}</Button>
     {:else}
-      <Button variant="ghost" onclick={() => (open = false)}>{t("common.cancel")}</Button>
+      <Button variant="ghost" disabled={busy} onclick={() => (open = false)}>{t("common.cancel")}</Button>
       <Button
         type="submit"
         form="tf-form"
@@ -305,6 +308,7 @@
   }
   .code-acts {
     display: flex;
+    flex-wrap: wrap;
     gap: var(--sp-2);
   }
   @media (max-width: 560px) {

@@ -114,13 +114,14 @@ impl Csv {
 }
 
 /// 读出 zip 里的 `imported_<族>_*.csv`，按族名索引。
-fn read_zip(bytes: &[u8]) -> Result<BTreeMap<String, Csv>> {
+fn read_zip(bytes: &[u8], file_limit: u64, total_limit: u64) -> Result<BTreeMap<String, Csv>> {
     let bad_zip =
         |e: zip::result::ZipError| failure("invalid_zip", format!("不是有效的 zip 文件：{e}"));
     let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).map_err(bad_zip)?;
     let mut out = BTreeMap::new();
+    let mut remaining = total_limit;
     for i in 0..zip.len() {
-        let mut entry = zip.by_index(i).map_err(bad_zip)?;
+        let entry = zip.by_index(i).map_err(bad_zip)?;
         let name = entry
             .name()
             .map_err(bad_zip)?
@@ -141,10 +142,20 @@ fn read_zip(bytes: &[u8]) -> Result<BTreeMap<String, Csv>> {
             .nth(2)
             .unwrap_or("")
             .to_owned();
+        let limit = file_limit.min(remaining);
+        let too_large = || failure("invalid_zip", format!("解压数据超过大小限制：{name}"));
+        if entry.size() > limit {
+            return Err(too_large());
+        }
         let mut bytes = Vec::new();
         entry
+            .take(limit + 1)
             .read_to_end(&mut bytes)
             .map_err(|e| failure("invalid_zip", format!("读取 {name} 失败：{e}")))?;
+        if bytes.len() as u64 > limit {
+            return Err(too_large());
+        }
+        remaining -= bytes.len() as u64;
         let mut reader = csv::ReaderBuilder::new()
             .has_headers(true)
             .from_reader(bytes.as_slice());
@@ -508,7 +519,9 @@ async fn prepare(
     tz_name: &str,
     zip: Vec<u8>,
 ) -> Result<(Summary, BTreeMap<&'static str, Agg>)> {
-    let files = tokio::task::spawn_blocking(move || read_zip(&zip))
+    const FILE_LIMIT: u64 = 64 * 1024 * 1024;
+    const TOTAL_LIMIT: u64 = 128 * 1024 * 1024;
+    let files = tokio::task::spawn_blocking(move || read_zip(&zip, FILE_LIMIT, TOTAL_LIMIT))
         .await
         .context("读取 zip 的任务异常退出")??;
 
@@ -568,7 +581,7 @@ async fn write(
     tz_name: &str,
     import_id: u64,
     tables: BTreeMap<&'static str, Agg>,
-) -> Result<Result<()>> {
+) -> Result<()> {
     // rollup_site 最后写：与构建任务一致，它的行是「这一天有数据」的标记
     let order = tables
         .keys()
@@ -584,16 +597,14 @@ async fn write(
                 m: *m,
             })
             .collect();
-        if let Err(e) = while_locked(
+        while_locked(
             db,
             rollup::insert_import(ch, scope, table, tz_name, import_id, &batch),
         )
         .await?
-        {
-            return Ok(Err(anyhow::anyhow!("写入 {table} 失败：{e}")));
-        }
+        .map_err(|e| anyhow::anyhow!("写入 {table} 失败：{e}"))?;
     }
-    Ok(Ok(()))
+    Ok(())
 }
 
 // A dedicated session avoids exhausting the request pool and cannot return with a session lock.
@@ -627,6 +638,7 @@ async fn while_locked<T>(db: &mut PgConnection, work: impl Future<Output = T>) -
 
 /// 提交 `importing` 前取锁，锁随专用连接交给实际执行者。
 pub struct RunningImport {
+    pg: PgPool,
     db: PgConnection,
     site_id: u64,
     timezone: String,
@@ -656,6 +668,7 @@ pub async fn start(
     );
     tx.commit().await?;
     Ok(Some(RunningImport {
+        pg: pg.clone(),
         db,
         site_id,
         timezone,
@@ -686,6 +699,7 @@ impl RunningImport {
 
     pub async fn execute(self, ch: &Client, zip: Vec<u8>) -> Result<Summary> {
         let Self {
+            pg,
             mut db,
             site_id,
             timezone,
@@ -694,41 +708,50 @@ impl RunningImport {
         let id = row.id;
         let import_id = u64::try_from(id).context("导入 id 为负数")?;
         let scope = TenantScope::new(site_id);
-        let error = match prepare(&mut db, ch, site_id, &timezone, zip).await {
-            Ok((s, tables)) => {
-                match write(&mut db, ch, &scope, &timezone, import_id, tables).await? {
-                    Ok(()) => {
-                        imports::complete(
-                            &mut db,
-                            id,
-                            &s.start.to_string(),
-                            &s.end.to_string(),
-                            i64::try_from(s.rows).unwrap_or(i64::MAX),
-                        )
-                        .await?;
-                        tracing::info!(site_id, import_id = id, rows = s.rows, start = %s.start, end = %s.end, "导入完成");
-                        return Ok(s);
-                    }
-                    Err(e) => {
-                        while_locked(&mut db, rollup::delete_import(ch, &scope, import_id))
-                            .await?
-                            .map_err(|d| {
-                                anyhow::anyhow!("写入失败（{e:#}），清理导入 #{id} 失败：{d}")
-                            })?;
-                        e
-                    }
-                }
+        let mut wrote = false;
+        let outcome = async {
+            let (s, tables) = prepare(&mut db, ch, site_id, &timezone, zip).await?;
+            wrote = true;
+            write(&mut db, ch, &scope, &timezone, import_id, tables).await?;
+            imports::complete(
+                &mut db,
+                id,
+                &s.start.to_string(),
+                &s.end.to_string(),
+                i64::try_from(s.rows).unwrap_or(i64::MAX),
+            )
+            .await?;
+            Ok::<_, anyhow::Error>(s)
+        }
+        .await;
+        let error = match outcome {
+            Ok(s) => {
+                tracing::info!(site_id, import_id = id, rows = s.rows, start = %s.start, end = %s.end, "导入完成");
+                return Ok(s);
             }
-            Err(e) => e,
+            Err(error) => error,
         };
         let msg = format!("{error:#}");
-        imports::fail(&mut db, id, error_code(&error), &msg).await?;
         tracing::warn!(site_id, import_id = id, error = %msg, "导入失败");
+        drop(db);
+        let mut db = import_connection(&pg)
+            .await
+            .with_context(|| format!("记录导入 #{id} 失败状态时无法连接：{error:#}"))?;
+        // Only clean data after the conditional status update succeeds. The completion
+        // might have committed even if its connection failed before acknowledging it.
+        imports::fail(&mut db, id, error_code(&error), &msg.replace('\0', "�"))
+            .await
+            .with_context(|| format!("记录导入 #{id} 失败状态：{error:#}"))?;
+        if wrote {
+            while_locked(&mut db, rollup::delete_import(ch, &scope, import_id))
+                .await?
+                .map_err(|e| anyhow::anyhow!("清理导入 #{id} 失败：{e}"))?;
+        }
         Err(error)
     }
 }
 
-/// 启动时只清理锁已释放、重读仍为 `importing` 的导入。
+/// 清理锁已释放、重读仍为 `importing` 的导入。
 pub async fn recover_interrupted(pg: &PgPool, ch: &Client) -> Result<usize> {
     let mut recovered = 0;
     for (id, site_id) in imports::interrupted(pg).await? {
@@ -739,31 +762,68 @@ pub async fn recover_interrupted(pg: &PgPool, ch: &Client) -> Result<usize> {
             continue;
         }
         let import_id = u64::try_from(id).context("导入 id 为负数")?;
-        while_locked(
-            &mut db,
-            rollup::delete_import(ch, &TenantScope::new(site_id), import_id),
-        )
-        .await?
-        .map_err(|e| anyhow::anyhow!("清理中断导入 #{id} 的汇总行失败：{e}"))?;
-        imports::fail(
-            &mut db,
-            id,
-            "interrupted",
-            "服务在导入过程中重启，导入没有完成",
-        )
-        .await?;
+        imports::fail(&mut db, id, "interrupted", "导入会话中断，导入没有完成").await?;
         recovered += 1;
-        tracing::warn!(
-            site_id,
-            import_id = id,
-            "上次进程退出时导入没有完成，已清理并置为失败"
-        );
+        let scope = TenantScope::new(site_id);
+        match while_locked(&mut db, rollup::delete_import(ch, &scope, import_id)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!(import_id = id, %error, "清理中断导入的汇总行失败"),
+            Err(error) => tracing::warn!(import_id = id, %error, "清理中断导入的锁会话失败"),
+        }
+        tracing::warn!(site_id, import_id = id, "导入会话已中断，已置为失败");
     }
     Ok(recovered)
+}
+
+pub fn spawn_recovery(
+    pg: PgPool,
+    ch: Client,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticks = tokio::time::interval(Duration::from_secs(60));
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                () = crate::stopped(&mut stop) => break,
+                _ = ticks.tick() => {}
+            }
+            if let Err(error) = recover_interrupted(&pg, &ch).await {
+                tracing::warn!(%error, "恢复中断的导入失败，下个周期重试");
+            }
+        }
+    })
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn zip_limits_apply_to_one_file_and_the_combined_csvs() {
+        let csv = b"date,visitors\n2026-01-01,1\n";
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for family in ["visitors", "pages"] {
+            zip.start_file(
+                format!("imported_{family}_20260101_20260101.csv"),
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Deflated),
+            )
+            .unwrap();
+            zip.write_all(csv).unwrap();
+        }
+        let zip = zip.finish().unwrap().into_inner();
+        let size = csv.len() as u64;
+        assert!(read_zip(&zip, size, 2 * size).is_ok());
+        assert_eq!(
+            error_code(&read_zip(&zip, size - 1, 2 * size).err().unwrap()),
+            "invalid_zip"
+        );
+        assert_eq!(
+            error_code(&read_zip(&zip, size, 2 * size - 1).err().unwrap()),
+            "invalid_zip"
+        );
+    }
 
     #[test]
     fn names_follow_rivu() {

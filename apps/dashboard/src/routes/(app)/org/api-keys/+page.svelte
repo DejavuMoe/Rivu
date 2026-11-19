@@ -236,7 +236,7 @@
   {/if}
 </div>
 
-<Dialog bind:open={createOpen} title={phase === "form" ? t("ak.dialog.title") : t("ak.created.title")} onclose={() => (minted = "")}>
+<Dialog bind:open={createOpen} requireConfirmation={busy || phase !== "form"} title={phase === "form" ? t("ak.dialog.title") : t("ak.created.title")} onclose={() => (minted = "")}>
   {#if phase === "form"}
     <form id="key-form" class="form" onsubmit={create} novalidate>
       <Field label={t("ak.name")} for="key-name" error={tried ? nameError : ""}>
@@ -286,7 +286,7 @@
   {/if}
   {#snippet footer()}
     {#if phase === "form"}
-      <Button variant="ghost" onclick={() => (createOpen = false)}>{t("common.cancel")}</Button>
+      <Button variant="ghost" disabled={busy} onclick={() => (createOpen = false)}>{t("common.cancel")}</Button>
       <Button type="submit" form="key-form" variant="primary" loading={busy}>{t("ak.create")}</Button>
     {:else}
       <Button variant="primary" onclick={() => (createOpen = false)}>{t("common.done")}</Button>

@@ -232,6 +232,17 @@ pub async fn remove_member(
     .await
     .context("吊销成员的 API key 失败")?
     .rows_affected();
+    sqlx::query(
+        "DELETE FROM weekly_report_subscriptions w USING sites s
+         WHERE w.site_id = s.id AND w.user_id = $2 AND s.organization_id = $1
+           AND NOT EXISTS (SELECT FROM site_memberships g
+               WHERE g.site_id = w.site_id AND g.user_id = w.user_id AND g.deleted_at IS NULL)",
+    )
+    .bind(org_id)
+    .bind(target_id)
+    .execute(&mut *tx)
+    .await
+    .context("清理成员周报订阅失败")?;
     tx.commit().await.context("提交事务失败")?;
     Ok(MemberChange::Done { keys_revoked })
 }
@@ -488,19 +499,39 @@ pub async fn list_guests(pool: &PgPool, org_id: i64) -> Result<Vec<GuestRow>> {
 
 /// 移除站点访客（软删除）；必须是这个组织未删除站点上的有效访客关系。
 pub async fn remove_guest(pool: &PgPool, org_id: i64, id: i64) -> Result<bool> {
-    let n = sqlx::query(
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT id FROM organizations WHERE id = $1 FOR UPDATE")
+        .bind(org_id)
+        .execute(&mut *tx)
+        .await?;
+    let revoked: Option<(i64, i64)> = sqlx::query_as(
         "UPDATE site_memberships g SET deleted_at = now()
          FROM sites s
          WHERE g.id = $1 AND g.deleted_at IS NULL
-           AND s.id = g.site_id AND s.organization_id = $2 AND s.deleted_at IS NULL",
+           AND s.id = g.site_id AND s.organization_id = $2 AND s.deleted_at IS NULL
+         RETURNING g.user_id, g.site_id",
     )
     .bind(id)
     .bind(org_id)
-    .execute(pool)
+    .fetch_optional(&mut *tx)
     .await
-    .context("移除站点访客失败")?
-    .rows_affected();
-    Ok(n > 0)
+    .context("移除站点访客失败")?;
+    let Some((user_id, site_id)) = revoked else {
+        return Ok(false);
+    };
+    sqlx::query(
+        "DELETE FROM weekly_report_subscriptions w WHERE user_id = $1 AND site_id = $2
+           AND NOT EXISTS (SELECT FROM memberships m
+               WHERE m.organization_id = $3 AND m.user_id = $1 AND m.deleted_at IS NULL)",
+    )
+    .bind(user_id)
+    .bind(site_id)
+    .bind(org_id)
+    .execute(&mut *tx)
+    .await
+    .context("清理站点访客周报订阅失败")?;
+    tx.commit().await?;
+    Ok(true)
 }
 
 // ------------------------------------------------------------------------------------------

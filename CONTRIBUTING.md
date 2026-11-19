@@ -23,6 +23,11 @@
    用 `RIVU_SCHEMA_UPDATE=1 cargo test -p rivu --test schema_snapshot` 更新 `schema/` 快照。
 4. 改界面：先对照 `apps/dashboard/DESIGN.md` 的硬性规则；较大的界面改动先在 `designs/` 的原型里做并确认。
 5. 提交说明用英文，格式 `type(scope): summary`（`feat`、`fix`、`docs`、`refactor`、`test`、`chore`）。
+6. 每次 Git 提交都必须在提交说明末尾添加以下固定的协作者记录，并且只保留这一条 `Co-Authored-By`。
+
+   ```text
+   Co-Authored-By: DeepSeek v4.1 Flash Codex (1M context) <noreply@openai.com>
+   ```
 
 ## 许可
 

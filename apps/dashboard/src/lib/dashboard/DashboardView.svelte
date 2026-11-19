@@ -380,7 +380,7 @@
             format={(n) => fmtAxis(metric, n, app.lang)}
             partialLast
             partialText={t("dash.partial")}
-            deltaOf={delta}
+            deltaOf={(cur, prev) => delta(cur, prev, metric === "bounce_rate" ? app.lang : undefined)}
             lowerIsBetter={lowerIsBetter(metric)}
             series={[
               { key: "cur", label: t(`metric.${metric}`), values },

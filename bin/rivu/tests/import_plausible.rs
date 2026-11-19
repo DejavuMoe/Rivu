@@ -541,6 +541,39 @@ async fn plausible_export_is_imported_into_the_rollup_tier() {
         .unwrap();
     assert_eq!(rows[0].id, id);
     assert_eq!(rows[0].error_code.as_deref(), Some("interrupted"));
+
+    let pending = rivu_jobs::import_plausible::start(&one, created.id, "lost-session.zip", None)
+        .await
+        .unwrap()
+        .unwrap();
+    let id = pending.row().id;
+    let terminated: bool = sqlx::query_scalar(
+        "SELECT pg_terminate_backend(pid, 5000) FROM pg_locks
+         WHERE locktype = 'advisory' AND objsubid = 2 AND granted
+           AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+           AND classid::bigint = ($1::bigint >> 32) AND objid::bigint = ($1::bigint & 4294967295)",
+    )
+    .bind(id)
+    .fetch_one(&one)
+    .await
+    .unwrap();
+    assert!(terminated);
+    assert!(pending.execute(&maintainer, export_zip()).await.is_err());
+    let rows = rivu_storage_pg::imports::list(&one, created.id)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].id, id);
+    assert_eq!(rows[0].status, "failed");
+    rivu_jobs::import_plausible::import_file(
+        &one,
+        &maintainer,
+        created.id,
+        export_zip(),
+        "retry.zip",
+        None,
+    )
+    .await
+    .expect("lost session must release the site for retry");
 }
 
 fn empty_zip() -> Vec<u8> {

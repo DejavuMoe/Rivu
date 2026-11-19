@@ -997,6 +997,24 @@ async fn weekly_report_rechecks_recipients_and_claims_survive_restart() {
     run(&restarted).await.unwrap();
     assert!(restarted_outbox.take().is_empty());
     let http = serve_dashboard(Arc::new(restarted), &cfg.base_url).await;
+    let link = en.unsubscribe_url.as_deref().expect("List-Unsubscribe URL");
+    assert!(en.body.contains(link));
+    let opt_out = link.strip_prefix(HTTP_ORIGIN).unwrap();
+    assert_eq!(http.get(opt_out).send().await.status, 200);
+    let active: bool = sqlx::query_scalar(
+        "SELECT confirmed_at IS NOT NULL FROM weekly_report_subscriptions WHERE user_id = $1",
+    )
+    .bind(owner.id)
+    .fetch_one(pg)
+    .await
+    .unwrap();
+    assert!(
+        active,
+        "mail previewing a link must not change the subscription"
+    );
+    let response = http.post(opt_out, &json!({})).send().await;
+    assert_eq!(response.status, 200);
+    assert!(response.body.contains("You have unsubscribed"));
     let cookie = login_cookie(&http, &owner.email).await;
     let path = format!("/api/internal/sites/{}/weekly-report", site.key);
     assert_eq!(http.delete(&path).cookie(&cookie).send().await.status, 204);
@@ -1006,6 +1024,8 @@ async fn weekly_report_rechecks_recipients_and_claims_survive_restart() {
         200
     );
     assert_eq!(iso.count("weekly_report_claims").await, 2);
+    let stale = http.post(opt_out, &json!({})).send().await;
+    assert!(stale.body.contains("already off"));
     // Make the new opt-in eligible for this historical clock, so only the overlap fences it.
     sqlx::query(
         "UPDATE weekly_report_subscriptions SET confirmed_at = '2026-03-16T00:00:00Z'
@@ -1039,6 +1059,23 @@ async fn weekly_report_rechecks_recipients_and_claims_survive_restart() {
             .iter()
             .all(|m| m.body.contains("2026-04-21") && m.body.contains("2026-04-27"))
     );
+    assert_eq!(iso.count("weekly_report_claims").await, 6);
+    let outcome =
+        rivu_storage_pg::members::remove_member(pg, org.id, owner.id, changed.id, |_, _| true)
+            .await
+            .unwrap();
+    assert!(matches!(
+        outcome,
+        rivu_storage_pg::members::MemberChange::Done { .. }
+    ));
+    let still_subscribed: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT FROM weekly_report_subscriptions WHERE user_id = $1)",
+    )
+    .bind(changed.id)
+    .fetch_one(pg)
+    .await
+    .unwrap();
+    assert!(!still_subscribed);
     assert_eq!(iso.count("weekly_report_claims").await, 6);
     cleanup(&env, &[site.id]).await;
     iso.drop().await;
@@ -1137,9 +1174,12 @@ async fn ingest(env: &TestEnv, pg: &PgPool, sites: &[&Site], geo: &Arc<GeoDb>) {
         Arc::clone(geo),
     );
     for site in sites {
-        for e in known_events() {
-            let body = json!({"v": 1, "sv": 1, "s": site.key, "n": e.name,
+        for (i, e) in known_events().into_iter().enumerate() {
+            let mut body = json!({"v": 1, "sv": 1, "s": site.key, "n": e.name,
                               "u": format!("https://{HOST}{}", e.path)});
+            if i == 0 {
+                body["p"] = json!({("x".repeat(250)): "fixture"});
+            }
             let out = pipeline.process(
                 body.to_string().as_bytes(),
                 RequestCtx {
@@ -2422,7 +2462,7 @@ async fn session_queries_equal_direct_execution_and_site_access_is_uniform() {
         r.body
     );
 
-    // 属性键列表：与查询同样的鉴权；这批事件没有属性，返回空列表；别的组织的站点 404
+    // 属性键列表使用与查询相同的鉴权；别的组织的站点返回 404。
     let keys_path = format!("/api/internal/sites/{}/property-keys", site_a.id);
     let keys_spec = json!({"metrics": ["events"], "date_range": "all"});
     let r = http
@@ -2431,7 +2471,10 @@ async fn session_queries_equal_direct_execution_and_site_access_is_uniform() {
         .send()
         .await;
     assert_eq!(r.status, 200, "{}", r.body);
-    assert_eq!(r.json(), json!({"keys": []}));
+    assert_eq!(
+        r.json(),
+        json!({"keys": [{"key": "x".repeat(250), "events": 1}]})
+    );
     assert_eq!(r.header("cache-control"), Some("no-store"));
     let r = http
         .post(
@@ -2528,10 +2571,10 @@ async fn session_queries_equal_direct_execution_and_site_access_is_uniform() {
     ] {
         assert!(!read(f).is_empty(), "{f}");
     }
-    assert_eq!(
-        read("custom_props.csv"),
-        "\u{feff}property,value,visitors,events\n"
-    );
+    let props = read("custom_props.csv");
+    assert!(props.starts_with("\u{feff}property,value,visitors,events\n"));
+    let expected = format!("{},fixture,1,1", "x".repeat(250));
+    assert!(props.lines().any(|line| line == expected));
 
     // 请求体里的 site 与路径不一致：404（与「站点不存在」同一个响应）
     let spec = &specs()[0].1;

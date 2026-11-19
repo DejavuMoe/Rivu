@@ -7,7 +7,8 @@
 //!   所有比率分母为 0 时取 0，不产生 `null`；
 //! - 时间维度的结果只含**有数据**的桶，完整的桶序列在 `meta.time_labels`（`include.time_labels`）；
 //! - 没有时间维度的对比：每行带 `comparison: {dimensions, metrics, change}`；有时间维度的对比：
-//!   `comparison_results` 是对比期的行（只含主结果里出现过的非时间维度取值），`meta.comparison_time_labels` 给出对比期的桶；
+//!   `comparison_results` 按时间排序，最多返回请求的 `limit` 行，只含主结果里出现过的非时间维度取值。
+//!   `meta.comparison_time_labels` 给出对比期的桶；
 //! - `change`：`bounce_rate`、`percentage`、`exit_rate` 是绝对差（新 − 旧），其余指标是相对变化 `(新 − 旧) / 旧`
 //!   （旧值为 0 时：新值也为 0 记 0，否则记 1）。
 

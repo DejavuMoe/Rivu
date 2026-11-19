@@ -103,4 +103,72 @@ fn bytes_per_session_and_alias() {
     // 设计估计每个会话 150–300 B、每个别名约 48 B（§4.6）。这里只防数量级的回归。
     assert!(per_session < 1500.0, "{per_session}");
     assert!(per_alias < 300.0, "{per_alias}");
+
+    const LONG: u64 = 2000;
+    let large = long_attrs();
+    let path = "x".repeat(2048);
+    let a = SessionAssigner::with_seed(SessionConfig::default(), 1);
+    let base = dhat::HeapStats::get().curr_bytes;
+    for id in 1..=LONG {
+        a.assign(&Incoming {
+            site_id: 1,
+            visitor_id: id,
+            prev_visitor_id: None,
+            routing: 0,
+            ts_ms: id as i64,
+            kind: EventKind::Pageview,
+            pathname: &path,
+            attrs: &large,
+        });
+    }
+    assert_eq!(a.len(), LONG as usize);
+    let long_bytes = (dhat::HeapStats::get().curr_bytes - base) as f64 / LONG as f64;
+    println!(
+        "Long synthetic sessions: {long_bytes:.0} B/session, {:.2} GiB at 2 million without the byte limit",
+        long_bytes * 2_000_000.0 / 2_f64.powi(30)
+    );
+}
+
+fn long_attrs() -> SessionAttrs {
+    SessionAttrs {
+        referrer: "x".repeat(2000),
+        utm_source: "界".repeat(255),
+        utm_medium: "界".repeat(255),
+        utm_campaign: "界".repeat(255),
+        utm_content: "界".repeat(255),
+        utm_term: "界".repeat(255),
+        ..SessionAttrs::default()
+    }
+}
+
+#[test]
+fn long_sessions_respect_payload_budget_during_ingestion_and_restore() {
+    let a = SessionAssigner::with_seed(SessionConfig::default(), 1);
+    let attrs = long_attrs();
+    let path = "x".repeat(2048);
+    for id in 1..=2500 {
+        a.assign(&Incoming {
+            site_id: 1,
+            visitor_id: id,
+            prev_visitor_id: None,
+            routing: 0,
+            ts_ms: id as i64,
+            kind: EventKind::Pageview,
+            pathname: &path,
+            attrs: &attrs,
+        });
+    }
+    let expected = 16 * 1024 * 1024 / (2000 + 5 * 255 * 3 + 2048);
+    assert_eq!(a.len(), expected);
+    assert!(a.peek(1, 0, 1).is_none());
+    assert!(a.peek(1, 0, 2500).is_some());
+    let b = SessionAssigner::new(SessionConfig::default());
+    let mut records = a.export();
+    let mut extra = records.last().unwrap().clone();
+    extra.session_id = 0x1f;
+    extra.keys = vec![2501];
+    extra.last_seen_ms += 1;
+    records.push(extra);
+    assert_eq!(b.restore(records), expected);
+    assert!(b.peek(1, 0, 2501).is_some());
 }

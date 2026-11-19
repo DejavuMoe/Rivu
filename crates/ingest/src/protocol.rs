@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use rivu_domain::{EventKind, NormalizedEvent, Referrer};
+use rivu_domain::{EventKind, MAX_PROP_KEY_BYTES, NormalizedEvent, Referrer};
 use serde_json::{Map, Value, json};
 use url::Url;
 
@@ -20,7 +20,6 @@ pub const MAX_BODY_BYTES: usize = 8192;
 const MAX_EVENT_NAME_CHARS: usize = 120;
 const MAX_REFERRER_CHARS: usize = 2000;
 const MAX_PROPS: usize = 30;
-const MAX_PROP_KEY_BYTES: usize = 300;
 const MAX_PROP_VALUE_BYTES: usize = 2000;
 const MAX_SCRIPT_VERSION: u64 = 999_999;
 /// `e` 的开区间上界：30 天的毫秒数。

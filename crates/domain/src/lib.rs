@@ -5,6 +5,9 @@
 
 use std::fmt;
 
+/// Maximum UTF-8 byte length of an event property key.
+pub const MAX_PROP_KEY_BYTES: usize = 300;
+
 /// `site_key` 的格式：12 位 base32 小写（`^[a-z2-7]{12}$`），与 `sites.site_key` 的 CHECK 相同。
 /// 线协议、站点脚本路径与 API key 的 scope 都用这一条规则。
 pub fn is_site_key(s: &str) -> bool {

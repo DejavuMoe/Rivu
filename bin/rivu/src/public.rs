@@ -133,14 +133,31 @@ fn header_str(headers: &HeaderMap, name: header::HeaderName) -> String {
         .unwrap_or_default()
 }
 
-/// 所有 `X-Forwarded-For` 头值，按出现顺序；不是有效文本的丢弃（客户端 IP 判定对解析失败回退对端地址）。
-fn forwarded_for(headers: &HeaderMap) -> Vec<String> {
+/// 保留每个头值中的有效代理后缀，坏字节只影响它所在的地址。
+pub(crate) fn forwarded_for(headers: &HeaderMap) -> Vec<String> {
     headers
         .get_all("x-forwarded-for")
         .iter()
-        .filter_map(|v| v.to_str().ok())
-        .map(str::to_owned)
+        .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
         .collect()
+}
+
+#[cfg(test)]
+#[test]
+fn forwarded_for_preserves_valid_proxy_suffix() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-forwarded-for",
+        header::HeaderValue::from_bytes(b"\x80, 198.51.100.7").unwrap(),
+    );
+    let values = forwarded_for(&headers);
+    let values: Vec<_> = values.iter().map(String::as_str).collect();
+    let ip = rivu_ingest::client_ip::client_ip(
+        "10.0.0.1".parse().unwrap(),
+        &values,
+        &["10.0.0.0/8".parse().unwrap()],
+    );
+    assert_eq!(ip.to_string(), "198.51.100.7");
 }
 
 async fn event(

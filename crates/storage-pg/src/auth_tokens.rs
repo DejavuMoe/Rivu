@@ -1,7 +1,18 @@
 //! 一次性令牌（`auth_tokens`）：目前只有找回密码。只存 token 的 SHA-256。
 
 use anyhow::{Context, Result};
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
+
+pub(crate) async fn invalidate_password_resets(db: &mut PgConnection, user_id: i64) -> Result<()> {
+    sqlx::query(
+        "DELETE FROM auth_tokens WHERE user_id = $1 AND kind = 'password_reset' AND used_at IS NULL",
+    )
+    .bind(user_id)
+    .execute(db)
+    .await
+    .context("作废旧的找回密码令牌失败")?;
+    Ok(())
+}
 
 /// 为用户签发找回密码的令牌：同一个事务里作废他之前没用过的令牌（只有最新的一封邮件有效）。
 pub async fn create_password_reset(
@@ -11,13 +22,12 @@ pub async fn create_password_reset(
     ttl_secs: i64,
 ) -> Result<()> {
     let mut tx = pool.begin().await.context("开启事务失败")?;
-    sqlx::query(
-        "DELETE FROM auth_tokens WHERE user_id = $1 AND kind = 'password_reset' AND used_at IS NULL",
-    )
-    .bind(user_id)
-    .execute(&mut *tx)
-    .await
-    .context("作废旧的找回密码令牌失败")?;
+    sqlx::query("SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await
+        .context("锁定用户失败")?;
+    invalidate_password_resets(&mut tx, user_id).await?;
     sqlx::query(
         "INSERT INTO auth_tokens (user_id, kind, token_hash, expires_at)
          VALUES ($1, 'password_reset', $2, now() + make_interval(secs => $3))",
@@ -53,6 +63,20 @@ pub async fn reset_password(
     new_hash: &str,
 ) -> Result<Option<i64>> {
     let mut tx = pool.begin().await.context("开启事务失败")?;
+    // Password changes and token issuance also lock the user before touching tokens.
+    let locked: Option<i64> = sqlx::query_scalar(
+        "SELECT u.id FROM users u JOIN auth_tokens t ON t.user_id = u.id
+         WHERE t.token_hash = $1 AND t.kind = 'password_reset' AND t.used_at IS NULL
+           AND t.expires_at > now() AND u.deleted_at IS NULL AND u.disabled_at IS NULL
+         FOR NO KEY UPDATE OF u",
+    )
+    .bind(&token_hash[..])
+    .fetch_optional(&mut *tx)
+    .await
+    .context("锁定用户失败")?;
+    if locked.is_none() {
+        return Ok(None);
+    }
     let user_id: Option<i64> = sqlx::query_scalar(
         "UPDATE auth_tokens t SET used_at = now() FROM users u
          WHERE u.id = t.user_id AND t.token_hash = $1 AND t.kind = 'password_reset'
@@ -72,6 +96,7 @@ pub async fn reset_password(
         .execute(&mut *tx)
         .await
         .context("更新 users.password_hash 失败")?;
+    invalidate_password_resets(&mut tx, user_id).await?;
     sqlx::query(
         "UPDATE auth_sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL",
     )

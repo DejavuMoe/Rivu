@@ -206,7 +206,9 @@ async fn restarted_collector_continues_sessions_from_clickhouse_and_snapshot() {
     assert!(status.clickhouse_error.is_none(), "{status:?}");
     pageview(c2.addr, key, "/a3", UA_A).await;
     // 关停：写快照
-    session_warm::save(&c2.pipeline, &data_dir).await;
+    session_warm::save(Arc::clone(&c2.pipeline), &data_dir)
+        .await
+        .unwrap();
     assert!(snapshot.is_file());
     drop(c2.pipeline);
     c2.writer.shutdown().await.expect("flush");

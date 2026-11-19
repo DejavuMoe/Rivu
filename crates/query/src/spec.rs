@@ -15,6 +15,7 @@ use std::fmt;
 
 use jiff::Timestamp;
 use jiff::civil::Date;
+use rivu_domain::MAX_PROP_KEY_BYTES;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::de::{self, Deserializer};
 use serde::ser::Serializer;
@@ -217,18 +218,16 @@ const FIXED_DIMENSIONS: [(&str, Dimension); 28] = [
     ("time:month", Dimension::TimeMonth),
 ];
 
-/// `event:props:<k>` 的键长上限。
-pub const MAX_PROP_KEY_LEN: usize = 200;
-
 impl Dimension {
     pub fn parse(s: &str) -> Result<Self, String> {
         if let Some((_, d)) = FIXED_DIMENSIONS.iter().find(|(name, _)| *name == s) {
             return Ok(d.clone());
         }
         if let Some(key) = s.strip_prefix("event:props:") {
-            if key.is_empty() || key.chars().count() > MAX_PROP_KEY_LEN {
+            // Preserve previously queryable Unicode keys in historical imports.
+            if key.is_empty() || key.len() > MAX_PROP_KEY_BYTES && key.chars().count() > 200 {
                 return Err(format!(
-                    "the property key in `event:props:<key>` must be 1 to {MAX_PROP_KEY_LEN} characters"
+                    "the property key in `event:props:<key>` must be nonempty and at most {MAX_PROP_KEY_BYTES} UTF-8 bytes or 200 characters"
                 ));
             }
             return Ok(Dimension::EventProp(key.to_owned()));
@@ -320,7 +319,7 @@ impl JsonSchema for Dimension {
             "description": "A dimension. `event:goal` groups by the site's goals (values are goal labels). `event:props:<key>` groups by a custom event property (events without the property are `(none)`).",
             "anyOf": [
                 {"type": "string", "enum": names},
-                {"type": "string", "pattern": "^event:props:.+$", "maxLength": 212}
+                {"type": "string", "pattern": "^event:props:.+$", "maxLength": "event:props:".len() + MAX_PROP_KEY_BYTES}
             ]
         }))
     }
@@ -1407,6 +1406,9 @@ mod tests {
             "event:props:a:b"
         );
         assert!(Dimension::parse("event:props:").is_err());
-        assert!(Dimension::parse(&format!("event:props:{}", "x".repeat(201))).is_err());
+        assert!(Dimension::parse(&format!("event:props:{}", "x".repeat(250))).is_ok());
+        assert!(Dimension::parse(&format!("event:props:{}", "界".repeat(100))).is_ok());
+        assert!(Dimension::parse(&format!("event:props:{}", "界".repeat(200))).is_ok());
+        assert!(Dimension::parse(&format!("event:props:{}", "界".repeat(201))).is_err());
     }
 }

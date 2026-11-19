@@ -228,6 +228,18 @@ test.describe('自动捕获 [§4.6]', () => {
     await expect.poll(() => named(fx, 'Outbound Link: Click').length).toBe(1);
   });
 
+  test('长链接属性保持在 UTF-8 字节上限内，事件仍发出', async ({ page, fx }) => {
+    await page.goto(fx.url('/capture', opts));
+    await page.locator('#out').evaluate((el) => {
+      (el as HTMLAnchorElement).href = 'https://example.org/' + '界'.repeat(800);
+    });
+    await page.click('#out');
+    await expect.poll(() => named(fx, 'Outbound Link: Click').length).toBe(1);
+    const url = (named(fx, 'Outbound Link: Click')[0]!.p as Record<string, string>).url!;
+    expect(url).toMatch(/^https:\/\/example\.org\//);
+    expect(Buffer.byteLength(url)).toBeLessThanOrEqual(2000);
+  });
+
   test('开关关闭时不捕获', async ({ page, fx }) => {
     await page.goto(fx.url('/capture', tagOnly));
     await waitForEvents(fx, 1);

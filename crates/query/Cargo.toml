@@ -10,6 +10,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+rivu-domain.workspace = true
 anyhow.workspace = true
 clickhouse.workspace = true
 jiff.workspace = true

@@ -1380,6 +1380,7 @@ pub fn run(spec_json: &Value, site: &RefSite, events: &[RefEvent]) -> Result<Ref
                 run.sort(&mut crow, &order);
                 out.comparison_rows = Some(
                     crow.into_iter()
+                        .take(spec.limit)
                         .map(|(raw, metrics)| (run.display(&raw), metrics))
                         .collect(),
                 );

@@ -3,7 +3,7 @@
 // - 优先级：tagged > 外链 > 下载；一次点击只产生一个事件（外部站点上的 `.pdf` 记为外链）。
 // - tagged：元素本身或向上最多 3 层父元素，**就近优先**；表单内的点击不算（只算 `submit`）；
 //   命中的元素是链接则自动补 `url` 属性。
-// - 外链：`link.host` 非空且不等于 `location.host`（含端口，子域也算外链），属性 `url` 为 `link.href` 原样。
+// - 外链：`link.host` 非空且不等于 `location.host`（含端口，子域也算外链），属性 `url` 取链接地址。
 // - 下载：`pathname` 的扩展名（小写）在表里，属性 `url` 去掉 query 与 hash。
 // - 表单：有 `novalidate` 或 `checkValidity()` 为真；被 tagged 的表单发 tagged 事件，不重复发。
 // - 不拦截导航、不 `preventDefault`、不延迟跳转（`keepalive` 保证送达）。
@@ -14,13 +14,20 @@ import { DOWNLOADS, extOf, parseTag } from './config.ts';
 
 let cfg: Config;
 
+// Leave room for the replacement character if the cutoff splits a UTF-8 sequence.
+const linkUrl = (url: string): string => {
+  if (url.length < 667) return url;
+  const bytes = new TextEncoder().encode(url);
+  return bytes.length <= 2000 ? url : new TextDecoder().decode(bytes.subarray(0, 1997));
+};
+
 /** 从 `el` 起向上最多 3 层父元素里最近的 tagged 元素，转成事件。 */
 const tagged = (el: Element | null): [string, Opts, Element] | undefined => {
   for (let i = 0; i < 4 && el; i++, el = el.parentElement) {
     const [name, props] = parseTag(el.classList);
     if (name) {
       const href = (el as HTMLAnchorElement).href;
-      const o: Opts = { props: el.tagName == 'A' && href ? { ...props, url: href } : props };
+      const o: Opts = { props: el.tagName == 'A' && href ? { ...props, url: linkUrl(href) } : props };
       return [name, o, el];
     }
   }
@@ -41,12 +48,12 @@ const onClick = (e: MouseEvent) => {
     const a = target.closest && (target.closest('a[href]') as HTMLAnchorElement | null);
     if (!a) return;
     if (cfg.outbound && a.host && a.host != location.host) {
-      event('Outbound Link: Click', { props: { url: a.href } });
+      event('Outbound Link: Click', { props: { url: linkUrl(a.href) } });
       return;
     }
     const dl = cfg.downloads as string[] | undefined;
     if (dl && dl.indexOf(extOf(a.pathname)) >= 0) {
-      event('File Download', { props: { url: a.origin + a.pathname } });
+      event('File Download', { props: { url: linkUrl(a.origin + a.pathname) } });
     }
   } catch {}
 };

@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
+use rivu_domain::UNKNOWN_SITE_ID;
 use rivu_storage_ch::rows::IngestCounterRow;
 use time::OffsetDateTime;
 
@@ -46,7 +47,11 @@ impl CounterBuffer {
             site_id,
             bucket: at_secs.div_euclid(BUCKET_SECS) * BUCKET_SECS,
             metric,
-            script_version: clamp_script_version(script_version),
+            script_version: if site_id == UNKNOWN_SITE_ID {
+                0
+            } else {
+                clamp_script_version(script_version)
+            },
         };
         *self.inner.lock().entry(key).or_insert(0) += 1;
     }
@@ -172,6 +177,16 @@ mod tests {
         assert_eq!(rows[1].minute.unix_timestamp(), 180);
         assert_eq!(rows[1].value, 1);
         assert!(rows.iter().all(|r| r.minute.unix_timestamp() % 60 == 0));
+    }
+
+    #[test]
+    fn unknown_site_counts_share_one_version_bucket() {
+        let c = CounterBuffer::default();
+        c.add(UNKNOWN_SITE_ID, "dropped_unknown_site", 1, 100);
+        c.add(UNKNOWN_SITE_ID, "dropped_unknown_site", 2, 100);
+        let rows = c.take_all();
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].script_version, rows[0].value), (0, 2));
     }
 
     #[test]

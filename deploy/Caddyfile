@@ -14,6 +14,12 @@
 # 环境变量：RIVU_DOMAIN（对外域名），RIVU_UPSTREAM（默认 rivu:8080），RIVU_ACCESS_LOG（默认 stdout）。
 
 {
+	log default {
+		format filter {
+			# 上游故障时保留错误详情，只遮盖退订凭据。
+			request>uri regexp /api/weekly-report/unsubscribe/.* /api/weekly-report/unsubscribe/REDACTED
+		}
+	}
 	# servers {
 	# 	trusted_proxies static 173.245.48.0/20
 	# }
@@ -30,6 +36,7 @@
 			request>tls delete
 		}
 	}
+	log_skip /api/weekly-report/unsubscribe/*
 
 	header Strict-Transport-Security "max-age=31536000"
 

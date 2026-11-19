@@ -21,7 +21,7 @@ use std::io::Write;
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use rivu_query::result::{MetricValue, QueryResult};
-use rivu_query::spec::MAX_LIMIT;
+use rivu_query::spec::{Dimension, MAX_LIMIT};
 use rivu_query::{QueryError, QuerySpec};
 use serde_json::{Value, json};
 
@@ -387,8 +387,11 @@ where
     }
 
     let mut props = Vec::new();
-    for key in keys.iter().take(MAX_PROP_KEYS) {
+    let valid_keys = keys.iter().filter_map(|key| {
         let dim = format!("event:props:{key}");
+        Dimension::parse(&dim).ok().map(|_| (key, dim))
+    });
+    for (key, dim) in valid_keys.take(MAX_PROP_KEYS) {
         let res = run(req.spec(&[&dim], &["visitors", "events"], false)?).await?;
         props.extend(res.results.into_iter().map(|r| {
             std::iter::once(text(key.clone()))

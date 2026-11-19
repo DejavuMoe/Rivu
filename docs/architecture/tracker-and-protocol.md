@@ -325,7 +325,7 @@ rivu('event', 'Video Play', { interactive: false })   // 发 i:false，不影响
 | 11 | 会话分配：engagement 没有会话 | `202`+dropped | `dropped_no_session` |
 | 12 | 写缓冲 | `503` | `dropped_overloaded` |
 
-`ingest_counters` 的维度为 `{分钟, 指标, site_id, script_version}`（进程内按 10 秒桶累加，桶用接收请求时的墙钟）；`sv` 超出 UInt16 的钳到 65535。未知站点统一记 `site_id = 0`，避免用户可控标签撑爆基数 `[01 §10.1]`。丢弃原因以 Rust 枚举 `DropReason` 为唯一来源（`system-design.md` §4.2、§10 Q13），指标名为 `dropped_<原因>`，仅内部可见。
+`ingest_counters` 的维度为 `{分钟, 指标, site_id, script_version}`（进程内按 10 秒桶累加，桶用接收请求时的墙钟）。已知站点的 `sv` 超出 UInt16 时钳到 65535。未知站点统一记 `site_id = 0, script_version = 0`。丢弃原因以 Rust 枚举 `DropReason` 为唯一来源（`system-design.md` §4.2、§10 Q13），指标名为 `dropped_<原因>`，仅内部可见。
 
 ## 7. 服务端规范化规则
 | 对象 | 规则 | 依据 |

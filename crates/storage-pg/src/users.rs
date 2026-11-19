@@ -134,6 +134,7 @@ pub async fn change_password(pool: &PgPool, user_id: i64, new_hash: &str) -> Res
     if n == 0 {
         return Ok(false);
     }
+    crate::auth_tokens::invalidate_password_resets(&mut tx, user_id).await?;
     sqlx::query(
         "UPDATE auth_sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL",
     )

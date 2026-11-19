@@ -36,7 +36,8 @@ impl QueryCache {
             results: moka::sync::Cache::builder()
                 .max_capacity(capacity_rows)
                 .weigher(|_, r: &Arc<QueryResult>| {
-                    u32::try_from(r.results.len() + 1).unwrap_or(u32::MAX)
+                    let comparison = r.comparison_results.as_ref().map_or(0, Vec::len);
+                    u32::try_from((r.results.len() + comparison).max(1)).unwrap_or(u32::MAX)
                 })
                 .time_to_live(MAX_BUCKET)
                 .build(),
@@ -118,6 +119,59 @@ mod tests {
 
     fn site() -> SiteContext {
         SiteContext::new(7, TimeZone::get("Asia/Shanghai").unwrap())
+    }
+
+    #[test]
+    fn comparison_rows_count_against_cache_capacity() {
+        use crate::result::{ComparisonRow, EchoedQuery, Meta, ResolvedRange, ResultRow};
+
+        let result = QueryResult {
+            results: vec![
+                ResultRow {
+                    dimensions: vec![],
+                    metrics: vec![],
+                    comparison: None
+                };
+                2
+            ],
+            comparison_results: Some(vec![
+                ComparisonRow {
+                    dimensions: vec![],
+                    metrics: vec![]
+                };
+                3
+            ]),
+            meta: Meta {
+                time_labels: None,
+                comparison_time_labels: None,
+                warnings: vec![],
+                tiers: vec![],
+                metric_semantics: Default::default(),
+                geo_attribution: None,
+                geo_capability: None,
+                total_rows: None,
+            },
+            query: EchoedQuery {
+                site: None,
+                metrics: vec![],
+                date_range: json!(null),
+                resolved_date_range: ResolvedRange {
+                    start: String::new(),
+                    end: String::new(),
+                },
+                comparison_date_range: None,
+                time_zone: "UTC".into(),
+                dimensions: vec![],
+                filters: vec![],
+                order_by: vec![],
+                include: json!({}),
+                pagination: json!({}),
+            },
+        };
+        let cache = QueryCache::new(10);
+        cache.insert(1, Arc::new(result));
+        cache.results.run_pending_tasks();
+        assert_eq!(cache.results.weighted_size(), 5);
     }
 
     #[test]

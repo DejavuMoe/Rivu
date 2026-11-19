@@ -325,7 +325,7 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 | 密码 | argon2id；长度 12–128，无字符类强制；哈希在 `spawn_blocking` 中执行并用信号量限并发。Plausible 用 bcrypt（04§1.2），Rivu 与 shared link 统一 argon2id |
 | 登录会话 | 32 字节 CSPRNG token，仅存 SHA-256（Plausible 的 `user_sessions.token` 存原值，04§1.2）。`expires_at = last_used_at + 14d`（04§2.4 同为 14 天），距上次续期超 10 分钟才写库 |
 | Cookie | `__Host-rivu_session`：`HttpOnly; Secure; SameSite=Lax; Path=/`，Max-Age 14 天随续期刷新；`http://localhost` 属安全上下文，开发无需额外开关（Plausible 按 `BASE_URL` 推断 Secure，04§4.2） |
-| 会话轮换 | 登录、改密、改邮箱时签发新会话并撤销其他会话；登出删除当前会话；提供「退出所有设备」 |
+| 会话轮换 | 登录签发新会话并撤销请求携带的旧会话，其他设备继续登录。改密撤销全部旧会话并签发新会话。登出撤销当前会话，也可选择「退出所有设备」 |
 | CSRF | 变更请求只接受 `Content-Type: application/json`（上传导出的 zip 用 `application/zip`）并校验 `Origin` 的 host 等于 `RIVU_BASE_URL`；无表单提交；同源部署不开 CORS |
 | 登录防护 | 限流见 4.4（按 `(账号, IP)` 与 IP 阻断，不按单纯账号阻断，避免被用来锁号）；用户不存在与密码错误的响应和耗时一致；失败日志只记账号 id 与结果，不记 IP（`RIVU_LOG_FAILED_LOGINS`，默认 off，对应 04§4.2）。**失败告警（只告警不阻断）**：只计失败（被限流拒绝的不算），同一账号 1 小时内失败达 50 次、全实例每分钟失败达 300 次时各打一条 `warn`（只记存在时的用户 id，不记邮箱与 IP）并累加 `rivu_auth_login_alerts_total{kind=account\|global}`，同一窗口同一对象只告警一次；账号计数表有上限（10 万），内存有界 |
 | 修改密码 | `POST /api/internal/me/password`（会话 + CSRF），请求体 `{"current","new"}`：先按 `(用户, IP)` 限流（同登录的 `(账号, IP)` 桶，5 次 / 60 秒，429），再校验新密码长度（400 `invalid_new_password`），然后**总是**对当前密码做一次 argon2id 校验（不对 400 `wrong_password`；与登录同样的哈希耗时），与当前相同 400 `same_password`；通过后在同一事务内更新 `password_hash` 并撤销该用户的全部会话（含发起请求的这一个），再签发新会话（`Set-Cookie`），响应 `{}` |
@@ -389,6 +389,8 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 两个 `POST` 成功时返回与 `GET` 相同的状态对象。SMTP 未配置时，`GET` 返回 `available: false`，`DELETE` 仍可用，两个 `POST` 返回 `503 mail_unavailable`。
 
 周报查询沿用站点隔离、导入与汇总层口径。有查询错误或警告时不领取发送记录，后续检查可重算。成功查询后再次核对邮箱、权限和订阅。PostgreSQL 在调用 SMTP 前提交领取记录，重复或重叠周期会被跳过。每个已领取的收件人、站点和周期新增一行，记录跨退订、重订和服务重启保留。若领取后进程退出或 SMTP 未返回明确结果，不会自动重发。
+
+周报正文与 `List-Unsubscribe` 邮件头提供免登录退订链接。打开链接会显示确认页，提交确认后关闭本次订阅。成员或访客失去站点访问权限时清理其订阅，历史发送记录仍用于去重。
 
 ## 7. 配置
 规则：
@@ -530,7 +532,7 @@ Plausible 自定义指标覆盖缓存命中、ingest buffer 入队与丢弃、�
 | 1 | 停 `rivu`（代理返回 502，期间事件丢失，是单实例恢复的代价） |
 | 2 | 还原 PG，再还原 ClickHouse |
 | 3 | `rivu migrate`，把旧版本 schema 升到当前 |
-| 4 | **重放删除意图**：把 `completed_at` 晚于 ClickHouse 备份时间点（`manifest`）的 `done` 记录重置为 `pending`，防止还原把用户已删除的数据找回来（`ch_delete_batch` 幂等，可重放）。`deploy/restore.sh` 依次执行 1–5 |
+| 4 | **重放删除意图**：迁移成功后，清空可能已执行过的未完成意图的分区进度，以及在 ClickHouse 备份开始时或之后完成的记录。保留这些意图的维护保护并立即重排。这样 `ch_delete_batch` 会重新删除备份还原出来的分区。`deploy/restore.sh` 依次执行 1–5 |
 | 5 | 启动 `rivu serve`（启动时先补盐），确认 `/readyz` |
 | 6 | 还原点之后的事件不可恢复 |
 

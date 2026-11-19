@@ -13,7 +13,7 @@
 //!   `rivu_reader` 账号的 ClickHouse 客户端、API key 鉴权与按组织限流（[`crate::api_auth::build_guard`]）；
 //!   看板与它的内部端点（[`crate::dash_api`]）；结果缓存（看板与 API 共用）。
 //!
-//! 关停顺序：停止接收（HTTP 服务优雅关停）→ 停止后台刷新任务 → 写会话快照 → 排空 BatchWriter 并 flush →
+//! 关停顺序：停止接收（HTTP 服务优雅关停）→ 停止后台刷新任务 → 并行写会话快照、排空 BatchWriter 并 flush →
 //! 刷出全部接入计数（包括还没结束的 10 秒桶）。
 
 use std::net::SocketAddr;
@@ -52,6 +52,10 @@ const SALT_CACHE_REFRESH: Duration = Duration::from_secs(60);
 const ROUTING_SECRET_TIMEOUT: Duration = Duration::from_secs(10);
 /// 会话清扫周期（§4.6「过期」）。
 const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+// Leave margin inside Compose's 30 second stop_grace_period.
+const HTTP_DRAIN: Duration = Duration::from_secs(6);
+const BACKGROUND_DRAIN: Duration = Duration::from_secs(3);
+const FINAL_DRAIN: Duration = Duration::from_secs(18);
 
 /// 等待 Ctrl-C；Unix 下还等待 SIGTERM。
 async fn wait_for_signal() {
@@ -89,7 +93,23 @@ async fn serve(
     listener: TcpListener,
     app: axum::Router,
     mut stop: watch::Receiver<bool>,
+    force: watch::Receiver<bool>,
 ) -> Result<()> {
+    let app = app.layer(axum::middleware::from_fn(
+        move |request: axum::extract::Request, next: axum::middleware::Next| {
+            let mut force = force.clone();
+            async move {
+                tokio::select! {
+                    biased;
+                    _ = force.wait_for(|stopped| *stopped) => {
+                        use axum::response::IntoResponse;
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response()
+                    }
+                    response = next.run(request) => response,
+                }
+            }
+        },
+    ));
     // `ConnectInfo<SocketAddr>`：collector 要用 TCP 对端地址判定客户端 IP。
     axum::serve(
         listener,
@@ -100,6 +120,16 @@ async fn serve(
     })
     .await
     .with_context(|| format!("{name} 服务异常退出"))
+}
+
+async fn stop_background(tasks: Vec<JoinHandle<()>>, budget: Duration) {
+    let deadline = tokio::time::Instant::now() + budget;
+    for mut task in tasks {
+        if tokio::time::timeout_at(deadline, &mut task).await.is_err() {
+            task.abort();
+            tracing::warn!("后台任务关停超时，已取消");
+        }
+    }
 }
 
 /// PG 连接池上限（`platform-and-ops.md` §7）。
@@ -334,12 +364,11 @@ pub async fn run(config: Config) -> Result<ExitCode> {
         config.ch_database.clone(),
         bg_stop_rx.clone(),
     ));
-    // 上次进程退出时没导完的导入：删除写到一半的汇总行，置为失败
-    match rivu_jobs::import_plausible::recover_interrupted(&pg, &maintainer).await {
-        Ok(0) => {}
-        Ok(n) => tracing::warn!(imports = n, "已清理上次没有完成的导入"),
-        Err(e) => tracing::error!(error = %format!("{e:#}"), "清理没有完成的导入失败"),
-    }
+    background.push(rivu_jobs::import_plausible::spawn_recovery(
+        pg.clone(),
+        maintainer.clone(),
+        bg_stop_rx.clone(),
+    ));
     background.push(rivu_jobs::spawn_rollup_build(
         pg.clone(),
         maintainer.clone(),
@@ -464,16 +493,14 @@ pub async fn run(config: Config) -> Result<ExitCode> {
         "rivu 已启动"
     );
     let (stop_tx, stop_rx) = watch::channel(false);
-    tokio::spawn(async move {
-        wait_for_signal().await;
-        let _ = stop_tx.send(true);
-    });
+    let (force_tx, force_rx) = watch::channel(false);
 
     let internal_task = serve(
         "内部端口",
         internal_listener,
         internal::router(state),
         stop_rx.clone(),
+        force_rx.clone(),
     );
     let public_task = serve(
         "公共端口",
@@ -486,25 +513,62 @@ pub async fn run(config: Config) -> Result<ExitCode> {
             ),
             Some(dashboard),
         ),
-        stop_rx.clone(),
+        stop_rx,
+        force_rx,
     );
-    let (internal_result, public_result) = tokio::join!(internal_task, public_task);
+    let http = async { tokio::try_join!(internal_task, public_task).map(|_| ()) };
+    tokio::pin!(http);
+    let http_result = tokio::select! {
+        result = &mut http => result,
+        () = wait_for_signal() => {
+            let _ = stop_tx.send(true);
+            tokio::time::timeout(HTTP_DRAIN, &mut http)
+                .await.context("HTTP 请求排空超时").and_then(|result| result)
+        }
+    };
+    let _ = force_tx.send(true);
 
     // 关停：HTTP 已停止接收 -> 停后台任务 -> 排空写缓冲、刷出计数。
     // 即使服务异常退出也要走完，避免丢掉缓冲里的数据。
     tracing::info!("已停止接收新请求，开始排空写缓冲");
     let _ = bg_stop_tx.send(true);
-    for task in background {
-        let _ = task.await;
+    stop_background(background, BACKGROUND_DRAIN).await;
+    let (snapshot, drained) = tokio::join!(
+        tokio::time::timeout(
+            FINAL_DRAIN,
+            session_warm::save(collector.pipeline, &config.geo.data_dir)
+        ),
+        tokio::time::timeout(FINAL_DRAIN, collector.writer.shutdown()),
+    );
+    if let Err(error) = snapshot
+        .context("会话快照关停超时")
+        .and_then(|result| result)
+    {
+        tracing::warn!(%error, "会话快照未写完，下次启动从 ClickHouse 预热");
     }
-    session_warm::save(&collector.pipeline, &config.geo.data_dir).await;
-    drop(collector.pipeline);
-    let drained = collector.writer.shutdown().await;
-
-    internal_result?;
-    public_result?;
-    drained?;
+    drained.context("事件写入缓冲排空超时")??;
+    http_result?;
 
     tracing::info!("rivu 已退出");
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn stalled_background_does_not_hold_up_shutdown() {
+    let task = tokio::spawn(std::future::pending());
+    let handle = task.abort_handle();
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        stop_background(vec![task], Duration::from_millis(10)),
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !handle.is_finished() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
 }

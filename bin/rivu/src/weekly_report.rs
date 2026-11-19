@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::extract::{Path, Request, State};
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use jiff::civil::{Date, Weekday};
 use jiff::tz::TimeZone;
@@ -28,6 +28,7 @@ use crate::dash_api::{
 use crate::query_api::{execute_cached, load_site_context, no_store};
 
 type Res<T> = Result<T, DashError>;
+const UNSUBSCRIBE_PATH: &str = "/api/weekly-report/unsubscribe";
 
 pub(crate) fn routes(api: &Arc<DashApi>) -> Router {
     endpoint(
@@ -44,6 +45,16 @@ pub(crate) fn routes(api: &Arc<DashApi>) -> Router {
         "internal.weekly_report_confirm",
         "/api/internal/sites/{site}/weekly-report/confirm",
         post(confirm).fallback(|| method_not_allowed("POST")),
+    ))
+    // This endpoint authorizes solely with the mail token, never cookies.
+    .merge(crate::query_api::count_requests(
+        Router::new()
+            .route(
+                "/api/weekly-report/unsubscribe/{token}",
+                get(unsubscribe_page).post(unsubscribe_by_token),
+            )
+            .with_state(Arc::clone(api)),
+        "weekly_report.unsubscribe",
     ))
 }
 
@@ -301,6 +312,7 @@ async fn request(
         to: recipient.email.clone(),
         subject: subject.into(),
         body: format!("{message}\n\n{}\n", token.plaintext()),
+        unsubscribe_url: None,
     };
     if mailer.send(mail).await.is_err() {
         tracing::warn!(site_id, user_id, "weekly report confirmation email failed");
@@ -383,6 +395,62 @@ async fn unsubscribe(
     Ok(api.finish(response, &ctx))
 }
 
+fn unsubscribe_response(page: &'static str) -> Response {
+    let mut response = Html(page).into_response();
+    no_store(&mut response);
+    response
+        .headers_mut()
+        .insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    response.headers_mut().insert(
+        "content-security-policy",
+        HeaderValue::from_static("default-src 'none'; form-action 'self'; frame-ancestors 'none'"),
+    );
+    response
+}
+
+async fn unsubscribe_page(Path(token): Path<String>) -> Res<Response> {
+    if !session::is_well_formed(&token) {
+        return Err(DashError::NotFound);
+    }
+    Ok(unsubscribe_response(
+        r#"<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Unsubscribe · Rivu</title>
+        <h1>Unsubscribe from Rivu weekly reports</h1>
+        <p lang="zh">退订 Rivu 周报</p>
+        <form method="post"><button>Unsubscribe · <span lang="zh">退订</span></button></form></html>"#,
+    ))
+}
+
+async fn unsubscribe_by_token(
+    State(api): State<Arc<DashApi>>,
+    Path(token): Path<String>,
+) -> Res<Response> {
+    if !session::is_well_formed(&token) {
+        return Err(DashError::NotFound);
+    }
+    let updated = sqlx::query(
+        "UPDATE weekly_report_subscriptions w
+         SET email = NULL, code_hash = NULL, attempts = 0, confirmed_at = NULL
+         FROM weekly_report_claims c
+         WHERE c.unsubscribe_hash = $1 AND w.user_id = c.user_id AND w.site_id = c.site_id
+           AND w.confirmed_at = c.confirmed_at",
+    )
+    .bind(session::hash_token(&token).as_slice())
+    .execute(&api.pg)
+    .await
+    .map_err(anyhow::Error::from)?
+    .rows_affected();
+    if updated == 0 {
+        return Ok(unsubscribe_response(
+            r#"<!doctype html><html lang="en"><meta charset="utf-8"><title>Rivu weekly reports</title>
+            <p>This link has expired or the subscription is already off.</p><p lang="zh">退订链接已过期，或订阅已关闭。</p></html>"#,
+        ));
+    }
+    Ok(unsubscribe_response(
+        r#"<!doctype html><html lang="en"><meta charset="utf-8"><title>Rivu weekly reports</title>
+        <p>You have unsubscribed from Rivu weekly reports for this site.</p><p lang="zh">你已退订此站点的 Rivu 周报。</p></html>"#,
+    ))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Period {
     from: Date,
@@ -455,6 +523,7 @@ async fn claim(
     site: &Site,
     user_id: i64,
     period: Period,
+    unsubscribe_hash: &[u8; 32],
 ) -> anyhow::Result<Option<(String, String)>> {
     let mut tx = api.pg.begin().await?;
     let Some(recipient) = lock_recipient(&mut tx, user_id, site.id).await? else {
@@ -469,14 +538,14 @@ async fn claim(
     // A previous end after this start fences overlap after any calendar change.
     let lang = sqlx::query_scalar(
         "WITH eligible AS (
-             SELECT lang FROM weekly_report_subscriptions
+             SELECT lang, confirmed_at FROM weekly_report_subscriptions
              WHERE user_id = $1 AND site_id = $2 AND email = $3
                AND confirmed_at < to_timestamp($4)
                AND NOT EXISTS (SELECT FROM weekly_report_claims
                    WHERE user_id = $1 AND site_id = $2 AND period_end > to_timestamp($5))
          ), claimed AS (
-             INSERT INTO weekly_report_claims (user_id, site_id, period_end)
-             SELECT $1, $2, to_timestamp($4) FROM eligible
+             INSERT INTO weekly_report_claims (user_id, site_id, period_end, confirmed_at, unsubscribe_hash)
+             SELECT $1, $2, to_timestamp($4), confirmed_at, $6 FROM eligible
              ON CONFLICT DO NOTHING RETURNING user_id
          )
          SELECT lang FROM eligible CROSS JOIN claimed",
@@ -486,6 +555,7 @@ async fn claim(
     .bind(&recipient.email)
     .bind(period.end.as_second() as f64)
     .bind(period.start.as_second() as f64)
+    .bind(unsubscribe_hash.as_slice())
     .fetch_optional(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -549,11 +619,13 @@ async fn deliver(
     let result =
         execute_cached(&api.reader, None, &context, spec, options, "weekly_report").await?;
     let (visitors, visits, pageviews) = totals(&result)?;
-    let link = format!("{}/s/{}", api.base_url, site.id);
+    let base = api.base_url.trim_end_matches('/');
+    let link = format!("{base}/s/{}", site.id);
     let (from, to) = (period.from, period.to);
     let name = &site.name;
     for user_id in candidates {
-        let (email, lang) = match claim(api, site, user_id, period).await {
+        let token = session::generate();
+        let (email, lang) = match claim(api, site, user_id, period, &token.hash()).await {
             Ok(Some(recipient)) => recipient,
             Ok(None) => continue,
             Err(error) => {
@@ -561,11 +633,12 @@ async fn deliver(
                 continue;
             }
         };
+        let unsubscribe_url = format!("{base}{UNSUBSCRIBE_PATH}/{}", token.plaintext());
         let (subject, body) = if lang == "zh" {
             (
                 "Rivu 周报",
                 format!(
-                    "{name}\n{from} 至 {to}（{}）\n\n访客：{visitors}\n访问：{visits}\n浏览量：{pageviews}\n\n查看仪表盘：{link}\n",
+                    "{name}\n{from} 至 {to}（{}）\n\n访客：{visitors}\n访问：{visits}\n浏览量：{pageviews}\n\n查看仪表盘：{link}\n退订周报：{unsubscribe_url}\n",
                     site.timezone
                 ),
             )
@@ -573,7 +646,7 @@ async fn deliver(
             (
                 "Rivu weekly report",
                 format!(
-                    "{name}\n{from} to {to} ({})\n\nVisitors: {visitors}\nVisits: {visits}\nPageviews: {pageviews}\n\nView dashboard: {link}\n",
+                    "{name}\n{from} to {to} ({})\n\nVisitors: {visitors}\nVisits: {visits}\nPageviews: {pageviews}\n\nView dashboard: {link}\nUnsubscribe: {unsubscribe_url}\n",
                     site.timezone
                 ),
             )
@@ -583,6 +656,7 @@ async fn deliver(
                 to: email,
                 subject: subject.into(),
                 body,
+                unsubscribe_url: Some(unsubscribe_url),
             })
             .await
             .is_err()

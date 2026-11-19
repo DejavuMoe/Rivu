@@ -11,6 +11,7 @@ const dict = {
   "common.delete": ["删除", "Delete"],
   "common.copy": ["复制", "Copy"],
   "common.copied": ["已复制", "Copied"],
+  "common.copyFailed": ["复制失败", "Copy failed"],
   "common.close": ["关闭", "Close"],
   "common.hide": ["隐藏", "Hide"],
   "common.show": ["显示", "Show"],

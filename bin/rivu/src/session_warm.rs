@@ -9,6 +9,7 @@
 //! ClickHouse 不可用或超时只记 warn，照常启动，代价是这段时间的会话被切开（§4.6「失败语义」）。
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clickhouse::Client;
@@ -161,17 +162,14 @@ pub async fn warm(pipeline: &Pipeline, data_dir: &Path, ch: &Client) -> WarmStat
 }
 
 /// 关停时写快照。调用前必须已经停止接收事件。
-pub async fn save(pipeline: &Pipeline, data_dir: &Path) {
-    let records = pipeline.assigner().export();
-    let n = records.len();
+pub async fn save(pipeline: Arc<Pipeline>, data_dir: &Path) -> anyhow::Result<()> {
     let path = snapshot_path(data_dir);
-    let result = {
-        let path = path.clone();
-        tokio::task::spawn_blocking(move || snapshot::write_file(&path, &records, now_ms())).await
-    };
-    match result {
-        Ok(Ok(())) => tracing::info!(sessions = n, path = %path.display(), "会话快照已写入"),
-        Ok(Err(e)) => tracing::warn!(error = %e, "写会话快照失败：下次启动改从 ClickHouse 预热"),
-        Err(e) => tracing::warn!(error = %e, "写会话快照的任务异常"),
-    }
+    tokio::task::spawn_blocking(move || {
+        let records = pipeline.assigner().export();
+        snapshot::write_file(&path, &records, now_ms())?;
+        tracing::info!(sessions = records.len(), path = %path.display(), "会话快照已写入");
+        Ok::<_, anyhow::Error>(())
+    })
+    .await??;
+    Ok(())
 }

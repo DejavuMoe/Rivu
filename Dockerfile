@@ -30,7 +30,7 @@ COPY apps/dashboard apps/dashboard
 RUN cd apps/dashboard && RIVU_VERSION=${RIVU_VERSION} pnpm build
 
 # ---------------------------------------------------------------- rivu 二进制
-FROM rust:1-bookworm AS rust
+FROM rust:1.98.1-bookworm AS rust
 ARG RIVU_GIT_COMMIT
 WORKDIR /src
 COPY . .

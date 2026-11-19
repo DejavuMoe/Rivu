@@ -16,7 +16,7 @@ fn canonical(ip: IpAddr) -> IpAddr {
 
 /// 解析 `X-Forwarded-For` 的一个元素：`1.2.3.4`、`1.2.3.4:5678`、`[::1]`、`[::1]:80`、`::1`。
 fn parse_hop(token: &str) -> Option<IpAddr> {
-    let t = token.trim();
+    let t = token.trim_matches([' ', '\t']);
     if let Ok(ip) = t.parse::<IpAddr>() {
         return Some(ip);
     }
@@ -41,13 +41,8 @@ pub fn client_ip(peer: IpAddr, xff_values: &[&str], trusted: &[Cidr]) -> IpAddr 
     if !is_trusted(peer, trusted) {
         return peer;
     }
-    let hops = xff_values
-        .iter()
-        .filter(|v| !v.trim().is_empty())
-        .flat_map(|v| v.split(','));
-    // 先收集再反向：`split` 不是双端迭代器。头部上限 16 KB，开销可忽略。
-    let hops: Vec<&str> = hops.collect();
-    for token in hops.into_iter().rev() {
+    let hops = xff_values.iter().rev().flat_map(|v| v.rsplit(','));
+    for token in hops {
         let Some(ip) = parse_hop(token) else {
             return peer;
         };
@@ -155,6 +150,22 @@ mod tests {
                 client_ip(ip("10.0.0.1"), &[bad], &trusted),
                 ip("10.0.0.1"),
                 "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_http_whitespace_is_trimmed_without_skipping_empty_hops() {
+        let trusted = cidrs(&["10.0.0.0/8"]);
+        let peer = ip("10.0.0.1");
+        assert_eq!(
+            client_ip(peer, &[" \t198.51.100.7\t ", "10.0.0.2"], &trusted),
+            ip("198.51.100.7")
+        );
+        for malformed in ["", " \t ", "\u{00a0}10.0.0.3", "10.0.0.3\u{2003}"] {
+            assert_eq!(
+                client_ip(peer, &["198.51.100.7", malformed, "10.0.0.2"], &trusted),
+                peer
             );
         }
     }

@@ -10,7 +10,7 @@ Rivu 是开源、自托管的网站分析系统（Plausible 的替代品）：�
 
 | 部分 | 内容 |
 |---|---|
-| 采集脚本（`apps/tracker`） | `core`（pageview、SPA、hash 路由、bfcache、预渲染）与 `full`（另有 engagement、手动 API、外链 / 下载 / 表单 / 标记元素的自动捕获）。不读写 Cookie 与浏览器存储 |
+| 采集脚本（`apps/tracker`） | `core`（pageview、SPA、hash 路由、bfcache、预渲染）与 `full`（另有 engagement、手动 API、外链 / 下载 / 表单 / 标记元素的自动捕获）。不读写 Cookie，不写浏览器存储。唯一读取的键是用于排除自身访问的 `localStorage.rivu_ignore` |
 | 接入（`POST /api/event`） | 协议解析、站点快照（增量刷新 + `LISTEN/NOTIFY`）、hostname 白名单、按站点限流、垃圾引荐、屏蔽规则（IP / CIDR / 国家 / 页面 / hostname）、机器人、GeoIP、UA、来源与渠道、每日盐 + 访客密钥的访客 ID、会话分配、批量写入（带去重 token 的重试）、`ingest_counters` |
 | 会话 | 进程内分片的 SessionAssigner；关停时写快照，启动时从快照或 ClickHouse 预热 |
 | 查询 | 统一查询内核 `rivu-query`（`QuerySpec`：指标、维度、过滤树、日期范围、时间序列、对比期、目标）；公开 API `POST /api/v1/query`（API key、按组织限流）与 `GET /api/v1/query/schema.json`；命令行 `rivu query` |

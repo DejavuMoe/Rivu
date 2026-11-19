@@ -277,6 +277,31 @@ pub async fn blocks_timezone_change(
     .context("检查影响时区变更的统计删除意图失败")
 }
 
+/// Completed, timezone-proven erases that could leave holes between native day markers.
+pub async fn erased_rollup_ranges(
+    db: &mut sqlx::PgConnection,
+    site_id: u64,
+    timezone: &str,
+    from: &str,
+    to: &str,
+) -> Result<Vec<(String, String, i64, i64)>> {
+    sqlx::query_as(
+        "SELECT DISTINCT to_char(date_from, 'YYYY-MM-DD'), to_char(date_to, 'YYYY-MM-DD'),
+                         utc_start_ms, utc_end_ms
+         FROM pending_stats_deletions
+         WHERE site_id = $1 AND timezone = $2 AND scope = 'date_range' AND status = 'done'
+           AND utc_start_ms IS NOT NULL AND utc_end_ms IS NOT NULL
+           AND date_from <= $4::text::date AND date_to >= $3::text::date",
+    )
+    .bind(id_i64(site_id)?)
+    .bind(timezone)
+    .bind(from)
+    .bind(to)
+    .fetch_all(db)
+    .await
+    .context("查询已擦除的汇总日期失败")
+}
+
 /// A claim is committed before any ClickHouse write. Even an exhausted or
 /// disconnected attempt can have submitted a mutation without a checkpoint.
 pub async fn maintenance_fences(

@@ -86,7 +86,7 @@
       >
         {#snippet cell(r, c)}
           {#if c.key === "label"}
-            <span class="lbl">{r.label}</span>
+            <button class="lbl" type="button">{r.label}</button>
           {:else if c.key === "visitors"}
             {full(r.value, app.lang)}
           {:else}
@@ -99,6 +99,13 @@
 </Dialog>
 
 <style>
+  .lbl {
+    padding: 0;
+    border: 0;
+    background: none;
+    color: inherit;
+    text-align: start;
+  }
   .tools {
     display: flex;
     gap: 8px;

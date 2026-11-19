@@ -410,8 +410,13 @@ TABLE weekly_report_claims
   user_id bigint NOT NULL
   site_id bigint NOT NULL
   period_end timestamp with time zone NOT NULL
+  confirmed_at timestamp with time zone
+  unsubscribe_hash bytea
   CONSTRAINT weekly_report_claims_pkey PRIMARY KEY (user_id, site_id, period_end)
-  CONSTRAINT weekly_report_claims_user_id_site_id_fkey FOREIGN KEY (user_id, site_id) REFERENCES weekly_report_subscriptions(user_id, site_id)
+  CONSTRAINT weekly_report_claims_site_id_fkey FOREIGN KEY (site_id) REFERENCES sites(id)
+  CONSTRAINT weekly_report_claims_unsubscribe_hash_check CHECK ((octet_length(unsubscribe_hash) = 32))
+  CONSTRAINT weekly_report_claims_user_id_fkey FOREIGN KEY (user_id) REFERENCES users(id)
+  CREATE UNIQUE INDEX weekly_report_unsubscribe_hash ON public.weekly_report_claims USING btree (unsubscribe_hash) WHERE (unsubscribe_hash IS NOT NULL)
 
 TABLE weekly_report_subscriptions
   user_id bigint NOT NULL

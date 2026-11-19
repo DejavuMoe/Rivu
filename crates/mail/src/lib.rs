@@ -7,7 +7,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use lettre::message::{Mailbox, header::ContentType};
+use lettre::message::{
+    Mailbox,
+    header::{ContentType, HeaderName, HeaderValue},
+};
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 
 /// 一次 SMTP 会话的超时。
@@ -41,6 +44,7 @@ pub struct Mail {
     pub to: String,
     pub subject: String,
     pub body: String,
+    pub unsubscribe_url: Option<String>,
 }
 
 enum Transport {
@@ -112,17 +116,26 @@ impl Mailer {
                 Ok(())
             }
             Transport::Smtp(t) => {
-                let msg = Message::builder()
-                    .from(self.from.clone())
-                    .to(mail.to.parse().context("收件人不是有效的邮箱地址")?)
-                    .subject(mail.subject)
-                    .header(ContentType::TEXT_PLAIN)
-                    .body(mail.body)
-                    .context("构造邮件失败")?;
+                let msg = self.message(mail)?;
                 t.send(msg).await.context("SMTP 发信失败")?;
                 Ok(())
             }
         }
+    }
+
+    fn message(&self, mail: Mail) -> Result<Message> {
+        let mut msg = Message::builder()
+            .from(self.from.clone())
+            .to(mail.to.parse().context("收件人不是有效的邮箱地址")?)
+            .subject(mail.subject)
+            .header(ContentType::TEXT_PLAIN);
+        if let Some(url) = mail.unsubscribe_url {
+            msg = msg.raw_header(HeaderValue::new(
+                HeaderName::new_from_ascii_str("List-Unsubscribe"),
+                format!("<{url}>"),
+            ));
+        }
+        msg.body(mail.body).context("构造邮件失败")
     }
 }
 
@@ -157,6 +170,7 @@ pub fn invitation(
         to: to.to_owned(),
         subject,
         body,
+        unsubscribe_url: None,
     }
 }
 
@@ -185,6 +199,7 @@ pub fn password_reset(lang: Lang, to: &str, link: &str, minutes: u32) -> Mail {
         to: to.to_owned(),
         subject,
         body,
+        unsubscribe_url: None,
     }
 }
 
@@ -196,12 +211,30 @@ pub fn test_mail(to: &str) -> Mail {
         body: "This is a test email from Rivu. SMTP is configured correctly.\n\
                这是 Rivu 的测试邮件，SMTP 配置正确。\n"
             .to_owned(),
+        unsubscribe_url: None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn smtp_message_contains_a_list_unsubscribe_uri() {
+        let (mailer, _) = Mailer::memory("rivu@example.test");
+        let url = format!(
+            "https://stats.example.test/api/weekly-report/unsubscribe/{}",
+            "a".repeat(43)
+        );
+        let mut mail = test_mail("recipient@example.test");
+        mail.unsubscribe_url = Some(url.clone());
+        let message = String::from_utf8(mailer.message(mail).unwrap().formatted()).unwrap();
+        let unfolded = message.replace("\r\n ", " ");
+        assert!(
+            unfolded.contains(&format!("List-Unsubscribe: <{url}>\r\n")),
+            "{unfolded}"
+        );
+    }
 
     #[test]
     fn language_follows_the_first_tag() {

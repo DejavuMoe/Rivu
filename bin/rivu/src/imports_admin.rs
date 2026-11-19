@@ -154,7 +154,7 @@ async fn create_import(
                 }
             }
             Err(e) => {
-                tracing::debug!(site_id, import_id = id, error = %format!("{e:#}"), "后台导入退出")
+                tracing::warn!(site_id, import_id = id, error = %format!("{e:#}"), "后台导入退出")
             }
         }
     });

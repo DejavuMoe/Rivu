@@ -470,6 +470,7 @@ async fn retention_waits_for_native_days(
         "retention-restore",
         "retention-old-tz",
         "retention-lock",
+        "retention-erased",
     ] {
         ids.push(
             rivu_storage_pg::sites::create_site(
@@ -485,11 +486,76 @@ async fn retention_waits_for_native_days(
             .id,
         );
     }
-    let [gap, race, rolling, restored, old_tz, lock_site] = ids.try_into().unwrap();
+    let [gap, race, rolling, restored, old_tz, lock_site, erased] = ids.try_into().unwrap();
     let unknown = u64::MAX - gap;
     let database = ch_database();
     let purge = || rivu_jobs::retention::run_once(pg, ch, &database, 30);
     let aug = |day| date(2026, 8, day);
+
+    for day in 1..=12 {
+        let ts = format!("{} 12:00:00", aug(day));
+        write(writer, erased, &ts, &ts, day as u64).await;
+        build(ch, erased, TimeZone::UTC, aug(day), now).await;
+    }
+    let tip = rivu_jobs::rollup::last_buildable(&TimeZone::UTC, now).unwrap();
+    build(ch, erased, TimeZone::UTC, tip, now).await;
+    let mut tx = pg.begin().await.unwrap();
+    rivu_storage_pg::sites::lock_timezone(&mut tx, erased, false)
+        .await
+        .unwrap()
+        .unwrap();
+    for (from, to) in [(aug(4), aug(5)), (aug(10), aug(12))] {
+        rivu_storage_pg::stats_deletions::create_date_range(
+            &mut tx,
+            erased,
+            &from.to_string(),
+            &to.to_string(),
+            "UTC",
+            rivu_query::resolve::local_dates_utc_ms(&TimeZone::UTC, from, to).unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    tx.commit().await.unwrap();
+    rivu_jobs::stats_delete::run_batch(pg, ch).await.unwrap();
+    assert_eq!(raw(ch, erased, 4).await.0, 0);
+    assert_eq!(raw(ch, erased, 8).await.0, 1);
+    let late = "2026-08-10 12:00:00";
+    let session_only = "2026-08-11 12:00:00";
+    write(writer, erased, late, late, 100).await;
+    write(writer, erased, session_only, session_only, 110).await;
+    ch.query("DELETE FROM events WHERE site_id = ? AND session_id = 110")
+        .bind(erased)
+        .with_setting("lightweight_deletes_sync", "2")
+        .execute()
+        .await
+        .unwrap();
+    assert_eq!(raw(ch, erased, 110).await, (0, 1));
+    let later = "2026-08-12 12:00:00";
+    // Another request can only trust retention up to the first unproven day.
+    write(writer, erased, later, later, 120).await;
+    rivu_jobs::rollup::build_site(pg, ch, erased).await.unwrap();
+    let repaired: (u64, u64) = ch
+        .query(
+            "SELECT count(), sum(events) FROM rollup_site FINAL
+         WHERE site_id = ? AND day BETWEEN '2026-08-04' AND '2026-08-05' AND origin = 'native'",
+        )
+        .bind(erased)
+        .fetch_one()
+        .await
+        .unwrap();
+    assert_eq!(repaired, (2, 0));
+    let still_missing: u64 = ch
+        .query(
+            "SELECT count() FROM rollup_site FINAL WHERE site_id = ?
+                AND day BETWEEN '2026-08-10' AND '2026-08-12' AND origin = 'native'",
+        )
+        .bind(erased)
+        .fetch_one()
+        .await
+        .unwrap();
+    assert_eq!(still_missing, 0, "晚到事件或单独存留的会话输入不是空日");
 
     // 8/11 曾有两个事件，模拟维度族已经写完但站点标记丢失，且只剩部分输入。
     let gap_ts = "2026-08-11 12:00:00";
@@ -656,6 +722,10 @@ async fn retention_waits_for_native_days(
         "A−1ms 的单独、分批、同批输入必须保留会话贡献，改时区必须等清理提交"
     );
     gated_result.unwrap();
+    assert_eq!(raw(ch, erased, 8).await.0, 0, "擦除中段后保留期继续推进");
+    assert_eq!(raw(ch, erased, 100).await, (1, 1));
+    assert_eq!(raw(ch, erased, 110).await, (0, 1));
+    assert_eq!(raw(ch, erased, 120).await, (1, 1));
 
     let native_markers: u64 = ch.query("SELECT count() FROM rollup_site FINAL WHERE site_id = ? AND day = '2026-08-11' AND origin = 'native' AND import_id = 0")
         .bind(gap).fetch_one().await.unwrap();
@@ -916,6 +986,13 @@ async fn rollup_tier_matches_the_raw_tier() {
     if let Some(m) = diff(&mixed, &raw) {
         panic!("汇总层 + 原始层与原始层不一致：{m}\n{s}");
     }
+    let mut limited = s.clone();
+    limited["date_range"] = json!(["2026-06-11", "2026-06-20"]);
+    limited["include"] = json!({"compare": "previous_period"});
+    limited["pagination"] = json!({"limit": 10});
+    let result = run(&reader, &site, &limited, now, false).await;
+    assert_eq!(result.results.len(), 10);
+    assert_eq!(result.comparison_results.unwrap().len(), 10);
 
     // ---- 建完全部，随机请求 -------------------------------------------------------------------
     let mut d = half.tomorrow().unwrap();

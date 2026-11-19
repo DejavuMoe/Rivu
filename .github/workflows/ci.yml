@@ -31,9 +31,9 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all --check
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: cargo test（集成测试在没有 RIVU_TEST_* 变量时自动跳过）
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
 
   # 短时模糊测试。保留崩溃输入，作业失败不阻塞合并。
   fuzz-smoke:
@@ -127,7 +127,7 @@ jobs:
       - name: Rust 工具链
         run: rustup show
       - name: 构建 rivu
-        run: cargo build -p rivu
+        run: cargo build --locked -p rivu
       - name: rivu migrate（第一次：全部应用）
         run: ./target/debug/rivu migrate
       - name: rivu migrate（第二次：必须幂等，没有待执行的迁移）
@@ -138,7 +138,7 @@ jobs:
       - name: rivu migrate status
         run: ./target/debug/rivu migrate status
       - name: 全量 rivu 测试（含真实 DB schema_snapshot）
-        run: cargo test -p rivu --tests --no-fail-fast -- --nocapture
+        run: cargo test --locked -p rivu --tests --no-fail-fast -- --nocapture
 
   # 浏览器采集脚本（apps/tracker）。与 Rust 的 job 互不依赖，可并行。
   tracker:
@@ -288,6 +288,19 @@ jobs:
         run: |
           cargo install cargo-audit --locked
           cargo audit
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+      - name: 安装 pnpm
+        id: audit-pnpm
+        run: npm install -g pnpm@12.5.1
+      - name: pnpm audit (tracker)
+        working-directory: apps/tracker
+        run: pnpm audit
+      - name: pnpm audit (dashboard)
+        if: ${{ !cancelled() && steps.audit-pnpm.outcome == 'success' }}
+        working-directory: apps/dashboard
+        run: pnpm audit
 
   image:
     runs-on: ubuntu-24.04

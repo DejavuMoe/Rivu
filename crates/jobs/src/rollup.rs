@@ -196,6 +196,29 @@ pub async fn build_site(pg: &PgPool, ch: &Client, site_id: u64) -> Result<usize>
             .await
             .map_err(|e| anyhow::anyhow!("删除旧时区的汇总行失败：{e}"))?;
         tracing::info!(site_id, timezone = tz_name, "站点时区已变更，汇总层重建");
+    } else if let (Some((first, _)), Some(last)) = (&state.first_marker, state.built_to)
+        && *first < last
+    {
+        let ranges = stats_deletions::erased_rollup_ranges(
+            &mut tx,
+            site_id,
+            &tz_name,
+            &first.to_string(),
+            &last.to_string(),
+        )
+        .await?;
+        let settled = last.min(last_buildable(&tz, now)?);
+        for (from, to, start_ms, end_ms) in ranges {
+            let (from, to) = (from.parse::<Date>()?, to.parse::<Date>()?);
+            let current = rivu_query::resolve::local_dates_utc_ms(&tz, from, to)
+                .map_err(|e| anyhow::anyhow!("换算已擦除日期失败：{e}"))?;
+            if current != (start_ms, end_ms) || from > settled {
+                continue;
+            }
+            rollup::mark_erased_days(ch, &scope, &tz, (*first).max(from), to.min(settled))
+                .await
+                .map_err(|e| anyhow::anyhow!("修补已擦除日期的汇总标记失败：{e}"))?;
+        }
     }
     let days = days_to_build(&state, last_buildable(&tz, now)?);
     if !state.tz_changed

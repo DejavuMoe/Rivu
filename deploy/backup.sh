@@ -15,13 +15,15 @@
 # 默认用 deploy/.env；用别的 compose 项目或 env 文件时设 COMPOSE，例如
 #   COMPOSE="docker compose -p rivu-drill -f compose.yml --env-file .env.drill" deploy/backup.sh
 set -Eeuo pipefail
+umask 077
 
 cd "$(dirname "$0")"
 read -r -a DC <<<"${COMPOSE:-docker compose -f compose.yml --env-file .env}"
 DEST="${1:-backups}"
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
 DIR="$DEST/rivu-$TS"
-mkdir -p "$DIR"
+mkdir -p "$DEST"
+mkdir "$DIR"
 NAME="rivu-$TS.zip"
 
 ch() { "${DC[@]}" exec -T clickhouse clickhouse-client -q "$1"; }
@@ -31,6 +33,7 @@ CH_STARTED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 t0=$(date +%s)
 ch "BACKUP DATABASE rivu TO File('/var/lib/clickhouse/backups/$NAME')" >/dev/null
 "${DC[@]}" cp "clickhouse:/var/lib/clickhouse/backups/$NAME" "$DIR/clickhouse.zip"
+chmod 600 "$DIR/clickhouse.zip"
 "${DC[@]}" exec -T clickhouse rm -f "/var/lib/clickhouse/backups/$NAME"
 CH_SECS=$(( $(date +%s) - t0 ))
 

@@ -20,10 +20,17 @@ import {
   labelDate,
 } from "../src/lib/dashboard/spec.ts";
 import { alignTo, axisLabels, tipLabels } from "../src/lib/dashboard/labels.ts";
-import { compact } from "../src/lib/format.ts";
+import { compact, delta } from "../src/lib/format.ts";
 import type { QueryResult } from "../src/lib/api.ts";
 
 const now = new Date("2026-10-24T07:42:17.500Z");
+
+test("rate comparisons show percentage points, including a zero baseline", () => {
+  assert.deepEqual(delta(0.5, 0.4, "zh"), { text: "+10 个百分点", dir: "up" });
+  assert.deepEqual(delta(0, 0.4, "en"), { text: "−40 pp", dir: "down" });
+  assert.deepEqual(delta(0.5, 0, "en"), { text: "+50 pp", dir: "up" });
+  assert.equal(delta(50, 40).text, "+25%");
+});
 const q = (s: string) => readState(new URLSearchParams(s));
 
 test("缺省状态与非法参数回落", () => {

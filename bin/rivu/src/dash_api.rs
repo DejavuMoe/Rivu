@@ -521,11 +521,8 @@ impl DashApi {
     }
 
     pub(crate) fn client_ip(&self, peer: SocketAddr, headers: &HeaderMap) -> IpAddr {
-        let xff: Vec<&str> = headers
-            .get_all("x-forwarded-for")
-            .iter()
-            .filter_map(|v| v.to_str().ok())
-            .collect();
+        let values = crate::public::forwarded_for(headers);
+        let xff: Vec<_> = values.iter().map(String::as_str).collect();
         rivu_ingest::client_ip::client_ip(peer.ip(), &xff, &self.trusted_proxies)
     }
 }

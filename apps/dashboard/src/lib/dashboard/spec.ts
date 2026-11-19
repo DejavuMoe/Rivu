@@ -56,11 +56,10 @@ export const DIMS: Record<string, string> = {
 /** 自定义属性的界面维度名：`prop:<键>`。 */
 export const PROP_PREFIX = "prop:";
 
-/** 属性键的长度上限（与服务端 `event:props:<k>` 一致）。 */
-const MAX_PROP_KEY = 200;
-
 export function isPropDim(dim: string): boolean {
-  return dim.startsWith(PROP_PREFIX) && dim.length > PROP_PREFIX.length && dim.length <= PROP_PREFIX.length + MAX_PROP_KEY;
+  if (!dim.startsWith(PROP_PREFIX)) return false;
+  const key = dim.slice(PROP_PREFIX.length);
+  return key.length > 0 && (new TextEncoder().encode(key).length <= 300 || [...key].length <= 200);
 }
 
 /** 界面维度名 → QuerySpec 维度（属性是 `event:props:<键>`）。 */
