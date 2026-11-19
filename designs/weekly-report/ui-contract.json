@@ -1,0 +1,68 @@
+{
+  "schemaVersion": 2,
+  "project": { "name": "Rivu 我的周报", "slug": "weekly-report", "surfaceType": "operational" },
+  "content": { "defaultProfile": "operational-strict", "inventory": "content-inventory.json", "approvedCopySources": [] },
+  "designSources": "design-sources.json",
+  "surfaces": [
+    {
+      "id": "weekly-report-settings",
+      "contentProfile": "operational-strict",
+      "prototype": {
+        "entry": "index.html",
+        "assetPath": "index.html",
+        "files": ["index.html"],
+        "states": ["inactive", "requesting-code", "pending", "request-cooldown", "code-missing", "code-invalid-or-expired", "code-void-after-attempts", "code-void-after-expiry", "confirmation-email-failed", "resending", "activating", "active", "cancelling", "mail-unavailable-inactive", "mail-unavailable-pending", "mail-unavailable-active", "loading", "load-error-retry", "access-denied"],
+        "stableIds": ["weekly-report", "weekly-report-settings"]
+      },
+      "production": {
+        "routeOrWindow": "/s/[id]/settings/weekly-report",
+        "files": [
+          "apps/dashboard/src/lib/admin/sections.ts",
+          "apps/dashboard/src/lib/app/SiteHeader.svelte",
+          "apps/dashboard/src/routes/(app)/s/[id]/settings/+layout.svelte",
+          "apps/dashboard/src/routes/(app)/s/[id]/settings/+page.ts",
+          "apps/dashboard/src/routes/(app)/s/[id]/settings/[section]/+page.svelte",
+          "apps/dashboard/src/routes/(app)/s/[id]/settings/strings.ts",
+          "bin/rivu/src/weekly_report.rs"
+        ],
+        "interfaces": [
+          "Implemented API (bin/rivu/src/weekly_report.rs, docs/architecture/platform-and-ops.md#周报订阅接口): GET /api/internal/sites/{site}/weekly-report returns {available, status: off|pending|active, email, timezone, week_starts_on}. POST with {lang: zh|en} requests a code, DELETE cancels a pending confirmation or an active subscription (204), POST .../confirm with {code} activates. Unknown site or no stats access returns 404.",
+          "Prototype state mapping: inactive = off, pending = pending, active = active. The prototype's mail scenarios map to available=false (503 mail_unavailable on request and confirm) and to 502 mail_failed on request. After 502 the server has already stored a new pending code that never reached the inbox, so the page re-reads status and asks the user to resend.",
+          "Request rate: one code request per account per minute across all sites (429 with Retry-After). The page disables Send and Resend and shows the remaining seconds; it counts down from the last request it made and from Retry-After.",
+          "Codes are 43-character base64url strings, valid for 15 minutes. The server answers 400 invalid_code for wrong, expired and used-up codes alike, so the page shows one message. The fifth wrong code clears the pending code; when the confirm call fails the page re-reads status, and status off means the code is void: show the void message and return to Not subscribed.",
+          "The request body carries the current dashboard language; confirmation and report emails use it. A POST while active only updates the stored language.",
+          "Signed-in users with effective site access can enter My weekly report, including site viewers. Existing settings permissions still govern every other section; the SiteHeader Settings link and the bare settings route use the first visible section. Public and shared-link viewers have no personal subscription controls.",
+          "Schedule uses the configured site time zone and first weekday, after local 09:00, covering the previous complete site-local week. The date shown is an example, without an exact send or delivery promise.",
+          "Primary actions use Button variant primary (solid accent), as in apps/dashboard/src/lib/ui/Button.svelte.",
+          "The preview has two Taipei site fixtures (Monday and Sunday start), two accounts with site access, and one denied access fixture. Shell destinations are context only. Preview controls simulate mail failures, expiry, the request wait and load errors locally; state resets on reload."
+        ],
+        "tests": ["bin/rivu/tests/internal_api.rs"]
+      },
+      "status": "needs-review"
+    },
+    {
+      "id": "weekly-report-email",
+      "contentProfile": "operational-strict",
+      "prototype": {
+        "entry": "email.html",
+        "assetPath": "email.html",
+        "files": ["email.html"],
+        "states": ["report-typical", "report-no-visits", "report-year-boundary-large-values", "confirmation-code", "html-600", "html-360", "html-dark", "plain-text", "current-plain-text"],
+        "stableIds": ["weekly-report-email"]
+      },
+      "production": {
+        "routeOrWindow": "SMTP: confirmation code and weekly report emails",
+        "files": ["bin/rivu/src/weekly_report.rs", "crates/mail/src/lib.rs"],
+        "interfaces": [
+          "Current production sends text/plain only (crates/mail/src/lib.rs Mailer::send). The Current plain text version reproduces today's subjects and bodies exactly; verify.cjs asserts them.",
+          "Proposed: send multipart/alternative with the HTML part and the Plain text part shown here. HTML is table-based with inline styles, no scripts, images or remote resources, under 100 KB, and a dark scheme under prefers-color-scheme.",
+          "Proposed copy changes, all from data the sender already has: the report subject names the site and the week (today every report is titled Rivu 周报, which threads all sites and weeks together in some clients); numbers use locale grouping; dates are written out in the email language; the link text uses the dashboard term 看板 instead of 仪表盘; the confirmation email uses 确认码, matching the settings page, and names the site; a zero week adds one line saying no visits were recorded.",
+          "Proposed footer: the reason for the email, the recipient address, and a Manage weekly report link to /s/{site_id}/settings/weekly-report. That route is the settings surface above and does not exist yet; unsubscribing still requires signing in.",
+          "Report data is exactly what deliver() queries: site name, period from/to, site time zone, visitors, visits, pageviews, and {RIVU_BASE_URL}/s/{site_id}. No comparison with the previous week is shown because none is queried."
+        ],
+        "tests": []
+      },
+      "status": "needs-review"
+    }
+  ]
+}
