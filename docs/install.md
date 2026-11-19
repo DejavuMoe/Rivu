@@ -62,10 +62,22 @@ done
 
 | 功能 | 变量 |
 |---|---|
-| MaxMind GeoLite2 / GeoIP2（城市数据更准） | `RIVU_MAXMIND_ACCOUNT_ID`、`RIVU_MAXMIND_LICENSE_KEY`、`RIVU_MAXMIND_EDITION` |
-| 自定义地理库地址 | `RIVU_GEOIP_DB_URL`，以及署名 `RIVU_GEOIP_ATTRIBUTION_TEXT` |
-| 过滤云厂商机房流量 | `RIVU_DATACENTER_FILTER=on` |
+| MaxMind GeoLite2 / 自定义地理库 | 直链或账户 ID + License Key，见下方配置 |
 | 缩短原始数据保留期（默认 731 天；站点还可以在设置里单独调短，汇总数据永久保留） | `RIVU_RETENTION_DAYS` |
+
+### GeoIP 地理库
+
+使用一条 City 或 Country `.mmdb` 下载直链即可。以下示例使用 GeoLite2 City 镜像，保留 MaxMind 署名。
+
+```dotenv
+RIVU_GEOIP_DB_URL=https://git.via.moe/dejavu/GeoLite.mmdb/releases/download/latest/GeoLite2-City.mmdb
+RIVU_GEOIP_ATTRIBUTION_TEXT="This product includes GeoLite Data created by MaxMind, available from https://www.maxmind.com."
+RIVU_GEOIP_ATTRIBUTION_URL=https://www.maxmind.com
+```
+
+只需要国家时，可用 [GeoLite2 Country 直链](https://git.via.moe/dejavu/GeoLite.mmdb/releases/download/latest/GeoLite2-Country.mmdb)。Rivu 的地理报表读取国家、地区和城市，ASN 库没有这些地理字段。
+
+也可以从 MaxMind 直接下载。在 `deploy/.env` 同时设置 `RIVU_MAXMIND_ACCOUNT_ID` 和 `RIVU_MAXMIND_LICENSE_KEY`。`RIVU_MAXMIND_EDITION` 默认为 `GeoLite2-City`，也可设为 `GeoLite2-Country`。授权密钥可通过 `RIVU_MAXMIND_LICENSE_KEY_FILE` 从挂载文件读取。两种来源都填时优先用直链，都留空时使用 DB-IP Lite。
 
 ## 升级
 
@@ -118,6 +130,8 @@ Rivu 只导入站点本地今天之前的完整历史日。如果站点已有原
 
 ## 排障
 
-- `docker compose -f deploy/compose.yml --env-file deploy/.env logs rivu`：结构化日志（JSON）。
+- `docker compose -f deploy/compose.yml --env-file deploy/.env logs --since 15m --timestamps rivu` 查看最近 15 分钟的日志。默认 `RIVU_LOG_FORMAT=json`、`RIVU_LOG_LEVEL=info`。
 - `docker compose -f deploy/compose.yml --env-file deploy/.env exec rivu rivu healthcheck`：就绪检查；失败时打印原因。
 - 看板的「接入诊断」页：每个站点接受与丢弃的事件数，按原因分开。
+
+需要复现问题时，在开发实例的环境文件里把 `RIVU_LOG_LEVEL` 临时设为 `debug`，还不够时再用 `trace`。`RIVU_LOG_FORMAT=pretty` 适合在终端读，`json` 适合筛选和交接。Compose 部署修改后执行 `docker compose -f deploy/compose.yml --env-file deploy/.env up -d --no-deps --force-recreate rivu`，复现后导出对应时间段，再恢复 `info`。交接日志时附上复现时间和操作，先删掉密钥、连接串和个人信息。
