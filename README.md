@@ -2,7 +2,7 @@
 
 Rivu 是开源、自托管的网站分析系统（Plausible 的替代品）：一个 Rust 二进制搭配 PostgreSQL 与 ClickHouse，单实例部署就是全功能版本。
 
-**部署**：见 [`docs/install.md`](docs/install.md)（Docker 镜像 + `deploy/compose.yml`，前面放 nginx 或 Caddy）。**进度与计划**：见 [`docs/roadmap.md`](docs/roadmap.md)。
+**部署**：见 [`docs/install.md`](docs/install.md)（Docker 镜像 + `deploy/compose.yml`，前面放 nginx 或 Caddy）。**进度与计划**：见 [`docs/roadmap.md`](docs/roadmap.md)。**全部文档**：见 [`docs/README.md`](docs/README.md)。
 
 技术栈：Rust（Axum + Tokio）、ClickHouse、PostgreSQL；看板 SvelteKit + Svelte 5；采集脚本 TypeScript + esbuild。许可证：[MIT](LICENSE)。
 
@@ -16,7 +16,7 @@ Rivu 是开源、自托管的网站分析系统（Plausible 的替代品）：�
 | 查询 | 统一查询内核 `rivu-query`（`QuerySpec`：指标、维度、过滤树、日期范围、时间序列、对比期、目标）；公开 API `POST /api/v1/query`（API key、按组织限流）与 `GET /api/v1/query/schema.json`；命令行 `rivu query` |
 | 看板（`apps/dashboard`） | 登录与首次初始化、站点列表、统计看板、安装与安装验证、站点设置（主机名、采集、脚本功能、隐私、屏蔽规则、目标、共享、危险操作）、接入诊断、成员与邀请、API key、账号与登录会话、共享链接与公开看板 |
 | 数据迁移与导出 | 从 Plausible 导入历史汇总数据、将统计视图导出为 CSV ZIP，支持看板和 CLI |
-| 邮件 | 配置 SMTP 后可发成员邀请、密码重置和站点周报。周报支持通过登录后的订阅接口开通，看板入口尚未接入 |
+| 邮件 | 配置 SMTP 后可发成员邀请、密码重置和站点周报。周报目前只能通过登录后的订阅接口开通，看板里的入口（账号页）还在原型阶段，见 [`docs/roadmap.md`](docs/roadmap.md) |
 | 后台任务 | 盐轮换、GeoIP 刷新、站点与日期范围的统计数据删除 |
 | 运维 | 单个二进制：`rivu serve` 运行实例，`rivu migrate` 执行迁移；PG 与 ClickHouse 迁移共用版本序列，带冻结校验与 schema 快照；内部端口 `/healthz` `/readyz` `/metrics` |
 
@@ -36,11 +36,12 @@ rivu/
 │   ├── query/ reference/                     # 查询内核、独立参考实现（差分测试用）
 │   ├── auth/ ratelimit/                      # 鉴权、限流
 │   ├── storage-pg/ storage-ch/ jobs/ common/ # 两个库的访问、后台任务、配置与遥测
-├── tools/              # loadgen、reconcile、reident、replay（压测与验收工具）
+├── tools/              # loadgen、reconcile、reident、replay（压测与验收工具）、design-lint（界面规则检查）
 ├── migrations/         # postgres/ 与 clickhouse/ 的初始迁移、checksums.lock
 ├── schema/             # 迁移后的 schema 快照（测试比对）
 ├── deploy/             # 生产 compose.yml 与 .env.example、nginx / Caddy 示例、开发用 compose.dev.yml
-├── docs/               # architecture/（设计）、research/（调研与验收报告）
+├── designs/            # 界面原型（先改原型，确认后再改 apps/dashboard）
+├── docs/               # 文档地图见 docs/README.md：进度、产品约束、系统设计、界面设计、调研与验收报告
 ├── fuzz/               # cargo-fuzz 目标（不在工作区内）
 └── .env.example        # 开发环境变量
 ```
@@ -165,6 +166,12 @@ docker compose -f deploy/compose.dev.yml down -v    # 同时删除数据卷
 `rivu --version` 输出版本和 git commit；commit 由构建环境通过 `RIVU_GIT_COMMIT` 注入，没有注入时显示 `unknown`。
 
 ## 文档索引
+
+按问题找文档，从 [`docs/README.md`](docs/README.md) 开始。常用的几份：
+
+- [`docs/roadmap.md`](docs/roadmap.md)：进度，离发布还差什么。
+- [`docs/product/constraints.md`](docs/product/constraints.md)：做什么不做什么。
+- [`apps/dashboard/DESIGN.md`](apps/dashboard/DESIGN.md) 与 [`designs/README.md`](designs/README.md)：界面规则与原型。
 
 架构（`docs/architecture/`）：
 

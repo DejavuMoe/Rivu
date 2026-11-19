@@ -16,3 +16,6 @@ Co-Authored-By: DeepSeek v4.1 Flash Codex (1M context) <noreply@openai.com>
 
 - 提交说明用英文，格式 `type(scope): summary`。
 - 一个改动只做一件事；本地验证命令与开发环境见 `CONTRIBUTING.md` 和 `README.md`。
+- 找文档从 `docs/README.md` 开始。加功能前先看 `docs/product/constraints.md`：不在范围内的功能不要顺手做。
+- 改界面：规则在 `apps/dashboard/DESIGN.md`，流程在 `designs/README.md`（先改原型，所有者确认后再改 `apps/dashboard`）。改完在仓库根目录运行 `node tools/design-lint/check.mjs`，并实际渲染出来看浅色、深色和手机宽度。
+- 改了进度或范围，同步更新 `docs/roadmap.md`；面向使用者的文档少用内部术语，第一次出现时用一句话解释。
