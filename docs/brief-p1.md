@@ -12,7 +12,7 @@
 
 | 做 | 不做（P2/P4） |
 |---|---|
-| 事件：`pageview`、`engagement` | 自定义事件的目标、漏斗、属性报表、收入 |
+| 事件：`pageview`、`engagement` | 自定义事件的目标、漏斗、属性报表 |
 | 指标：`visitors` `visits` `pageviews` `bounce_rate` `visit_duration` `engaged_duration` | 日汇总层、规划器选层、结果缓存 |
 | 维度：页面、来源/渠道、国家、设备类别 | 导入、导出、邮件报告、分群、共享链接 |
 
@@ -39,7 +39,7 @@ Plausible 只作对照组，不作判卷标准。判卷依据来自：
 - 自有站点的边缘访问日志（Caddy/CDN），同时录下来用于回放；
 - 浏览器规范：HTML Living Standard（页面生命周期、bfcache）、Beacon、Fetch `keepalive`、Speculation Rules、Referrer Policy；
 - 过滤规则列表：EasyPrivacy、uBlock Origin、AdGuard；
-- 云厂商公开网段（AWS `ip-ranges.json`、GCP、Azure）、`monperrus/crawler-user-agents`、uap-core 测试用例；
+- `monperrus/crawler-user-agents`、uap-core 测试用例；
 - IANA tzdata；
 - 锁定版本的 ClickHouse 源码、测试与 changelog；
 - GDPR、ePrivacy 第 5(3) 条、EDPB Guidelines 2/2023、CNIL 受众统计免同意条件的原文。
@@ -62,7 +62,6 @@ Plausible 只作对照组，不作判卷标准。判卷依据来自：
 - [x] 边缘日志里 `/api/event` 的请求数与 `ingest_counters` 严格对账（`research/edge-reconciliation-2026-10.md`）；
 - [x] 与 Plausible CE 并行回放同一请求流，所有差异都能对应到「刻意偏离清单」（`research/plausible-replay-2026-10.md`，清单见 `system-design.md` 附录 C）；
 - [x] 参考实现与管线结果在事先写明的容差内一致（`bin/rivu/tests/query_differential.rs`：计数严格相等，比率 1e-9）；
-- [ ] 已知答案探针（定时制造已知访问的无头浏览器）连续 7 天全部通过：探针与本地 30 轮已通过（`research/known-answer-probe.md`），7 天连续运行需要常驻实例，尚未开始；
 - [x] 用数据库导出做重识别测试，结论写进隐私说明（`research/re-identification-2026-10.md`、`privacy.md`）；
 - [x] 发布前冻结 ClickHouse schema，此后只能新增迁移（`migrations/checksums.lock` 与 `schema/` 快照）；
 - [x] pageview 5 s 内可见；固定到达率下的 p95 公开、可复现（`research/load-test-2026-10.md`：可见性 p95 约 1.1 s。3 千万行表上 30 天查询的 p95 为 0.3–2.9 s，没有达到 system-design 的 300 ms 目标，留给 P2 的汇总层与缓存）。
