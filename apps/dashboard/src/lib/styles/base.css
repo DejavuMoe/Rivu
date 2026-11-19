@@ -170,8 +170,10 @@ kbd,
   *::before,
   *::after,
   ::backdrop {
+    /* design-lint-allow motion: 这里就是把所有时长压成即时 */
     animation-duration: 1ms !important;
     animation-iteration-count: 1 !important;
+    /* design-lint-allow motion: 同上 */
     transition-duration: 1ms !important;
     scroll-behavior: auto !important;
   }

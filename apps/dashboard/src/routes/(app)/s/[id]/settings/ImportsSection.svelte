@@ -372,8 +372,10 @@
     content: "";
     position: absolute;
     inset: 0;
+    /* design-lint-allow raw-color effect: 已登记的例外，全站唯一一处渐变；去留见 docs/ui/design-review-2026-11.md */
     background: linear-gradient(90deg, transparent, rgb(255 255 255 / 0.45), transparent);
     transform: translateX(-100%);
+    /* design-lint-allow motion: 循环动画的周期，不属于 --dur 的三档 */
     animation: sweep 1.1s var(--ease-move) infinite;
   }
   @keyframes sweep {

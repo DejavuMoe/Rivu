@@ -196,7 +196,9 @@
             <!-- 服务端生成的二维码（白底黑码，暗色主题下也能扫） -->
             <div class="qr">
               <svg viewBox="-2 -2 {N + 4} {N + 4}" role="img" aria-label="QR">
+                <!-- design-lint-allow raw-color: 二维码必须白底黑码 -->
                 <rect x="-2" y="-2" width={N + 4} height={N + 4} fill="#fff" />
+                <!-- design-lint-allow raw-color: 二维码必须白底黑码 -->
                 {#each cells as [x, y] (`${x},${y}`)}<rect {x} {y} width="1" height="1" fill="#000" />{/each}
               </svg>
             </div>
@@ -298,6 +300,7 @@
     height: 168px;
     overflow: hidden;
     border-radius: var(--r-sm);
+    /* design-lint-allow raw-color: 二维码必须白底黑码，深色主题下也要能扫 */
     background: #fff;
     box-shadow: 0 0 0 var(--hairline) var(--border);
   }

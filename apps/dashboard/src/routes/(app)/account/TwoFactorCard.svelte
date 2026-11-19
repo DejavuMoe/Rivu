@@ -279,6 +279,7 @@
     height: 168px;
     overflow: hidden;
     border-radius: var(--r-sm);
+    /* design-lint-allow raw-color: 二维码必须白底黑码，深色主题下也要能扫 */
     background: #fff;
     box-shadow: 0 0 0 var(--hairline) var(--border);
   }
