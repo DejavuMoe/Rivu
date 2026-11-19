@@ -33,7 +33,7 @@
       {@const d = k.prev === null ? null : delta(k.value, k.prev, key === "bounce_rate" ? app.lang : undefined)}
       {@const good = d && d.dir !== "flat" && (d.dir === "up") !== lowerIsBetter(key)}
       <button type="button" role="tab" class="kpi" aria-selected={selected === key} onclick={() => onselect(key)}>
-        <span class="label">{t(`metric.${key}`)}</span>
+        <span class="label" title={t(`metric.${key}.def`)}>{t(`metric.${key}`)}</span>
         {#if loading}
           <Skeleton width="72px" height={28} />
         {:else}

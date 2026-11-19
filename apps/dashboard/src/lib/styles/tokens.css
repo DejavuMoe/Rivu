@@ -103,8 +103,8 @@
   --series-3: var(--violet-9);
   --series-compare: var(--gray-8);
   --chart-area: var(--blue-a2);
-  --chart-bar: var(--gray-a3);
-  --chart-bar-hover: var(--gray-a4);
+  --chart-bar: var(--gray-a4);
+  --chart-bar-hover: var(--gray-a5);
   --chart-grid: var(--gray-a4);
   --chart-axis: var(--gray-a6);
 

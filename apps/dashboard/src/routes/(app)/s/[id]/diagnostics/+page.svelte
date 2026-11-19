@@ -92,6 +92,8 @@
     dates.map((d) => (range === "7d" ? `${dateShort(d, app.lang)} ${pad(d.getHours())}:00` : range === "24h" ? `${dateShort(d, app.lang)} ${hm(d)}` : hm(d))),
   );
   let view = $state<"chart" | "table">("chart");
+  /** 原因代码（dropped_…）只在对照日志与监控指标时有用：默认不显示 */
+  let showCodes = $state(false);
 
   const minutesAgo = (iso: string) => Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 60000));
   const lastEvent = $derived(
@@ -218,6 +220,11 @@
       </section>
 
       <Card title={t("diag.reasons.title")} flush>
+        {#snippet actions()}
+          {#if !loading && !failed}
+            <Button size="sm" variant="ghost" active={showCodes} aria-pressed={showCodes} onclick={() => (showCodes = !showCodes)}>{t("diag.reasons.codes")}</Button>
+          {/if}
+        {/snippet}
         {#if loading}
           <div class="rows-sk">
             {#each [1, 2, 3, 4] as i (i)}<Skeleton height={40} radius={4} />{/each}
@@ -242,7 +249,7 @@
               {@const d = def(r.reason)}
               {#if c.key === "reason"}
                 <div class="reason">
-                  <span class="rname">{reasonName(r.reason)}<code class="rid">dropped_{r.reason}</code></span>
+                  <span class="rname">{reasonName(r.reason)}{#if showCodes}<code class="rid">dropped_{r.reason}</code>{/if}</span>
                   {#if d?.why}<span class="rwhy">{t(`diag.r.${r.reason}.why`)}</span>{/if}
                 </div>
               {:else if c.key === "count"}
