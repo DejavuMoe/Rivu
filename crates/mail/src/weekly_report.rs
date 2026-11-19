@@ -32,6 +32,14 @@ pub struct Report<'a> {
 
 /// 周报邮件。
 pub fn report(r: &Report<'_>) -> Mail {
+    // 站点名称是用户填的，没有长度和字符限制：换行会让主题和纯文本正文多出伪造的行。
+    let site_name = single_line(r.site_name);
+    let timezone = single_line(r.timezone);
+    let r = &Report {
+        site_name: &site_name,
+        timezone: &timezone,
+        ..*r
+    };
     let s = Words::of(r.lang);
     let (long, short) = period(r.from, r.until, r.lang);
     let subject = match r.lang {
@@ -313,6 +321,26 @@ fn footer(lines: &[String]) -> String {
          {}\n</td></tr></table>\n</td></tr>",
         lines.join("\n")
     )
+}
+
+/// 把控制字符（换行、制表等）换成空格并收拢成一行，过长的截断：用在主题和纯文本正文里。
+fn single_line(value: &str) -> String {
+    const MAX_CHARS: usize = 200;
+    let cleaned: String = value
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let mut out = String::with_capacity(cleaned.len());
+    for word in cleaned.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(word);
+    }
+    if out.chars().count() > MAX_CHARS {
+        out = out.chars().take(MAX_CHARS).collect::<String>() + "…";
+    }
+    out
 }
 
 /// 正文和属性值里都能用的转义。
@@ -645,6 +673,35 @@ mod tests {
         let html = report(&r).html.unwrap();
         assert!(html.contains("收件地址 a&quot;b@example.com。"));
         assert!(html.contains("href=\"https://rivu.example.com/x?a=1&amp;b=&quot;2/account\""));
+    }
+
+    #[test]
+    fn a_site_name_cannot_add_lines_or_headers() {
+        let hostile = "Acme\r\nBcc: thief@example.test\n\nUnsubscribe: https://evil.example/x";
+        let mut r = fixture(Lang::En, "studio");
+        r.site_name = hostile;
+        let mail = report(&r);
+        assert!(!mail.subject.contains(['\r', '\n']), "{}", mail.subject);
+        assert!(
+            mail.subject.starts_with(
+                "Acme Bcc: thief@example.test Unsubscribe: https://evil.example/x weekly report"
+            ),
+            "{}",
+            mail.subject
+        );
+        // 纯文本里站点名只占第一行，伪造的「退订」行不会单独成行。
+        let first = mail.body.lines().next().unwrap();
+        assert!(first.starts_with("Acme Bcc:"), "{first}");
+        assert!(
+            !mail
+                .body
+                .lines()
+                .any(|l| l.starts_with("Unsubscribe: https://evil.example"))
+        );
+
+        let long: &'static str = Box::leak("x".repeat(500).into_boxed_str());
+        r.site_name = long;
+        assert!(report(&r).subject.chars().count() < 260);
     }
 
     #[test]
