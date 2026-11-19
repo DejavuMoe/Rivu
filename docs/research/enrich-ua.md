@@ -245,7 +245,7 @@ impl UaParser {
 
 - **设备类别没有外部 ground truth**：uap-core 测试集没有类别字段，规则是启发式，靠 18 条手工断言支撑。真实流量上的准确率要等访问日志回放，才能与 Plausible 的结果并行对比。
 - **机器人检测率是对一份名单的数字**，不是对线上流量的数字；名单里的小众爬虫（327 个 UA 未命中）几乎不触发 tracker。「已知答案探针」（brief 验收项）要覆盖 headless Chrome、Playwright、Selenium 这类会执行 JS 的机器人，这部分在本 crate 里只有单元测试，没有端到端验证。
-- **数据中心 CIDR**（§4.4「可选」）不在本 crate 范围（`DropReason::DatacenterIp` 由别处负责）。
+- 这组机器人检测结果来自 UA。云机房网段也承载 VPN 和企业代理流量，无法据此判定来访者是机器人。
 - **uap-core 的升级**需要手工换 commit、重新下载并跑测试；没有自动化。
 - **未实测 `uaparser` crate 的通过率与耗时**，选择理由基于维护状态与依赖。
 - 没有做并发性能压测；单次耗时在 Windows 上测得，Linux 上的数字应通过 `linux-task.ps1` 再测一次（本次按要求没有运行）。

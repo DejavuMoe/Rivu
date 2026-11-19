@@ -1,6 +1,6 @@
 # Rivu 采集脚本与采集协议规范
 > 协议版本：`v=1` ｜ 第 4 阶段（P4）的内容已在正文标注
-> 范围：浏览器脚本（构建、嵌入、运行时行为）、`POST /api/event` 线协议与 HTTP 契约、服务端规范化规则、版本策略、Plausible 兼容层设计、测试清单。不含：UA/地理/来源分类富化、访客哈希与会话、写缓冲与 ClickHouse 表结构（只写交接要求）。
+> 范围：浏览器脚本（构建、嵌入、运行时行为）、`POST /api/event` 线协议与 HTTP 契约、服务端规范化规则、版本策略和测试清单。不含：UA/地理/来源分类富化、访客哈希与会话、写缓冲与 ClickHouse 表结构（只写交接要求）。
 > 出处记号：`[01 §x]` = `docs/research/plausible/01-ingestion-pipeline.md` 第 x 节；`[00 §x]` = `00-rea-analysis.md`；`[src]` = 为核对行为只读过的 Plausible `tracker/src/*.js`。
 > 许可：Plausible tracker 为 MIT（`tracker/npm_package/LICENSE.md`），服务端为 AGPL-3.0，`extra/`(EE) 另有许可 [01 头部]。本规范只描述行为，不含 Plausible 代码；未参考 EE 实现。「必须/不得」为强制，「应」为默认遵循，「可」为可选。
 
@@ -78,7 +78,7 @@ window.rivu=window.rivu||function(){(rivu.q=rivu.q||[]).push(arguments)};rivu.c=
 ### 2.4 构建选择与缓存
 | 项 | 规则 |
 |---|---|
-| 选 `full` 的条件 | 站点启用了任一 full 专属能力：`engagement`、`outbound`、`downloads`、`forms`、`tagged`、`manual`、手动 API/属性/收入；否则选 `core` |
+| 选 `full` 的条件 | 站点启用了任一 full 专属能力：`engagement`、`outbound`、`downloads`、`forms`、`tagged`、`manual`、手动 API/属性；否则选 `core` |
 | 响应头（站点脚本） | `Content-Type: application/javascript; charset=utf-8`、`ETag`、`Cache-Control: public, max-age=300`、`X-Content-Type-Options: nosniff`、`Cross-Origin-Resource-Policy: cross-origin`、`Access-Control-Allow-Origin: *`（头集合参照 `[01 §3.5]`） |
 | ETag 与生效延迟 | ETag = `sha256(构建号 ‖ 前缀 ‖ 脚本字节)` 截取 16 字节（混入脚本字节，同一构建号重新构建后不会命中旧 ETag），`If-None-Match` 命中返回 `304`；开关变更最多 5 分钟生效（Plausible 为 60 秒 `[01 §3.5]`，Rivu 以 ETag 换更长缓存） |
 | 未知、已删除或已停用（`collect_enabled = false`）的 `site_key` | `404`，`Cache-Control: no-store`，空体 |
@@ -113,14 +113,14 @@ window.rivu=window.rivu||function(){(rivu.q=rivu.q||[]).push(arguments)};rivu.c=
 | `engagement` | 状态机、滚动深度、`ResizeObserver` | — | 360 |
 | `links` | 外链 + 文件下载（含扩展名表） | — | 230 |
 | `forms` | 表单提交 | — | 70 |
-| `tagged` | class 标记事件（含 revenue 标记） | — | 220 |
-| `api` | 队列回放、`rivu()` 命令、全局/单次属性、收入、callback、`url` | — | 260 |
+| `tagged` | class 标记事件 | — | 220 |
+| `api` | 队列回放、`rivu()` 命令、全局/单次属性、callback、`url` | — | 260 |
 | `debug` | 忽略原因 `console.warn` | — | 50 |
 | **合计估算** | | **≈ 780** | **≈ 2,030** |
 | **预算** | | **≤ 1,024** | **≤ 2,816** |
 | **实测（2026-10-27，sv=1）** | | **869** | **≈ 2,600** |
 
-`full` 估算仅余约 18 B，**视为高风险**。超预算时按此顺序削减（不改变决策 6 的功能范围）：① `debug` 日志；② 下载扩展名表缩回 26 项；③ tagged 父层搜索 3 层→1 层；④ tagged 的 revenue 标记；⑤ 仍超则需拍板调整预算（见附录）。
+`full` 的体积由 CI 检查。调整脚本功能时以实际 gzip 体积为准（见 §11.3）。
 
 ### 3.3 CI 检查
 | 检查 | 方法 | 失败条件 |
@@ -206,7 +206,7 @@ window.rivu=window.rivu||function(){(rivu.q=rivu.q||[]).push(arguments)};rivu.c=
 
 - 优先级：tagged > 外链 > 下载；一次点击只产生一个事件（外链先于下载，外部站点上的 `.pdf` 记为外链）。
 - 默认扩展名（28 项）：`pdf xlsx xls docx doc txt rtf csv exe key pps ppt pptx 7z pkg rar gz zip avi mov mp4 mpeg wmv midi mp3 wav wma dmg`。前 26 项等同 Plausible 默认 `[01 §2.8]`，Rivu 追加 `xls`、`doc`；`downloads` 为数组时整体替换默认表。
-- tagged 语法（前缀 `rivu-event-`）：class `rivu-event-name=Signup`（或 `rivu-event-name--Signup`，供不允许 `=` 的 CMS）定义事件名；`rivu-event-<k>=<v>` 定义属性，值中 `+` 换成空格；`rivu-revenue-amount=…`、`rivu-revenue-currency=…` 定义收入。元素本身或向上最多 3 层父元素命中；**多层嵌套时就近优先**（Plausible 取最外层 `[src]`）。表单内的点击不算，只算 `submit`；命中的元素是链接则自动补 `url` 属性 `[01 §2.8]`。
+- tagged 语法（前缀 `rivu-event-`）：class `rivu-event-name=Signup`（或 `rivu-event-name--Signup`，供不允许 `=` 的 CMS）定义事件名。`rivu-event-<k>=<v>` 定义属性，值中 `+` 换成空格。元素本身或向上最多 3 层父元素命中，**多层嵌套时就近优先**（Plausible 取最外层 `[src]`）。表单只在 `submit` 时上报，命中的元素是链接则自动补 `url` 属性 `[01 §2.8]`。
 - 不拦截导航、不 `preventDefault`、不延迟跳转（`keepalive` 保证送达；Plausible 仅兼容变体做 5 秒延迟 `[01 §2.5]`）。
 
 ### 4.7 排除逻辑（每次发送前判定）
@@ -222,7 +222,7 @@ window.rivu=window.rivu||function(){(rivu.q=rivu.q||[]).push(arguments)};rivu.c=
 ### 4.8 手动 API（仅 `full`）
 | 调用 | 说明 |
 |---|---|
-| `rivu('event', name, opts?)` | 自定义事件。`opts`：`props`（对象，值为 string/number/boolean，客户端转字符串；其余类型跳过）、`revenue`（`{amount, currency}`）、`interactive`（`false` 不计入跳出率）、`url`（覆盖 `u`）、`callback` |
+| `rivu('event', name, opts?)` | 自定义事件。`opts`：`props`（对象，值为 string/number/boolean，客户端转字符串，其余类型跳过）、`interactive`（`false` 不计入跳出率）、`url`（覆盖 `u`）、`callback` |
 | `rivu('pageview', opts?)` | 手动 pageview，等价 `rivu('event','pageview',opts)`；与自动 pageview 并存时不去重 `[01 §2.3]` |
 | `rivu('set', {props})` | 全局属性，**替换**上一次的 `set`；与单次 `props` 合并，单次优先；对所有事件（含 pageview、engagement）生效 `[01 §2.9]` |
 | `rivu('init', opts)` | 仅加载前有效，见 2.5 |
@@ -231,13 +231,15 @@ window.rivu=window.rivu||function(){(rivu.q=rivu.q||[]).push(arguments)};rivu.c=
 | 异常 | 所有命令内部吞异常，不抛给页面 |
 
 ```js
-rivu('event', 'Purchase', { props: { plan: 'pro' }, revenue: { amount: 29, currency: 'USD' } })
+rivu('event', 'Signup', { props: { plan: 'pro' } })
 rivu('event', 'Video Play', { interactive: false })   // 发 i:false，不影响跳出率
 ```
 
 ## 5. 线协议（`v=1`）
 ### 5.1 字段总表
 请求体为单个 JSON 对象（UTF-8），键区分大小写；未知键忽略（前向兼容）；多错误一次性汇总返回。长度单位以各行为准（字节 ≠ 字符，见 `[01 §11.2 #1]`）。
+
+旧脚本提交的 `$` 收入字段会被忽略，同一请求里的事件和自定义属性仍按下面的规则处理。
 
 | 键 | 类型 | 必填 | 适用事件 | 限制 | 服务端处理 | 依据 |
 |---|---|---|---|---|---|---|
@@ -252,7 +254,6 @@ rivu('event', 'Video Play', { interactive: false })   // 发 i:false，不影响
 | `h` | integer | 否 | 全部 | 仅 `1` 生效 | `1` 时 pathname 追加 `#fragment`；其他整数视为未设置；非整数 → 400 | `[01 §4.1]` |
 | `sd` | integer | 条件 | `engagement` | 0–100 | >100 夹到 100；null/负数/非整数视为缺失；非 engagement 忽略 | `[01 §4.3]` |
 | `e` | integer | 条件 | `engagement` | 毫秒，< 30 天（2,592,000,000） | 越界/缺失/非法视为 0；非 engagement 忽略 | `[01 §4.3]` |
-| `$` | object | 否 | 自定义事件（第 4 阶段） | `{"a":"12.50","c":"USD"}`；`a` 匹配 `^\d{1,15}(\.\d{1,4})?$`，`c` 为 ISO 4217 大写三字母 | 非法 → 400 `$`；对 `pageview`/`engagement` 忽略；是否入库由站点收入目标决定 | `[01 §2.9]` |
 
 `engagement` 必须至少带有效的 `sd` 或 `e` 之一，否则 400（`[01 §4.3]`，决策 8）。时间字段不存在：任何 `t`/`ts` 之类的键一律忽略。
 
@@ -263,10 +264,10 @@ rivu('event', 'Video Play', { interactive: false })   // 发 i:false，不影响
 {"v":1,"sv":3,"s":"k7qm2xv5atbr","n":"pageview","u":"https://www.Example.com/pricing?utm_source=newsletter&utm_medium=email&token=abc123#plans","r":"https://news.example.org/post/42?id=7"}
 ```
 
-示例 2：自定义事件（带属性与收入；`i` 缺省即 `true`；`$` 在第 4 阶段前被服务端忽略）
+示例 2：带属性的自定义事件（`i` 缺省即 `true`）
 
 ```json
-{"v":1,"sv":3,"s":"k7qm2xv5atbr","n":"Purchase","u":"https://example.com/checkout/done","p":{"plan":"pro","seats":"5"},"$":{"a":"29.00","c":"USD"}}
+{"v":1,"sv":3,"s":"k7qm2xv5atbr","n":"Signup","u":"https://example.com/signup/done","p":{"plan":"pro","seats":"5"}}
 ```
 
 示例 3：engagement（用户滚到 72%，自上次上报起参与 18.45 秒）
@@ -319,7 +320,7 @@ rivu('event', 'Video Play', { interactive: false })   // 发 i:false，不影响
 | 6 | 采集限流：每站令牌桶，站点 `ingest_rate_limit_per_min` 优先，否则 `RIVU_INGEST_RATE_LIMIT_PER_MIN`（默认 300000，`0` 不限流）；engagement 同样适用 | `202`+dropped | `dropped_rate_limited` |
 | 7 | 垃圾引荐（referrer 的 host 后缀命中 Matomo 名单）；engagement 跳过（它的 `r` 不会被使用） | `202`+dropped | `dropped_spam_referrer` |
 | 8 | 屏蔽规则：IP/CIDR（先），页面通配（后）；**engagement 同样适用**：纯内存判断，且必须挡住被屏蔽页面的 engagement，否则它会借同一访客在其它页面已开的会话被接受 | `202`+dropped | `dropped_ip_blocked` / `dropped_page_blocked` |
-| 9 | 机器人、地理、国家规则（含 UA/来源富化）；engagement 整段跳过：它不能开会话，富化结果不会被使用；机器人的 pageview 已被丢弃，它的 engagement 自然记为 `dropped_no_session` | `202`+dropped | `dropped_bot` / `dropped_datacenter_ip` / `dropped_country_blocked` |
+| 9 | 机器人、地理、国家规则（含 UA/来源富化）；engagement 整段跳过：它不能开会话，富化结果不会被使用；机器人的 pageview 已被丢弃，它的 engagement 自然记为 `dropped_no_session` | `202`+dropped | `dropped_bot` / `dropped_country_blocked` |
 | 10 | 身份：事件的站点本地日期没有盐（collector 不现场生成盐） | `202`+dropped | `dropped_salt_missing` |
 | 11 | 会话分配：engagement 没有会话 | `202`+dropped | `dropped_no_session` |
 | 12 | 写缓冲 | `503` | `dropped_overloaded` |
@@ -355,23 +356,9 @@ rivu('event', 'Video Play', { interactive: false })   // 发 i:false，不影响
 | 为什么需要窗口 | 站点脚本最多缓存 5 分钟，但第三方自托管的 `t.js` 副本可能长期不更新 |
 | `sv` 的用途 | CI 生成的单调递增整数（`__SV__`）。只用于计数标签、排障（定位哪个构建在产生 400 或异常流量）、安装检测；服务端**不得**依据 `sv` 改变协议行为（行为分支只看 `v`） |
 
-## 9. Plausible 兼容层设计（第 4 阶段提供，已决定）
-`system-design.md` §10 Q4 已决定在第 4 阶段提供兼容端点；本节是设计，第 4 阶段之前不实现。端点 `POST /api/plausible/event`，目标：Plausible 用户把 `data-api`（旧式脚本）或 `endpoint`（`plausible-web`/npm 的 init 选项）指向 Rivu 即可复用现有集成 `[01 §2.1]` `[01 §2.10]`。Plausible tracker 为 MIT，可以在文档中引导用户继续使用其脚本；兼容层只按公开协议行为独立实现。限制与 HTTP 契约（8 KB、CORS、可信代理 IP、不读 `x-plausible-ip` 等无条件信任头 `[01 §4.4]`）与原生端点一致。
+## 9. 从 Plausible 迁移
 
-| Plausible 字段（短键/长键） | Rivu 内部字段 | 转换与差异 |
-|---|---|---|
-| `n` / `name` | `n` | 整数转字符串（Plausible 用于 404 跟踪 `[01 §2.2]`） |
-| `u` / `url` | `u` | 同原生规则 |
-| `d` / `domain` | `s`（经站点解析） | 规范化（小写、去 `www.`）后与站点的**非通配**白名单项精确匹配；缺失时回退 `u` 的 host `[01 §2.2]`；命中 0 个或多个站点 → `202`+dropped；含 `,`（多域名扇出 `[01 §1.2]`）→ 400 `d`，不支持 |
-| `r` / `referrer` | `r` | 非字符串忽略，按字符截断 2000 `[01 §2.2]` |
-| `p` / `props` / `m` / `meta` | `p` | 对象或 JSON 字符串；**宽松模式**：数组/对象值静默丢弃，> 30 键取前 30（按键序，确定性），键/值超长仍 400 `[01 §4.2]` |
-| `i` / `interactive` | `i` | 同原生 |
-| `h` / `hashMode` | `h` | 仅整数 `1` 生效 |
-| `sd`、`e` | `sd`、`e` | 接受整数或整串数字字符串 `[01 §4.3]` |
-| `$` / `revenue` | `$` | `{amount, currency}` → `{a, c}`；amount 为数字或可解析字符串，转十进制字符串 `[01 §2.9]` |
-| `v`（脚本版本，如 36 `[00 §5.4]`） | `sv` | 协议版本固定为 `v=1`；`sv` 用于计数，标签 `compat=plausible` |
-
-响应：`202` + 文本体 `ok`（`[00 §5.4]` 实测）+ `x-plausible-dropped` + `x-rivu-dropped`；400 体同原生格式（Plausible 的 `{"errors":{字段:[消息]}}` `[01 §3.2]`，键名为其长键名时保持原键，如 `url`、`domain`）。不提供 `/js/plausible*.js`，也不复刻 `GET /api/error`。
+用 Rivu 的脚本或 `POST /api/event` 接入新流量。历史汇总通过 [Plausible ZIP 导入](../install.md#从-plausible-迁移)迁移。
 
 ## 10. 与 Plausible 的差异
 | # | Rivu | Plausible | 原因 | 证据 |
@@ -401,7 +388,6 @@ rivu('event', 'Video Play', { interactive: false })   // 发 i:false，不影响
 | 23 | 额外监听 `prerenderingchange` | 仅 `visibilitychange` | Speculation Rules 预渲染 | `[01 §2.6]` |
 | 24 | 下载扩展名小写且按 `pathname` 匹配；`xls`、`doc` 入默认表；tagged 就近优先 | 区分大小写、含 hash 时失配；最外层优先 | 减少漏报 | `[01 §2.8]` `[src]` |
 | 25 | 无导航延迟、无 XHR | 兼容变体有 5 秒延迟与 XHR | 体积与体验 | `[01 §2.5]` |
-| 26 | 收入格式 `$`:{a,c} 公开定义（第 4 阶段） | 仅 EE 解析，CE 为空操作 | 开源版需完整功能；只参考行为契约 | `[01 §2.9]` |
 
 ## 11. 测试清单
 ### 11.1 协议契约测试（Rust，表驱动）
@@ -414,7 +400,6 @@ rivu('event', 'Video Play', { interactive: false })   // 发 i:false，不影响
 | 规范化 | `www.`/大小写/尾点/端口/punycode；`*.example.com` 不匹配根域；空白名单 fail-closed；`%zz`、`%2F`、`%00`、非 UTF-8 转义保留；hash 模式 `?`、`#access_token=` 处理；`?utm_source=&ref=x` 取 `ref`；click id 只存名；非白名单参数不出现在任何落库/日志字段 |
 | 头与版本 | `text/plain;charset=UTF-8`、`application/json`、缺失、`*/*` 均可解析；`Set-Cookie` 永不出现；`v=1` 通过，`v=0/2/"1"` → 400；`sv` 非法按 0 不 400 |
 | 脚本端点 | 构建选择表驱动（开关组合 → core/full）；ETag/304；未知 key → 404；前缀转义（`</script>`、U+2028）；前缀由映射函数生成，改一个开关则 ETag 变化 |
-| 兼容层（第 4 阶段） | 回放 `[00 §5.4]` 抓到的真实请求体（含布尔属性 `logged_in:false`、`r:null`、`v:36`）→ 202；长键与短键等价；`d` 含逗号 → 400 |
 | 模糊/属性 | 对规范化函数做幂等与不 panic 的 fuzz；`cargo-fuzz` 对 URL、JSON 解析入口 |
 
 ### 11.2 浏览器行为测试（Playwright，夹具在 `localhost`，故测试页须设 `local:true` 与 `window.__rivu = true`）
@@ -444,6 +429,5 @@ rivu('event', 'Video Play', { interactive: false })   // 发 i:false，不影响
 
 ## 附录：待拍板问题
 1. `r` 超长是截断（本稿，同 Plausible）还是按决策 2 的「超长」返回 400。
-2. 兼容层 `d` 含逗号（多站点扇出）按 400 拒绝，是否可接受。
-3. DNT/GPC 是否作为站点开关。
-4. 可选的新字段（新增可选字段不升版，§8）：在 `Macintosh` UA 上附带 `navigator.maxTouchPoints` 可把 iPadOS 桌面 UA 改判为平板；高熵 Client Hints 的 `platformVersion` 可区分 Windows 10 / 11。两者都会让 tracker 多发数据或多读一个 API，P2 以后再议（`system-design.md` §10 Q22、Q23）。
+2. DNT/GPC 是否作为站点开关。
+3. 可选的新字段（新增可选字段不升版，§8）：在 `Macintosh` UA 上附带 `navigator.maxTouchPoints` 可把 iPadOS 桌面 UA 改判为平板；高熵 Client Hints 的 `platformVersion` 可区分 Windows 10 / 11。两者都会让 tracker 多发数据或多读一个 API，P2 以后再议（`system-design.md` §10 Q22、Q23）。

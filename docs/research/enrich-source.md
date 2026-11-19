@@ -292,7 +292,7 @@ Plausible 的 `Source.resolve` 在前两步完全一致（utm 优先，`canonica
 
 | 编号 | 主题 | Rivu | Plausible | GA4 | 理由 / 测试 |
 |---|---|---|---|---|---|
-| D1 | AI 渠道名 | `AI Assistant` | `AI Assistants`（自定义） | `AI Assistant` | 取 GA4 官方名称，一手来源优先；P4 的 Plausible 兼容层要做 `AI Assistant` ↔ `AI Assistants` 映射。`plausible_parity`：8 行（Perplexity、Gemini、ChatGPT、Claude、Phind、DeepSeek、Copilot、Grok） |
+| D1 | AI 渠道名 | `AI Assistant` | `AI Assistants`（自定义） | `AI Assistant` | 取 GA4 官方名称，一手来源优先。`plausible_parity`：8 行（Perplexity、Gemini、ChatGPT、Claude、Phind、DeepSeek、Copilot、Grok） |
 | D2 | Display 与 click id 的顺序 | 显式 `display` medium 优先于 click id；Display 排在 Paid Search/Social/Video 之后 | Elixir 版：Paid Search 在 Display 之前；SQL 版：Display 在最前，两者对「Google + display + gclid」结果不同 | Display 在 Paid Video 之后 | 只有一份实现，顺序随 GA4。`plausible_parity`：`google + display + gclid` |
 | D3 | `medium=organic` | → Organic Search | 无此规则，无来源时是 Direct | 有（Medium exactly matches organic） | 补上 GA4 规则。`plausible_parity`：`organic medium without source` |
 | D4 | `medium=ai-assistant` | → AI Assistant | 无 | 有 | 补上 GA4 规则。`plausible_parity`：`ai-assistant medium` |
