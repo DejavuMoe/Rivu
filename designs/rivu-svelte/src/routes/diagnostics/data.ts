@@ -5,52 +5,61 @@ import { NOW, type Site } from "../../lib/data/fixtures";
 
 export type RangeId = "1h" | "24h" | "7d";
 
+export type FixSection = "hostnames" | "collection" | "shield";
+
+/** 丢弃原因的界面信息（与生产的 reasons.ts 一致）。key 是 metric 去掉 dropped_ 前缀后的标识。 */
 export interface ReasonDef {
-  /** metric 去掉 dropped_ 前缀后的标识（与 Rust 代码一致） */
-  id: string;
-  /** 在近似权重里的占比（只用于生成模拟数据） */
-  weight: number;
-  /** 处理入口：设置分区；没有则只给文字建议 */
-  fix?: { section: "hostnames" | "collection" | "shield"; };
-  /** 不属于站点管理员能处理的（实例问题） */
+  /** 处理入口：站点设置的分区 */
+  fix?: FixSection;
+  /** 站点管理员处理不了的实例问题 */
   admin?: boolean;
-  /** 通常无需处理 */
-  benign?: boolean;
+  /** 名称看不出含义，需要一行说明 */
+  why?: boolean;
 }
 
-/** 站点级别的丢弃原因（dropped_unknown_site 不计入站点，只在说明里提）。 */
-export const REASONS: ReasonDef[] = [
-  { id: "bot", weight: 0.44, benign: true },
-  { id: "spam_referrer", weight: 0.21, benign: true },
-  { id: "hostname_not_allowed", weight: 0.15, fix: { section: "hostnames" } },
-  { id: "datacenter_ip", weight: 0.06, benign: true },
-  { id: "ip_blocked", weight: 0.045, fix: { section: "shield" } },
-  { id: "rate_limited", weight: 0.03, fix: { section: "collection" } },
-  { id: "no_session", weight: 0.028 },
-  { id: "country_blocked", weight: 0.022, fix: { section: "shield" } },
-  { id: "page_blocked", weight: 0.012, fix: { section: "shield" } },
-  { id: "overloaded", weight: 0.003, admin: true },
-  { id: "site_disabled", weight: 0, fix: { section: "collection" } },
-  { id: "salt_missing", weight: 0, admin: true },
+// dropped_unknown_site 记在 site_id = 0，不会出现在站点的诊断里。
+export const REASONS: Record<string, ReasonDef> = {
+  site_disabled: { fix: "collection" },
+  hostname_not_allowed: { fix: "hostnames", why: true },
+  rate_limited: { fix: "collection", why: true },
+  spam_referrer: { why: true },
+  ip_blocked: { fix: "shield" },
+  page_blocked: { fix: "shield" },
+  country_blocked: { fix: "shield" },
+  bot: {},
+  datacenter_ip: { why: true }, // 仅用于旧版本写入的计数。
+  no_session: { why: true },
+  salt_missing: { admin: true },
+  overloaded: { admin: true },
+};
+
+/** 各原因在丢弃里的近似权重（只用于生成模拟数据）。 */
+const WEIGHTS: [string, number][] = [
+  ["bot", 0.44],
+  ["spam_referrer", 0.21],
+  ["hostname_not_allowed", 0.15],
+  ["datacenter_ip", 0.06],
+  ["ip_blocked", 0.045],
+  ["rate_limited", 0.03],
+  ["no_session", 0.028],
+  ["country_blocked", 0.022],
+  ["page_blocked", 0.012],
+  ["overloaded", 0.003],
 ];
 
 export interface ScriptVersion {
-  version: string;
-  build: "core" | "full";
+  /** 脚本版本号（事件里的 sv）；0 表示没有上报 */
+  version: number;
   share: number;
   /** 最后出现距今的分钟数 */
   lastSeenMin: number;
-  outdated: boolean;
 }
 
-/** 当前最新版本；低于它的标记为「已过时」。 */
-export const LATEST_SCRIPT = "2.4.1";
-
 const VERSIONS: ScriptVersion[] = [
-  { version: "2.4.1", build: "full", share: 0.58, lastSeenMin: 0, outdated: false },
-  { version: "2.4.1", build: "core", share: 0.31, lastSeenMin: 0, outdated: false },
-  { version: "2.3.0", build: "core", share: 0.085, lastSeenMin: 2, outdated: true },
-  { version: "1.9.2", build: "full", share: 0.025, lastSeenMin: 41, outdated: true },
+  { version: 3, share: 0.89, lastSeenMin: 0 },
+  { version: 2, share: 0.085, lastSeenMin: 2 },
+  { version: 1, share: 0.015, lastSeenMin: 41 },
+  { version: 0, share: 0.01, lastSeenMin: 300 },
 ];
 
 function rng(seed: number) {
@@ -121,11 +130,8 @@ export function diagnose(site: Site, range: RangeId, offset = 0): Diag {
   const dropped = buckets.reduce((a, b) => a + b.dropped, 0);
 
   // 北风站点：bot 最多，其次垃圾引荐、主机名不在白名单，少量限流
-  const total = REASONS.reduce((a, r) => a + r.weight, 0);
-  const reasons = REASONS.filter((r) => r.weight > 0).map((r) => ({
-    id: r.id,
-    count: Math.round((dropped * r.weight) / total),
-  }));
+  const total = WEIGHTS.reduce((a, [, w]) => a + w, 0);
+  const reasons = WEIGHTS.map(([id, w]) => ({ id, count: Math.round((dropped * w) / total) }));
   const diff = dropped - reasons.reduce((a, r) => a + r.count, 0);
   if (reasons.length) reasons[0].count += diff;
 

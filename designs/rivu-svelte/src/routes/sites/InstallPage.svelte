@@ -1,6 +1,7 @@
 <!--
   安装引导：复制代码、验证安装两部分。
-  验证结果由评审面板的 app.review.install 驱动：waiting、received、dropped。
+  验证：页面打开期间自动检测，没有手动重新检查；只有「等待」与「已收到」两种结果。
+  原型里由评审面板的 app.review.install 驱动：「已收到」显示收到事件的页面，其余都按等待显示。
   脚本功能开关属于站点设置的数据采集，不在这里。
 -->
 <script lang="ts">
@@ -13,7 +14,7 @@
   import Tabs from "../../lib/ui/Tabs.svelte";
   import type { Site } from "../../lib/data/fixtures";
   import { t } from "../../lib/i18n";
-  import { app, canManage, toast } from "../../lib/state.svelte";
+  import { app } from "../../lib/state.svelte";
   import { href } from "../../lib/router.svelte";
   import "./strings";
 
@@ -25,7 +26,6 @@
   const IGNORE = 'localStorage.rivu_ignore = "true"';
 
   let method = $state<Method>("site");
-  let checking = $state(false);
 
   const siteTag = $derived(`<script defer src="${BASE}/js/${site.siteKey}.js"><\/script>`);
   const code = $derived.by(() => {
@@ -36,20 +36,12 @@
         siteTag,
         `<script>rivu('event','Signup',{props:{plan:'pro'}})<\/script>`,
       ].join("\n");
-    return `<script defer src="https://cdn.example.net/rivu/t.js"\n        data-site="${site.siteKey}"\n        data-api="${BASE}/api/event"><\/script>`;
+    return `<script defer src="${BASE}/js/t.js"\n        data-site="${site.siteKey}"><\/script>`;
   });
   const note = $derived(t(`in.${method}.note`));
   const exclude = $derived(t("in.exclude", { cmd: "{cmd}" }).split("{cmd}"));
 
-  function recheck() {
-    checking = true;
-    setTimeout(() => {
-      checking = false;
-      toast(t("in.verify.stillWaiting"));
-    }, 700);
-  }
-
-  const result = $derived(app.review.install);
+  const received = $derived(app.review.install === "received");
 </script>
 
 <div class="page">
@@ -75,26 +67,12 @@
   </Card>
 
   <Card title={t("in.verify")}>
-    {#if result === "waiting"}
-      <div class="row">
-        <p class="status"><LiveDot size={8} />{t("in.verify.waiting")}</p>
-        <Button loading={checking} onclick={recheck}>{t("in.verify.recheck")}</Button>
-      </div>
-    {:else if result === "received"}
+    {#if !received}
+      <p class="status"><LiveDot size={8} />{t("in.verify.waiting")}</p>
+    {:else}
       <div class="stack">
         <Callout tone="good">{t("in.verify.ok", { path: "/pricing" })}</Callout>
         <div class="row end"><Button variant="primary" href={href(`/s/${site.id}`)}>{t("in.openDashboard")}</Button></div>
-      </div>
-    {:else}
-      <div class="stack">
-        <Callout tone="warn">{t("in.verify.dropped", { host: "staging.northwind.dev" })}</Callout>
-        <div class="row end">
-          {#if !canManage()}<p class="muted">{t("in.verify.dropped.contact")}</p>{/if}
-          <Button href={href(`/s/${site.id}/diagnostics`)}>{t("in.verify.diag")}</Button>
-          {#if canManage()}
-            <Button variant="primary" href={href(`/s/${site.id}/settings/hostnames`)}>{t("in.verify.dropped.fix")}</Button>
-          {/if}
-        </div>
       </div>
     {/if}
   </Card>

@@ -1,26 +1,34 @@
 <!--
-  导入：把 Plausible 导出的 zip 拖进上传区（或点选），上传后服务端在后台写入日汇总层。
-  上传区在导入期间原地变成进度（同一个框、同样高度，不挤动下面的列表）；一次只跑一个导入。
+  导入：把 Plausible 导出的 zip 拖进上传区（或点选），上传后服务端在后台写入日汇总层，列表里的状态随之更新。
+  上传区在导入期间原地变成进度（同一个框、同样高度，不挤动下面的列表）；一个站点同时只跑一个导入。
+  只导入早于今天、且早于首个 Rivu 原生日的完整历史日（按站点时区）。
   导入记录列出日期范围与状态；删除已完成的导入要确认，失败的记录直接删。
 -->
 <script lang="ts">
-  import { FileUp, Trash2 } from "@lucide/svelte";
+  import { CircleAlert, FileUp, Trash2 } from "@lucide/svelte";
   import Badge from "../../lib/ui/Badge.svelte";
   import Button from "../../lib/ui/Button.svelte";
   import Card from "../../lib/ui/Card.svelte";
   import Dialog from "../../lib/ui/Dialog.svelte";
   import EmptyState from "../../lib/ui/EmptyState.svelte";
+  import Skeleton from "../../lib/ui/Skeleton.svelte";
   import Table from "../../lib/ui/Table.svelte";
   import { t } from "../../lib/i18n";
-  import { toast } from "../../lib/state.svelte";
+  import { app, toast } from "../../lib/state.svelte";
   import { NOW, USER, type Site } from "../../lib/data/fixtures";
   import { cfgs, firstDay, nextId, ymd, type Import } from "./store.svelte";
   import "./strings";
 
-  let { site, readOnly = false }: { site: Site; readOnly?: boolean } = $props();
+  let { site }: { site: Site } = $props();
   const cfg = $derived(cfgs[site.id]);
   const first = $derived(firstDay(site));
   const hasData = $derived(site.scale > 0);
+
+  /** 与服务端的上传上限一致 */
+  const MAX_BYTES = 128 * 1024 * 1024;
+
+  const loading = $derived(app.review.dataState === "loading");
+  const failed = $derived(["error", "busy", "timeout"].includes(app.review.dataState));
 
   const days = (a: string, b: string) => Math.round((Date.parse(b) - Date.parse(a)) / 864e5) + 1;
   const shift = (d: string, n: number) => ymd(new Date(Date.parse(`${d}T12:00:00`) + n * 864e5));
@@ -34,14 +42,18 @@
   let input: HTMLInputElement | undefined = $state();
 
   function start(file: File | undefined) {
-    if (!file || readOnly || phase !== "idle") return;
+    if (!file || phase !== "idle") return;
     if (!file.name.toLowerCase().endsWith(".zip")) {
       error = t("set.imp.notZip");
       return;
     }
+    if (file.size > MAX_BYTES) {
+      error = t("set.imp.tooLarge");
+      return;
+    }
     error = "";
     current = file.name;
-    const rec: Import = { id: nextId(), file: file.name, status: "importing", from: "", to: "", error: "", by: USER.name, createdAt: NOW };
+    const rec: Import = { id: nextId(), file: file.name, status: "importing", from: "", to: "", errorCode: "", by: USER.name, createdAt: NOW };
     cfg.imports.unshift(rec);
     phase = "uploading";
     progress = 0;
@@ -65,7 +77,7 @@
     const clash = cfg.imports.find((i) => i.status === "completed" && i.from <= to && i.to >= from);
     if (clash) {
       rec.status = "failed";
-      rec.error = t("set.imp.overlap", { a: clash.from, b: clash.to });
+      rec.errorCode = "overlap";
       toast(t("set.imp.fail"), "bad");
       return;
     }
@@ -102,52 +114,61 @@
 <Card title={t("set.imp.title")}>
   <div class="intro">
     <p>{t("set.imp.how")}</p>
-    <p class="muted">{hasData ? t("set.imp.before", { d: first }) : t("set.imp.beforeEmpty")}</p>
+    {#if !loading && !failed}
+      <p class="muted">
+        {hasData ? t("set.imp.before", { d: first }) : t("set.imp.beforeEmpty")}
+        {t("set.imp.cutover")}
+      </p>
+    {/if}
   </div>
 
-  {#if !readOnly}
-    <div
-      class="zone"
-      class:over
-      class:busy={phase !== "idle"}
-      role="group"
-      aria-label={t("set.imp.title")}
-      ondragover={(e) => {
-        e.preventDefault();
-        if (phase === "idle") over = true;
-      }}
-      ondragleave={() => (over = false)}
-      ondrop={onDrop}
-    >
-      {#if phase === "idle"}
-        <!-- 整个区域都能点；触屏没有拖放，只说「选择」 -->
-        <button type="button" class="pick" onclick={() => input?.click()}>
-          <FileUp size={18} strokeWidth={1.75} aria-hidden="true" />
-          {#if over}<span>{t("set.imp.dropActive")}</span>{:else}
-            <span class="drag">{t("set.imp.drop")}</span>
-            <span class="link">{t("set.imp.pick")}</span>
-            <span class="touch">{t("set.imp.pickZip")}</span>
-          {/if}
-        </button>
-      {:else}
-        <div class="progress" role="status">
-          <div class="line">
-            <span class="file">{current}</span>
-            <span class="muted num">{phase === "uploading" ? t("set.imp.uploading", { p: progress }) : t("set.imp.writing")}</span>
-          </div>
-          <div class="bar" class:writing={phase === "writing"} aria-hidden="true">
-            <span style:transform="scaleX({phase === 'writing' ? 1 : progress / 100})"></span>
-          </div>
+  <div
+    class="zone"
+    class:over
+    class:busy={phase !== "idle"}
+    role="group"
+    aria-label={t("set.imp.title")}
+    ondragover={(e) => {
+      e.preventDefault();
+      if (phase === "idle") over = true;
+    }}
+    ondragleave={() => (over = false)}
+    ondrop={onDrop}
+  >
+    {#if phase !== "idle"}
+      <div class="progress" role="status">
+        <div class="line">
+          <span class="file">{current}</span>
+          <span class="muted num">{phase === "uploading" ? t("set.imp.uploading", { p: progress }) : t("set.imp.writing")}</span>
         </div>
-      {/if}
-      <input bind:this={input} type="file" accept=".zip,application/zip" hidden onchange={(e) => start(e.currentTarget.files?.[0])} />
-    </div>
-    {#if error}<p class="err" role="alert">{error}</p>{/if}
-  {/if}
+        <div class="bar" class:writing={phase === "writing"} aria-hidden="true">
+          <span style:transform="scaleX({phase === 'writing' ? 1 : progress / 100})"></span>
+        </div>
+      </div>
+    {:else}
+      <!-- 整个区域都能点；触屏没有拖放，只说「选择」 -->
+      <button type="button" class="pick" disabled={loading || failed} onclick={() => input?.click()}>
+        <FileUp size={18} strokeWidth={1.75} aria-hidden="true" />
+        {#if over}<span>{t("set.imp.dropActive")}</span>{:else}
+          <span class="drag">{t("set.imp.drop")}</span>
+          <span class="link">{t("set.imp.pick")}</span>
+          <span class="touch">{t("set.imp.pickZip")}</span>
+        {/if}
+      </button>
+    {/if}
+    <input bind:this={input} type="file" accept=".zip,application/zip" hidden onchange={(e) => start(e.currentTarget.files?.[0])} />
+  </div>
+  {#if error}<p class="err" role="alert">{error}</p>{/if}
 </Card>
 
 <Card title={t("set.imp.list")} flush>
-  {#if cfg.imports.length === 0}
+  {#if failed}
+    <EmptyState compact icon={CircleAlert} tone="bad" title={t("set.loadFailed")}>
+      {#snippet actions()}<Button onclick={() => toast(t("common.retry"))}>{t("common.retry")}</Button>{/snippet}
+    </EmptyState>
+  {:else if loading}
+    <div class="sk" aria-busy="true"><Skeleton height={32} radius={6} /><Skeleton height={32} radius={6} /></div>
+  {:else if cfg.imports.length === 0}
     <EmptyState compact title={t("set.imp.none")} />
   {:else}
     <Table
@@ -168,7 +189,7 @@
             {#if i.status === "completed"}
               <span class="muted num">{t("set.imp.range", { a: i.from, b: i.to, n: days(i.from, i.to) })}</span>
             {:else if i.status === "failed"}
-              <span class="bad">{i.error}</span>
+              <span class="bad">{t(`set.imp.err.${i.errorCode || "internal"}`)}</span>
             {/if}
           </span>
         {:else if c.key === "status"}
@@ -180,7 +201,7 @@
             <span>{i.by}</span>
             <span class="muted num">{ymd(i.createdAt)}</span>
           </span>
-        {:else if !readOnly && i.status !== "importing"}
+        {:else if i.status !== "importing"}
           <Button
             variant="ghost"
             size="sm"
@@ -214,8 +235,6 @@
   .zone {
     display: flex;
     align-items: center;
-    justify-content: center;
-    gap: var(--sp-2);
     height: 88px;
     border-radius: var(--r-sm);
     background: var(--bg-subtle);
@@ -242,13 +261,16 @@
     gap: 4px var(--sp-2);
     width: 100%;
     height: 100%;
-    padding: 0;
+    padding: 0 var(--sp-4);
     border: 0;
     border-radius: inherit;
     background: none;
     color: inherit;
     font: inherit;
     cursor: pointer;
+  }
+  .pick:disabled {
+    cursor: default;
   }
   .pick:focus-visible {
     outline: 2px solid var(--accent-focus);
@@ -350,5 +372,11 @@
     display: flex;
     flex-direction: column;
     padding: 4px 0;
+  }
+  .sk {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-2);
+    padding: var(--sp-4);
   }
 </style>

@@ -12,6 +12,8 @@ extend({
   "login.required": ["请填写邮箱和密码。", "Enter your email and password."],
   "login.rate": ["尝试次数过多，请在 {n} 秒后重试。", "Too many attempts. Try again in {n} seconds."],
   "login.rate.wait": ["{n} 秒后重试", "Retry in {n}s"],
+  "login.network": ["无法连接到服务器。", "Can't reach the server."],
+  "login.failed": ["登录失败，请稍后重试。", "Sign-in failed. Try again shortly."],
   "login.help": ["没有账号或忘记密码，请联系管理员。", "No account or forgot your password? Contact an admin."],
   "login.helpMail": ["没有账号？请管理员邀请你。", "No account? Ask an admin to invite you."],
   "login.forgot": ["忘记密码？", "Forgot password?"],
@@ -24,8 +26,10 @@ extend({
   "login.code.useApp": ["改用验证码", "Use the authenticator app"],
   "login.code.invalid": ["验证码不正确或已经用过。", "The code is incorrect or was already used."],
   "login.code.expired": ["登录已超时，请重新输入邮箱和密码。", "This sign-in expired. Enter your email and password again."],
+  "login.code.unavailable": ["服务器没有配置 RIVU_SECRET_KEY，暂时无法验证，请联系管理员。", "The server is missing RIVU_SECRET_KEY, so the code can't be checked. Contact an admin."],
   "login.code.submit": ["验证", "Verify"],
   "login.code.back": ["换个账号", "Use another account"],
+  "login.code.recoveryLeft": ["已用掉一个恢复码，还剩 {n} 个。", "Recovery code used. {n} left."],
 
   // ---- 找回密码 ----
   "forgot.title": ["找回密码", "Reset your password"],
@@ -53,7 +57,7 @@ extend({
   // ---- 初始化 ----
   "setup.title": ["初始化 Rivu", "Set up Rivu"],
   "setup.token": ["初始化令牌", "Setup token"],
-  "setup.token.required": ["请填写初始化令牌。", "Enter the setup token."],
+  "setup.token.invalid": ["初始化令牌不正确。", "The setup token is incorrect."],
   "setup.name": ["名字", "Name"],
   "setup.name.long": ["名字最多 100 个字符。", "Name must be at most 100 characters."],
   "setup.email": ["邮箱", "Email"],
@@ -68,6 +72,7 @@ extend({
   "setup.done": ["初始化完成", "Setup complete"],
   "setup.have": ["已经初始化过？", "Already set up?"],
   "setup.signIn": ["登录", "Sign in"],
+  "setup.already": ["这个实例已经初始化过。", "This instance is already set up."],
 
   // ---- 接受邀请 ----
   "inv.acc.invalid": ["邀请无效或已过期", "This invitation is invalid or has expired"],
@@ -81,5 +86,6 @@ extend({
   "inv.acc.other": ["当前登录的是 {current}，这个邀请发给 {email}。", "You are signed in as {current}, but this invitation is for {email}."],
   "inv.acc.signOut": ["退出登录", "Sign out"],
   "inv.acc.create": ["创建账号并加入", "Create account and join"],
-  "inv.acc.joined": ["已加入 {org}", "Joined {org}"],
+  "inv.acc.mismatch": ["当前登录的账号与邀请的邮箱不一致。", "The signed-in account doesn't match the invited email."],
+  "inv.acc.needSignIn": ["请先登录后再接受邀请。", "Sign in first to accept this invitation."],
 });

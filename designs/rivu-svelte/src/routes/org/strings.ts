@@ -1,6 +1,10 @@
 import { extend } from "../../lib/i18n";
 
 extend({
+  // 服务端拒绝操作时的提示（原型没有会失败的操作，词条与生产保持一致）
+  "org.err.generic": ["操作失败，请稍后重试。", "Something went wrong. Try again shortly."],
+  "org.err.forbidden": ["没有权限执行这个操作。", "You don't have permission to do this."],
+
   // ---- 成员 ----
   "mb.title": ["成员", "Members"],
   "mb.invite": ["邀请成员", "Invite member"],
@@ -30,6 +34,7 @@ extend({
   "mb.guest.remove.body": ["对方将无法再查看 {site}。", "They will no longer be able to view {site}."],
   "mb.guestRemoved": ["已移除 {email} 对 {site} 的访问", "Removed {email}'s access to {site}"],
   "mb.error.title": ["成员列表加载失败", "Couldn't load members"],
+  "mb.noOrg": ["你不是这个组织的成员", "You are not a member of this organization"],
   "inv.title": ["邀请成员", "Invite member"],
   "inv.scope": ["邀请范围", "Scope"],
   "inv.scope.org": ["整个组织", "Whole organization"],
@@ -39,12 +44,12 @@ extend({
   "inv.email.dup": ["这个邮箱已经是成员或有待接受的邀请。", "This email is already a member or has a pending invitation."],
   "inv.role": ["角色", "Role"],
   "inv.site": ["站点", "Site"],
-  "inv.send": ["发送邀请", "Send invitation"],
-  "inv.sent": ["已邀请 {email}", "Invited {email}"],
+  "inv.create": ["创建邀请", "Create invitation"],
   "inv.created": ["邀请已创建", "Invitation created"],
+  "inv.createdToast": ["已创建给 {email} 的邀请", "Created an invitation for {email}"],
   "inv.link": ["邀请链接", "Invitation link"],
-  "inv.once": ["链接 7 天内有效，只显示这一次。", "The link is valid for 7 days and is shown only once."],
   "inv.mailed": ["邀请邮件已发到 {email}。也可以复制下面的链接自己转发，7 天内有效，只显示这一次。", "An invitation email is on its way to {email}. You can also copy the link below and send it yourself. It's valid for 7 days and shown only once."],
+  "inv.once": ["链接 7 天内有效，只显示这一次。", "The link is valid for 7 days and is shown only once."],
 
   // ---- API 密钥 ----
   "ak.title": ["API 密钥", "API keys"],
@@ -57,6 +62,7 @@ extend({
   "ak.never": ["永不过期", "Never"],
   "ak.neverUsed": ["从未使用", "Never used"],
   "ak.expiresSoon": ["{n} 天后过期", "Expires in {n} days"],
+  "ak.expired": ["已过期", "Expired"],
   "ak.scope.all": ["全部站点", "All sites"],
   "ak.scope.sites": ["{n} 个站点", "{n} sites"],
   "ak.revoke": ["撤销", "Revoke"],
@@ -68,7 +74,7 @@ extend({
   "ak.dialog.title": ["创建 API 密钥", "Create API key"],
   "ak.name": ["名称", "Name"],
   "ak.name.placeholder": ["例如 BI 日报导出", "For example, BI daily export"],
-  "ak.name.required": ["请填写密钥名称。", "Enter a key name."],
+  "ak.name.required": ["请填写密钥名称，不超过 100 个字符。", "Enter a key name, up to 100 characters."],
   "ak.scope": ["范围", "Scope"],
   "ak.scope.optAll": ["全部站点", "All sites"],
   "ak.scope.optPick": ["指定站点", "Selected sites"],

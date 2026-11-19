@@ -1,5 +1,7 @@
 <!--
-  账号与安全：个人资料、修改密码、两步验证、登录会话。主题与语言在侧栏用户菜单里设置。
+  账号与安全：个人资料（只读）、修改密码、两步验证、登录会话。主题与语言在侧栏用户菜单里设置。
+  后端目前没有改名、改邮箱的接口。改密码成功后服务端撤销全部旧会话并换发新会话，会话列表只剩当前这一个。
+  评审面板的「登录结果」演示修改密码时当前密码错误、被限流与其他失败；新密码与当前密码相同由原型直接判断。
 -->
 <script lang="ts">
   import { Monitor, Smartphone, TriangleAlert } from "@lucide/svelte";
@@ -17,14 +19,15 @@
   import { NOW, USER } from "../../lib/data/fixtures";
   import { relativeTime } from "../../lib/format";
   import { t } from "../../lib/i18n";
-  import { app, toast } from "../../lib/state.svelte";
-  import { isoDate } from "../org/data";
+  import { app, passwordResult, toast } from "../../lib/state.svelte";
+  import { navigate } from "../../lib/router.svelte";
   import TwoFactorCard from "./TwoFactorCard.svelte";
   import "./strings";
 
   interface Session {
     id: string;
-    device: string;
+    /** 设备标签：客户端没有给时为 null，显示「未知设备」 */
+    device: string | null;
     mobile?: boolean;
     usedMinutesAgo: number;
     current?: boolean;
@@ -35,19 +38,13 @@
     { id: "s2", device: "iPhone Safari", mobile: true, usedMinutesAgo: 2 * 60 },
     { id: "s3", device: "Linux Firefox", usedMinutesAgo: 3 * 24 * 60 },
     { id: "s4", device: "Windows Edge", usedMinutesAgo: 9 * 24 * 60 },
+    { id: "s5", device: null, usedMinutesAgo: 12 * 24 * 60 },
   ]);
   const loading = $derived(app.review.dataState === "loading");
   const failed = $derived(["error", "busy", "timeout"].includes(app.review.dataState));
-  const expires = (s: Session) => isoDate(new Date(NOW.getTime() - s.usedMinutesAgo * 60000 + 14 * 864e5));
-
-  // ---- 个人资料 ----
-  let name = $state(USER.name);
-  let savedName = $state(USER.name);
-  function saveProfile(e: SubmitEvent) {
-    e.preventDefault();
-    savedName = name.trim();
-    toast(t("ac.saved"), "good");
-  }
+  const device = (s: Session) => s.device || t("ac.unknownDevice");
+  const date = (s: Session) =>
+    new Date(NOW.getTime() - s.usedMinutesAgo * 60000 + 14 * 864e5).toLocaleDateString(app.lang === "zh" ? "zh-CN" : "en-US");
 
   // ---- 修改密码 ----
   let cur = $state("");
@@ -55,10 +52,12 @@
   let again = $state("");
   let pwTried = $state(false);
   let pwBusy = $state(false);
+  /** 服务端返回的字段错误（输入变了就清掉） */
+  let serverErr = $state<{ cur?: string; next?: string }>({});
   const nextLen = $derived([...next].length);
   const pwErr = $derived({
-    cur: cur ? "" : t("ac.pw.currentRequired"),
-    next: nextLen < 12 ? t("ac.pw.short") : nextLen > 128 ? t("ac.pw.long") : "",
+    cur: serverErr.cur ?? (cur ? "" : t("ac.pw.currentRequired")),
+    next: serverErr.next ?? (nextLen < 12 ? t("ac.pw.short") : nextLen > 128 ? t("ac.pw.long") : ""),
     again: again === next ? "" : t("ac.pw.mismatch"),
   });
   function changePassword(e: SubmitEvent) {
@@ -68,23 +67,39 @@
     pwBusy = true;
     setTimeout(() => {
       pwBusy = false;
-      cur = next = again = "";
-      pwTried = false;
-      toast(t("ac.pw.done"), "good");
+      const r = passwordResult();
+      if (r === "wrong") serverErr = { cur: t("ac.pw.wrong") };
+      else if (next === cur) serverErr = { next: t("ac.pw.same") };
+      else if (r === "rate") toast(t("ac.pw.rate"), "bad");
+      else if (r === "failed") toast(t("ac.failed"), "bad");
+      else {
+        cur = next = again = "";
+        pwTried = false;
+        serverErr = {};
+        toast(t("ac.pw.done"), "good");
+        // 其他设备的会话已被服务端撤销，只剩换发的这一个
+        sessions = sessions.filter((s) => s.current);
+      }
     }, 650);
   }
 
   // ---- 会话 ----
-  let othersOpen = $state(false);
-  const others = $derived(sessions.filter((s) => !s.current));
-  function signOut(s: Session) {
+  let allOpen = $state(false);
+  let busy = $state(false);
+  function revoke(s: Session) {
+    if (s.current) {
+      navigate("/login");
+      return;
+    }
     sessions = sessions.filter((x) => x.id !== s.id);
-    toast(t("ac.signedOut", { device: s.device }));
+    toast(t("ac.signedOut", { device: device(s) }));
   }
-  function signOutOthers() {
-    sessions = sessions.filter((s) => s.current);
-    othersOpen = false;
-    toast(t("ac.signedOutOthers"));
+  function revokeAll() {
+    busy = true;
+    setTimeout(() => {
+      busy = false;
+      navigate("/login");
+    }, 500);
   }
   const cols = $derived<Column[]>([
     { key: "device", label: t("ac.col.device") },
@@ -97,31 +112,40 @@
 <div class="page">
   <PageHeader title={t("ac.title")} />
 
-  <form onsubmit={saveProfile}>
-    <Card title={t("ac.profile")}>
-      <div class="rows">
-        <Field layout="row" label={t("ac.name")} for="ac-name">
-          <Input id="ac-name" autocomplete="name" bind:value={name} />
-        </Field>
-        <Field layout="row" label={t("ac.email")} for="ac-email">
-          <Input id="ac-email" type="email" value={USER.email} disabled />
-        </Field>
-      </div>
-      {#snippet footer()}
-        <span></span>
-        <Button type="submit" variant="primary" size="sm" disabled={!name.trim() || name.trim() === savedName}>{t("common.save")}</Button>
-      {/snippet}
-    </Card>
-  </form>
+  <Card title={t("ac.profile")}>
+    <div class="rows">
+      <!-- 还没有修改资料的接口：只读，显示成文字而不是禁用的输入框 -->
+      <Field layout="row" label={t("ac.name")}>
+        <span class="val">{USER.name || "—"}</span>
+      </Field>
+      <Field layout="row" label={t("ac.email")}>
+        <span class="val">{USER.email}</span>
+      </Field>
+    </div>
+  </Card>
 
   <form onsubmit={changePassword} novalidate>
     <Card title={t("ac.password")}>
       <div class="rows">
         <Field layout="row" label={t("ac.pw.current")} for="ac-cur" error={pwTried ? pwErr.cur : ""}>
-          <Input id="ac-cur" type="password" autocomplete="current-password" bind:value={cur} invalid={pwTried && !!pwErr.cur} />
+          <Input
+            id="ac-cur"
+            type="password"
+            autocomplete="current-password"
+            bind:value={cur}
+            oninput={() => (serverErr = { ...serverErr, cur: undefined })}
+            invalid={pwTried && !!pwErr.cur}
+          />
         </Field>
         <Field layout="row" label={t("ac.pw.new")} for="ac-new" hint={t("ac.pw.newHint")} error={pwTried || nextLen > 128 ? pwErr.next : ""}>
-          <Input id="ac-new" type="password" autocomplete="new-password" bind:value={next} invalid={(pwTried || nextLen > 128) && !!pwErr.next} />
+          <Input
+            id="ac-new"
+            type="password"
+            autocomplete="new-password"
+            bind:value={next}
+            oninput={() => (serverErr = { ...serverErr, next: undefined })}
+            invalid={(pwTried || nextLen > 128) && !!pwErr.next}
+          />
         </Field>
         <Field layout="row" label={t("ac.pw.confirm")} for="ac-again" error={pwTried ? pwErr.again : ""}>
           <Input id="ac-again" type="password" autocomplete="new-password" bind:value={again} invalid={pwTried && !!pwErr.again} />
@@ -138,8 +162,8 @@
 
   <Card title={t("ac.sessions")} flush>
     {#snippet actions()}
-      {#if others.length > 0 && !loading && !failed}
-        <Button size="sm" onclick={() => (othersOpen = true)}>{t("ac.signOutOthers")}</Button>
+      {#if !loading && !failed}
+        <Button size="sm" onclick={() => (allOpen = true)}>{t("ac.signOutAll")}</Button>
       {/if}
     {/snippet}
     {#if loading}
@@ -158,15 +182,15 @@
           {#if c.key === "device"}
             <div class="dev">
               {#if s.mobile}<Smartphone size={16} strokeWidth={1.75} aria-hidden="true" />{:else}<Monitor size={16} strokeWidth={1.75} aria-hidden="true" />{/if}
-              <span>{s.device}</span>
+              <span>{device(s)}</span>
               {#if s.current}<Badge>{t("ac.current")}</Badge>{/if}
             </div>
           {:else if c.key === "used"}
             <span class="muted">{relativeTime(s.usedMinutesAgo, app.lang)}</span>
           {:else if c.key === "expires"}
-            <span class="muted num">{expires(s)}</span>
-          {:else if c.key === "act" && !s.current}
-            <Button variant="ghost" size="sm" aria-label={`${t("ac.signOut")} ${s.device}`} onclick={() => signOut(s)}>{t("ac.signOut")}</Button>
+            <span class="muted num">{date(s)}</span>
+          {:else if c.key === "act"}
+            <Button variant="ghost" size="sm" aria-label={`${t("ac.signOut")} ${device(s)}`} onclick={() => revoke(s)}>{t("ac.signOut")}</Button>
           {/if}
         {/snippet}
       </Table>
@@ -174,15 +198,19 @@
   </Card>
 </div>
 
-<Dialog bind:open={othersOpen} size="sm" title={t("ac.signOutOthers.title")} description={t("ac.signOutOthers.body")}>
-  <span class="sr-only">{others.map((s) => s.device).join(", ")}</span>
+<Dialog bind:open={allOpen} size="sm" title={t("ac.signOutAll.title")} description={t("ac.signOutAll.body")}>
+  <span></span>
   {#snippet footer()}
-    <Button variant="ghost" onclick={() => (othersOpen = false)}>{t("common.cancel")}</Button>
-    <Button variant="danger" onclick={signOutOthers}>{t("ac.signOutOthers")}</Button>
+    <Button variant="ghost" onclick={() => (allOpen = false)}>{t("common.cancel")}</Button>
+    <Button variant="danger" loading={busy} onclick={revokeAll}>{t("ac.signOutAll")}</Button>
   {/snippet}
 </Dialog>
 
 <style>
+  /* 与行布局里标签的 5px 上内边距对齐 */
+  .val {
+    padding-top: 5px;
+  }
   .page {
     display: flex;
     flex-direction: column;

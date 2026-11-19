@@ -1,6 +1,6 @@
 <!--
   添加 / 修改筛选：选维度 → 选条件 → 勾选值（带搜索，也可以直接输入）。
-  一个维度只有一条筛选；多个值之间是「或」。
+  一个维度只有一条筛选；多个值之间是「或」。可选的值来自当前范围内该维度的排行（不含这个维度自己的筛选）。
 -->
 <script lang="ts">
   import { Search } from "@lucide/svelte";
@@ -12,32 +12,20 @@
   import Checkbox from "../../lib/ui/Checkbox.svelte";
   import Field from "../../lib/ui/Field.svelte";
   import { t } from "../../lib/i18n";
-  import { dimensionValues } from "../../lib/data/fixtures";
-  import type { Filter, Op } from "./query";
+  import { app } from "../../lib/state.svelte";
+  import { PROP_PREFIX, isPropDim, opsFor, type Filter, type Op } from "./query";
+  import { displayValue } from "./values";
 
   interface Props {
     open: boolean;
     initial: Filter | null;
+    /** 可以筛选的维度 */
+    dims: string[];
+    /** 维度的候选值（原始取值） */
+    suggest: (dim: string) => string[];
     onsave: (f: Filter) => void;
   }
-  let { open = $bindable(), initial, onsave }: Props = $props();
-
-  const DIMS = [
-    "page",
-    "entry_page",
-    "exit_page",
-    "source",
-    "channel",
-    "referrer",
-    "utm_campaign",
-    "country",
-    "region",
-    "city",
-    "device",
-    "browser",
-    "os",
-    "goal",
-  ];
+  let { open = $bindable(), initial, dims, suggest, onsave }: Props = $props();
 
   let dim = $state("country");
   let op = $state<Op>("is");
@@ -46,7 +34,7 @@
 
   $effect(() => {
     if (open) {
-      dim = initial?.dim ?? "country";
+      dim = initial?.dim ?? (dims.includes("country") ? "country" : dims[0]);
       op = initial?.op ?? "is";
       picked = [...(initial?.values ?? [])];
       query = "";
@@ -54,7 +42,16 @@
   });
 
   const isMatch = $derived(op === "contains" || op === "contains_not");
-  const suggestions = $derived(dimensionValues(dim).filter((v) => v.toLowerCase().includes(query.toLowerCase())));
+  const label = (v: string) => displayValue(dim, v, app.lang);
+  // 已选但不在排行里的值（比如修改筛选时）也要列出来
+  const options = $derived(suggest(dim));
+  const all = $derived([...picked.filter((v) => !options.includes(v)), ...options]);
+  const suggestions = $derived(
+    all.filter((v) => {
+      const s = query.toLowerCase();
+      return v.toLowerCase().includes(s) || label(v).toLowerCase().includes(s);
+    }),
+  );
   const values = $derived(isMatch ? (query.trim() ? [query.trim()] : []) : picked);
 
   function toggle(v: string, on: boolean) {
@@ -79,8 +76,9 @@
           onchange={(v) => {
             dim = v;
             picked = [];
+            if (!opsFor(v).includes(op)) op = "is";
           }}
-          options={DIMS.map((d) => ({ value: d, label: t(`fdim.${d}`) }))}
+          options={dims.map((d) => ({ value: d, label: isPropDim(d) ? d.slice(PROP_PREFIX.length) : t(`fdim.${d}`) }))}
         />
       </Field>
       <Field label={t("filter.operator")}>
@@ -88,11 +86,7 @@
           block
           label={t("filter.operator")}
           bind:value={op}
-          options={[
-            { value: "is", label: t("op.is") },
-            { value: "is_not", label: t("op.is_not") },
-            { value: "contains", label: t("op.contains") },
-          ]}
+          options={opsFor(dim).map((o) => ({ value: o, label: t(`op.${o}`) }))}
         />
       </Field>
     </div>
@@ -105,7 +99,7 @@
       <div class="values" role="group" aria-label={t("filter.value")}>
         {#each suggestions as v (v)}
           <div class="val">
-            <Checkbox checked={picked.includes(v)} onchange={(on) => toggle(v, on)}>{v}</Checkbox>
+            <Checkbox checked={picked.includes(v)} onchange={(on) => toggle(v, on)}>{label(v)}</Checkbox>
           </div>
         {:else}
           <p class="none">{t("filter.noMatch")}</p>
@@ -132,6 +126,7 @@
     gap: var(--sp-3);
   }
   .values {
+    min-height: 48px;
     max-height: 240px;
     overflow: auto;
     margin-top: -4px;

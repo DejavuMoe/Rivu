@@ -8,12 +8,10 @@ extend({
   "diag.range.7d": ["7 天", "7 days"],
   "diag.lastEvent": ["最后收到事件 {when}", "Last event {when}"],
   "diag.lastEvent.none": ["还没有收到事件", "No events yet"],
-  "diag.secAgo": ["{n} 秒前", "{n}s ago"],
 
   "diag.kpi.accepted": ["已接收", "Accepted"],
   "diag.kpi.dropped": ["已丢弃", "Dropped"],
   "diag.kpi.rate": ["丢弃率", "Drop rate"],
-  "diag.vsPrev": ["对比上一周期", "vs previous period"],
 
   "diag.chart.title": ["每{unit}事件数", "Events per {unit}"],
   "diag.unit.minute": ["分钟", "minute"],
@@ -46,8 +44,11 @@ extend({
   "diag.r.page_blocked.name": ["页面已屏蔽", "Page blocked"],
   "diag.r.country_blocked.name": ["国家已屏蔽", "Country blocked"],
   "diag.r.bot.name": ["机器人", "Bot"],
-  "diag.r.datacenter_ip.name": ["数据中心 IP", "Datacenter IP"],
-  "diag.r.datacenter_ip.why": ["访客 IP 属于云厂商或机房网段", "The visitor IP is in a datacenter range"],
+  "diag.r.datacenter_ip.name": ["数据中心 IP（历史）", "Datacenter IP (historical)"],
+  "diag.r.datacenter_ip.why": [
+    "旧版 Rivu 根据云厂商网段丢弃了这些事件，现已移除此过滤规则。",
+    "An earlier version of Rivu dropped these events based on cloud provider IP ranges. This filter has been removed.",
+  ],
   "diag.r.no_session.name": ["无会话的停留事件", "Engagement without session"],
   "diag.r.no_session.why": ["找不到对应的会话，通常是会话已过期", "No matching session, usually expired"],
   "diag.r.salt_missing.name": ["缺少盐值", "Salt missing"],
@@ -55,11 +56,9 @@ extend({
 
   "diag.ver.title": ["脚本版本", "Script versions"],
   "diag.ver.version": ["版本", "Version"],
-  "diag.ver.build": ["构建", "Build"],
   "diag.ver.events": ["事件数", "Events"],
   "diag.ver.last": ["最后出现", "Last seen"],
-  "diag.ver.outdated": ["已过时", "Outdated"],
-  "diag.ver.reinstall": ["查看安装代码", "View install code"],
+  "diag.ver.unknown": ["未标明", "Not reported"],
 
   "diag.empty.title": ["还没有收到这个站点的事件", "No events received for this site yet"],
   "diag.empty.body": ["安装统计脚本并有人访问后，事件会在几秒内出现。", "Events appear within seconds once the script is installed and visited."],
@@ -67,7 +66,7 @@ extend({
   "diag.error.title": ["诊断数据加载失败", "Couldn't load diagnostics"],
   "diag.error.body": ["已接收的数据没有丢失，请稍后重试。", "Collected data is safe. Try again shortly."],
   "diag.busy.title": ["查询排队中", "Queries queued"],
-  "diag.busy.body": ["并发查询已达上限，稍后自动重试。", "The concurrent query limit was reached. Retrying shortly."],
+  "diag.busy.body": ["并发查询已达上限，请稍后重试。", "The concurrent query limit was reached. Try again shortly."],
   "diag.timeout.title": ["查询超时", "Query timed out"],
   "diag.timeout.body": ["缩短时间范围后重试。", "Try a shorter time range."],
 });

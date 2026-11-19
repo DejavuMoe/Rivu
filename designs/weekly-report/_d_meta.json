@@ -20,7 +20,7 @@
       "versions": [
         {
           "path": "email.html",
-          "createdAt": "2026-11-19T03:06:32.039Z",
+          "createdAt": "2026-11-19T11:13:13.009Z",
           "status": "needs-review",
           "viewport": {
             "width": 1440,
@@ -31,5 +31,5 @@
     }
   },
   "createdAt": "2026-11-19T01:09:21.571Z",
-  "updatedAt": "2026-11-19T03:06:32.162Z"
+  "updatedAt": "2026-11-19T11:13:13.009Z"
 }

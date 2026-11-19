@@ -1,33 +1,22 @@
 <!--
-  左侧栏：组织切换与搜索 → 全部站点 → 站点列表 → 组织、文档 → 用户菜单。
-  侧栏只负责「去哪个站点」；站点内的看板 / 接入诊断 / 安装 / 设置在站点页头的标签栏里（SiteHeader）。
-  当前项用背景色表示，不加色条。onclose 有值时是移动端抽屉：顶部多一个关闭按钮，行高加大到 40px 便于触摸。
+  左侧栏：组织切换与搜索 → 全部站点 → 当前组织的站点 → 组织 → 用户菜单。owner / admin 在「站点」标题行右侧有添加站点的加号。
+  侧栏只负责「去哪个对象」；站点内的看板 / 接入诊断 / 安装 / 设置在页头的标签栏（SiteHeader），组织的成员 / API 密钥同理（OrgHeader）。
+  组织菜单里也有成员、API 密钥入口；只以站点访客身份可见的组织（菜单里标「访客权限」）没有这两页。当前项用背景色表示，不加色条。
+  onclose 有值时是移动端抽屉：顶部多一个关闭按钮，行高加大到 40px 便于触摸。
 -->
 <script lang="ts">
-  import {
-    BookOpen,
-    ChevronsUpDown,
-    KeyRound,
-    LayoutGrid,
-    LogOut,
-    Plus,
-    Search,
-    ShieldCheck,
-    Users,
-    X,
-  } from "@lucide/svelte";
+  import { ChevronsUpDown, KeyRound, LayoutGrid, LogOut, Plus, Search, ShieldCheck, Users, X } from "@lucide/svelte";
   import Popover from "../ui/Popover.svelte";
   import MenuItem from "../ui/MenuItem.svelte";
   import MenuLabel from "../ui/MenuLabel.svelte";
   import Avatar from "../ui/Avatar.svelte";
   import Logo from "../ui/Logo.svelte";
   import Kbd from "../ui/Kbd.svelte";
-  import LiveDot from "../ui/LiveDot.svelte";
   import Segmented from "../ui/Segmented.svelte";
   import { ORGS, USER } from "../data/fixtures";
   import { SITES } from "../data/sites.svelte";
   import { t } from "../i18n";
-  import { app, canManage, setLang, setTheme, type ThemePref, type Lang } from "../state.svelte";
+  import { app, canAddSite, setLang, setTheme, type ThemePref, type Lang } from "../state.svelte";
   import { href, navigate, route } from "../router.svelte";
 
   let {
@@ -58,7 +47,7 @@
         {#each ORGS as o (o.id)}
           <MenuItem
             checked={o.id === orgId}
-            hint={t(`role.${o.role}`)}
+            hint={o.role ? t(`role.${o.role}`) : t("sites.guest")}
             onclick={() => {
               orgId = o.id;
               close();
@@ -68,9 +57,11 @@
             {o.name}
           </MenuItem>
         {/each}
-        <MenuLabel separator />
-        <MenuItem icon={Users} onclick={() => { close(); navigate("/org/members"); }}>{t("nav.members")}</MenuItem>
-        <MenuItem icon={KeyRound} onclick={() => { close(); navigate("/org/api-keys"); }}>{t("nav.apiKeys")}</MenuItem>
+        {#if org.role}
+          <MenuLabel separator />
+          <MenuItem icon={Users} onclick={() => { close(); navigate("/org/members"); }}>{t("nav.members")}</MenuItem>
+          <MenuItem icon={KeyRound} onclick={() => { close(); navigate("/org/api-keys"); }}>{t("nav.apiKeys")}</MenuItem>
+        {/if}
       {/snippet}
     </Popover>
     {#if onclose}
@@ -91,33 +82,30 @@
       <span class="grow">{t("nav.allSites")}</span>
     </a>
 
-    <div class="group">
-      <span>{t("nav.sites")}</span>
-      {#if canManage()}
-        <a class="add" href={href("/sites/new")} aria-label={t("nav.addSite")} title={t("nav.addSite")}><Plus size={16} strokeWidth={1.75} /></a>
-      {/if}
-    </div>
+    {#if sites.length || canAddSite(orgId)}
+      <div class="group">
+        <span>{t("nav.sites")}</span>
+        {#if canAddSite(orgId)}
+          <a class="add" href={href("/sites/new")} aria-label={t("nav.addSite")} title={t("nav.addSite")}><Plus size={16} strokeWidth={1.75} /></a>
+        {/if}
+      </div>
+    {/if}
 
     {#each sites as s (s.id)}
       <a class="item" href={href(`/s/${s.id}`)} aria-current={s.id === currentSite ? "page" : undefined}>
         <Avatar name={s.name} shape="square" size={16} />
         <span class="grow">{s.name}</span>
-        {#if s.live > 0}
-          <span class="meta" title={t("dash.live", { n: s.live })}><LiveDot size={6} />{s.live}</span>
-        {/if}
       </a>
     {/each}
   </nav>
 
   <div class="bottom">
-    <a class="item" href={href("/org/members")} aria-current={seg[0] === "org" ? "page" : undefined}>
-      <Users size={16} strokeWidth={1.75} />
-      <span class="grow">{t("nav.org")}</span>
-    </a>
-    <a class="item" href="https://github.com/" target="_blank" rel="noreferrer">
-      <BookOpen size={16} strokeWidth={1.75} />
-      <span class="grow">{t("nav.docs")}</span>
-    </a>
+    {#if org.role}
+      <a class="item" href={href("/org/members")} aria-current={seg[0] === "org" ? "page" : undefined}>
+        <Users size={16} strokeWidth={1.75} />
+        <span class="grow">{t("nav.org")}</span>
+      </a>
+    {/if}
 
     <Popover width="trigger" side="top">
       {#snippet trigger({ toggle, props })}
@@ -309,14 +297,6 @@
   .add:hover {
     background: var(--bg-element);
     color: var(--text);
-  }
-  .meta {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    color: var(--text-muted);
-    font-size: var(--fs-sm);
-    font-variant-numeric: tabular-nums;
   }
   .bottom {
     display: flex;

@@ -57,6 +57,12 @@ export function setQuery(patch: Record<string, string | null>) {
   navigate(route.current.path + (qs ? "?" + qs : ""), { replace: true });
 }
 
+/** 登录后回到原来的页面：只接受站内的相对路径。 */
+export function safeNext(raw: string | null): string {
+  if (!raw || !raw.startsWith("/") || raw.startsWith("//") || raw.startsWith("/\\")) return "/sites";
+  return raw;
+}
+
 export function href(path: string) {
   return "#" + path;
 }

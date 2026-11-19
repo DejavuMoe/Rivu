@@ -1,6 +1,6 @@
 <!--
-  添加站点：域名（实时规范化）、名称（默认跟随域名）、时区。只有所有者和管理员能进，其他角色是 404 风格。
-  提交后跳到示例的未接入站点（站点 4）的安装页。
+  添加站点：域名（实时规范化）、名称（默认跟随域名）、时区。只有当前组织的所有者和管理员能进，其他角色（含只以站点访客身份可见的组织）是 404 风格。
+  提交后跳到示例的未接入站点（站点 4）的安装页。评审面板的数据状态为出错、排队、超时时，创建失败，只弹出失败提示、留在本页。
 -->
 <script lang="ts">
   import PageHeader from "../../lib/app/PageHeader.svelte";
@@ -9,9 +9,9 @@
   import Field from "../../lib/ui/Field.svelte";
   import Input from "../../lib/ui/Input.svelte";
   import NotFound from "../NotFound.svelte";
-  import TimezoneSelect from "./TimezoneSelect.svelte";
+  import TimezoneSelect from "../../lib/app/TimezoneSelect.svelte";
   import { t } from "../../lib/i18n";
-  import { canManage, toast } from "../../lib/state.svelte";
+  import { app, canAddSite, toast } from "../../lib/state.svelte";
   import { href, navigate } from "../../lib/router.svelte";
   import { isValidDomain, normalizeDomain } from "./domain";
   import "./strings";
@@ -37,6 +37,7 @@
   // 用户没有手动改过名称时，名称跟随规范化后的域名
   const shownName = $derived(nameTouched ? name : host);
   const showError = $derived(tried || (raw.trim().length > 0 && !hostOk && /\.[a-z0-9-]{2,}/i.test(raw)));
+  const unavailable = $derived(["error", "busy", "timeout"].includes(app.review.dataState));
 
   function submit(e: SubmitEvent) {
     e.preventDefault();
@@ -46,13 +47,17 @@
     const label = shownName.trim() || host;
     setTimeout(() => {
       busy = false;
+      if (unavailable) {
+        toast(t("as.failed"), "bad");
+        return;
+      }
       toast(t("as.created", { name: label }), "good");
       navigate("/s/4/install");
     }, 650);
   }
 </script>
 
-{#if !canManage()}
+{#if !canAddSite()}
   <NotFound />
 {:else}
   <div class="page">

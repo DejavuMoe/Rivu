@@ -35,13 +35,14 @@
     .preview-fields { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px; margin-top: 8px; font-size: 12px; }
     .preview-fields label { display: inline-flex; align-items: center; gap: 6px; }
     .stage { display: grid; justify-items: center; gap: 16px; padding: 24px 16px 48px; }
-    .envelope { width: 100%; max-width: var(--frame, 600px); display: grid; gap: 4px; font-size: 12px; }
-    .envelope div { display: grid; grid-template-columns: 64px minmax(0, 1fr); gap: 8px; }
+    .envelope { width: 100%; max-width: var(--frame, 600px); display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 8px; font-size: 12px; }
+    .envelope div { display: contents; }
     .envelope dt { color: var(--text-muted); }
     .envelope dd { overflow-wrap: anywhere; }
     .envelope #subject { font-size: 14px; font-weight: 600; }
     .frame { width: 100%; max-width: var(--frame, 600px); border: var(--hairline) solid var(--border-subtle); border-radius: var(--r-md); background: var(--bg-app); overflow: hidden; }
     iframe { display: block; width: 100%; height: 480px; border: 0; }
+    #unsubscribe-frame { background: #ffffff; color-scheme: light; }
     pre { margin: 0; padding: 20px; font: 14px/1.6 var(--font-mono); white-space: pre-wrap; overflow-wrap: anywhere; }
     @media (max-width: 520px) {
       .preview-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -54,21 +55,24 @@
     <summary data-copy="preview"></summary>
     <div class="preview-fields">
       <label><span data-copy="mail"></span>
-        <select id="mail"><option value="report" data-copy="report"></option><option value="code" data-copy="code"></option></select>
+        <select id="mail"><option value="report" data-copy="report"></option><option value="code" data-copy="code"></option><option value="unsubscribe" data-copy="unsubscribe"></option></select>
       </label>
-      <label><span data-copy="language"></span>
+      <label id="language-field"><span data-copy="language"></span>
         <select id="language"><option value="zh-CN" lang="zh-CN">简体中文</option><option value="en" lang="en">English</option></select>
       </label>
       <label id="fixture-field"><span data-copy="fixture"></span>
         <select id="fixture"><option value="studio" data-copy="studio"></option><option value="quiet" data-copy="quiet"></option><option value="large" data-copy="large"></option></select>
       </label>
-      <label><span data-copy="version"></span>
+      <label id="unsubscribe-page-field" hidden><span data-copy="unsubscribePage"></span>
+        <select id="unsubscribe-page"><option value="confirm" data-copy="pageConfirm"></option><option value="done" data-copy="pageDone"></option><option value="expired" data-copy="pageExpired"></option></select>
+      </label>
+      <label id="version-field"><span data-copy="version"></span>
         <select id="version"><option value="html">HTML</option><option value="text" data-copy="text"></option><option value="current" data-copy="current"></option></select>
       </label>
       <label><span data-copy="width"></span>
         <select id="width"><option value="600">600 px</option><option value="360">360 px</option></select>
       </label>
-      <label><span data-copy="scheme"></span>
+      <label id="scheme-field"><span data-copy="scheme"></span>
         <select id="scheme"><option value="light" data-copy="light"></option><option value="dark" data-copy="dark"></option></select>
       </label>
     </div>
@@ -79,11 +83,13 @@
       <div><dt data-copy="from"></dt><dd id="from">Rivu &lt;rivu@example.com&gt;</dd></div>
       <div><dt data-copy="to"></dt><dd id="to"></dd></div>
       <div><dt data-copy="subject"></dt><dd id="subject"></dd></div>
+      <div id="list-unsubscribe-row"><dt data-copy="listUnsubscribe"></dt><dd id="list-unsubscribe"></dd></div>
       <div id="preheader-row"><dt data-copy="preheader"></dt><dd id="preheader"></dd></div>
     </dl>
     <div class="frame">
       <iframe id="message" title=""></iframe>
       <pre id="plain" hidden></pre>
+      <iframe id="unsubscribe-frame" title="" sandbox="allow-same-origin" hidden></iframe>
     </div>
   </main>
 
@@ -94,6 +100,9 @@
       large: ["跨年、大数值", "Year boundary, large values"], version: ["版本", "Version"], text: ["纯文本", "Plain text"],
       current: ["现行纯文本", "Current plain text"], width: ["宽度", "Width"], scheme: ["外观", "Appearance"], light: ["浅色", "Light"], dark: ["深色", "Dark"],
       from: ["发件人", "From"], to: ["收件人", "To"], subject: ["主题", "Subject"], preheader: ["摘要", "Preview"],
+      listUnsubscribe: ["List-Unsubscribe", "List-Unsubscribe"],
+      unsubscribe: ["退订页（现行）", "Current unsubscribe page"], unsubscribePage: ["页面", "Page"],
+      pageConfirm: ["确认页", "Confirmation"], pageDone: ["已退订", "Unsubscribed"], pageExpired: ["链接过期或已关闭", "Expired or already off"],
     };
 
     const base = "https://rivu.example.com";
@@ -104,6 +113,17 @@
     };
     const recipient = "viewer@example.com";
     const sampleCode = "q7Rk2vX9mB4nT0pL8sW1yZ3cF6hJ5dG2aE7uK9wQ0rM";
+    const unsubscribeUrl = `${base}/api/weekly-report/unsubscribe/U-T6YSW5Iz5wLwwUwOIRmlrLLTd32AZim_9uftvAePg`;
+    const unsubscribePages = {
+      confirm: `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Unsubscribe · Rivu</title>
+        <h1>Unsubscribe from Rivu weekly reports</h1>
+        <p lang="zh">退订 Rivu 周报</p>
+        <form method="post"><button>Unsubscribe · <span lang="zh">退订</span></button></form></html>`,
+      done: `<!doctype html><html lang="en"><meta charset="utf-8"><title>Rivu weekly reports</title>
+        <p>You have unsubscribed from Rivu weekly reports for this site.</p><p lang="zh">你已退订此站点的 Rivu 周报。</p></html>`,
+      expired: `<!doctype html><html lang="en"><meta charset="utf-8"><title>Rivu weekly reports</title>
+            <p>This link has expired or the subscription is already off.</p><p lang="zh">退订链接已过期，或订阅已关闭。</p></html>`,
+    };
 
     const strings = {
       zh: {
@@ -114,6 +134,7 @@
         open: "打开看板",
         reason: (f) => `你订阅了 ${f.site} 的周报，收件地址 ${recipient}。`,
         manage: "管理周报",
+        unsubscribe: "退订周报",
         codeSubject: "Rivu 周报确认码",
         codeTitle: "确认周报订阅",
         codeLead: (f) => `在 Rivu 的「我的周报」中粘贴下面的确认码，开通 ${f.site} 的周报。`,
@@ -129,6 +150,7 @@
         open: "Open dashboard",
         reason: (f) => `You subscribed to the weekly report for ${f.site} at ${recipient}.`,
         manage: "Manage weekly report",
+        unsubscribe: "Unsubscribe",
         codeSubject: "Rivu weekly report confirmation code",
         codeTitle: "Confirm your weekly report",
         codeLead: (f) => `Paste this code into My weekly report in Rivu to turn on the weekly report for ${f.site}.`,
@@ -146,7 +168,7 @@
     const mono = "'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, 'Courier New', monospace";
 
     const byId = (id) => document.getElementById(id);
-    const ui = { mail: byId("mail"), language: byId("language"), fixture: byId("fixture"), version: byId("version"), width: byId("width"), scheme: byId("scheme") };
+    const ui = { mail: byId("mail"), language: byId("language"), fixture: byId("fixture"), unsubscribePage: byId("unsubscribe-page"), version: byId("version"), width: byId("width"), scheme: byId("scheme") };
     const english = () => ui.language.value === "en";
     const t = (key) => copy[key][english() ? 1 : 0];
     const escape = (value) => String(value).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
@@ -247,6 +269,7 @@ ${quiet ? text("muted", escape(s.noVisits), "margin-top:8px;") : ""}
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr><td class="line" style="border-top:1px solid ${c.line};padding-top:16px;">
 ${text("muted", escape(s.reason(f)))}
 ${text("muted", `<a class="lk" href="${base}/s/${f.id}/settings/weekly-report" style="color:${c.link};text-decoration:underline;">${escape(s.manage)}</a>`, "margin-top:4px;")}
+${text("muted", `<a class="lk" href="${unsubscribeUrl}" style="color:${c.link};text-decoration:underline;">${escape(s.unsubscribe)}</a>`, "margin-top:4px;")}
 </td></tr></table>
 </td></tr>`;
       return shell({ lang: lang === "zh" ? "zh-CN" : "en", title: s.reportSubject(f, p), preheader: s.reportPreheader(n), scheme, body });
@@ -289,7 +312,7 @@ ${text("muted", escape(s.codeIgnore))}
         `${s.visitors}${s.colon}${n.visitors}`, `${s.visits}${s.colon}${n.visits}`, `${s.pageviews}${s.colon}${n.pageviews}`,
         ...(f.visitors + f.visits + f.pageviews === 0 ? [s.noVisits] : []), "",
         `${s.open}${s.colon}${base}/s/${f.id}`, "",
-        s.reason(f), `${s.manage}${s.colon}${base}/s/${f.id}/settings/weekly-report`, "",
+        s.reason(f), `${s.manage}${s.colon}${base}/s/${f.id}/settings/weekly-report`, `${s.unsubscribe}${s.colon}${unsubscribeUrl}`, "",
       ].join("\n");
     }
 
@@ -306,31 +329,49 @@ ${text("muted", escape(s.codeIgnore))}
           : { subject: "Rivu weekly report confirmation code", body: `Paste this code into Rivu within 15 minutes.\n\n${sampleCode}\n` };
       }
       return lang === "zh"
-        ? { subject: "Rivu 周报", body: `${f.site}\n${f.from} 至 ${f.to}（${f.tz}）\n\n访客：${f.visitors}\n访问：${f.visits}\n浏览量：${f.pageviews}\n\n查看仪表盘：${link}\n` }
-        : { subject: "Rivu weekly report", body: `${f.site}\n${f.from} to ${f.to} (${f.tz})\n\nVisitors: ${f.visitors}\nVisits: ${f.visits}\nPageviews: ${f.pageviews}\n\nView dashboard: ${link}\n` };
+        ? { subject: "Rivu 周报", body: `${f.site}\n${f.from} 至 ${f.to}（${f.tz}）\n\n访客：${f.visitors}\n访问：${f.visits}\n浏览量：${f.pageviews}\n\n查看仪表盘：${link}\n退订周报：${unsubscribeUrl}\n` }
+        : { subject: "Rivu weekly report", body: `${f.site}\n${f.from} to ${f.to} (${f.tz})\n\nVisitors: ${f.visitors}\nVisits: ${f.visits}\nPageviews: ${f.pageviews}\n\nView dashboard: ${link}\nUnsubscribe: ${unsubscribeUrl}\n` };
     }
 
     const frame = byId("message");
     const plain = byId("plain");
-    function fit() {
-      const doc = frame.contentDocument;
-      if (doc?.body) frame.style.height = `${doc.body.scrollHeight}px`;
+    const pageFrame = byId("unsubscribe-frame");
+    function fit(target = frame) {
+      const doc = target.contentDocument;
+      // The unsubscribe page keeps the browser's default body margin, which body.scrollHeight leaves out.
+      if (doc?.body) target.style.height = `${target === pageFrame ? doc.documentElement.offsetHeight : doc.body.scrollHeight}px`;
     }
-    frame.addEventListener("load", fit);
+    frame.addEventListener("load", () => fit(frame));
+    pageFrame.addEventListener("load", () => fit(pageFrame));
 
     function render() {
       const lang = english() ? "en" : "zh";
       const kind = ui.mail.value;
-      const f = fixtures[kind === "code" ? "studio" : ui.fixture.value];
+      const notice = kind === "unsubscribe";
+      const f = fixtures[kind === "report" ? ui.fixture.value : "studio"];
       const scheme = ui.scheme.value;
       const dark = scheme === "dark";
       document.documentElement.lang = ui.language.value;
       document.documentElement.style.colorScheme = dark ? "dark" : "light";
       document.title = `${t(kind)} – Rivu`;
       document.querySelectorAll("[data-copy]").forEach((node) => setText(node, t(node.dataset.copy)));
-      byId("fixture-field").hidden = kind === "code";
+      byId("fixture-field").hidden = kind !== "report";
+      for (const id of ["language-field", "version-field", "scheme-field"]) byId(id).hidden = notice;
+      byId("unsubscribe-page-field").hidden = !notice;
+      byId("envelope").hidden = notice;
       byId("stage").style.setProperty("--frame", `${ui.width.value}px`);
       setText(byId("to"), recipient);
+
+      pageFrame.hidden = !notice;
+      if (notice) {
+        const next = unsubscribePages[ui.unsubscribePage.value];
+        frame.hidden = true;
+        plain.hidden = true;
+        pageFrame.title = next.match(/<title>([^<]*)<\/title>/)[1];
+        if (pageFrame.srcdoc !== next) pageFrame.srcdoc = next;
+        else fit(pageFrame);
+        return;
+      }
 
       const s = strings[lang];
       let subject;
@@ -349,6 +390,8 @@ ${text("muted", escape(s.codeIgnore))}
         setText(plain, codeText(f, lang));
       }
       setText(byId("subject"), subject);
+      byId("list-unsubscribe-row").hidden = kind !== "report";
+      setText(byId("list-unsubscribe"), kind === "report" ? `<${unsubscribeUrl}>` : "");
       setText(byId("preheader"), preheader);
       byId("preheader-row").hidden = ui.version.value !== "html";
       const html = ui.version.value === "html";
@@ -358,13 +401,13 @@ ${text("muted", escape(s.codeIgnore))}
       if (html) {
         const next = kind === "report" ? reportHtml(f, lang, scheme) : codeHtml(f, lang, scheme);
         if (frame.srcdoc !== next) frame.srcdoc = next;
-        else fit();
+        else fit(frame);
       }
     }
 
     Object.values(ui).forEach((control) => { control.onchange = render; });
-    window.addEventListener("resize", fit);
-    window.__weeklyReportEmail = { reportHtml, codeHtml, reportText, codeText, current, fixtures, sampleCode };
+    window.addEventListener("resize", () => { fit(frame); fit(pageFrame); });
+    window.__weeklyReportEmail = { reportHtml, codeHtml, reportText, codeText, current, fixtures, sampleCode, unsubscribeUrl, unsubscribePages };
     render();
   </script>
 </body>

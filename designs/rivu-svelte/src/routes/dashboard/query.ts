@@ -1,9 +1,10 @@
 // 看板的「查询」：把 URL 里的看板状态（范围、对比、粒度、筛选）换算成模拟结果。
 // 正式实现里这一层换成 POST /api/internal/sites/{id}/query（QuerySpec），组件不变。
 
-import { breakdown, daily, hourly, monthly, NOW, type Point, type Row, type Site } from "../../lib/data/fixtures";
+import { breakdown, daily, hourly, monthly, NOW, type Point, type Row as FixtureRow, type Site } from "../../lib/data/fixtures";
 import { dateShort, hourLabel, dateLong } from "../../lib/format";
-import type { Lang } from "../../lib/state.svelte";
+import { app, type Lang } from "../../lib/state.svelte";
+import { cfgs, INSTANCE_RETENTION } from "../settings/store.svelte";
 
 export type RangeKey =
   | "realtime"
@@ -45,6 +46,42 @@ export const RANGES: RangeKey[][] = [
 
 export const METRICS: MetricKey[] = ["visitors", "visits", "pageviews", "views_per_visit", "bounce_rate", "visit_duration"];
 
+/** 自定义属性的界面维度名：`prop:<键>`。 */
+export const PROP_PREFIX = "prop:";
+
+export function isPropDim(dim: string): boolean {
+  return dim.startsWith(PROP_PREFIX) && dim.length > PROP_PREFIX.length;
+}
+
+/** 可以按它筛选的维度，顺序即筛选对话框里的顺序。 */
+export const DIMS = [
+  "goal",
+  "page",
+  "entry_page",
+  "exit_page",
+  "hostname",
+  "source",
+  "channel",
+  "referrer",
+  "utm_source",
+  "utm_medium",
+  "utm_campaign",
+  "country",
+  "region",
+  "city",
+  "device",
+  "browser",
+  "os",
+];
+
+/** 只有国家级地理库时没有意义的维度。 */
+export const CITY_LEVEL_DIMS = new Set(["region", "city"]);
+
+/** 维度允许的筛选条件：目标只能按名字等于 / 不等于。 */
+export function opsFor(dim: string): Op[] {
+  return dim === "goal" ? ["is", "is_not"] : ["is", "is_not", "contains"];
+}
+
 /** 每个范围允许的粒度，第一个是默认值。 */
 export function grans(range: RangeKey): Gran[] {
   switch (range) {
@@ -69,31 +106,62 @@ export function grans(range: RangeKey): Gran[] {
 
 // ---------- URL 编解码 ----------
 
+const OPS = new Set<Op>(["is", "is_not", "contains", "contains_not"]);
+const RANGE_SET = new Set(RANGES.flat());
+
 export function decodeFilters(s: string | null): Filter[] {
   if (!s) return [];
-  return s
-    .split(";")
-    .map((p) => {
-      const [dim, op, v] = p.split("~");
-      return { dim, op: op as Op, values: (v ?? "").split("|").filter(Boolean).map(decodeURIComponent) };
-    })
-    .filter((f) => f.dim && f.op && f.values.length);
+  const out: Filter[] = [];
+  for (const p of s.split(";")) {
+    const [rawDim, op, v] = p.split("~");
+    let dim = rawDim;
+    try {
+      dim = decodeURIComponent(rawDim ?? "");
+    } catch {
+      continue;
+    }
+    if (!dim || !(DIMS.includes(dim) || isPropDim(dim)) || !OPS.has(op as Op)) continue;
+    if (dim === "goal" && op !== "is" && op !== "is_not") continue;
+    const values = (v ?? "")
+      .split("|")
+      .filter(Boolean)
+      .map((x) => {
+        try {
+          return decodeURIComponent(x);
+        } catch {
+          return x;
+        }
+      });
+    if (!values.length) continue;
+    // 一个维度只有一条筛选（后出现的覆盖前面的）
+    const f = { dim, op: op as Op, values };
+    const same = out.findIndex((x) => x.dim === dim);
+    if (same >= 0) out[same] = f;
+    else out.push(f);
+  }
+  return out;
 }
 
 export function encodeFilters(fs: Filter[]): string {
-  return fs.map((f) => [f.dim, f.op, f.values.map(encodeURIComponent).join("|")].join("~")).join(";");
+  // encodeURIComponent 不编码 ~，而 ~ 是这里的字段分隔符
+  const enc = (v: string) => encodeURIComponent(v).replaceAll("~", "%7E");
+  // 维度名也编码：属性键里可能有分隔符
+  return fs.map((f) => [enc(f.dim), f.op, f.values.map(enc).join("|")].join("~")).join(";");
 }
 
 export function readState(q: URLSearchParams): DashState {
-  const range = (q.get("range") as RangeKey) || "30d";
+  const rawRange = q.get("range") as RangeKey;
+  const range: RangeKey = RANGE_SET.has(rawRange) ? rawRange : "30d";
   const allowed = grans(range);
   const gran = allowed.includes(q.get("gran") as Gran) ? (q.get("gran") as Gran) : allowed[0];
-  let metric = (q.get("metric") as MetricKey) || "visitors";
+  const rawMetric = q.get("metric") as MetricKey;
+  let metric: MetricKey = METRICS.includes(rawMetric) ? rawMetric : "visitors";
   // 实时只有访客与浏览量两条曲线
   if (range === "realtime" && metric !== "pageviews") metric = "visitors";
+  const rawCmp = q.get("cmp") as CompareKey;
   return {
     range,
-    compare: (q.get("cmp") as CompareKey) || "previous_period",
+    compare: rawCmp === "off" || rawCmp === "year_over_year" ? rawCmp : "previous_period",
     gran,
     metric,
     filters: decodeFilters(q.get("f")),
@@ -103,11 +171,26 @@ export function readState(q: URLSearchParams): DashState {
 // ---------- 结果 ----------
 
 export interface Kpi {
-  /** current：实时在线（只在 realtime 范围出现，不能作为主图指标） */
+  /** current：当前在线（只在实时视图出现，不能作为主图指标） */
   key: MetricKey | "current";
   value: number;
   prev: number | null;
-  spark: number[];
+}
+
+/** 分解行：维度取值（服务端的原始取值，显示名见 values.ts）与访客数。 */
+export interface Row {
+  label: string;
+  visitors: number;
+}
+
+export interface GoalRow {
+  /** 目标的名字 */
+  label: string;
+  visitors: number;
+  /** 完成次数 */
+  events: number;
+  /** 0–1 */
+  cr: number;
 }
 
 export interface DashResult {
@@ -121,14 +204,73 @@ export interface DashResult {
   totalVisitors: number;
   factor: number;
   breakdown: (dim: string) => Row[];
-  /** 选中范围的文字描述（用于对比说明等） */
+  /** 每个有转化的目标一行（没有时整张目标卡片不显示） */
+  goals: GoalRow[];
+  /** 范围伸到了原始数据保留期之前、而日汇总层答不了这次查询（meta.warnings: range_beyond_raw_retention） */
+  beyondRetention: boolean;
+  /** 导入的历史数据没有算进这次查询（meta.warnings: imported_data_excluded） */
+  importedExcluded: boolean;
+}
+
+// ---------- 分解的原始取值 ----------
+
+/** 夹具里没有的维度：按份额生成。 */
+const EXTRA_DIMS: Record<string, [string, number][]> = {
+  utm_source: [
+    ["newsletter", 0.05],
+    ["twitter", 0.03],
+    ["hackernews", 0.02],
+  ],
+  utm_medium: [
+    ["email", 0.05],
+    ["social", 0.035],
+    ["cpc", 0.012],
+  ],
+};
+
+/** 夹具里的地区代码 → ISO 3166-2（服务端存 `<国家>-<第一级子区划代码>`，界面原样显示代码）。 */
+const REGION_ISO: Record<string, string> = { "CN-SH": "CN-31", "CN-BJ": "CN-11", "CN-GD": "CN-44", "CN-ZJ": "CN-33" };
+
+/** 服务端返回的是原始取值（国家是 ISO 代码，地区是 ISO 3166-2），中文名、国家名在界面按语言翻译。 */
+function rawLabel(dim: string, r: FixtureRow): string {
+  if (dim === "country") return r.code ?? r.label;
+  if (dim === "region") return r.code ? (REGION_ISO[r.code] ?? r.code) : r.label;
+  return r.label;
+}
+
+function rowsFor(site: Site, dim: string, total: number): Row[] {
+  if (dim === "hostname") {
+    return [
+      { label: site.domain, visitors: Math.max(1, Math.round(total * 0.86)) },
+      { label: `www.${site.domain}`, visitors: Math.max(1, Math.round(total * 0.14)) },
+    ];
+  }
+  const extra = EXTRA_DIMS[dim];
+  if (extra) return extra.map(([label, share]) => ({ label, visitors: Math.max(1, Math.round(total * share)) }));
+  return breakdown(site, dim, total).map((r) => ({ label: rawLabel(dim, r), visitors: r.visitors }));
+}
+
+/** 筛选对话框里的候选值：该维度的排行。 */
+export function suggestValues(site: Site, dim: string): string[] {
+  return site.scale === 0 ? [] : rowsFor(site, dim, 10000).map((r) => r.label);
+}
+
+/** 这个维度自己的筛选作用在排行上：等于只留所选值，不等于去掉所选值，包含按子串匹配。 */
+function applyOwn(rows: Row[], own: Filter | undefined): Row[] {
+  if (!own) return rows;
+  const hit = (label: string) =>
+    own.op === "is" || own.op === "is_not"
+      ? own.values.includes(label)
+      : own.values.some((v) => label.toLowerCase().includes(v.toLowerCase()));
+  const keep = own.op === "is" || own.op === "contains";
+  return rows.filter((r) => hit(r.label) === keep);
 }
 
 /** 筛选把流量按份额缩小：is 取所选值的份额之和，is_not 取剩余，contains 估 30%。 */
 function filterFactor(site: Site, filters: Filter[]): number {
   let f = 1;
   for (const flt of filters) {
-    const rows = breakdown(site, flt.dim, 10000);
+    const rows = rowsFor(site, flt.dim, 10000);
     const picked = rows.filter((r) => flt.values.includes(r.label)).reduce((a, r) => a + r.visitors, 0) / 10000;
     const share = Math.min(1, picked || 0.05);
     if (flt.op === "is") f *= Math.max(0.02, share);
@@ -137,6 +279,111 @@ function filterFactor(site: Site, filters: Filter[]): number {
     else f *= 0.7;
   }
   return f;
+}
+
+// ---------- 模拟的请求 ----------
+
+export function isAbort(e: unknown): boolean {
+  return e instanceof DOMException && e.name === "AbortError";
+}
+
+/** 模拟一次请求：隔一小会儿返回；中途取消就中止；评审开关选了出错、排队、超时时失败。 */
+export function simulateFetch<T>(value: () => T, signal: AbortSignal, ms = 300): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const id = setTimeout(() => {
+      const ds = app.review.dataState;
+      if (ds === "error" || ds === "busy" || ds === "timeout") reject(new Error(ds));
+      else resolve(value());
+    }, ms);
+    signal.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(id);
+        reject(new DOMException("Aborted", "AbortError"));
+      },
+      { once: true },
+    );
+  });
+}
+
+// ---------- 地理库 ----------
+
+/** 地理库的署名：服务端随含位置维度的查询一起返回，文字固定是英文。 */
+export const GEO_ATTRIBUTION = { text: "IP Geolocation by DB-IP", url: "https://db-ip.com" };
+
+/**
+ * 地理库能不能到地区级。正式实现取自查询返回的 meta.geo_capability（默认的 DB-IP Lite 只有国家级）；
+ * 原型里跟着站点设置的地理精度，选「国家」时看板只有国家。城市级没有名称，看板不显示城市。
+ */
+export function geoHasRegions(site: Site): boolean {
+  return (cfgs[site.id]?.geo ?? "city") !== "country";
+}
+
+// ---------- 提示：保留期与导入 ----------
+
+const DAY = 864e5;
+
+interface Span {
+  start: Date;
+  end: Date;
+}
+
+/** 站点已完成的导入覆盖的日期范围。 */
+function importedSpan(site: Site): Span | null {
+  const done = (cfgs[site.id]?.imports ?? []).filter((i) => i.status === "completed" && i.from && i.to);
+  if (!done.length) return null;
+  const from = Math.min(...done.map((i) => Date.parse(`${i.from}T00:00:00`)));
+  const to = Math.max(...done.map((i) => Date.parse(`${i.to}T23:59:59`)));
+  return { start: new Date(from), end: new Date(to) };
+}
+
+/** 每个范围的时间区间（大致：只用来判断它和保留期、导入的日期有没有交集）。 */
+function intervalOf(site: Site, s: DashState): Span {
+  const y = NOW.getFullYear();
+  const m = NOW.getMonth();
+  const today = new Date(y, m, NOW.getDate());
+  const daysAgo = (n: number) => new Date(today.getTime() - n * DAY);
+  const start = {
+    realtime: new Date(NOW.getTime() - 30 * 60_000),
+    "24h": new Date(NOW.getTime() - DAY),
+    day: today,
+    "7d": daysAgo(6),
+    "30d": daysAgo(29),
+    month: new Date(y, m, 1),
+    "6mo": new Date(y, m - 5, 1),
+    "12mo": new Date(y, m - 11, 1),
+    year: new Date(y, 0, 1),
+    all: importedSpan(site)?.start ?? daysAgo(site.createdDaysAgo),
+  }[s.range];
+  return { start, end: NOW };
+}
+
+function compareOf(s: DashState, iv: Span): Span | null {
+  if (s.compare === "off" || s.range === "realtime") return null;
+  if (s.compare === "year_over_year") {
+    const back = (d: Date) => new Date(d.getFullYear() - 1, d.getMonth(), d.getDate(), d.getHours(), d.getMinutes());
+    return { start: back(iv.start), end: back(iv.end) };
+  }
+  return { start: new Date(iv.start.getTime() - (iv.end.getTime() - iv.start.getTime())), end: iv.start };
+}
+
+/**
+ * 日汇总层答不了的查询：原始层里保留期之前的天没有数据，导入的天（只在汇总层）算不进来。
+ * 汇总层能答的查询（整本地日的范围、天以上的粒度、没有筛选）没有这两个提示；规则见 system-design §6.4。
+ */
+function warningsOf(site: Site, s: DashState): { beyondRetention: boolean; importedExcluded: boolean } {
+  const compatible = !s.filters.length && s.range !== "realtime" && s.range !== "24h" && s.gran !== "minute" && s.gran !== "hour";
+  if (compatible) return { beyondRetention: false, importedExcluded: false };
+  const iv = intervalOf(site, s);
+  const cmp = compareOf(s, iv);
+  const spans = cmp ? [iv, cmp] : [iv];
+  const keep = Number(cfgs[site.id]?.retention) || INSTANCE_RETENTION;
+  const since = NOW.getTime() - keep * DAY;
+  const imported = importedSpan(site);
+  return {
+    beyondRetention: spans.some((x) => x.start.getTime() < since),
+    importedExcluded: !!imported && spans.some((x) => x.start.getTime() <= imported.end.getTime() && x.end.getTime() >= imported.start.getTime()),
+  };
 }
 
 function minuteSeries(site: Site): Point[] {
@@ -254,32 +501,44 @@ function total(points: Point[], key: MetricKey): number {
   }
 }
 
-export function runQuery(site: Site, s: DashState, lang: Lang): DashResult {
+/** blank：范围里一条数据也没有（实时视图不显示空状态，所有数字都是 0）。 */
+export function runQuery(site: Site, s: DashState, lang: Lang, blank = false): DashResult {
   const factor = filterFactor(site, s.filters);
-  const points = series(site, s, factor, false);
+  const zeroed = (ps: Point[]): Point[] =>
+    ps.map((p) => ({ ...p, visitors: 0, visits: 0, pageviews: 0, bounce_rate: 0, visit_duration: 0, views_per_visit: 0 }));
+  const points = blank ? zeroed(series(site, s, factor, false)) : series(site, s, factor, false);
   const cmpOn = s.compare !== "off" && s.range !== "realtime";
   const prevPoints = cmpOn ? series(site, s, factor, true).slice(-points.length) : null;
   const { x, tip } = labels(points, s.gran, lang);
   const prevTip = prevPoints ? labels(prevPoints, s.gran, lang).tip : [];
   // 每个范围都包含「现在」（过去 N 天含今天，6mo、12mo 含本月），最后一个桶都不完整
   const partialLast = true;
-  // 每个范围都包含「现在」，最后一个桶都不完整（6mo、12mo 包含本月）
   let kpis: Kpi[] = METRICS.map((key) => ({
     key,
     value: total(points, key),
     prev: prevPoints ? total(prevPoints, key) : null,
-    spark: points.map((p) => p[key] as number),
   }));
   if (s.range === "realtime") {
     // 实时：当前在线（过去 5 分钟）+ 过去 30 分钟的独立访客与浏览量；每分钟访客不能相加
     const uniq = Math.round(points.reduce((a, p) => a + p.visitors, 0) * 0.31);
     kpis = [
-      { key: "current", value: site.live, prev: null, spark: [] },
-      { key: "visitors", value: uniq, prev: null, spark: [] },
-      { key: "pageviews", value: total(points, "pageviews"), prev: null, spark: [] },
+      { key: "current", value: blank ? 0 : site.live, prev: null },
+      { key: "visitors", value: uniq, prev: null },
+      { key: "pageviews", value: total(points, "pageviews"), prev: null },
     ];
   }
   const totalVisitors = kpis.find((k) => k.key === "visitors")!.value;
+  const ownOf = (dim: string) => s.filters.find((f) => f.dim === dim);
+
+  // 每个目标一行（只有有转化的目标）：完成次数按每个访客的平均次数估，转化率是转化访客占全部访客的份额
+  const goals: GoalRow[] = blank
+    ? []
+    : applyOwn(rowsFor(site, "goal", totalVisitors), ownOf("goal")).map((r, i) => ({
+        label: r.label,
+        visitors: r.visitors,
+        events: Math.round(r.visitors * [1.3, 2.4, 1.1, 1.6][i % 4]),
+        cr: totalVisitors ? Math.min(1, r.visitors / totalVisitors) : 0,
+      }));
 
   return {
     points,
@@ -291,10 +550,8 @@ export function runQuery(site: Site, s: DashState, lang: Lang): DashResult {
     kpis,
     totalVisitors,
     factor,
-    breakdown: (dim) => {
-      const rows = breakdown(site, dim, totalVisitors);
-      const own = s.filters.find((f) => f.dim === dim && f.op === "is");
-      return own ? rows.filter((r) => own.values.includes(r.label)) : rows;
-    },
+    breakdown: (dim) => (blank ? [] : applyOwn(rowsFor(site, dim, totalVisitors), ownOf(dim))),
+    goals,
+    ...warningsOf(site, s),
   };
 }

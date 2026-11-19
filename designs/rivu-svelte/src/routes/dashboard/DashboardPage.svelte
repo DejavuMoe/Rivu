@@ -6,6 +6,7 @@
 <script lang="ts">
   import { ChartSpline, CircleAlert, Clock, Download, Hourglass, Inbox, Share2, Table2 } from "@lucide/svelte";
   import SiteHeader from "../../lib/app/SiteHeader.svelte";
+  import Callout from "../../lib/ui/Callout.svelte";
   import Card from "../../lib/ui/Card.svelte";
   import Button from "../../lib/ui/Button.svelte";
   import Segmented from "../../lib/ui/Segmented.svelte";
@@ -14,15 +15,29 @@
   import Table from "../../lib/ui/Table.svelte";
   import TrendChart from "../../lib/charts/TrendChart.svelte";
   import { t } from "../../lib/i18n";
-  import { app, canEdit, toast } from "../../lib/state.svelte";
+  import { app, canEdit, siteAccess, toast } from "../../lib/state.svelte";
   import { delta } from "../../lib/format";
   import { href, route, setQuery } from "../../lib/router.svelte";
   import { propertyKeys, type Site } from "../../lib/data/fixtures";
   import FilterBar from "./FilterBar.svelte";
   import KpiStrip from "./KpiStrip.svelte";
   import BreakdownCard from "./BreakdownCard.svelte";
+  import GoalsCard from "./GoalsCard.svelte";
   import PropsCard from "./PropsCard.svelte";
-  import { encodeFilters, grans, readState, runQuery, type Filter, type Gran, type MetricKey } from "./query";
+  import {
+    CITY_LEVEL_DIMS,
+    DIMS,
+    GEO_ATTRIBUTION,
+    encodeFilters,
+    geoHasRegions,
+    grans,
+    readState,
+    runQuery,
+    suggestValues,
+    type Filter,
+    type Gran,
+    type MetricKey,
+  } from "./query";
   import { fmtAxis, fmtMetric, lowerIsBetter } from "./metrics";
 
   let { site, mode = "app" }: { site: Site; mode?: "app" | "shared" } = $props();
@@ -30,12 +45,21 @@
 
   const dash = $derived(readState(route.current.query));
   const view = $derived(route.current.query.get("view") === "table" ? "table" : "chart");
+  const realtime = $derived(dash.range === "realtime");
   const ds = $derived(app.review.dataState);
-  const noData = $derived(site.scale === 0 || ds === "empty");
   const loading = $derived(ds === "loading");
   const failed = $derived(ds === "error" || ds === "busy" || ds === "timeout");
+  /** 数据到齐了：提示条、地理库署名、目标与属性卡片都要等到这时才出现 */
+  const settled = $derived(!loading && !failed);
+  /** 范围内没有数据。实时视图没有空状态，数字都是 0 */
+  const noData = $derived(site.scale === 0 || ds === "empty");
+  const empty = $derived(settled && noData && !realtime);
+  /** 站点从来没有收到过数据（决定空状态的文案与动作）；带筛选的查询不做这个判断 */
+  const neverReceived = $derived(site.scale === 0 && !dash.filters.length);
+  /** 页头的在线人数：加载中、出错时还没取到，不显示；范围里没有数据时是 0；其余取站点的模拟值 */
+  const live = $derived(!settled ? null : noData ? 0 : undefined);
 
-  const res = $derived(runQuery(site, dash, app.lang));
+  const res = $derived(runQuery(site, dash, app.lang, noData && realtime));
   const metric = $derived(dash.metric);
   const values = $derived(res.points.map((p) => p[metric] as number));
   const prevValues = $derived(res.prevPoints?.map((p) => p[metric] as number) ?? null);
@@ -43,12 +67,18 @@
     dash.compare === "year_over_year" ? t("compare.year_over_year") : t("compare.previous_period"),
   );
 
+  /** 导出：有效角色 editor 起（含站点访客 editor）；分享：组织成员里的 editor 起，站点访客不行 */
+  const mayExport = $derived(canEdit(site));
+  const mayShare = $derived(canEdit(site) && siteAccess(site).access === "member");
+
+  /** 地理库到地区级时，位置卡片有「地区」标签页；筛选里没有城市（见 query.ts） */
+  const regions = $derived(geoHasRegions(site));
+  const filterDims = $derived(DIMS.filter((d) => d !== "city" && (regions || !CITY_LEVEL_DIMS.has(d))));
+
   function addFilter(dim: string, value: string) {
     const rest = dash.filters.filter((f) => f.dim !== dim);
     setQuery({ f: encodeFilters([...rest, { dim, op: "is", values: [value] }]) });
   }
-
-  const deviceName = (dim: string, label: string) => (dim === "device" ? t(`device.${label}`) : label);
 
   const failure = $derived(
     {
@@ -59,12 +89,17 @@
   );
   const pending = $derived(loading || failed);
 
-  // 导出当前视图（时间范围与筛选）为 CSV 压缩包；实时不能导出。原型里只模拟生成的耗时
+  // 导出当前视图（时间范围与筛选）为 CSV 压缩包；实时不能导出。原型里只模拟生成的耗时，
+  // 评审开关选了出错、排队、超时时导出也失败
   let exporting = $state(false);
   function exportCsv() {
     exporting = true;
     setTimeout(() => {
       exporting = false;
+      if (failed) {
+        toast(t("dash.exportFailed"), "bad");
+        return;
+      }
       const day = (d: Date | undefined) => (d ? d.toISOString().slice(0, 10) : "");
       const span = `${day(res.points[0]?.t)}-${day(res.points.at(-1)?.t)}`;
       toast(t("dash.exportedFile", { f: `rivu-${site.domain}-${span}.zip` }), "good");
@@ -72,11 +107,17 @@
   }
 </script>
 
+{#snippet attribution()}
+  <a href={GEO_ATTRIBUTION.url} target="_blank" rel="noreferrer">{GEO_ATTRIBUTION.text}</a>
+{/snippet}
+
 <div class="page">
-<SiteHeader {site} {shared}>
+  <SiteHeader {site} {live} {shared}>
     {#snippet actions()}
-      {#if !shared && canEdit()}
-        <Button icon={Download} loading={exporting} disabled={noData || dash.range === "realtime"} onclick={exportCsv}>{t("dash.exportView")}</Button>
+      {#if !shared && mayExport}
+        <Button icon={Download} loading={exporting} disabled={realtime || (settled && neverReceived)} onclick={exportCsv}>{t("dash.exportView")}</Button>
+      {/if}
+      {#if !shared && mayShare}
         <Button icon={Share2} href={href(`/s/${site.id}/settings/sharing`)}>{t("dash.share")}</Button>
       {/if}
     {/snippet}
@@ -85,24 +126,34 @@
   <div class="toolbar">
     <FilterBar
       {dash}
+      dims={filterDims}
+      suggest={(dim) => suggestValues(site, dim)}
       onrange={(r) => setQuery({ range: r === "30d" ? null : r, gran: null })}
       oncompare={(c) => setQuery({ cmp: c === "previous_period" ? null : c })}
       onfilters={(fs: Filter[]) => setQuery({ f: fs.length ? encodeFilters(fs) : null })}
     />
   </div>
 
-  {#if noData}
+  {#if settled && res.beyondRetention && !empty}
+    <Callout tone="warn">{t("dash.retentionWarn")}</Callout>
+  {/if}
+  {#if settled && res.importedExcluded}
+    <Callout tone="warn">{t("dash.importedExcludedWarn")}</Callout>
+  {/if}
+
+  {#if empty}
     <Card>
       <EmptyState
         icon={Inbox}
-        title={site.scale === 0 ? t("dash.waiting.title") : t("dash.empty.title")}
-        body={!shared && site.scale === 0 ? t("dash.empty.body") : undefined}
+        title={neverReceived ? t("dash.waiting.title") : t("dash.empty.title")}
+        body={!shared && neverReceived ? t("dash.empty.body") : undefined}
       >
         {#snippet actions()}
-          {#if !shared && site.scale === 0}
+          {#if !shared && neverReceived}
             <Button variant="primary" href={href(`/s/${site.id}/install`)}>{t("dash.installGuide")}</Button>
-          {:else if !shared}
-            <Button href={href(`/s/${site.id}/diagnostics`)}>{t("dash.empty.action")}</Button>
+          {:else if !neverReceived && dash.range !== "all"}
+            <!-- 所选范围没有数据，但站点以前收到过 -->
+            <Button onclick={() => setQuery({ range: "all", gran: null })}>{t("dash.viewAll")}</Button>
           {/if}
         {/snippet}
       </EmptyState>
@@ -162,7 +213,7 @@
             format={(n) => fmtAxis(metric, n, app.lang)}
             partialLast={res.partialLast}
             partialText={t("dash.partial")}
-            deltaOf={delta}
+            deltaOf={(cur, prev) => delta(cur, prev, metric === "bounce_rate" ? app.lang : undefined)}
             lowerIsBetter={lowerIsBetter(metric)}
             series={[
               { key: "cur", label: t(`metric.${metric}`), values },
@@ -170,6 +221,7 @@
             ]}
           />
         {:else}
+          {@const cols = (realtime ? ["visitors", "pageviews"] : ["visitors", "visits", "pageviews", "bounce_rate", "visit_duration"]) as MetricKey[]}
           <div class="tbl">
             <Table
               sticky
@@ -178,7 +230,7 @@
               rowKey={(r) => r.i}
               columns={[
                 { key: "t", label: t("common.time") },
-                ...(["visitors", "visits", "pageviews", "bounce_rate", "visit_duration"] as MetricKey[]).map((k) => ({
+                ...cols.map((k) => ({
                   key: k,
                   label: t(`metric.${k}`),
                   align: "right" as const,
@@ -202,7 +254,8 @@
         rowsOf={res.breakdown}
         total={res.totalVisitors}
         onpick={addFilter}
-        loading={pending}
+        {loading}
+        {failed}
       />
       <BreakdownCard
         title={t("dash.card.pages")}
@@ -210,42 +263,33 @@
         rowsOf={res.breakdown}
         total={res.totalVisitors}
         onpick={addFilter}
-        loading={pending}
+        {loading}
+        {failed}
       />
       <BreakdownCard
         title={t("dash.card.locations")}
-        dims={["country", "region", "city"]}
+        dims={regions ? ["country", "region"] : ["country"]}
         rowsOf={res.breakdown}
         total={res.totalVisitors}
         onpick={addFilter}
-        loading={pending}
-      >
-        {#snippet footer()}
-          <a href="https://db-ip.com" target="_blank" rel="noreferrer">{t("dash.geoAttribution")}</a>
-        {/snippet}
-      </BreakdownCard>
+        {loading}
+        {failed}
+        footer={settled ? attribution : undefined}
+      />
       <BreakdownCard
         title={t("dash.card.devices")}
         dims={["device", "browser", "os"]}
         rowsOf={res.breakdown}
         total={res.totalVisitors}
         onpick={addFilter}
-        loading={pending}
-        display={deviceName}
+        {loading}
+        {failed}
       />
     </div>
 
     <div class="grid">
-      <BreakdownCard
-        title={t("dim.goal")}
-        dims={["goal"]}
-        minRows={0}
-        rowsOf={res.breakdown}
-        total={res.totalVisitors}
-        onpick={addFilter}
-        loading={pending}
-      />
-      <PropsCard keys={propertyKeys(site)} minRows={0} rowsOf={res.breakdown} total={res.totalVisitors} onpick={addFilter} loading={pending} />
+      <GoalsCard rows={res.goals} onpick={addFilter} {loading} {failed} />
+      <PropsCard keys={propertyKeys(site)} rowsOf={res.breakdown} total={res.totalVisitors} onpick={addFilter} {loading} {failed} />
     </div>
   {/if}
 </div>
@@ -324,6 +368,10 @@
   @media (max-width: 960px) {
     .grid {
       grid-template-columns: 1fr;
+    }
+    /* 补空行只为并排的卡片等高，单列时不需要 */
+    .grid :global(.row.filler) {
+      display: none;
     }
   }
   @media (max-width: 720px) {

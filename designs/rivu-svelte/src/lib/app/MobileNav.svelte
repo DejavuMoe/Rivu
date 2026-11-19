@@ -1,9 +1,8 @@
 <!--
   窄屏（860px 以下）顶部栏 + 左侧抽屉。大屏不显示。
   抽屉是原生 <dialog>，里面复用 Sidebar（带关闭按钮、40px 行高）。打开时从左侧滑入、背景淡入，关闭时反向；
-  Sidebar 始终挂载，关闭动画期间内容不会消失。App 在窄屏用 .app :global(.sidebar){display:none} 隐藏侧栏，
+  Sidebar 始终挂载，关闭动画期间内容不会消失。应用外壳在窄屏用 .app :global(.sidebar){display:none} 隐藏侧栏，
   这里用更具体的选择器（.drawer .panel .sidebar）覆盖回来。路由变化时自动关闭抽屉。
-  搜索按钮没有专用回调：派发一次 Ctrl+K，App 已经监听它来打开命令面板。
 -->
 <script lang="ts">
   import { Menu, Search } from "@lucide/svelte";

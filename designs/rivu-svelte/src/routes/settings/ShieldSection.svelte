@@ -1,9 +1,10 @@
 <!--
-  屏蔽规则：ip / cidr / country / hostname / page。命中「拒绝」规则的事件被丢弃，原因出现在接入诊断里。
-  添加对话框按类型切换校验；上限 500 条，用量显示在表头右侧。编辑者只读（没有添加与删除入口）。
+  屏蔽规则：ip / cidr / country / hostname / page。命中「拒绝」规则的事件被丢弃。
+  添加对话框按类型做初筛（服务端校验为准）；上限 500 条，用量显示在表头右侧。
+  只有 owner / admin 能写；editor 只读（没有添加与删除入口）。
 -->
 <script lang="ts">
-  import { Plus, Trash2 } from "@lucide/svelte";
+  import { CircleAlert, Plus, Trash2 } from "@lucide/svelte";
   import Badge from "../../lib/ui/Badge.svelte";
   import Button from "../../lib/ui/Button.svelte";
   import Card from "../../lib/ui/Card.svelte";
@@ -13,9 +14,10 @@
   import Input from "../../lib/ui/Input.svelte";
   import Segmented from "../../lib/ui/Segmented.svelte";
   import Select from "../../lib/ui/Select.svelte";
+  import Skeleton from "../../lib/ui/Skeleton.svelte";
   import Table from "../../lib/ui/Table.svelte";
   import { t } from "../../lib/i18n";
-  import { toast } from "../../lib/state.svelte";
+  import { app, toast } from "../../lib/state.svelte";
   import { NOW, type Site } from "../../lib/data/fixtures";
   import { cfgs, MAX_RULES, nextId, ymd, type RuleType } from "./store.svelte";
   import "./strings";
@@ -24,6 +26,8 @@
   const cfg = $derived(cfgs[site.id]);
   const used = $derived(cfg.rules.length);
   const full = $derived(used >= MAX_RULES);
+  const loading = $derived(app.review.dataState === "loading");
+  const failed = $derived(["error", "busy", "timeout"].includes(app.review.dataState));
 
   const types: RuleType[] = ["ip", "cidr", "country", "hostname", "page"];
 
@@ -94,10 +98,18 @@
 
 <Card title={t("set.shield.title")} flush>
   {#snippet actions()}
-    <span class="used num">{t("set.shield.used", { n: used, max: MAX_RULES })}</span>
-    {#if !readOnly}<Button variant="primary" icon={Plus} disabled={full} onclick={openAdd}>{t("set.shield.add")}</Button>{/if}
+    {#if !loading && !failed}
+      <span class="used num">{t("set.shield.used", { n: used, max: MAX_RULES })}</span>
+      {#if !readOnly}<Button variant="primary" icon={Plus} disabled={full} onclick={openAdd}>{t("set.shield.add")}</Button>{/if}
+    {/if}
   {/snippet}
-  {#if cfg.rules.length === 0}
+  {#if failed}
+    <EmptyState compact icon={CircleAlert} tone="bad" title={t("set.loadFailed")}>
+      {#snippet actions()}<Button onclick={() => toast(t("common.retry"))}>{t("common.retry")}</Button>{/snippet}
+    </EmptyState>
+  {:else if loading}
+    <div class="sk" aria-busy="true"><Skeleton height={32} radius={6} /><Skeleton height={32} radius={6} /></div>
+  {:else if cfg.rules.length === 0}
     <EmptyState compact title={t("set.shield.none")} />
   {:else}
     <Table
@@ -206,6 +218,12 @@
   .used {
     color: var(--text-muted);
     font-size: var(--fs-sm);
+  }
+  .sk {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-3);
+    padding: var(--sp-4) var(--sp-5);
   }
   .val {
     display: flex;

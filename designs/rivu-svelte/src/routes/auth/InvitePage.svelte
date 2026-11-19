@@ -1,19 +1,20 @@
 <!--
-  接受邀请（公开页）。状态由评审面板的 app.review.invite 切换：
-  loading 骨架；invalid 无效或过期（失效、已用、已撤销都只显示这一种）；
+  接受邀请（公开页，登录与否都能打开）。状态由评审面板的 app.review.invite 切换：
+  loading 骨架；invalid 无效或过期（失效、已用、已撤销，服务端一律 404，只显示这一种）；failed 连不上服务器，可重试；
   new 没有账号，填名字（可选）和密码；existing 已用被邀请的邮箱登录；
-  other 登录的是别人，提示并可退出；signedOut 有账号但没登录，去登录。
-  app.review.inviteScope 切换整个组织的邀请与单个站点的访客邀请。
+  other 登录的是别人，提示并可退出；signedOut 有账号但没登录，去登录（登录后回到这里）。
+  app.review.inviteScope 切换整个组织的邀请与单个站点的访客邀请；「登录结果」演示接受时被限流与连不上服务器。
 -->
 <script lang="ts">
   import AuthShell from "./AuthShell.svelte";
   import Button from "../../lib/ui/Button.svelte";
+  import Callout from "../../lib/ui/Callout.svelte";
   import Field from "../../lib/ui/Field.svelte";
   import Input from "../../lib/ui/Input.svelte";
   import Skeleton from "../../lib/ui/Skeleton.svelte";
   import { t } from "../../lib/i18n";
   import { app, setReview, toast } from "../../lib/state.svelte";
-  import { href, navigate } from "../../lib/router.svelte";
+  import { href, navigate, route } from "../../lib/router.svelte";
   import "./strings";
 
   const org = "Northwind Labs";
@@ -26,10 +27,12 @@
   let password = $state("");
   let tried = $state(false);
   let busy = $state(false);
+  let form = $state("");
 
   const mode = $derived(app.review.invite);
   const isSite = $derived(app.review.inviteScope === "site");
   const roleLabel = $derived(t(isSite ? "role.viewer" : "role.editor"));
+  const loginHref = $derived(href(`/login?next=${encodeURIComponent(route.current.path)}`));
 
   const pwLen = $derived([...password].length);
   const nameLen = $derived([...name.trim()].length);
@@ -45,11 +48,14 @@
       tried = true;
       if (errors.name || errors.password) return;
     }
+    form = "";
     busy = true;
     setTimeout(() => {
       busy = false;
-      toast(t("inv.acc.joined", { org }), "good");
-      navigate(isSite ? "/s/2" : "/sites");
+      const r = app.review.login;
+      if (r === "rateLimited") form = t("login.rate", { n: 30 });
+      else if (r === "network") form = t("login.network");
+      else navigate(isSite ? "/s/2" : "/sites");
     }, 650);
   }
 
@@ -75,11 +81,18 @@
       <h1>{t("inv.acc.invalid")}</h1>
       <Button href={href("/login")} block>{t("inv.acc.toLogin")}</Button>
     </div>
+  {:else if mode === "failed"}
+    <div class="stack">
+      <h1>{t("login.network")}</h1>
+      <Button block onclick={() => toast(t("common.retry"))}>{t("common.retry")}</Button>
+    </div>
   {:else}
     <form class="stack" onsubmit={accept} novalidate>
       <h1>{isSite ? t("inv.acc.title.site", { org, site }) : t("inv.acc.title.org", { org })}</h1>
       <p class="muted">{t("inv.acc.as", { email, role: roleLabel })}</p>
       <p class="muted">{t("inv.acc.by", { name: inviter })}</p>
+
+      {#if form}<Callout tone="bad">{form}</Callout>{/if}
 
       {#if mode === "existing"}
         <Button type="submit" variant="primary" size="lg" block loading={busy}>{t("inv.acc.accept")}</Button>
@@ -87,7 +100,7 @@
         <p>{t("inv.acc.other", { current: other, email })}</p>
         <Button size="lg" block loading={busy} onclick={signOut}>{t("inv.acc.signOut")}</Button>
       {:else if mode === "signedOut"}
-        <Button variant="primary" size="lg" block href={href("/login")}>{t("inv.acc.signIn")}</Button>
+        <Button variant="primary" size="lg" block href={loginHref}>{t("inv.acc.signIn")}</Button>
       {:else}
         <Field label={t("setup.name")} for="inv-name" optional error={tried ? errors.name : ""}>
           <Input id="inv-name" autocomplete="name" bind:value={name} invalid={tried && !!errors.name} />

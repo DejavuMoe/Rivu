@@ -1,20 +1,26 @@
 <!--
-  站点设置：站点页头（标签栏选中「设置」）下面，左侧分区导航 + 右侧每组字段一张卡片（最宽 720px）；窄屏分区导航变成横向 Tabs。
+  站点设置外壳：站点页头（标签栏选中「设置」）下面，左侧分区导航 + 右侧内容（最宽 720px）；窄屏分区导航变成横向 Tabs。
   分区导航的选中底色在分区之间滑动。
-  分区可见性按角色：常规 / 主机名 / 数据采集 / 隐私 / 导入 / 危险操作 需要 canManage；
-  屏蔽规则编辑者可看但只读；目标与共享编辑者可写。
+  需要站点 settings 的分区（常规、主机名、数据采集、隐私）先加载：评审面板的「加载」显示骨架，「出错 / 排队 / 超时」显示重试；
+  其余分区各自加载自己的列表（见各分区）。
+  分区可见性按角色（见 lib/data/sections.ts 的 visibleSections）；不存在或无权的分区是「找不到页面」。
 -->
 <script lang="ts">
-  import { Globe, Radio, Settings2, Share2, ShieldBan, Target, TriangleAlert, EyeOff, Upload } from "@lucide/svelte";
+  import { CircleAlert, Globe, Radio, Settings2, Share2, ShieldBan, Target, TriangleAlert, EyeOff, Upload } from "@lucide/svelte";
   import SiteHeader from "../../lib/app/SiteHeader.svelte";
+  import Button from "../../lib/ui/Button.svelte";
+  import Card from "../../lib/ui/Card.svelte";
+  import EmptyState from "../../lib/ui/EmptyState.svelte";
+  import Skeleton from "../../lib/ui/Skeleton.svelte";
   import { trackIndicator } from "../../lib/ui/indicator";
   import Tabs from "../../lib/ui/Tabs.svelte";
   import NotFound from "../NotFound.svelte";
   import { t } from "../../lib/i18n";
-  import { canEdit, canManage } from "../../lib/state.svelte";
+  import { app, toast } from "../../lib/state.svelte";
   import { href, navigate } from "../../lib/router.svelte";
   import type { Site } from "../../lib/data/fixtures";
   import type { IconType } from "../../lib/ui/types";
+  import { isSectionKey, sectionReadOnly, visibleSections, type SectionKey } from "../../lib/data/sections";
   import GeneralSection from "./GeneralSection.svelte";
   import HostnamesSection from "./HostnamesSection.svelte";
   import CollectionSection from "./CollectionSection.svelte";
@@ -28,29 +34,33 @@
 
   let { site, section = "general" }: { site: Site; section?: string } = $props();
 
-  interface Def {
-    key: string;
-    icon: IconType;
-    /** 能进入这个分区 */
-    visible: () => boolean;
-    /** 进入后是只读 */
-    readOnly: () => boolean;
-  }
-  const defs: Def[] = [
-    { key: "general", icon: Settings2, visible: canManage, readOnly: () => !canManage() },
-    { key: "hostnames", icon: Globe, visible: canManage, readOnly: () => !canManage() },
-    { key: "collection", icon: Radio, visible: canManage, readOnly: () => !canManage() },
-    { key: "privacy", icon: EyeOff, visible: canManage, readOnly: () => !canManage() },
-    { key: "shield", icon: ShieldBan, visible: canEdit, readOnly: () => !canManage() },
-    { key: "goals", icon: Target, visible: canEdit, readOnly: () => !canEdit() },
-    { key: "sharing", icon: Share2, visible: canEdit, readOnly: () => !canEdit() },
-    { key: "imports", icon: Upload, visible: canManage, readOnly: () => !canManage() },
-    { key: "danger", icon: TriangleAlert, visible: canManage, readOnly: () => !canManage() },
-  ];
+  const icons: Record<SectionKey, IconType> = {
+    general: Settings2,
+    hostnames: Globe,
+    collection: Radio,
+    privacy: EyeOff,
+    shield: ShieldBan,
+    goals: Target,
+    sharing: Share2,
+    imports: Upload,
+    danger: TriangleAlert,
+  };
+  /** 这些分区要用站点的 settings；屏蔽规则、目标、共享链接与导入各自加载自己的列表 */
+  const NEEDS_SETTINGS = new Set<SectionKey>(["general", "hostnames", "collection", "privacy"]);
 
-  const visible = $derived(defs.filter((d) => d.visible()));
-  const current = $derived(visible.find((d) => d.key === section));
+  const visible = $derived(visibleSections(site));
+  const current = $derived(isSectionKey(section) && visible.includes(section) ? section : undefined);
+
+  // 没有「常规」权限的角色（editor）从 /settings 进来时落到第一个可见分区
+  $effect(() => {
+    if (!current && section === "general" && visible.length) navigate(`/s/${site.id}/settings/${visible[0]}`, { replace: true });
+  });
+
   const go = (key: string) => navigate(`/s/${site.id}/settings/${key}`);
+
+  const loading = $derived(app.review.dataState === "loading");
+  const failed = $derived(["error", "busy", "timeout"].includes(app.review.dataState));
+  const waiting = $derived(!!current && NEEDS_SETTINGS.has(current) && (loading || failed));
 
   let side: HTMLElement | undefined = $state();
   let ind: HTMLSpanElement | undefined = $state();
@@ -68,43 +78,53 @@
     <div class="layout">
       <nav class="side" aria-label={t("nav.settings")} bind:this={side}>
         <span class="ind" bind:this={ind} aria-hidden="true"></span>
-        {#each visible as d (d.key)}
-          {#if d.key === "danger"}<span class="rule" aria-hidden="true"></span>{/if}
-          <a class="item" class:danger={d.key === "danger"} href={href(`/s/${site.id}/settings/${d.key}`)} aria-current={d.key === section ? "page" : undefined}>
-            <d.icon size={15} strokeWidth={1.75} />
-            <span>{t(`set.nav.${d.key}`)}</span>
+        {#each visible as key (key)}
+          {@const Icon = icons[key]}
+          {#if key === "danger"}<span class="rule" aria-hidden="true"></span>{/if}
+          <a class="item" class:danger={key === "danger"} href={href(`/s/${site.id}/settings/${key}`)} aria-current={key === current ? "page" : undefined}>
+            <Icon size={15} strokeWidth={1.75} />
+            <span>{t(`set.nav.${key}`)}</span>
           </a>
         {/each}
       </nav>
 
       <div class="tabbar">
-        <Tabs
-          label={t("nav.settings")}
-          value={section}
-          onchange={go}
-          options={visible.map((d) => ({ value: d.key, label: t(`set.nav.${d.key}`) }))}
-        />
+        <Tabs label={t("nav.settings")} value={current} onchange={go} options={visible.map((k) => ({ value: k, label: t(`set.nav.${k}`) }))} />
       </div>
 
       <div class="content">
-        {#if current.key === "general"}
-          <GeneralSection {site} readOnly={current.readOnly()} />
-        {:else if current.key === "hostnames"}
-          <HostnamesSection {site} readOnly={current.readOnly()} />
-        {:else if current.key === "collection"}
-          <CollectionSection {site} readOnly={current.readOnly()} />
-        {:else if current.key === "privacy"}
-          <PrivacySection {site} readOnly={current.readOnly()} />
-        {:else if current.key === "shield"}
-          <ShieldSection {site} readOnly={current.readOnly()} />
-        {:else if current.key === "goals"}
-          <GoalsSection {site} readOnly={current.readOnly()} />
-        {:else if current.key === "sharing"}
-          <SharingSection {site} readOnly={current.readOnly()} />
-        {:else if current.key === "imports"}
-          <ImportsSection {site} readOnly={current.readOnly()} />
-        {:else if current.key === "danger"}
-          <DangerSection {site} readOnly={current.readOnly()} />
+        {#if waiting && failed}
+          <Card>
+            <EmptyState icon={CircleAlert} tone="bad" title={t("set.loadFailed")}>
+              {#snippet actions()}<Button onclick={() => toast(t("common.retry"))}>{t("common.retry")}</Button>{/snippet}
+            </EmptyState>
+          </Card>
+        {:else if waiting}
+          <Card>
+            <div class="sk" aria-busy="true">
+              <Skeleton width="40%" height={16} />
+              <Skeleton height={32} radius={6} />
+              <Skeleton height={32} radius={6} />
+            </div>
+          </Card>
+        {:else if current === "general"}
+          <GeneralSection {site} />
+        {:else if current === "hostnames"}
+          <HostnamesSection {site} />
+        {:else if current === "collection"}
+          <CollectionSection {site} />
+        {:else if current === "privacy"}
+          <PrivacySection {site} />
+        {:else if current === "shield"}
+          <ShieldSection {site} readOnly={sectionReadOnly("shield", site)} />
+        {:else if current === "goals"}
+          <GoalsSection {site} readOnly={sectionReadOnly("goals", site)} />
+        {:else if current === "sharing"}
+          <SharingSection {site} />
+        {:else if current === "imports"}
+          <ImportsSection {site} />
+        {:else if current === "danger"}
+          <DangerSection {site} />
         {/if}
       </div>
     </div>
@@ -194,6 +214,11 @@
     flex-direction: column;
     gap: var(--sp-4);
     min-width: 0;
+  }
+  .sk {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-3);
   }
   @media (max-width: 720px) {
     .page {

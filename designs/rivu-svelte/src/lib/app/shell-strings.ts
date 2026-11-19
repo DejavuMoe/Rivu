@@ -12,4 +12,8 @@ extend({
   "mn.close": ["关闭菜单", "Close menu"],
   "nav.install": ["安装", "Install"],
   "nav.tabSettings": ["设置", "Settings"],
+  "tz.label": ["时区", "Timezone"],
+  "tz.search": ["搜索时区", "Search timezones"],
+  "tz.none": ["没有匹配的时区", "No matching timezones"],
+  "tz.browser": ["浏览器时区", "Browser timezone"],
 });
