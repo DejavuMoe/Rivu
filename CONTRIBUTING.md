@@ -13,13 +13,14 @@
 1. 一个改动只做一件事；涉及行为或口径的改动同时更新对应的设计文档。
 2. 本地通过：
    ```bash
-   cargo fmt --check
-   cargo clippy --all-targets -- -D warnings
-   cargo test                                  # 加载 .env.example 后会连 dev 的 PostgreSQL / ClickHouse
+   cargo fmt --all --check
+   cargo clippy --locked --all-targets -- -D warnings
+   cargo test --locked                         # 加载 .env.example 后会连 dev 的 PostgreSQL / ClickHouse
    cd apps/tracker && pnpm test && pnpm size    # 改了采集脚本时
    cd apps/dashboard && pnpm test && pnpm run check   # 改了看板时
    node tools/design-lint/check.mjs             # 改了看板或原型的界面时，在仓库根目录运行
    ```
+   `--locked` 与 CI 一致：改了依赖却没提交 `Cargo.lock` 时，本地就会失败，而不是等到 CI。
 3. 改数据库结构：新增一个迁移文件，不修改已登记在 `migrations/checksums.lock` 里的迁移（v0.1.0 发布前例外）；
    用 `RIVU_SCHEMA_UPDATE=1 cargo test -p rivu --test schema_snapshot` 更新 `schema/` 快照。
 4. 改界面：先对照 `apps/dashboard/DESIGN.md` 的硬性规则；较大的界面改动先在 `designs/` 的原型里做并确认（流程见 `designs/README.md`）。
@@ -40,6 +41,7 @@
 
 发布由 `.github/workflows/release.yml` 完成，推送标签触发。标签要打在 `master` 上一个 CI 已经通过的提交上，版本号要与 `bin/rivu/Cargo.toml` 一致。
 
+- **镜像包的写权限**：镜像发布到 `ghcr.io/dejavumoe/rivu`。这个包要在它的设置页（`https://github.com/users/DejavuMoe/packages/container/rivu/settings`）的 Manage Actions access 里把本仓库加进去，角色选 Write，否则发布流程在最后推送时会被拒绝（`denied`）。只需设置一次。
 - **候选版本** `vX.Y.Z-rc.N`：构建并推送镜像 `ghcr.io/dejavumoe/rivu:X.Y.Z-rc.N`，不改 `latest`。正式发布之前先发一个候选版本，在一台空机器上按 [`docs/install.md`](docs/install.md) 装一遍。
 - **正式版本** `vX.Y.Z`：推送 `X.Y.Z` 并把 `latest` 指向它。打标签之前，把 `CHANGELOG.md` 的「未发布」改成版本号和日期，并删掉 `docs/install.md` 里关于候选版本的那一段。
 
