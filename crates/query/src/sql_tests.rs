@@ -670,11 +670,6 @@ fn invalid_combinations_and_unsupported_features_fail_with_paths() {
             "metrics[0]",
             "not supported yet",
         ),
-        (
-            json!({"metrics": ["visitors", "total_revenue"], "date_range": "day"}),
-            "metrics[1]",
-            "not supported yet",
-        ),
         // 属性：会话指标、engagement 指标不能配，一次查询至多 8 个不同的键
         (
             base(

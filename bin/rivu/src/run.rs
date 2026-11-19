@@ -26,7 +26,6 @@ use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 use rivu_common::build_info;
 use rivu_common::config::Config;
 use rivu_geo::GeoDb;
-use rivu_geo::datacenter::DcDb;
 use rivu_ingest::pipeline::{Pipeline, SaltCache, SiteSnapshot, salt_window, utc_today};
 use rivu_jobs::GeoRefreshState;
 use rivu_ua::UaParser;
@@ -49,8 +48,6 @@ const GEO_RELOAD_CHECK_INTERVAL: Duration = Duration::from_secs(3600);
 
 /// 盐缓存的重载周期（`platform-and-ops.md` §3.3：各进程每 60 秒从 PG 刷新）。
 const SALT_CACHE_REFRESH: Duration = Duration::from_secs(60);
-/// collector 检查数据中心网段文件修改时间的周期。
-const DATACENTER_RELOAD_CHECK_INTERVAL: Duration = Duration::from_secs(300);
 /// 启动时读取 routing 密钥的时间上限。
 const ROUTING_SECRET_TIMEOUT: Duration = Duration::from_secs(10);
 /// 会话清扫周期（§4.6「过期」）。
@@ -123,7 +120,6 @@ async fn start_collector(
     config: &Config,
     pg: &PgPool,
     geo_db: Arc<GeoDb>,
-    datacenter: Option<Arc<DcDb>>,
     stop: &watch::Receiver<bool>,
     background: &mut Vec<JoinHandle<()>>,
 ) -> Result<Collector> {
@@ -181,7 +177,7 @@ async fn start_collector(
             .context("构建 UA 解析器的任务异常")?
             .context("构建 UA 解析器失败")?,
     );
-    let mut pipeline = Pipeline::new(
+    let pipeline = Pipeline::new(
         Arc::clone(&sites),
         Arc::clone(&salts),
         writer.handle(),
@@ -191,15 +187,6 @@ async fn start_collector(
     )
     .with_default_ingest_rate(config.ingest_rate_limit_per_min)
     .with_routing_secret(routing_secret);
-    // 数据中心网段（可选）：collector 按文件修改时间热加载 worker 下载的清单
-    if let Some(dc) = datacenter {
-        background.push(dc.spawn_reloader(
-            config.datacenter.path.clone(),
-            DATACENTER_RELOAD_CHECK_INTERVAL,
-            stop.clone(),
-        ));
-        pipeline = pipeline.with_datacenter(dc);
-    }
     let pipeline = Arc::new(pipeline);
     // 开始服务之前预热会话：关停快照，或从 ClickHouse 重建（§4.6「预热」）。
     let sessions = Arc::new(session_warm::warm(&pipeline, &config.geo.data_dir, &ch).await);
@@ -378,26 +365,10 @@ pub async fn run(config: Config) -> Result<ExitCode> {
         bg_stop_rx.clone(),
     ));
 
-    // 数据中心网段过滤（默认关闭）：下载清单、热加载，管线第 5 步使用。
-    let datacenter = config.datacenter.enabled.then(|| Arc::new(DcDb::new()));
-    if config.datacenter.enabled {
-        tracing::info!(
-            sources = config.datacenter.sources.len(),
-            path = %config.datacenter.path.display(),
-            "数据中心网段过滤已开启：命中的事件按 datacenter_ip 丢弃"
-        );
-        background.push(rivu_jobs::spawn_datacenter_refresh(
-            config.datacenter.clone(),
-            datacenter.clone(),
-            bg_stop_rx.clone(),
-        ));
-    }
-
     let collector = start_collector(
         &config,
         &pg,
         Arc::clone(&geo_db),
-        datacenter.clone(),
         &bg_stop_rx,
         &mut background,
     )
@@ -446,6 +417,12 @@ pub async fn run(config: Config) -> Result<ExitCode> {
         .with_cache(Arc::clone(&query_cache)),
     );
     background.push(dash_api::spawn_maintenance(pg.clone(), bg_stop_rx.clone()));
+    if dash.mailer.is_some() {
+        background.push(crate::weekly_report::spawn(
+            Arc::clone(&dash),
+            bg_stop_rx.clone(),
+        ));
+    }
     let query_routes = query_api::router(Arc::new(
         QueryApi::new(
             guard,
@@ -468,7 +445,6 @@ pub async fn run(config: Config) -> Result<ExitCode> {
     let state = Arc::new(InternalState {
         probe,
         collector: Some(collector.readiness.clone()),
-        datacenter,
         tracker: Some(Arc::clone(&collector.tracker)),
         dashboard: Some(Arc::clone(&dashboard)),
         geo: GeoReadiness {

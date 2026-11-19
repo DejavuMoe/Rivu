@@ -323,7 +323,7 @@ export async function startFixture(): Promise<Fixture> {
         `<a id="same" data-stay href="/other">same</a>` +
         `<a id="dlout" data-stay href="${rivuOrigin}/f/a.zip">dlout</a>` +
         `<div class="rivu-event-name=Outer"><button id="tag" class="rivu-event-name=Signup rivu-event-plan=pro+plan">tag</button></div>` +
-        `<div class="rivu-event-name=Wrap rivu-revenue-amount=9.5 rivu-revenue-currency=USD"><span><b id="deep">deep</b></span></div>` +
+        `<div class="rivu-event-name=Wrap rivu-event-plan=pro rivu-revenue-amount=9.5 rivu-revenue-currency=USD"><span><b id="deep">deep</b></span></div>` +
         `<div class="rivu-event-name=TooFar"><div><div><div><i id="far">far</i></div></div></div></div>` +
         `<a id="taglink" data-stay class="rivu-event-name=Docs" href="${rivuOrigin}/docs">docs</a>` +
         `<form id="f1" onsubmit="return false"><input name="q"><button id="f1b">go</button></form>` +

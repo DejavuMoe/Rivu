@@ -53,6 +53,7 @@ pub struct EventRow {
     pub props: HashMap<String, String>,
     pub scroll_depth: u8,
     pub engagement_ms: u32,
+    // 旧列没有显式 DEFAULT，ClickHouse 客户端校验要求写入行包含它们，采集端始终填空值。
     pub revenue_amount: Option<i64>,
     pub revenue_currency: String,
 }

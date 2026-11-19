@@ -10,7 +10,7 @@ const base = () => ({ v: 1, s: SITE, n: 'pageview', u: 'https://example.com/' })
 
 test('规范 §5.2 的三个示例合法', () => {
   const ex1 = JSON.parse('{"v":1,"sv":3,"s":"k7qm2xv5atbr","n":"pageview","u":"https://www.Example.com/pricing?utm_source=newsletter&utm_medium=email&token=abc123#plans","r":"https://news.example.org/post/42?id=7"}');
-  const ex2 = JSON.parse('{"v":1,"sv":3,"s":"k7qm2xv5atbr","n":"Purchase","u":"https://example.com/checkout/done","p":{"plan":"pro","seats":"5"},"$":{"a":"29.00","c":"USD"}}');
+  const ex2 = JSON.parse('{"v":1,"sv":3,"s":"k7qm2xv5atbr","n":"Purchase","u":"https://example.com/checkout/done","p":{"plan":"pro","seats":"5"}}');
   const ex3 = JSON.parse('{"v":1,"sv":3,"s":"k7qm2xv5atbr","n":"engagement","u":"https://example.com/pricing","sd":72,"e":18450}');
   for (const ex of [ex1, ex2, ex3]) assert.deepEqual(validateWire(ex), []);
 });

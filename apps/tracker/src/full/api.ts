@@ -1,6 +1,6 @@
 // 手动 API 与事件发送（规范 §4.8）。
 //
-// - `rivu('event', name, opts?)`：自定义事件；`opts` = `props`、`revenue`（`{amount, currency}`）、
+// - `rivu('event', name, opts?)`：自定义事件；`opts` = `props`、
 //   `interactive`（`false` 时发 `i:false`）、`url`（覆盖 `u`）、`callback`。
 // - `rivu('pageview', opts?)` 等价 `rivu('event', 'pageview', opts)`：走 pageview 流程（先 flush engagement）。
 // - `rivu('set', {props})`：全局属性，替换上一次的 `set`；与单次 `props` 合并，单次优先；对所有事件（含 engagement）生效。
@@ -18,7 +18,6 @@ import { engBegin } from './engagement.ts';
 
 export interface Opts {
   props?: unknown;
-  revenue?: { amount?: unknown; currency?: unknown };
   interactive?: boolean;
   url?: string;
   callback?: Callback;
@@ -52,11 +51,7 @@ export const emit = (name: string, o?: Opts, ref?: string): void => {
   // 单次属性优先；合并后没有任何属性就不发 p
   const props = cleanProps({ ...global, ...(o.props as object) });
   if (props) p.p = props;
-  if (name != 'pageview') {
-    if (o.interactive === false) p.i = false;
-    const r = o.revenue;
-    if (r) p.$ = { a: String(r.amount), c: r.currency };
-  }
+  if (name != 'pageview' && o.interactive === false) p.i = false;
   const cb = o.callback;
   // 页面已隐藏、又不需要结果：beacon 更可能送达
   if (!cb && document.visibilityState == 'hidden') beacon(cfg.endpoint!, p);

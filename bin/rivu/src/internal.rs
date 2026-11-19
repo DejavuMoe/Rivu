@@ -13,7 +13,6 @@ use metrics_exporter_prometheus::PrometheusHandle;
 use rivu_common::build_info;
 use rivu_common::migration::{self, Store};
 use rivu_geo::GeoDb;
-use rivu_geo::datacenter::DcDb;
 use rivu_ingest::pipeline::{SaltCache, SiteSnapshot, utc_today};
 use rivu_jobs::GeoRefreshState;
 use serde_json::{Value, json};
@@ -80,8 +79,6 @@ pub struct InternalState {
     /// 看板静态文件。**只报告，不判就绪失败**：缺失时页面返回 503，API 照常。
     pub dashboard: Option<Arc<crate::dashboard::DashboardAssets>>,
     pub geo: GeoReadiness,
-    /// 数据中心网段表：只在开启过滤时有。**只报告，不判就绪失败**：未加载时不丢弃任何事件。
-    pub datacenter: Option<Arc<DcDb>>,
     pub metrics: PrometheusHandle,
     pub started: Instant,
 }
@@ -203,11 +200,6 @@ async fn readyz(State(state): State<Arc<InternalState>>) -> impl IntoResponse {
         checks["sessions"] = sessions;
     }
     checks["geoip"] = geoip_check(&state.geo);
-    if let Some(dc) = &state.datacenter {
-        let mut v = json!(dc.status());
-        v["ok"] = json!(true);
-        checks["datacenter"] = v;
-    }
     if let Some(t) = &state.tracker {
         checks["tracker"] = t.status();
     }

@@ -8,7 +8,7 @@
 //! - 业务校验（指标与维度的组合、时间范围换算、正则限制、「尚未支持」的功能）在 [`crate::resolve`]。
 //!
 //! 「尚未支持」的取值（`group_conversion_rate`、`has_done` 等）能解析成功，
-//! 在 resolve 阶段才返回明确的 `not supported yet` 校验错误，这样 schema 与 Plausible 的取值集合一致。
+//! 在 resolve 阶段返回明确的 `not supported yet` 校验错误。
 
 use std::borrow::Cow;
 use std::fmt;
@@ -83,7 +83,7 @@ impl SubError {
 // 指标
 // ------------------------------------------------------------------------------------------
 
-/// 指标。`group_conversion_rate` 与收入（`total_revenue` `average_revenue`）在本轮不支持：能解析，resolve 阶段报 `not supported yet`。
+/// 指标。`group_conversion_rate` 能解析，但在 resolve 阶段报 `not supported yet`。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Metric {
@@ -101,12 +101,10 @@ pub enum Metric {
     ScrollDepth,
     ConversionRate,
     GroupConversionRate,
-    TotalRevenue,
-    AverageRevenue,
 }
 
 impl Metric {
-    pub const ALL: [Metric; 16] = [
+    pub const ALL: [Metric; 14] = [
         Metric::Visitors,
         Metric::Visits,
         Metric::Pageviews,
@@ -121,8 +119,6 @@ impl Metric {
         Metric::ScrollDepth,
         Metric::ConversionRate,
         Metric::GroupConversionRate,
-        Metric::TotalRevenue,
-        Metric::AverageRevenue,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -141,17 +137,12 @@ impl Metric {
             Metric::ScrollDepth => "scroll_depth",
             Metric::ConversionRate => "conversion_rate",
             Metric::GroupConversionRate => "group_conversion_rate",
-            Metric::TotalRevenue => "total_revenue",
-            Metric::AverageRevenue => "average_revenue",
         }
     }
 
     /// 是否在本轮实现。
     pub fn is_supported(self) -> bool {
-        !matches!(
-            self,
-            Metric::GroupConversionRate | Metric::TotalRevenue | Metric::AverageRevenue
-        )
+        self != Metric::GroupConversionRate
     }
 }
 
@@ -1227,10 +1218,12 @@ mod tests {
 
     #[test]
     fn bad_metric_and_dimension_names_carry_indexes() {
-        let (p, m) =
-            parse(json!({"metrics": ["visitors", "visitorz"], "date_range": "day"})).unwrap_err();
-        assert_eq!(p, "metrics[1]");
-        assert!(m.contains("unknown variant `visitorz`"), "{m}");
+        for metric in ["visitorz", "total_revenue", "average_revenue"] {
+            let (p, m) =
+                parse(json!({"metrics": ["visitors", metric], "date_range": "day"})).unwrap_err();
+            assert_eq!(p, "metrics[1]");
+            assert!(m.contains(&format!("unknown variant `{metric}`")), "{m}");
+        }
 
         let (p, m) = parse(json!({
             "metrics": ["visitors"], "date_range": "day",
@@ -1363,7 +1356,7 @@ mod tests {
     #[test]
     fn unsupported_features_still_parse() {
         let q = parse(json!({
-            "metrics": ["conversion_rate", "total_revenue"], "date_range": "day",
+            "metrics": ["conversion_rate", "group_conversion_rate"], "date_range": "day",
             "dimensions": ["event:goal", "event:props:plan", "time:minute"],
             "filters": [["has_done", ["is", "event:name", ["Signup"]]], ["is", "segment", [3]]]
         }))
