@@ -1,0 +1,371 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="data:,">
+  <title>周报邮件 – Rivu</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg-app: #fcfcfc; --bg-subtle: #f9f9f9; --bg-element: #f0f0f0; --bg-hover: #e8e8e8;
+      --border-subtle: #d9d9d9; --border: #cecece; --border-hover: #bbbbbb;
+      --text-muted: #646464; --text: #202020; --accent-focus: #5eb1ef;
+      --font-sans: "IBM Plex Sans", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC", system-ui, sans-serif;
+      --font-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      --hairline: 0.5px; --r-sm: 6px; --r-md: 8px;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        color-scheme: dark;
+        --bg-app: #111111; --bg-subtle: #191919; --bg-element: #222222; --bg-hover: #2a2a2a;
+        --border-subtle: #3a3a3a; --border: #484848; --border-hover: #606060;
+        --text-muted: #b4b4b4; --text: #eeeeee; --accent-focus: #2870bd;
+      }
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg-subtle); color: var(--text); font: 14px/1.5 var(--font-sans); }
+    h1, p, dl, dd { margin: 0; }
+    [hidden] { display: none !important; }
+    :focus-visible { outline: 2px solid var(--accent-focus); outline-offset: 2px; }
+    select { min-height: 32px; max-width: 100%; padding: 4px 6px; border: var(--hairline) solid var(--border); border-radius: var(--r-sm); background: var(--bg-app); color: inherit; font: inherit; }
+    select:hover { border-color: var(--border-hover); }
+    .preview { padding: 8px 16px; background: var(--bg-element); border-bottom: var(--hairline) solid var(--border); }
+    .preview summary { width: fit-content; cursor: pointer; font-size: 12px; font-weight: 600; }
+    .preview-fields { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px; margin-top: 8px; font-size: 12px; }
+    .preview-fields label { display: inline-flex; align-items: center; gap: 6px; }
+    .stage { display: grid; justify-items: center; gap: 16px; padding: 24px 16px 48px; }
+    .envelope { width: 100%; max-width: var(--frame, 600px); display: grid; gap: 4px; font-size: 12px; }
+    .envelope div { display: grid; grid-template-columns: 64px minmax(0, 1fr); gap: 8px; }
+    .envelope dt { color: var(--text-muted); }
+    .envelope dd { overflow-wrap: anywhere; }
+    .envelope #subject { font-size: 14px; font-weight: 600; }
+    .frame { width: 100%; max-width: var(--frame, 600px); border: var(--hairline) solid var(--border-subtle); border-radius: var(--r-md); background: var(--bg-app); overflow: hidden; }
+    iframe { display: block; width: 100%; height: 480px; border: 0; }
+    pre { margin: 0; padding: 20px; font: 14px/1.6 var(--font-mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+    @media (max-width: 520px) {
+      .preview-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .preview-fields label { flex-direction: column; align-items: stretch; gap: 2px; }
+    }
+  </style>
+</head>
+<body>
+  <details class="preview" id="preview" data-screen-id="weekly-report-email-preview">
+    <summary data-copy="preview"></summary>
+    <div class="preview-fields">
+      <label><span data-copy="mail"></span>
+        <select id="mail"><option value="report" data-copy="report"></option><option value="code" data-copy="code"></option></select>
+      </label>
+      <label><span data-copy="language"></span>
+        <select id="language"><option value="zh-CN" lang="zh-CN">简体中文</option><option value="en" lang="en">English</option></select>
+      </label>
+      <label id="fixture-field"><span data-copy="fixture"></span>
+        <select id="fixture"><option value="studio" data-copy="studio"></option><option value="quiet" data-copy="quiet"></option><option value="large" data-copy="large"></option></select>
+      </label>
+      <label><span data-copy="version"></span>
+        <select id="version"><option value="html">HTML</option><option value="text" data-copy="text"></option><option value="current" data-copy="current"></option></select>
+      </label>
+      <label><span data-copy="width"></span>
+        <select id="width"><option value="600">600 px</option><option value="360">360 px</option></select>
+      </label>
+      <label><span data-copy="scheme"></span>
+        <select id="scheme"><option value="light" data-copy="light"></option><option value="dark" data-copy="dark"></option></select>
+      </label>
+    </div>
+  </details>
+
+  <main class="stage" id="stage" data-screen-id="weekly-report-email">
+    <dl class="envelope" id="envelope">
+      <div><dt data-copy="from"></dt><dd id="from">Rivu &lt;rivu@example.com&gt;</dd></div>
+      <div><dt data-copy="to"></dt><dd id="to"></dd></div>
+      <div><dt data-copy="subject"></dt><dd id="subject"></dd></div>
+      <div id="preheader-row"><dt data-copy="preheader"></dt><dd id="preheader"></dd></div>
+    </dl>
+    <div class="frame">
+      <iframe id="message" title=""></iframe>
+      <pre id="plain" hidden></pre>
+    </div>
+  </main>
+
+  <script>
+    const copy = {
+      preview: ["原型预览", "Prototype preview"], mail: ["邮件", "Email"], report: ["周报", "Weekly report"], code: ["确认码", "Confirmation code"],
+      language: ["语言", "Language"], fixture: ["数据", "Data"], studio: ["普通周", "Typical week"], quiet: ["无访问", "No visits"],
+      large: ["跨年、大数值", "Year boundary, large values"], version: ["版本", "Version"], text: ["纯文本", "Plain text"],
+      current: ["现行纯文本", "Current plain text"], width: ["宽度", "Width"], scheme: ["外观", "Appearance"], light: ["浅色", "Light"], dark: ["深色", "Dark"],
+      from: ["发件人", "From"], to: ["收件人", "To"], subject: ["主题", "Subject"], preheader: ["摘要", "Preview"],
+    };
+
+    const base = "https://rivu.example.com";
+    const fixtures = {
+      studio: { id: 1, site: "studio.example.com", tz: "Asia/Taipei", from: "2026-11-16", to: "2026-11-22", visitors: 1284, visits: 1702, pageviews: 4315 },
+      quiet: { id: 2, site: "docs.example.com", tz: "Asia/Taipei", from: "2026-11-15", to: "2026-11-21", visitors: 0, visits: 0, pageviews: 0 },
+      large: { id: 3, site: "shop.example.com", tz: "America/New_York", from: "2026-12-28", to: "2027-01-03", visitors: 12840310, visits: 18755902, pageviews: 96302417 },
+    };
+    const recipient = "viewer@example.com";
+    const sampleCode = "q7Rk2vX9mB4nT0pL8sW1yZ3cF6hJ5dG2aE7uK9wQ0rM";
+
+    const strings = {
+      zh: {
+        reportSubject: (f, p) => `${f.site} 周报：${p.short}`,
+        reportPreheader: (n) => `访客 ${n.visitors}，访问 ${n.visits}，浏览量 ${n.pageviews}`,
+        visitors: "访客", visits: "访问", pageviews: "浏览量",
+        noVisits: "这一周没有记录到访问。",
+        open: "打开看板",
+        reason: (f) => `你订阅了 ${f.site} 的周报，收件地址 ${recipient}。`,
+        manage: "管理周报",
+        codeSubject: "Rivu 周报确认码",
+        codeTitle: "确认周报订阅",
+        codeLead: (f) => `在 Rivu 的「我的周报」中粘贴下面的确认码，开通 ${f.site} 的周报。`,
+        codeTerms: "确认码 15 分钟内有效。重新发送后，之前的确认码失效。",
+        codeIgnore: "如果不是你本人操作，忽略这封邮件即可，不会开通周报。",
+        colon: "：",
+      },
+      en: {
+        reportSubject: (f, p) => `${f.site} weekly report: ${p.short}`,
+        reportPreheader: (n) => `${n.visitors} visitors, ${n.visits} visits, ${n.pageviews} pageviews`,
+        visitors: "Visitors", visits: "Visits", pageviews: "Pageviews",
+        noVisits: "No visits were recorded this week.",
+        open: "Open dashboard",
+        reason: (f) => `You subscribed to the weekly report for ${f.site} at ${recipient}.`,
+        manage: "Manage weekly report",
+        codeSubject: "Rivu weekly report confirmation code",
+        codeTitle: "Confirm your weekly report",
+        codeLead: (f) => `Paste this code into My weekly report in Rivu to turn on the weekly report for ${f.site}.`,
+        codeTerms: "The code expires in 15 minutes. Requesting a new code makes this one invalid.",
+        codeIgnore: "If you didn’t request this, ignore this email. No report will be set up.",
+        colon: ": ",
+      },
+    };
+
+    const palette = {
+      light: { page: "#f9f9f9", card: "#fcfcfc", line: "#d9d9d9", text: "#202020", muted: "#646464", codeBg: "#f0f0f0", codeLine: "#cecece", link: "#0d74ce" },
+      dark: { page: "#111111", card: "#191919", line: "#3a3a3a", text: "#eeeeee", muted: "#b4b4b4", codeBg: "#222222", codeLine: "#484848", link: "#70b8ff" },
+    };
+    const sans = "-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', Arial, Helvetica, sans-serif";
+    const mono = "'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, 'Courier New', monospace";
+
+    const byId = (id) => document.getElementById(id);
+    const ui = { mail: byId("mail"), language: byId("language"), fixture: byId("fixture"), version: byId("version"), width: byId("width"), scheme: byId("scheme") };
+    const english = () => ui.language.value === "en";
+    const t = (key) => copy[key][english() ? 1 : 0];
+    const escape = (value) => String(value).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+    const setText = (node, value) => { if (node.textContent !== value) node.textContent = value; };
+
+    function period(f, lang) {
+      const day = (value) => new Date(`${value}T12:00:00Z`);
+      const [a, b] = [day(f.from), day(f.to)];
+      if (lang === "en") {
+        const long = new Intl.DateTimeFormat("en", { year: "numeric", month: "short", day: "numeric", timeZone: "UTC" });
+        const short = new Intl.DateTimeFormat("en", { month: "short", day: "numeric", timeZone: "UTC" });
+        return { long: long.formatRange(a, b), short: short.formatRange(a, b) };
+      }
+      const parts = (d) => ({ y: d.getUTCFullYear(), m: d.getUTCMonth() + 1, d: d.getUTCDate() });
+      const [x, y] = [parts(a), parts(b)];
+      const tail = x.y !== y.y ? `${y.y} 年 ${y.m} 月 ${y.d} 日` : x.m !== y.m ? `${y.m} 月 ${y.d} 日` : `${y.d} 日`;
+      const long = `${x.y} 年 ${x.m} 月 ${x.d} 日至 ${tail}`;
+      if (x.y !== y.y) return { long, short: long };
+      return { long, short: `${x.m} 月 ${x.d} 日至 ${x.m !== y.m ? `${y.m} 月 ${y.d} 日` : `${y.d} 日`}` };
+    }
+
+    function shell({ lang, title, preheader, scheme, body }) {
+      const c = palette.light;
+      const d = palette.dark;
+      const darkRules = `
+        .bg { background: ${d.page} !important; }
+        .card { background: ${d.card} !important; border-color: ${d.line} !important; }
+        .line { border-color: ${d.line} !important; }
+        .tx { color: ${d.text} !important; }
+        .mu { color: ${d.muted} !important; }
+        .lk { color: ${d.link} !important; }
+        .cd { background: ${d.codeBg} !important; border-color: ${d.codeLine} !important; color: ${d.text} !important; }
+        .metric + .metric { border-top-color: ${d.line} !important; }`;
+      return `<!doctype html>
+<html lang="${lang}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="${scheme === "auto" ? "light dark" : scheme}">
+<meta name="supported-color-schemes" content="${scheme === "auto" ? "light dark" : scheme}">
+<title>${escape(title)}</title>
+<style>
+  body { margin: 0; padding: 0; }
+  a { text-decoration: none; }
+  @media (max-width: 480px) {
+    .px { padding-left: 20px !important; padding-right: 20px !important; }
+    .metric { display: block !important; width: auto !important; border-left: 0 !important; }
+    .metric + .metric { border-top: 1px solid ${c.line} !important; }
+  }
+  ${scheme === "auto" ? `@media (prefers-color-scheme: dark) {${darkRules}
+  }` : scheme === "dark" ? darkRules : ""}
+</style>
+</head>
+<body class="bg" style="margin:0;padding:0;background:${c.page};">
+<div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;">${escape(preheader)}</div>
+<table role="presentation" class="bg" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${c.page};">
+<tr><td align="center" style="padding:24px 12px;">
+<table role="presentation" class="card" width="600" cellpadding="0" cellspacing="0" border="0" style="width:100%;max-width:600px;background:${c.card};border:1px solid ${c.line};border-radius:8px;border-collapse:separate;">
+<tr><td class="px tx" style="padding:28px 32px 0;font-family:${sans};font-size:14px;line-height:20px;font-weight:600;color:${c.text};mso-line-height-rule:exactly;">Rivu</td></tr>
+${body}
+</table>
+</td></tr>
+</table>
+</body>
+</html>`;
+    }
+
+    const text = (style, content, extra = "") => `<p class="${style === "muted" ? "mu" : "tx"}" style="margin:0;font-family:${sans};font-size:${style === "muted" ? "12px;line-height:18px" : "14px;line-height:22px"};color:${style === "muted" ? palette.light.muted : palette.light.text};mso-line-height-rule:exactly;${extra}">${content}</p>`;
+
+    function reportHtml(f, lang, scheme = "auto") {
+      const s = strings[lang];
+      const n = numbers(f, lang);
+      const p = period(f, lang);
+      const c = palette.light;
+      const metric = (label, value, first) => `<td class="metric line" width="33%" valign="top" style="width:33%;padding:14px 16px;${first ? "" : `border-left:1px solid ${c.line};`}">
+${text("muted", escape(label))}
+<p class="tx" style="margin:4px 0 0;font-family:${sans};font-size:24px;line-height:32px;font-weight:600;color:${c.text};font-variant-numeric:tabular-nums;mso-line-height-rule:exactly;">${escape(value)}</p>
+</td>`;
+      const quiet = f.visitors === 0 && f.visits === 0 && f.pageviews === 0;
+      const body = `
+<tr><td class="px" style="padding:20px 32px 0;">
+<h1 class="tx" style="margin:0;font-family:${sans};font-size:16px;line-height:24px;font-weight:600;color:${c.text};mso-line-height-rule:exactly;">${escape(f.site)}</h1>
+${text("body", `<span class="mu" style="color:${c.muted};">${escape(p.long)}${lang === "zh" ? "（" : " ("}${escape(f.tz)}${lang === "zh" ? "）" : ")"}</span>`, "margin-top:2px;")}
+</td></tr>
+<tr><td class="px" style="padding:20px 32px 0;">
+<table role="presentation" class="line" width="100%" cellpadding="0" cellspacing="0" border="0" style="border:1px solid ${c.line};border-radius:8px;border-collapse:separate;">
+<tr>${metric(s.visitors, n.visitors, true)}${metric(s.visits, n.visits)}${metric(s.pageviews, n.pageviews)}</tr>
+</table>
+${quiet ? text("muted", escape(s.noVisits), "margin-top:8px;") : ""}
+</td></tr>
+<tr><td class="px" style="padding:24px 32px 0;">
+<table role="presentation" cellpadding="0" cellspacing="0" border="0"><tr>
+<td bgcolor="#0090ff" style="border-radius:6px;background:#0090ff;">
+<a href="${base}/s/${f.id}" style="display:block;padding:8px 14px;font-family:${sans};font-size:14px;line-height:20px;font-weight:500;color:#ffffff;text-decoration:none;border-radius:6px;mso-line-height-rule:exactly;">${escape(s.open)}</a>
+</td></tr></table>
+</td></tr>
+<tr><td class="px" style="padding:28px 32px 28px;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr><td class="line" style="border-top:1px solid ${c.line};padding-top:16px;">
+${text("muted", escape(s.reason(f)))}
+${text("muted", `<a class="lk" href="${base}/s/${f.id}/settings/weekly-report" style="color:${c.link};text-decoration:underline;">${escape(s.manage)}</a>`, "margin-top:4px;")}
+</td></tr></table>
+</td></tr>`;
+      return shell({ lang: lang === "zh" ? "zh-CN" : "en", title: s.reportSubject(f, p), preheader: s.reportPreheader(n), scheme, body });
+    }
+
+    function codeHtml(f, lang, scheme = "auto") {
+      const s = strings[lang];
+      const c = palette.light;
+      const body = `
+<tr><td class="px" style="padding:20px 32px 0;">
+<h1 class="tx" style="margin:0;font-family:${sans};font-size:16px;line-height:24px;font-weight:600;color:${c.text};mso-line-height-rule:exactly;">${escape(s.codeTitle)}</h1>
+${text("body", escape(s.codeLead(f)), "margin-top:8px;")}
+</td></tr>
+<tr><td class="px" style="padding:16px 32px 0;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr>
+<td class="cd" style="padding:12px 14px;background:${c.codeBg};border:1px solid ${c.codeLine};border-radius:6px;font-family:${mono};font-size:16px;line-height:24px;color:${c.text};word-break:break-all;mso-line-height-rule:exactly;">${escape(sampleCode)}</td>
+</tr></table>
+${text("muted", escape(s.codeTerms), "margin-top:8px;")}
+</td></tr>
+<tr><td class="px" style="padding:28px 32px 28px;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr><td class="line" style="border-top:1px solid ${c.line};padding-top:16px;">
+${text("muted", escape(s.codeIgnore))}
+</td></tr></table>
+</td></tr>`;
+      return shell({ lang: lang === "zh" ? "zh-CN" : "en", title: s.codeSubject, preheader: s.codeLead(f), scheme, body });
+    }
+
+    function numbers(f, lang) {
+      const format = new Intl.NumberFormat(lang === "zh" ? "zh-CN" : "en");
+      return { visitors: format.format(f.visitors), visits: format.format(f.visits), pageviews: format.format(f.pageviews) };
+    }
+
+    function reportText(f, lang) {
+      const s = strings[lang];
+      const n = numbers(f, lang);
+      const p = period(f, lang);
+      const zone = lang === "zh" ? `（${f.tz}）` : ` (${f.tz})`;
+      return [
+        f.site, `${p.long}${zone}`, "",
+        `${s.visitors}${s.colon}${n.visitors}`, `${s.visits}${s.colon}${n.visits}`, `${s.pageviews}${s.colon}${n.pageviews}`,
+        ...(f.visitors + f.visits + f.pageviews === 0 ? [s.noVisits] : []), "",
+        `${s.open}${s.colon}${base}/s/${f.id}`, "",
+        s.reason(f), `${s.manage}${s.colon}${base}/s/${f.id}/settings/weekly-report`, "",
+      ].join("\n");
+    }
+
+    function codeText(f, lang) {
+      const s = strings[lang];
+      return [s.codeLead(f), "", sampleCode, "", s.codeTerms, "", s.codeIgnore, ""].join("\n");
+    }
+
+    function current(kind, f, lang) {
+      const link = `${base}/s/${f.id}`;
+      if (kind === "code") {
+        return lang === "zh"
+          ? { subject: "Rivu 周报验证码", body: `请将下面的验证码粘贴到 Rivu。验证码在 15 分钟内有效。\n\n${sampleCode}\n` }
+          : { subject: "Rivu weekly report confirmation code", body: `Paste this code into Rivu within 15 minutes.\n\n${sampleCode}\n` };
+      }
+      return lang === "zh"
+        ? { subject: "Rivu 周报", body: `${f.site}\n${f.from} 至 ${f.to}（${f.tz}）\n\n访客：${f.visitors}\n访问：${f.visits}\n浏览量：${f.pageviews}\n\n查看仪表盘：${link}\n` }
+        : { subject: "Rivu weekly report", body: `${f.site}\n${f.from} to ${f.to} (${f.tz})\n\nVisitors: ${f.visitors}\nVisits: ${f.visits}\nPageviews: ${f.pageviews}\n\nView dashboard: ${link}\n` };
+    }
+
+    const frame = byId("message");
+    const plain = byId("plain");
+    function fit() {
+      const doc = frame.contentDocument;
+      if (doc?.body) frame.style.height = `${doc.body.scrollHeight}px`;
+    }
+    frame.addEventListener("load", fit);
+
+    function render() {
+      const lang = english() ? "en" : "zh";
+      const kind = ui.mail.value;
+      const f = fixtures[kind === "code" ? "studio" : ui.fixture.value];
+      const scheme = ui.scheme.value;
+      const dark = scheme === "dark";
+      document.documentElement.lang = ui.language.value;
+      document.documentElement.style.colorScheme = dark ? "dark" : "light";
+      document.title = `${t(kind)} – Rivu`;
+      document.querySelectorAll("[data-copy]").forEach((node) => setText(node, t(node.dataset.copy)));
+      byId("fixture-field").hidden = kind === "code";
+      byId("stage").style.setProperty("--frame", `${ui.width.value}px`);
+      setText(byId("to"), recipient);
+
+      const s = strings[lang];
+      let subject;
+      let preheader = "";
+      if (ui.version.value === "current") {
+        const mail = current(kind, f, lang);
+        subject = mail.subject;
+        setText(plain, mail.body);
+      } else if (kind === "report") {
+        subject = s.reportSubject(f, period(f, lang));
+        preheader = s.reportPreheader(numbers(f, lang));
+        setText(plain, reportText(f, lang));
+      } else {
+        subject = s.codeSubject;
+        preheader = s.codeLead(f);
+        setText(plain, codeText(f, lang));
+      }
+      setText(byId("subject"), subject);
+      setText(byId("preheader"), preheader);
+      byId("preheader-row").hidden = ui.version.value !== "html";
+      const html = ui.version.value === "html";
+      frame.hidden = !html;
+      plain.hidden = html;
+      frame.title = subject;
+      if (html) {
+        const next = kind === "report" ? reportHtml(f, lang, scheme) : codeHtml(f, lang, scheme);
+        if (frame.srcdoc !== next) frame.srcdoc = next;
+        else fit();
+      }
+    }
+
+    Object.values(ui).forEach((control) => { control.onchange = render; });
+    window.addEventListener("resize", fit);
+    window.__weeklyReportEmail = { reportHtml, codeHtml, reportText, codeText, current, fixtures, sampleCode };
+    render();
+  </script>
+</body>
+</html>

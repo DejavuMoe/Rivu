@@ -1,0 +1,35 @@
+{
+  "type": "design",
+  "designSystems": [],
+  "primaryDesignSystem": null,
+  "assets": {
+    "我的周报": {
+      "versions": [
+        {
+          "path": "index.html",
+          "createdAt": "2026-11-19T01:09:21.567Z",
+          "status": "needs-review",
+          "viewport": {
+            "width": 1440,
+            "height": 900
+          }
+        }
+      ]
+    },
+    "周报邮件": {
+      "versions": [
+        {
+          "path": "email.html",
+          "createdAt": "2026-11-19T03:06:32.039Z",
+          "status": "needs-review",
+          "viewport": {
+            "width": 1440,
+            "height": 900
+          }
+        }
+      ]
+    }
+  },
+  "createdAt": "2026-11-19T01:09:21.571Z",
+  "updatedAt": "2026-11-19T03:06:32.162Z"
+}
