@@ -374,7 +374,7 @@ pub struct DashApi {
     pub(crate) dashboard_timeout_secs: u64,
     public_timeout_secs: u64,
     /// `RIVU_ROLLUP_MIN_ROWS`（§6.4 选层）。
-    rollup_min_rows: Option<u64>,
+    pub(crate) rollup_min_rows: Option<u64>,
     /// 结果缓存（与公开 API 共用，§6.9）；`None` 不缓存。
     pub(crate) cache: Option<Arc<QueryCache>>,
     /// `RIVU_RETENTION_DAYS`。
@@ -1162,7 +1162,7 @@ pub(crate) fn effective_role(roles: &UserSiteRoles) -> Option<OrgRole> {
 }
 
 /// 用户在这个站点上的有效角色是否允许读统计（`stats.read`，查 `rivu-auth` 的角色矩阵：所有角色都允许）。
-fn may_read_stats(roles: &UserSiteRoles) -> bool {
+pub(crate) fn may_read_stats(roles: &UserSiteRoles) -> bool {
     effective_role(roles).is_some_and(|r| allowed(r, Action::StatsRead))
 }
 async fn list_sites(State(api): State<Arc<DashApi>>, req: Request) -> Res<Response> {
@@ -1892,6 +1892,7 @@ pub fn router(api: Arc<DashApi>) -> Router {
         .merge(crate::org_admin::routes(a))
         .merge(crate::imports_admin::routes(a))
         .merge(crate::account::routes(a))
+        .merge(crate::weekly_report::routes(a))
 }
 // ------------------------------------------------------------------------------------------
 // 后台：活跃会话数与清理
