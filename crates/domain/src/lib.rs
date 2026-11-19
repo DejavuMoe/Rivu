@@ -113,7 +113,6 @@ pub enum DropReason {
     IpBlocked,
     PageBlocked,
     Bot,
-    DatacenterIp,
     CountryBlocked,
     NoSession,
     /// 事件的站点本地日期没有可用的盐（`platform-and-ops.md` §3.3：collector 不现场生成盐）。
@@ -122,7 +121,7 @@ pub enum DropReason {
 }
 
 impl DropReason {
-    pub const ALL: [DropReason; 13] = [
+    pub const ALL: [DropReason; 12] = [
         Self::UnknownSite,
         Self::SiteDisabled,
         Self::HostnameNotAllowed,
@@ -131,7 +130,6 @@ impl DropReason {
         Self::IpBlocked,
         Self::PageBlocked,
         Self::Bot,
-        Self::DatacenterIp,
         Self::CountryBlocked,
         Self::NoSession,
         Self::SaltMissing,
@@ -148,7 +146,6 @@ impl DropReason {
             Self::IpBlocked => "ip_blocked",
             Self::PageBlocked => "page_blocked",
             Self::Bot => "bot",
-            Self::DatacenterIp => "datacenter_ip",
             Self::CountryBlocked => "country_blocked",
             Self::NoSession => "no_session",
             Self::SaltMissing => "salt_missing",
@@ -167,7 +164,6 @@ impl DropReason {
             Self::IpBlocked => "dropped_ip_blocked",
             Self::PageBlocked => "dropped_page_blocked",
             Self::Bot => "dropped_bot",
-            Self::DatacenterIp => "dropped_datacenter_ip",
             Self::CountryBlocked => "dropped_country_blocked",
             Self::NoSession => "dropped_no_session",
             Self::SaltMissing => "dropped_salt_missing",

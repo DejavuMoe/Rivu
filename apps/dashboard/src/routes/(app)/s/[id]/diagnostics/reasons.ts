@@ -1,4 +1,4 @@
-// 丢弃原因（`ingest_counters.metric` 去掉 `dropped_` 前缀，与 Rust 的 `DropReason` 一致）：
+// 丢弃原因取 `ingest_counters.metric` 去掉 `dropped_` 前缀，含历史原因。
 // fix 是处理入口（站点设置的分区），admin 是站点管理员处理不了的实例问题，why 表示名称看不出含义、需要一行说明。
 // dropped_unknown_site 记在 site_id = 0，不会出现在站点的诊断里。
 
@@ -19,7 +19,7 @@ export const REASONS: Record<string, ReasonDef> = {
   page_blocked: { fix: "shield" },
   country_blocked: { fix: "shield" },
   bot: {},
-  datacenter_ip: { why: true },
+  datacenter_ip: { why: true }, // 仅用于旧版本写入的计数。
   no_session: { why: true },
   salt_missing: { admin: true },
   overloaded: { admin: true },

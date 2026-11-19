@@ -2,10 +2,8 @@
 //! 与 `ch_monitor`（[`ch_monitor`]），都在 `rivu serve` 进程内定时执行（`platform-and-ops.md` §6）。
 //!
 //! `geoip_refresh` 见 [`geoip`]：下载并原子替换 GeoIP 库，成功后热加载。
-//! `datacenter_refresh` 见 [`datacenter`]：同样的方式维护数据中心网段清单（只在开启过滤时运行）。
 
 pub mod ch_monitor;
-pub mod datacenter;
 pub mod geoip;
 pub mod import_plausible;
 pub mod retention;
@@ -13,7 +11,6 @@ pub mod rollup;
 pub mod stats_delete;
 
 pub use ch_monitor::spawn_ch_monitor;
-pub use datacenter::spawn_datacenter_refresh;
 pub use geoip::{GeoRefreshJob, GeoRefreshSnapshot, GeoRefreshState, spawn_geoip_refresh};
 pub use retention::spawn_retention_purge;
 pub use rollup::spawn_rollup_build;
