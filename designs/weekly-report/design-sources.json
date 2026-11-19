@@ -90,13 +90,13 @@
       "licenseOrPermission": "User-authorized in-repository prototype reference.",
       "localCopies": [],
       "observations": [
-        "Mailer::send builds a single text/plain message in Mailer::message. When Mail.unsubscribe_url is set (weekly reports only) the message gets a List-Unsubscribe: <url> header; the confirmation email, the invitation and the password reset do not set it."
+        "Mailer::message builds multipart/alternative (plain text first, HTML second) when Mail.html is set, which the two weekly report emails do; invitations and password resets stay text/plain. When Mail.unsubscribe_url is set (weekly reports only) the message gets List-Unsubscribe: <url> and List-Unsubscribe-Post: List-Unsubscribe=One-Click; the confirmation email, the invitation and the password reset do not set it."
       ],
       "inferences": [
-        "An HTML email needs a multipart/alternative change in Mailer::message; the List-Unsubscribe header can stay as it is."
+        "The HTML and plain-text parts are built in crates/mail/src/weekly_report.rs from the same data, so both carry the same links."
       ],
       "limitations": [
-        "There is no List-Unsubscribe-Post header, so one-click unsubscribe (RFC 8058) is not implemented."
+        "Rendering was checked in Chromium only, not in real mail clients."
       ]
     },
     {

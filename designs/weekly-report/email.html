@@ -84,6 +84,7 @@
       <div><dt data-copy="to"></dt><dd id="to"></dd></div>
       <div><dt data-copy="subject"></dt><dd id="subject"></dd></div>
       <div id="list-unsubscribe-row"><dt data-copy="listUnsubscribe"></dt><dd id="list-unsubscribe"></dd></div>
+      <div id="list-unsubscribe-post-row"><dt data-copy="listUnsubscribePost"></dt><dd id="list-unsubscribe-post">List-Unsubscribe=One-Click</dd></div>
       <div id="preheader-row"><dt data-copy="preheader"></dt><dd id="preheader"></dd></div>
     </dl>
     <div class="frame">
@@ -101,6 +102,7 @@
       current: ["现行纯文本", "Current plain text"], width: ["宽度", "Width"], scheme: ["外观", "Appearance"], light: ["浅色", "Light"], dark: ["深色", "Dark"],
       from: ["发件人", "From"], to: ["收件人", "To"], subject: ["主题", "Subject"], preheader: ["摘要", "Preview"],
       listUnsubscribe: ["List-Unsubscribe", "List-Unsubscribe"],
+      listUnsubscribePost: ["List-Unsubscribe-Post", "List-Unsubscribe-Post"],
       unsubscribe: ["退订页（现行）", "Current unsubscribe page"], unsubscribePage: ["页面", "Page"],
       pageConfirm: ["确认页", "Confirmation"], pageDone: ["已退订", "Unsubscribed"], pageExpired: ["链接过期或已关闭", "Expired or already off"],
     };
@@ -324,16 +326,13 @@ ${text("muted", escape(s.confirmIgnore))}
       return [s.confirmLead, "", `${s.confirmAction}${s.colon}${confirmUrl}`, "", s.confirmTerms, "", s.confirmIgnore, ""].join("\n");
     }
 
+    // Production (crates/mail/src/weekly_report.rs) sends the HTML and plain-text versions above
+    // since 2026-11-19, so its plain-text part is the Plain text version.
     function current(kind, f, lang) {
-      const link = `${base}/s/${f.id}`;
-      if (kind === "confirmation") {
-        return lang === "zh"
-          ? { subject: "确认接收 Rivu 周报", body: `点下面的链接，确认用这个邮箱接收 Rivu 周报。链接 1 小时内有效，只能用一次。\n\n${confirmUrl}\n\n如果不是你本人操作，忽略这封邮件即可。\n` }
-          : { subject: "Confirm your email for Rivu weekly reports", body: `Open this link to confirm that this address should receive Rivu weekly reports. The link works once and expires in 1 hour.\n\n${confirmUrl}\n\nIf you didn't ask for this, you can ignore this email.\n` };
-      }
-      return lang === "zh"
-        ? { subject: "Rivu 周报", body: `${f.site}\n${f.from} 至 ${f.to}（${f.tz}）\n\n访客：${f.visitors}\n访问：${f.visits}\n浏览量：${f.pageviews}\n\n查看仪表盘：${link}\n退订周报：${unsubscribeUrl}\n` }
-        : { subject: "Rivu weekly report", body: `${f.site}\n${f.from} to ${f.to} (${f.tz})\n\nVisitors: ${f.visitors}\nVisits: ${f.visits}\nPageviews: ${f.pageviews}\n\nView dashboard: ${link}\nUnsubscribe: ${unsubscribeUrl}\n` };
+      const s = strings[lang];
+      return kind === "confirmation"
+        ? { subject: s.confirmSubject, body: confirmText(lang) }
+        : { subject: s.reportSubject(f, period(f, lang)), body: reportText(f, lang) };
     }
 
     const frame = byId("message");
@@ -394,6 +393,7 @@ ${text("muted", escape(s.confirmIgnore))}
       }
       setText(byId("subject"), subject);
       byId("list-unsubscribe-row").hidden = kind !== "report";
+      byId("list-unsubscribe-post-row").hidden = kind !== "report";
       setText(byId("list-unsubscribe"), kind === "report" ? `<${unsubscribeUrl}>` : "");
       setText(byId("preheader"), preheader);
       byId("preheader-row").hidden = ui.version.value !== "html";

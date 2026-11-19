@@ -39,16 +39,35 @@ function save(name, captures) {
   writeFileSync(join(output, `${name}.json`), JSON.stringify({ ...captures[0], items: [...items.values()] }));
 }
 
-function expectedCurrent(kind, f, lang, confirm, unsubscribe) {
-  const link = `https://rivu.example.com/s/${f.id}`;
+// What production sends (crates/mail/src/weekly_report.rs and its tests), written out rather than
+// generated, so a change on either side shows up here.
+const PRODUCTION_DATES = {
+  zh: {
+    studio: ['11 月 16 日至 22 日', '2026 年 11 月 16 日至 22 日'],
+    quiet: ['11 月 15 日至 21 日', '2026 年 11 月 15 日至 21 日'],
+    large: ['2026 年 12 月 28 日至 2027 年 1 月 3 日', '2026 年 12 月 28 日至 2027 年 1 月 3 日'],
+  },
+  en: {
+    studio: ['Nov 16 – 22', 'Nov 16 – 22, 2026'],
+    quiet: ['Nov 15 – 21', 'Nov 15 – 21, 2026'],
+    large: ['Dec 28, 2026 – Jan 3, 2027', 'Dec 28, 2026 – Jan 3, 2027'],
+  },
+};
+const PRODUCTION_NUMBERS = { studio: ['1,284', '1,702', '4,315'], quiet: ['0', '0', '0'], large: ['12,840,310', '18,755,902', '96,302,417'] };
+
+function expectedCurrent(kind, fixture, f, lang, confirm, unsubscribe) {
+  const base = 'https://rivu.example.com';
   if (kind === 'confirmation') {
     return lang === 'zh'
-      ? ['确认接收 Rivu 周报', `点下面的链接，确认用这个邮箱接收 Rivu 周报。链接 1 小时内有效，只能用一次。\n\n${confirm}\n\n如果不是你本人操作，忽略这封邮件即可。\n`]
-      : ['Confirm your email for Rivu weekly reports', `Open this link to confirm that this address should receive Rivu weekly reports. The link works once and expires in 1 hour.\n\n${confirm}\n\nIf you didn't ask for this, you can ignore this email.\n`];
+      ? ['确认接收 Rivu 周报', `确认用这个邮箱接收 Rivu 周报。\n\n确认邮箱：${confirm}\n\n链接 1 小时内有效，只能用一次。\n\n如果不是你本人操作，忽略这封邮件即可。\n`]
+      : ['Confirm your email for Rivu weekly reports', `Confirm that Rivu weekly reports should be sent to this address.\n\nConfirm email: ${confirm}\n\nThe link works once and expires in 1 hour.\n\nIf you didn’t ask for this, you can ignore this email.\n`];
   }
+  const [short, long] = PRODUCTION_DATES[lang][fixture];
+  const [visitors, visits, pageviews] = PRODUCTION_NUMBERS[fixture];
+  const quiet = fixture === 'quiet';
   return lang === 'zh'
-    ? ['Rivu 周报', `${f.site}\n${f.from} 至 ${f.to}（${f.tz}）\n\n访客：${f.visitors}\n访问：${f.visits}\n浏览量：${f.pageviews}\n\n查看仪表盘：${link}\n退订周报：${unsubscribe}\n`]
-    : ['Rivu weekly report', `${f.site}\n${f.from} to ${f.to} (${f.tz})\n\nVisitors: ${f.visitors}\nVisits: ${f.visits}\nPageviews: ${f.pageviews}\n\nView dashboard: ${link}\nUnsubscribe: ${unsubscribe}\n`];
+    ? [`${f.site} 周报：${short}`, `${f.site}\n${long}（${f.tz}）\n\n访客：${visitors}\n访问：${visits}\n浏览量：${pageviews}\n${quiet ? '这一周没有记录到访问。\n' : ''}\n打开看板：${base}/s/${f.id}\n\n你订阅了 ${f.site} 的周报，收件地址 viewer@example.com。\n管理周报：${base}/account\n退订周报：${unsubscribe}\n`]
+    : [`${f.site} weekly report: ${short}`, `${f.site}\n${long} (${f.tz})\n\nVisitors: ${visitors}\nVisits: ${visits}\nPageviews: ${pageviews}\n${quiet ? 'No visits were recorded this week.\n' : ''}\nOpen dashboard: ${base}/s/${f.id}\n\nYou subscribed to the weekly report for ${f.site} at viewer@example.com.\nManage weekly report: ${base}/account\nUnsubscribe: ${unsubscribe}\n`];
 }
 
 async function emails(page, address, mobile) {
@@ -69,10 +88,15 @@ async function emails(page, address, mobile) {
   assert(confirm.endsWith(`/${token}`));
   const unsubscribe = await api.evaluate((x) => x.unsubscribeUrl);
   assert.match(unsubscribe, UNSUBSCRIBE);
-  // The report carries the List-Unsubscribe header in every version; the confirmation email has none.
+  // The report carries List-Unsubscribe and List-Unsubscribe-Post (RFC 8058 one-click) in every
+  // version; the confirmation email has neither.
   const header = async (kind) => {
     assert.equal(await control('list-unsubscribe-row').isHidden(), kind === 'confirmation');
-    if (kind === 'report') assert.equal(await control('list-unsubscribe').innerText(), `<${unsubscribe}>`);
+    assert.equal(await control('list-unsubscribe-post-row').isHidden(), kind === 'confirmation');
+    if (kind === 'report') {
+      assert.equal(await control('list-unsubscribe').innerText(), `<${unsubscribe}>`);
+      assert.equal(await control('list-unsubscribe-post').innerText(), 'List-Unsubscribe=One-Click');
+    }
   };
 
   const expected = {
@@ -165,10 +189,13 @@ async function emails(page, address, mobile) {
         assert(await control('preheader-row').isHidden());
         await header(kind);
         await capture();
+        const proposed = await control('plain').evaluate((element) => element.textContent);
         await control('version').selectOption('current');
-        const [subject, body] = expectedCurrent(kind, f, lang, confirm, unsubscribe);
+        const [subject, body] = expectedCurrent(kind, fixture, f, lang, confirm, unsubscribe);
         assert.equal(await control('subject').innerText(), subject);
         assert.equal(await control('plain').evaluate((element) => element.textContent), body);
+        // Production's plain-text part is the Plain text version, byte for byte.
+        assert.equal(body, proposed);
         await header(kind);
         await capture();
         await control('version').selectOption('html');
