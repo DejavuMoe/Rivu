@@ -2,7 +2,7 @@
 
 已审批的可交互原型，是 `apps/dashboard` 的视觉与交互参照，不是生产代码；数据全部是固定种子的模拟数据。设计规范见 [`apps/dashboard/DESIGN.md`](../../apps/dashboard/DESIGN.md)，原型在整个流程里的位置见 [`../README.md`](../README.md)。
 
-待确认的部分：「账号 → 邮件周报」（`src/routes/account/WeeklyReportsCard.svelte`）和邮件里的确认链接页（`src/routes/auth/WeeklyConfirmPage.svelte`，路径 `#/weekly-report/confirm/t0k3n`）。
+2026-11-19 确认、正在实现的部分：「账号 → 邮件周报」（`src/routes/account/WeeklyReportsCard.svelte`）和邮件里的确认链接页（`src/routes/auth/WeeklyConfirmPage.svelte`，路径 `#/weekly-report/confirm/t0k3n`）。
 
 ## 运行
 
