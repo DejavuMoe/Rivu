@@ -44,8 +44,11 @@ extend({
   "diag.r.page_blocked.name": ["页面已屏蔽", "Page blocked"],
   "diag.r.country_blocked.name": ["国家已屏蔽", "Country blocked"],
   "diag.r.bot.name": ["机器人", "Bot"],
-  "diag.r.datacenter_ip.name": ["数据中心 IP", "Datacenter IP"],
-  "diag.r.datacenter_ip.why": ["访客 IP 属于云厂商或机房网段", "The visitor IP is in a datacenter range"],
+  "diag.r.datacenter_ip.name": ["数据中心 IP（历史）", "Datacenter IP (historical)"],
+  "diag.r.datacenter_ip.why": [
+    "旧版 Rivu 根据云厂商网段丢弃了这些事件，现已移除此过滤规则。",
+    "An earlier version of Rivu dropped these events based on cloud provider IP ranges. This filter has been removed.",
+  ],
   "diag.r.no_session.name": ["无会话的停留事件", "Engagement without session"],
   "diag.r.no_session.why": ["找不到对应的会话，通常是会话已过期", "No matching session, usually expired"],
   "diag.r.salt_missing.name": ["缺少盐值", "Salt missing"],

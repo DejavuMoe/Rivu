@@ -2,8 +2,7 @@
 //!
 //! 规则出处：`docs/architecture/tracker-and-protocol.md` §5（字段总表）、§6.2（错误词表）、
 //! §7（服务端规范化规则）。这里不碰 HTTP、不碰站点配置：
-//! 内部引荐的判定（referrer 的 host 是否命中站点白名单）、hostname 白名单、`$` 收入入库，
-//! 都由调用方在后续阶段处理。
+//! 内部引荐的判定（referrer 的 host 是否命中站点白名单）与 hostname 白名单都在后续阶段处理。
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -296,48 +295,9 @@ fn valid_engagement_ms(v: Option<&Value>) -> Option<u32> {
     }
 }
 
-/// `$` 收入对象的格式校验：`a` 匹配 `^\d{1,15}(\.\d{1,4})?$`，`c` 为三个大写 ASCII 字母。
-/// 通过后丢弃，P4 前不入库。
-fn validate_revenue(v: &Value, errs: &mut ProtocolErrors) {
-    let Value::Object(map) = v else {
-        errs.add("$", MUST_BE_OBJECT);
-        return;
-    };
-    for key in ["a", "c"] {
-        match present(map, key) {
-            None => errs.add("$", IS_REQUIRED),
-            Some(Value::String(s)) => {
-                let ok = if key == "a" {
-                    is_valid_amount(s)
-                } else {
-                    is_valid_currency(s)
-                };
-                if !ok {
-                    errs.add("$", INVALID_FORMAT);
-                }
-            }
-            Some(_) => errs.add("$", MUST_BE_STRING),
-        }
-    }
-}
-
-fn is_valid_amount(s: &str) -> bool {
-    let (int, frac) = match s.split_once('.') {
-        Some((i, f)) => (i, Some(f)),
-        None => (s, None),
-    };
-    let digits =
-        |p: &str, max: usize| (1..=max).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_digit());
-    digits(int, 15) && frac.is_none_or(|f| digits(f, 4))
-}
-
-fn is_valid_currency(s: &str) -> bool {
-    s.len() == 3 && s.bytes().all(|b| b.is_ascii_uppercase())
-}
-
 /// 解析并规范化 `POST /api/event` 的请求体。
 ///
-/// 请求体一律按 UTF-8 JSON 解析（不看 `Content-Type`），必须是 JSON 对象；未知键忽略；
+/// 请求体一律按 UTF-8 JSON 解析（不看 `Content-Type`），必须是 JSON 对象；未知键（包括旧版的 `$`）忽略；
 /// 各字段的错误一次性汇总在 [`ProtocolErrors`] 里。超过 [`MAX_BODY_BYTES`] 的 413 在 HTTP 层处理。
 pub fn parse_event(body: &[u8]) -> Result<NormalizedEvent, ProtocolErrors> {
     let value: Value =
@@ -354,7 +314,7 @@ pub fn parse_event(body: &[u8]) -> Result<NormalizedEvent, ProtocolErrors> {
 
     let raw_name = required_str(&obj, "n", &mut errs);
     let name = raw_name.and_then(|n| parse_name(n, &mut errs));
-    // 名字非法时仍按 trim 后的原文判断种类，让 `i`/`sd`/`e`/`$` 的校验口径不随 `n` 的对错而变。
+    // 名字非法时仍按 trim 后的原文判断种类，让 `i`/`sd`/`e` 的校验口径不随 `n` 的对错而变。
     let kind = raw_name.map_or(EventKind::Custom, |n| EventKind::from_name(n.trim()));
 
     let hash_mode = parse_hash_mode(&obj, &mut errs);
@@ -384,13 +344,11 @@ pub fn parse_event(body: &[u8]) -> Result<NormalizedEvent, ProtocolErrors> {
             }
             (true, sd.unwrap_or(SCROLL_DEPTH_UNREPORTED), e.unwrap_or(0))
         }
-        EventKind::Custom => {
-            let interactive = parse_interactive(&obj, &mut errs);
-            if let Some(revenue) = present(&obj, "$") {
-                validate_revenue(revenue, &mut errs);
-            }
-            (interactive, SCROLL_DEPTH_UNREPORTED, 0)
-        }
+        EventKind::Custom => (
+            parse_interactive(&obj, &mut errs),
+            SCROLL_DEPTH_UNREPORTED,
+            0,
+        ),
     };
 
     match (protocol_version, site_key, name, page) {
@@ -496,8 +454,8 @@ mod tests {
     }
 
     #[test]
-    fn example_2_custom_event_with_props_and_revenue() {
-        let body = br#"{"v":1,"sv":3,"s":"k7qm2xv7atbr","n":"Purchase","u":"https://example.com/checkout/done","p":{"plan":"pro","seats":"5"},"$":{"a":"29.00","c":"USD"}}"#;
+    fn example_2_custom_event_with_props() {
+        let body = br#"{"v":1,"sv":3,"s":"k7qm2xv7atbr","n":"Purchase","u":"https://example.com/checkout/done","p":{"plan":"pro","seats":"5"}}"#;
         let ev = parse_event(body).unwrap();
         assert_eq!(
             ev,
@@ -1236,78 +1194,17 @@ mod tests {
         assert!(parse(&with(base(), "n", json!(" engagement "))).is_err());
     }
 
-    // ---- $ ----
-
-    fn custom() -> Value {
-        with(base(), "n", json!("Purchase"))
-    }
-
     #[test]
-    fn revenue_valid_forms() {
-        for (a, c) in [
-            ("12.50", "USD"),
-            ("0", "EUR"),
-            ("999999999999999", "JPY"),
-            ("1.2345", "CNY"),
-            ("5.0", "GBP"),
-        ] {
-            let v = with(custom(), "$", json!({"a": a, "c": c}));
-            assert!(parse(&v).is_ok(), "{a} {c}");
+    fn legacy_revenue_does_not_affect_event_parsing() {
+        let custom = with(base(), "n", json!("Purchase"));
+        let engagement = with(engagement(), "sd", json!(5));
+        for event in [base(), custom, engagement] {
+            let event = with(event, "p", json!({"plan": "pro", "$": "custom prop"}));
+            let expected = ok(&event);
+            for legacy in [json!({"a": "29.00", "c": "USD"}), json!([])] {
+                assert_eq!(ok(&with(event.clone(), "$", legacy)), expected);
+            }
         }
-    }
-
-    #[test]
-    fn revenue_invalid_forms() {
-        for (a, c) in [
-            ("1234567890123456", "USD"), // 16 位整数
-            ("1.23456", "USD"),          // 5 位小数
-            ("1.", "USD"),
-            (".5", "USD"),
-            ("-1", "USD"),
-            ("1,5", "USD"),
-            ("１２", "USD"), // 全角数字
-            ("", "USD"),
-            ("12", "usd"),
-            ("12", "US"),
-            ("12", "USDX"),
-            ("12", "U1D"),
-            ("12", "ÜSD"),
-        ] {
-            let v = with(custom(), "$", json!({"a": a, "c": c}));
-            assert_single_error(&v, "$", "has an invalid format");
-        }
-    }
-
-    #[test]
-    fn revenue_shape_errors() {
-        assert_single_error(
-            &with(custom(), "$", json!("12 USD")),
-            "$",
-            "must be an object",
-        );
-        assert_single_error(&with(custom(), "$", json!([1])), "$", "must be an object");
-        assert_single_error(&with(custom(), "$", json!({"a": "1"})), "$", "is required");
-        assert_single_error(
-            &with(custom(), "$", json!({"c": "USD"})),
-            "$",
-            "is required",
-        );
-        assert_single_error(
-            &with(custom(), "$", json!({"a": 12, "c": "USD"})),
-            "$",
-            "must be a string",
-        );
-        assert!(parse(&with(custom(), "$", json!(null))).is_ok());
-    }
-
-    #[test]
-    fn revenue_is_discarded_and_ignored_for_system_events() {
-        let with_rev = with(custom(), "$", json!({"a": "29.00", "c": "USD"}));
-        assert_eq!(ok(&with_rev), ok(&custom()));
-        // pageview / engagement 对 `$` 不校验。
-        assert!(parse(&with(base(), "$", json!("garbage"))).is_ok());
-        let eng = with(engagement(), "sd", json!(5));
-        assert!(parse(&with(eng, "$", json!([]))).is_ok());
     }
 
     // ---- 错误词表 ----

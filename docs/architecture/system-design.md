@@ -235,17 +235,17 @@ tracker ─► 反向代理 ─► rivu serve
 | 2 | 客户端上下文 | TCP 对端属于 `RIVU_TRUSTED_PROXIES` 时才读 `X-Forwarded-For`，从右往左取第一个不可信的地址；IP 规范化（IPv4-mapped 转为 IPv4，IPv6 转为小写压缩形式） | 无 | 配置 |
 | 3 | 准入 | 按次序：用 `site_key` 在内存快照中查 `SiteConfig`；站点是否停用；hostname 是否在白名单（白名单为空时全部丢弃，fail-closed，§10 Q12）；hostname 屏蔽规则（`deny` 命中且无 `allow` 例外，记 `hostname_not_allowed`）；每站令牌桶限流（站点 `ingest_rate_limit_per_min` 优先，否则 `RIVU_INGEST_RATE_LIMIT_PER_MIN`）；垃圾引荐（referrer 的 host 后缀命中名单；**engagement 跳过**，它的 referrer 不会被使用）。限流放在 hostname 之后，别的 hostname 冒用 `site_key` 灌进来的流量不会耗掉站点额度 | `unknown_site` `site_disabled` `hostname_not_allowed` `rate_limited` `spam_referrer` | SiteSnapshot、垃圾引荐表 |
 | 4 | 规则 | IP/CIDR 规则（先）、页面通配规则（后）。**engagement 同样适用**：内存里的哈希与比较，没有富化成本；页面规则若放过 engagement，被屏蔽页面的 pageview 虽被丢弃，同一访客在其它页面已开的会话仍会让该页的 engagement 被接受并盖上会话属性，污染 `engaged_duration` 和页面榜；规则在会话中途新增时，已开会话里的 IP 也立即被挡住 | `ip_blocked` `page_blocked` | SiteConfig |
-| 5 | 机器人 | `rivu-ua` 判定：uap-core 的 `Spider`、Headless、自动化框架与脚本客户端、爬虫名与自报家门规则；**空 UA 也算机器人**（§10 Q21）；可选数据中心 CIDR 表 | `bot` `datacenter_ip` | uap-core 规则、自维护名字表、CIDR 表 |
+| 5 | 机器人 | `rivu-ua` 判定：uap-core 的 `Spider`、Headless、自动化框架与脚本客户端、爬虫名与自报家门规则。**空 UA 也算机器人**（§10 Q21） | `bot` | uap-core 规则、自维护名字表 |
 | 6 | 地理 | 非公网地址（私有、回环、链路本地、CGNAT、文档、保留、组播等；IPv4-mapped 先转 IPv4）不查库，位置为空。否则查 GeoIP 库得 country、region、city，按站点 `geo_level` 截断，再过国家规则（没有国家的事件按 `ZZ` 判定；engagement 不做，它没有地理查询）。国家码不是两个 ASCII 字母，或为占位码（`ZZ` `XX` `A1` `A2` `T1`），视为未知；没有国家时区域与城市也为空；`region_code` 为 `<国家>-<第一级子区划代码>`（§10 Q26）。默认来源下 region、city 恒为空（§10 Q24） | `country_blocked` | GeoIP 库 |
 | 7 | UA 富化 | 与第 5 步共用一次 `UaParser::parse`（UA 先截断到 512 字节，结果按截断后的 UA 缓存，空 UA 不进缓存）。浏览器和系统取 major.minor，浏览器名按归一化表映射；冻结或精简的 `os_version` 报空串；设备类别只有 desktop / mobile / tablet（§10 Q22） | 无 | uap-core 规则 |
 | 8 | 来源 | `rivu-source` 的 `classify`：referrer → source（host 命中站点白名单的视为内部引荐，调用方传 `None`）；UTM（空串视为缺失）；click id 只记参数名；渠道分类（只有一份 Rust 实现，规则带版本号） | 无 | Matomo 来源库（CC0）、自维护补充表、渠道规则 |
-| 9 | 属性 | 规范化 props；可选的站点 props 白名单；收入（P4） | 无 | SiteConfig |
+| 9 | 属性 | 规范化 props，应用可选的站点 props 白名单 | 无 | SiteConfig |
 | 10 | 身份 | 计算 `visitor_id`、`prev_visitor_id`、`partition`（§4.5） | `salt_missing` | salts |
 | 11 | 交接 | 交给 SessionAssigner，再交给 BatchWriter | `no_session`（engagement）、`overloaded` | 无 |
 
 - **顺序原则**与 Plausible 相同（R01 §5.2）：先做便宜的判断，昂贵的 UA 解析和地理查询放在规则之后。
 - **每个阶段**都记录耗时直方图 `rivu_ingest_stage_seconds{stage}`；每个丢弃原因都计入 `ingest_counters`（§5.4）。`stage` 标签共 10 个：`parse`（第 1 步）、`admit`（第 2–3 步，含客户端 IP 与限流）、`shield`（第 4 步）、`bot`（第 5 步；一次 `UaParser::parse` 的耗时记在这里）、`geo`（第 6 步，含国家规则）、`ua`（第 7 步，只是把解析结果写进会话属性）、`source`（第 8 步）、`identity`（第 10 步）、`session`（第 11 步的 SessionAssigner）、`write`（组装行并交给 BatchWriter）。engagement 不经过 `bot` `geo` `ua` `source`，这几个直方图的样本数只对应 pageview 与自定义事件。被限流拒绝的请求另计 `rivu_ratelimit_rejected_total{scope="ingest"}`。
-- **丢弃原因的标识符**（§10 Q13）以 Rust 枚举 `DropReason`（`rivu-domain`）为唯一来源，共 13 个：`unknown_site` `site_disabled` `hostname_not_allowed` `rate_limited` `spam_referrer` `ip_blocked` `page_blocked` `bot` `datacenter_ip` `country_blocked` `no_session` `salt_missing` `overloaded`。`ingest_counters.metric` 取 `accepted` 或 `dropped_<原因>`；未知站点记 `site_id = 0`；已删除的站点从快照摘除后，同样按 `unknown_site` 计。机器人一律记 `dropped_bot`；`rivu-ua` 的 `BotKind`（`spider` `headless` `automation` `empty`）只用于统计与排错，不进 `ingest_counters.metric`（§10 Q21）。`salt_missing` 表示事件的站点本地日期没有盐：collector 不现场生成盐（`platform-and-ops.md` §3.3）。
+- **丢弃原因的标识符**（§10 Q13）以 `rivu-domain` 的 `DropReason` 为准。`ingest_counters.metric` 取 `accepted` 或 `dropped_<原因>`。未知站点记 `site_id = 0`，已删除的站点从快照摘除后也按 `unknown_site` 计。机器人一律记 `dropped_bot`。`rivu-ua` 的 `BotKind` 只用于排错。`salt_missing` 表示站点本地日期没有预先生成的盐（`platform-and-ops.md` §3.3）。
 - **采集限流**（`rivu-ratelimit::KeyedLimiter`）：每站一个令牌桶，容量 N、补充速率 N/60 每秒（N = 每分钟额度，所以可以一次突发一分钟的量）。额度取站点 `ingest_rate_limit_per_min`，为空取 `RIVU_INGEST_RATE_LIMIT_PER_MIN`，设为 `0` 表示不限流。默认 300000 个/分钟，即 5000 个/秒的系统峰值目标（§7）：`site_key` 是公开的，没有默认上限就等于没有限流；而单站日均 1000 万事件、20 倍峰值约 2300 个/秒，默认值不会误伤目标规模内的真实流量，小站想更严就设站点自己的额度。状态在进程内，重启清零；站点额度变化时就地调整桶，不重置已有令牌；站点被删除后，它的桶在下一轮会话清扫（每 60 秒）时丢掉。engagement 同样计数：限流是洪水防护，不分事件类型。
 - **屏蔽规则的语义**（`platform-and-ops.md` §3.3）：规则随站点快照编译成不可变的 `ShieldRules`，`deny` 命中就丢弃，`allow` 是同一类型内的例外。只有 `allow` 没有 `deny` 时不起作用，不是白名单模式。页面通配用分段比较而不是正则（无回溯，pathname ≤1024 字节、模式 ≤250 字节），所以匹配代价有界。
 - **可选优化**：续期会话的事件最终会被盖上会话属性，所以第 5–8 步的结果会被覆盖。可以在第 10 步之后先查会话，命中时跳过这几步。
@@ -273,7 +273,6 @@ tracker ─► 反向代理 ─► rivu serve
 | 用途 | 选型 | 许可与注意 |
 |---|---|---|
 | UA 解析 | `ua-parser` 0.2（uap-core 官方 Rust 实现）+ 固定 commit 的 `regexes.yaml`，随仓库嵌入（`crates/ua/data/uap-core/`），运行期不读文件、不联网。固定 commit 与升级流程见该目录的 `PROVENANCE.md`；uap-core 自带测试集 100% 通过（`test_ua` 1601、`test_os` 483、`test_device` 16129，见 `docs/research/enrich-ua.md` §6.1） | Apache-2.0。Plausible 用的 Matomo device-detector 数据是 LGPL-3.0，不用。上游在固定 commit 没有 `NOTICE`，仓库里的 `NOTICE` 是我们写的署名说明 |
-| 数据中心网段（可选，`RIVU_DATACENTER_FILTER=on`，默认关） | AWS `ip-ranges.json`、Google Cloud `cloud.json`、Oracle Cloud `public_ip_ranges.json`、DigitalOcean 与 Linode 的 geofeed（RFC 8805），每天下载、合并成 `${RIVU_DATA_DIR}/datacenter/ranges.txt`，全部来源成功才替换；collector 按修改时间热加载，管线第 5 步在 UA 机器人判定之后查（合并后的区间二分查找），命中记 `datacenter_ip`。Azure 的 Service Tags 没有固定地址，需要时用 `RIVU_DATACENTER_SOURCES` 指向自己镜像的文件。默认关闭：不少 VPN 与企业代理的出口在云上。2026-10-27 实测五个来源去重后约 2.06 万条 | 各家公开发布、供客户配置防火墙的清单，只下载到本地、不随仓库分发 |
 | 机器人 | uap-core 的 device=Spider，加自维护的 Headless、自动化框架、脚本 HTTP 客户端、爬虫名与自报家门规则（全是子串或前缀比较，没有正则）；空 UA 算机器人（§10 Q21）。在 crawler-user-agents 的 2120 个样例 UA 上检测率 84.58%（uap-core 单独 62.36%）；这是对一份名单的数字，不代表线上流量（§6.10） | 规则库同上；自维护名字表每条要有证据。crawler-user-agents 是 MIT，只当测试输入，不嵌入其正则 |
 | GeoIP | 默认 DB-IP Lite；可选 MaxMind GeoLite2；可选自定义 mmdb 直链（§10 Q5，详见下） | DB-IP Lite 为 CC BY 4.0，必须署名；GeoLite2 需要 Account ID 加 license key 并遵守其 EULA，也要求署名；自定义库的许可由运维者负责 |
 | 地名 | GeoNames（查询时经 CH 字典转换，与 Plausible 的 `location_data_dict` 做法相同） | CC BY 4.0。默认来源 DB-IP Lite 没有城市的 GeoNames id、也没有子区划代码（§10 Q24），字典只在 MaxMind 或同结构的自定义库下有数据可转换 |
@@ -487,8 +486,8 @@ CREATE TABLE rivu.events
     props            Map(LowCardinality(String), String) CODEC(ZSTD(3)),
     scroll_depth     UInt8  DEFAULT 255,            -- 255 表示无（只有 engagement 事件带）
     engagement_ms    UInt32 DEFAULT 0,
-    revenue_amount   Nullable(Decimal(18, 3)),      -- P4
-    revenue_currency LowCardinality(String)         -- P4
+    revenue_amount   Nullable(Decimal(18, 3)),      -- 旧 schema 字段
+    revenue_currency LowCardinality(String)         -- 旧 schema 字段
 )
 ENGINE = MergeTree
 PARTITION BY toYYYYMM(ts)
@@ -697,7 +696,7 @@ TTL minute + INTERVAL 90 DAY DELETE;
 | 字段 | 取值 |
 |---|---|
 | `site` | `site_key`。公开 API（`POST /api/v1/query`）没有路径参数，`site` 必填，缺失返回 400；站点由它经 `authorize_site` 授权后确定，不存在或无权访问一律 404。看板内部端点由路径给出站点，`site` 可以省略，给出时只用来核对：与路径不一致返回 404，`resolve` 再核对一次，不一致按校验错误拒绝 |
-| `metrics` | 至少 1 个、至多 12 个，不得重复：`visitors` `visits` `pageviews` `events` `views_per_visit` `bounce_rate` `visit_duration` `engaged_duration` `percentage` `exit_rate` `time_on_page` `scroll_depth` `conversion_rate`（要求 `event:goal` 维度或过滤，§6.5）；`group_conversion_rate` 与收入指标 `total_revenue` `average_revenue` 能解析，但返回 `not supported yet` |
+| `metrics` | 至少 1 个、至多 12 个，不得重复：`visitors` `visits` `pageviews` `events` `views_per_visit` `bounce_rate` `visit_duration` `engaged_duration` `percentage` `exit_rate` `time_on_page` `scroll_depth` `conversion_rate`（要求 `event:goal` 维度或过滤，§6.5）。`group_conversion_rate` 能解析，执行时返回 `not supported yet` |
 | `date_range` | `day` `24h` `month` `year` `all` `realtime`、`Nd`（1–5000，含 `7d` `28d` `30d`）、`Nmo`（1–100，含 `6mo` `12mo`），或 `[from, to]`：两端同为日期（`YYYY-MM-DD`，含两端的站点本地日）或同为带 UTC 偏移的 RFC 3339 时间戳（含起点、不含终点）。`realtime` 是最近 5 分钟，QuerySpec 本身接受，是否只对看板开放由路由层决定。换算规则见 §6.7 |
 | `dimensions` | 至多 4 个，不得重复，至多一个时间维度。`event:name` `event:page` `event:hostname` `event:goal` `event:props:<k>`、`visit:entry_page` `visit:exit_page` `visit:source` `visit:channel` `visit:referrer` `visit:utm_*` `visit:country` `visit:region` `visit:city` `visit:device` `visit:browser(_version)` `visit:os(_version)`、`time`（自动粒度）`time:minute` `time:hour` `time:day` `time:week` `time:month` |
 | `filters` | 顶层数组是隐式 AND。叶子节点为 `[op, dim, [values], {case_sensitive}]`：`op` 取 `is` `is_not` `contains` `contains_not` `matches` `matches_not` `matches_wildcard` `matches_wildcard_not`；`values` 是非空的字符串或整数数组；`case_sensitive` 缺省 `true`。组合节点为 `and` `or` `not` `has_done` `has_not_done`；另有 `["is","segment",[id]]`。嵌套至多 8 层，叶子至多 100 个；时间维度不能用于过滤 |
@@ -717,11 +716,11 @@ TTL minute + INTERVAL 90 DAY DELETE;
 
 #### 当前支持范围（P1，原始层）
 
-不支持的项都能通过语法检查（schema 与 Plausible 的取值集合一致），在 `resolve` 阶段返回校验错误 `… is not supported yet`（带字段路径）。
+公开 schema 列出 Rivu 接受的查询规格。`group_conversion_rate` 等已声明但暂不支持的查询项通过解析，再由 `resolve` 返回带字段路径的 `… is not supported yet`。未知指标在解析阶段返回错误。
 
-| 类别 | 已支持 | 返回 `not supported yet` |
+| 类别 | 已支持 | 当前未实现 |
 |---|---|---|
-| 指标 | `visitors` `visits` `pageviews` `events` `views_per_visit` `bounce_rate` `visit_duration` `engaged_duration` `percentage` `exit_rate` `time_on_page` `scroll_depth` `conversion_rate` | 分组转化率（`group_conversion_rate`）、收入（`total_revenue` `average_revenue`） |
+| 指标 | `visitors` `visits` `pageviews` `events` `views_per_visit` `bounce_rate` `visit_duration` `engaged_duration` `percentage` `exit_rate` `time_on_page` `scroll_depth` `conversion_rate` | 分组转化率（`group_conversion_rate`） |
 | 维度 | `event:name` `event:page` `event:hostname` `event:goal` `visit:entry_page` `visit:exit_page` `visit:source` `visit:channel` `visit:referrer` `visit:utm_*` `visit:country` `visit:region` `visit:city` `visit:device` `visit:browser(_version)` `visit:os(_version)`、`time` `time:minute` `time:hour` `time:day` `time:week` `time:month`（`time:minute` 至多 1500 个桶，约 25 小时）；属性 `event:props:<k>`：取 `props[k]`，没有这个键的事件为 `(none)`，是事件级维度（不能配会话指标与 `time_on_page` `scroll_depth`），一次查询至多 8 个不同的键，键名只以参数出现，暂不走日汇总层 | — |
 | 过滤 | 上述维度（不含时间维度）上的 8 个叶子操作符，以及 `and` `or` `not`；`visit:city` 只支持 `is` `is_not`，取值是 GeoNames id；`event:goal` 只支持 `is` `is_not`，取值是目标的标签或 id；属性上的过滤是事件级叶子（会话指标上是「存在」语义） | `has_done` `has_not_done`、`["is","segment",[id]]` |
 | 目标 | 事件目标（事件名）与页面目标（pathname 通配），见 §6.6 | 滚动深度目标、目标的 props 条件（要改表结构） |
@@ -757,7 +756,7 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 
 | 对象 | 归属 |
 |---|---|
-| `pageviews` `events` `time_on_page` `scroll_depth` 收入 | events |
+| `pageviews` `events` `time_on_page` `scroll_depth` | events |
 | `bounce_rate` `visit_duration` `engaged_duration` `views_per_visit` `exit_rate`；`visits`（没有 `event:*` 维度时） | sessions |
 | `visits`（有 `event:*` 维度时） | events：含该维度值的（非 engagement）事件所属的不同会话数，`uniq(session_id)`（§6.5） |
 | `visitors` | 只从 events 计算：`sessions` 没有 `visitor_id`（§10 Q9） |
@@ -914,7 +913,7 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 | `visit:device` | desktop、mobile 中；tablet 偏低 | iPadOS 13+ Safari 默认发桌面 UA，与 Mac Safari 不可区分：iPad 被计为 macOS + desktop，`tablet` 被低估、`desktop` 被高估，服务端不处理（§10 Q23）。Android 只看 `Mobile` 记号；无该记号的手机 WebView、Chrome「桌面版网站」会与 Plausible 有差异；电视、游戏机、车机、未知归 desktop。规则是启发式，没有外部 ground truth，只有 18 条手工断言，真实流量上的准确率要等访问日志对账（UA 研究 §5、§11） | 文档与看板说明 tablet 偏低；与 Plausible 并行回放时，device 的差异先归因到这几类 |
 | `visit:country` | 中高 | DB-IP Lite 是完整库的子集（“reduced coverage and accuracy”），按月更新。与五个 RIR 的公开分配记录对照，国家一致率 **90.99%**（6369/7000）：IPv4 按块 90.16%，按地址数加权 93.84%；IPv6 93.05%；RIPE NCC 最低（83.06%），LACNIC 最高（99.20%）。RIR 记录的是**注册国**，不是使用地，跨国使用的块（云、托管）本来就会不同，所以这是一致率，不是准确率（Geo 研究 §5.2） | 显示署名（§4.4）；不把这个数字说成准确率 |
 | `visit:region`，`visit:city` | 默认配置下无数据 | DB-IP Lite 没有 ISO 3166-2 代码和 GeoNames id（§10 Q24）：`region_code` 恒空，`city_geoname_id` 恒为 0（7000 个地址实测 0 个非空）。MaxMind 库下这两个字段有值，但本项目没有对它的定位准确度做外部对照，官方测试库只证明字段解码正确（Geo 研究 §4、§5.3） | 见下「地理精度提示」 |
-| 机器人过滤（`dropped_bot`） | 中 | 检测率 84.58%（1793/2120）是对 crawler-user-agents 名单的数字，不代表线上流量；名字表有一部分是看过名单的漏检项后补的，不是盲测（补之前 69.6%）。未命中的 327 个多是几乎不执行 JS 的小众爬虫，对 tracker 影响小；要紧的是会执行 JS 的机器人（无头浏览器、合成监控），靠已知答案探针和访问日志核对，目前只有单元测试，没有端到端验证。非 Spider 语料里浏览器形态 UA 10389 条只有 9 条判为机器人，全是真机器人，但语料偏旧，不代表 2026 年的真实流量。数据中心 CIDR 不在 `rivu-ua` 范围（UA 研究 §6.2、§6.3、§11） | 不把 `dropped_bot` 的比例读作「机器人占比」 |
+| 机器人过滤（`dropped_bot`） | 中 | 检测率 84.58%（1793/2120）是对 crawler-user-agents 名单的数字，不代表线上流量；名字表有一部分是看过名单的漏检项后补的，不是盲测（补之前 69.6%）。未命中的 327 个多是几乎不执行 JS 的小众爬虫，对 tracker 影响小；要紧的是会执行 JS 的机器人（无头浏览器、合成监控），靠已知答案探针和访问日志核对，目前只有单元测试，没有端到端验证。非 Spider 语料里浏览器形态 UA 10389 条只有 9 条判为机器人，全是真机器人，但语料偏旧，不代表 2026 年的真实流量。 | 不把 `dropped_bot` 的比例读作「机器人占比」 |
 | 访问数本身（拦截插件） | 偏低，维度不失真 | 拦截插件让整条事件缺失，服务端无法识别，也不进 `ingest_counters`；只能靠边缘日志与 `ingest_counters` 对账（`brief-p1.md` 验收）。站点可配置第一方 `endpoint` 反代（`tracker-and-protocol.md` §1.2） | 不修正，不估算 |
 
 **地理精度提示（`geo_level`）**：站点 `geo_level` 为 `region` 或 `city`，而查询返回的 `meta.geo_capability` 低于它时（默认 DB-IP Lite 恒为 `country`；MaxMind Country 版也是）：
@@ -988,7 +987,7 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 | P1 MVP | tracker core/full；collector 管线（准入、hostname、IP 和页面规则、机器人、地理、UA、来源、身份）；SessionAssigner；BatchWriter；`events`、`sessions`、`ingest_counters`；查询 DSL 的核心指标与维度；看板主视图；PG 基础表 | 端到端：pageview 在 5 s 内可见；visits、跳出、停留时长的样例与手工计算一致；跨本地午夜的会话连续 |
 | P2 性能 | 日汇总层和规划器；结果缓存；租户并发限制；压测（持续 1000/s、峰值 5000/s，加并发查询）；merge 监控 | 常见报表 p95 < 300 ms（分别报告命中和未命中缓存）；事件可见 p95 < 5 s |
 | P3 可靠 | 单实例故障注入（持续写入下对 rivu 执行 `kill -9`、重启 CH，各 100 次）；备份恢复演练；写入积压告警 | CH 重启不丢事件；rivu 崩溃的损失不超过写缓冲里的事件；没有重复行（`docs/roadmap.md` P3） |
-| P4 产品 | 目标、转化、漏斗；engagement 指标；自定义属性；收入；分群；共享链接；公开 API；导入（Plausible CSV 进日汇总层、GA4）；导出；邮件报告；Plausible 协议兼容端点 | 按功能逐项验收 |
+| P4 产品 | 目标、转化、漏斗、engagement 指标、自定义属性、分群、共享链接、公开 API、Plausible 历史汇总导入、导出、邮件报告 | 按功能逐项验收 |
 
 ---
 
@@ -1001,7 +1000,7 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 | Q1 | 原始数据默认保留期 | 默认 731 天（连续两个自然年，含一个闰年）。日均 1000 万事件的部署建议把 `RIVU_RETENTION_DAYS` 调低到 180 天 | D12；§5.1 表；§5.6 `retention_purge`；§7 容量；`RIVU_RETENTION_DAYS` 默认 731 |
 | Q2 | `visit_duration` 是否计入 engagement 时间 | 不计入，与 Plausible 和导入数据一致；另设独立指标 `engaged_duration` | §5.3 派生指标；§5.5 `s_eng_ms` `s_eng_n` 列；§6.2 指标列表；§6.4 归属；§6.5 定义 |
 | Q3 | tracker 是否读取 `localStorage.rivu_ignore`（站点所有者排除自己的访问） | 只读：tracker 永不写入，也不用于标识或上报 | `tracker-and-protocol.md` §1.1、§4.7；§8 |
-| Q4 | 是否提供 Plausible 协议兼容端点 | P4 提供 `POST /api/plausible/event`，便于迁移；Plausible 的 tracker 是 MIT 许可 | §9 的 P4；`tracker-and-protocol.md` §9 |
+| Q4 | 如何从 Plausible 迁移 | 新流量走 Rivu 的 `POST /api/event`，历史汇总通过 Plausible ZIP 导入 | `tracker-and-protocol.md` §9 |
 | Q5 | UA 库和 GeoIP 库的选型与许可 | UA 用 uap-core（Apache-2.0）。GeoIP 默认 DB-IP Lite（CC BY 4.0，必须署名）；继续支持 MaxMind GeoLite2；新增自定义 mmdb 直链 `RIVU_GEOIP_DB_URL`。优先级：自定义 URL > MaxMind key > DB-IP | §4.4（来源、更新、校验、署名）；看板必须在显示位置数据处署名，查询 API 返回当前库的署名；`platform-and-ops.md` 的 `geoip_refresh` 任务、配置变量、指标 |
 | Q6 | 是否做 `SAMPLE` 采样 | 暂不做，用日汇总层的自动分层代替；DDL 里保留 `SAMPLE BY visitor_id` | §2.6；§5.2；§6.4 |
 | Q7 | 会话最长时长 | 7 天。续期条件：`ts − last_seen_at ≤ 30 min` 且 `ts − started_at ≤ 7 d`。跨午夜靠会话的别名 key，最多 8 个 | §4.6（规则、并发、内存、预热、失败语义）；§4.5；§6.5 `visits` 回溯 7 天；§7 内存；§8 |
@@ -1014,8 +1013,8 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 | Q15 | 从 ClickHouse 预热时找不到分片 | 把 `routing % 32` 写入 `ingest_partition`，分片数固定为 32；预热按 `ingest_partition` 放回分片 | §4.5；§4.6（并发、预热）；§5.2 DDL 注释 |
 | Q16 | 写缓冲默认值 | 变量名取 `platform-and-ops.md` 的，默认值以 §4.7 为准：1000 ms、20000 行、8388608 字节、channel 20 万条；P2 压测后再调 | §4.7；`platform-and-ops.md` §7 |
 | Q17 | `visitors` 是否统计 engagement 事件 | 排除，与 `realtime` 同口径 | §5.5；§6.5 |
-| Q18 | 线协议的错误词表与测试清单 | 词表补一条 `has an invalid format`，用于 `s` 格式错、`n` 含控制字符、`$` 字段格式错；`u` 不限长，超长 query 被丢弃、pathname 截断到 1024 字节，不回 400 | `tracker-and-protocol.md` §6.2、§11.1 |
-| Q19 | 渠道取值集合与中英文名 | 取 GA4 默认渠道分组的 19 个渠道，**不含 `Unassigned`**：没有来源归 `Direct`，有来源但 medium 不认识归 `Referral`（偏离 Google 的 Unassigned，Source-D9）。英文标识写入 ClickHouse `channel` 列，发布后不改：`Direct` `Cross-network` `Paid Search` `Paid Social` `Paid Video` `Paid Shopping` `Paid Other` `Display` `Organic Search` `Organic Social` `Organic Video` `Organic Shopping` `AI Assistant` `Email` `Affiliates` `Audio` `SMS` `Mobile Push Notifications` `Referral`。中文名取 Google 官方简体中文帮助页，由 UI 按标识映射，不入库：直接、跨广告网络、付费搜索、付费社交媒体广告、付费视频、付费购物、其他付费渠道、展示广告、自然搜索、自然社交、自然视频、自然购物、AI 助理、邮件、联属营销方、音频、短信、移动推送通知、引荐。规则是 `rivu-source` 里一张 21 条的有序表（先匹配先赢，顺序以 GA4 帮助页为准，Display 在付费搜索 / 社交 / 视频之后，AI Assistant 在 Organic Search 之前）；规则、取值或来源数据任何一处变化，`RULES_VERSION` 加一，并用离线 mutation 回填历史数据 | §4.2 第 8 步；§5.2 `channel` 列；`docs/research/enrich-source.md` §3；看板维护 19 个中文名映射；P4 兼容层要做 `AI Assistant` ↔ `AI Assistants` 映射（Source-D1）；新增或改名取值走 `RULES_VERSION` 加回填；Google Ads 等广告平台规则采集端拿不到，不实现（§6.10） |
+| Q18 | 线协议的错误词表与测试清单 | `has an invalid format` 用于 `s` 格式错或 `n` 含控制字符。`u` 不限长，超长 query 被丢弃、pathname 截断到 1024 字节，不回 400 | `tracker-and-protocol.md` §6.2、§11.1 |
+| Q19 | 渠道取值集合与中英文名 | 取 GA4 默认渠道分组的 19 个渠道，**不含 `Unassigned`**：没有来源归 `Direct`，有来源但 medium 不认识归 `Referral`（偏离 Google 的 Unassigned，Source-D9）。英文标识写入 ClickHouse `channel` 列，发布后不改：`Direct` `Cross-network` `Paid Search` `Paid Social` `Paid Video` `Paid Shopping` `Paid Other` `Display` `Organic Search` `Organic Social` `Organic Video` `Organic Shopping` `AI Assistant` `Email` `Affiliates` `Audio` `SMS` `Mobile Push Notifications` `Referral`。中文名取 Google 官方简体中文帮助页，由 UI 按标识映射，不入库：直接、跨广告网络、付费搜索、付费社交媒体广告、付费视频、付费购物、其他付费渠道、展示广告、自然搜索、自然社交、自然视频、自然购物、AI 助理、邮件、联属营销方、音频、短信、移动推送通知、引荐。规则是 `rivu-source` 里一张 21 条的有序表（先匹配先赢，顺序以 GA4 帮助页为准，Display 在付费搜索 / 社交 / 视频之后，AI Assistant 在 Organic Search 之前）；规则、取值或来源数据任何一处变化，`RULES_VERSION` 加一，并用离线 mutation 回填历史数据 | §4.2 第 8 步；§5.2 `channel` 列；`docs/research/enrich-source.md` §3；看板维护 19 个中文名映射；新增或改名取值走 `RULES_VERSION` 加回填；Google Ads 等广告平台规则采集端拿不到，不实现（§6.10） |
 | Q20 | 来源数据用哪份，优先级怎样 | 来源名数据用 Matomo `searchengine-and-social-list`（CC0-1.0，固定 commit `4254b8d`，放在 `crates/source/data/matomo/`）加自维护补充表 `supplement.yml`（135 条，每条写明依据：`GA4-LIST`、`FACT`、`CONVENTION`）。**Snowplow `referers.yml` 不用**：其 README 写明数据按 GPL-3.0 提供，不能随 MIT 项目分发。Google GA4 来源清单无许可声明，只作对照不入库；Plausible 的 `custom_sources.json` 等在 AGPL-3.0 仓库里，不拷贝。数据在构建时核对 SHA-256 并编译成排序静态表，升级要同时改哈希、`PROVENANCE.md`、`RULES_VERSION`。来源优先级：`utm_source`（含 `source`、`ref` 回退）> referrer host > click id 推断；内部引荐由接入层判定后传 `None` | §4.2 第 8 步；§4.4 来源行；`platform-and-ops.md` §6 `sources_update`（来源库不在线更新）；`docs/research/enrich-source.md` §4、§5；Snowplow 的增量要先取得许可或自行核实后才能补 |
 | Q21 | 空 UA 与 `BotKind` | **空 UA（或只有空白）视为机器人**（`BotKind::Empty`），丢弃并记 `dropped_bot`。浏览器的 `fetch` / `sendBeacon` 一定带 `User-Agent`，空 UA 只来自脚本或被剥头的转发链。这是对 Plausible 的刻意偏离：它不解析不丢弃，事件入库（R01 §8.1）。`BotKind`（`spider` `headless` `automation` `empty`）只用于统计与排错，不进 `ingest_counters.metric`；将来要保守，只需在调用处忽略 `Empty` | §4.2 第 5 步；§4.4 机器人行；附录 C（UA-1）；`docs/research/enrich-ua.md` §4.2 |
 | Q22 | UA 精简与冻结值怎么处理 | 精简或冻结的值不是数据，**报空串，不补值**：macOS `10.15`（Chrome 90 起封顶）、ChromeOS、`Android 10; K)` 这个形状（带真实型号的 Android 10 保留 `10`）的 `os_version` 都为空串，真实的 macOS 10.13 等老版本保留（代价：真实的 10.15 用户也被置空）。Windows 的 `NT 10.0` 记 `10`，含义是 **Windows 10 / 11**，文档与看板必须注明。iOS Safari 26+ 且 UA 里 iOS 主版本为 18 时，`os_version` 取 `Version/` 的 major.minor（真实的 Safari 18.6 不改写）。Android 的设备类别只看 `Mobile` 记号（有则 mobile，没有则 tablet，电视、游戏机记号除外），不用型号。版本一律取 major.minor | §4.2 第 7 步；§6.10；附录 C（UA-2、UA-3）；`docs/research/enrich-ua.md` §5、§7。用 Client Hints `platformVersion` 区分 Windows 10 / 11 要 tracker 配合，P2 以后再议 |

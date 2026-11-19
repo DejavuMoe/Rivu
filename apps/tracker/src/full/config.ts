@@ -42,24 +42,20 @@ export const extOf = (pathname: string): string => {
   return m ? m[1]!.toLowerCase() : '';
 };
 
-/** tagged 标记解析的结果：事件名、属性、收入金额、收入币种。 */
-export type Tag = [name?: string, props?: Record<string, string>, amount?: string, currency?: string];
+export type Tag = [name?: string, props?: Record<string, string>];
 
 /**
  * 一个元素的 class 列表里的 tagged 标记（规范 §4.6）：`rivu-event-name=Signup`（或 `--`）定义事件名，
- * `rivu-event-<k>=<v>` 定义属性（值里的 `+` 换成空格），`rivu-revenue-amount` / `-currency` 定义收入。
+ * `rivu-event-<k>=<v>` 定义属性（值里的 `+` 换成空格）。
  */
 export const parseTag = (classes: Iterable<string>): Tag => {
   const t: Tag = [];
   for (const c of classes) {
-    const m = /^rivu-(event|revenue)-(.+?)(?:=|--)(.+)$/.exec(c);
+    const m = /^rivu-event-(.+?)(?:=|--)(.+)$/.exec(c);
     if (m) {
-      const k = m[2]!;
-      const v = m[3]!.replace(/\+/g, ' ');
-      if (m[1] == 'revenue') {
-        if (k == 'amount') t[2] = v;
-        else if (k == 'currency') t[3] = v;
-      } else if (k == 'name') t[0] = v;
+      const k = m[1]!;
+      const v = m[2]!.replace(/\+/g, ' ');
+      if (k == 'name') t[0] = v;
       else (t[1] = t[1] || {})[k] = v;
     }
   }

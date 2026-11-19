@@ -62,10 +62,28 @@ done
 
 | 功能 | 变量 |
 |---|---|
-| MaxMind GeoLite2 / GeoIP2（城市数据更准） | `RIVU_MAXMIND_ACCOUNT_ID`、`RIVU_MAXMIND_LICENSE_KEY`、`RIVU_MAXMIND_EDITION` |
-| 自定义地理库地址 | `RIVU_GEOIP_DB_URL`，以及署名 `RIVU_GEOIP_ATTRIBUTION_TEXT` |
-| 过滤云厂商机房流量 | `RIVU_DATACENTER_FILTER=on` |
+| MaxMind GeoLite2 / 自定义地理库 | 直链或账户 ID + License Key，见下方配置 |
 | 缩短原始数据保留期（默认 731 天；站点还可以在设置里单独调短，汇总数据永久保留） | `RIVU_RETENTION_DAYS` |
+
+### GeoIP 地理库
+
+使用一条 City 或 Country `.mmdb` 下载直链即可。以下示例使用 GeoLite2 City 镜像，保留 MaxMind 署名。
+
+```dotenv
+RIVU_GEOIP_DB_URL=https://git.via.moe/dejavu/GeoLite.mmdb/releases/download/latest/GeoLite2-City.mmdb
+RIVU_GEOIP_ATTRIBUTION_TEXT="This product includes GeoLite Data created by MaxMind, available from https://www.maxmind.com."
+RIVU_GEOIP_ATTRIBUTION_URL=https://www.maxmind.com
+```
+
+只需要国家时，可用 [GeoLite2 Country 直链](https://git.via.moe/dejavu/GeoLite.mmdb/releases/download/latest/GeoLite2-Country.mmdb)。Rivu 的地理报表读取国家、地区和城市，ASN 库没有这些地理字段。
+
+也可以从 MaxMind 直接下载。在 `deploy/.env` 同时设置 `RIVU_MAXMIND_ACCOUNT_ID` 和 `RIVU_MAXMIND_LICENSE_KEY`。`RIVU_MAXMIND_EDITION` 默认为 `GeoLite2-City`，也可设为 `GeoLite2-Country`。授权密钥可通过 `RIVU_MAXMIND_LICENSE_KEY_FILE` 从挂载文件读取。两种来源都填时优先用直链，都留空时使用 DB-IP Lite。
+
+### 站点周报
+
+配置 `RIVU_SMTP_URL` 和 `RIVU_SMTP_FROM` 后，用户可为有权查看统计的站点订阅。默认关闭。用户先收取确认码，验证本人账号邮箱，再从下一次完整周结算开始收取访客数、访问次数和页面浏览量。周报按站点时区和每周起始日安排，在每周第一天当地 09:00 后发送。
+
+当前通过登录后的[周报订阅接口](architecture/platform-and-ops.md#周报订阅接口)管理，看板入口尚未接入。停机恢复后只处理最近一个完整周。发送前会再次核对订阅、邮箱和访问权限。同一人、同一站点、同一期最多尝试发送一次。若登记发送后进程退出，或 SMTP 应答丢失，该期可能漏发。
 
 ## 升级
 
@@ -79,6 +97,8 @@ git pull && docker build -t rivu:latest . && \
 ```
 
 若使用自定义镜像标签，构建时用该标签，并让 `RIVU_IMAGE` 指向同一镜像。
+
+旧的 `RIVU_DATACENTER_FILTER`、`RIVU_DATACENTER_SOURCES` 及对应的 `*_FILE` 配置可以删掉，新版会忽略它们。云机房和 VPN 出口按正常规则采集。接入诊断仍会显示保留期内的历史机房丢弃计数。
 
 `migrate` 先应用待执行的迁移，成功后才启动新版本的 `rivu`。跨迁移版本回退时，用目标版本的镜像和配置，将与该版本匹配的 PostgreSQL 与 ClickHouse 备份恢复到空的数据库卷。旧镜像的 `migrate` 会拒绝数据库中它不认识的迁移记录。恢复点之后写入的数据不会随备份恢复。
 
@@ -118,6 +138,8 @@ Rivu 只导入站点本地今天之前的完整历史日。如果站点已有原
 
 ## 排障
 
-- `docker compose -f deploy/compose.yml --env-file deploy/.env logs rivu`：结构化日志（JSON）。
+- `docker compose -f deploy/compose.yml --env-file deploy/.env logs --since 15m --timestamps rivu` 查看最近 15 分钟的日志。默认 `RIVU_LOG_FORMAT=json`、`RIVU_LOG_LEVEL=info`。
 - `docker compose -f deploy/compose.yml --env-file deploy/.env exec rivu rivu healthcheck`：就绪检查；失败时打印原因。
 - 看板的「接入诊断」页：每个站点接受与丢弃的事件数，按原因分开。
+
+需要复现问题时，在开发实例的环境文件里把 `RIVU_LOG_LEVEL` 临时设为 `debug`，还不够时再用 `trace`。`RIVU_LOG_FORMAT=pretty` 适合在终端读，`json` 适合筛选和交接。Compose 部署修改后执行 `docker compose -f deploy/compose.yml --env-file deploy/.env up -d --no-deps --force-recreate rivu`，复现后导出对应时间段，再恢复 `info`。交接日志时附上复现时间和操作，先删掉密钥、连接串和个人信息。

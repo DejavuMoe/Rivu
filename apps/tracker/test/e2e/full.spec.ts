@@ -54,7 +54,7 @@ test.describe('加载与队列回放 [§2.5、§4.1]', () => {
 });
 
 test.describe('手动 API [§4.8]', () => {
-  test('自定义事件：属性、收入、interactive:false、url 覆盖、callback 拿到状态码', async ({ page, fx }) => {
+  test('自定义事件：属性、interactive:false、url 覆盖和 callback 照常，忽略旧收入选项', async ({ page, fx }) => {
     await page.goto(fx.url('/plain', full()));
     await waitForEvents(fx, 1);
     await page.evaluate(() => {
@@ -74,9 +74,9 @@ test.describe('手动 API [§4.8]', () => {
     expect(buy[0]).toMatchObject({
       u: 'https://shop.example/checkout?x=1',
       i: false,
-      $: { a: '29.9', c: 'EUR' },
       p: { tier: 'silver', qty: '2', gift: 'false' },
     });
+    expect(buy[0]).not.toHaveProperty('$');
     expect(Object.keys(buy[0]!.p as object).sort()).toEqual(['gift', 'qty', 'tier']);
     expect(await page.evaluate(() => (window as W).__n)).toBe(1);
   });
@@ -238,7 +238,7 @@ test.describe('自动捕获 [§4.6]', () => {
     expect(fx.posts()).toHaveLength(1);
   });
 
-  test('tagged：就近优先、属性、收入、链接补 url；超过 3 层不算；表单内的点击不算', async ({ page, fx }) => {
+  test('tagged：就近优先、属性、链接补 url，忽略旧收入标记；超过 3 层与表单内点击不算', async ({ page, fx }) => {
     await page.goto(fx.url('/capture', tagOnly));
     await waitForEvents(fx, 1);
     await page.click('#tag');
@@ -250,7 +250,10 @@ test.describe('自动捕获 [§4.6]', () => {
     await settle(page);
     expect(named(fx, 'Signup')[0]!.p).toEqual({ plan: 'pro plan' });
     expect(named(fx, 'Outer')).toHaveLength(0);
-    expect(named(fx, 'Wrap')[0]!.$).toEqual({ a: '9.5', c: 'USD' });
+    const wrap = named(fx, 'Wrap');
+    expect(wrap).toHaveLength(1);
+    expect(wrap[0]!.p).toEqual({ plan: 'pro' });
+    expect(wrap[0]).not.toHaveProperty('$');
     expect(named(fx, 'TooFar')).toHaveLength(0);
     expect((named(fx, 'Docs')[0]!.p as Record<string, string>).url).toMatch(/\/docs$/);
     // #f3b 在表单里：点击不算，提交时发表单自己的标记
