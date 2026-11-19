@@ -716,9 +716,9 @@ TTL minute + INTERVAL 90 DAY DELETE;
 
 #### 当前支持范围（P1，原始层）
 
-不支持的项都能通过语法检查（schema 与 Plausible 的取值集合一致），在 `resolve` 阶段返回校验错误 `… is not supported yet`（带字段路径）。
+公开 schema 列出 Rivu 接受的查询规格。`group_conversion_rate` 等已声明但暂不支持的查询项通过解析，再由 `resolve` 返回带字段路径的 `… is not supported yet`。未知指标在解析阶段返回错误。
 
-| 类别 | 已支持 | 返回 `not supported yet` |
+| 类别 | 已支持 | 当前未实现 |
 |---|---|---|
 | 指标 | `visitors` `visits` `pageviews` `events` `views_per_visit` `bounce_rate` `visit_duration` `engaged_duration` `percentage` `exit_rate` `time_on_page` `scroll_depth` `conversion_rate` | 分组转化率（`group_conversion_rate`） |
 | 维度 | `event:name` `event:page` `event:hostname` `event:goal` `visit:entry_page` `visit:exit_page` `visit:source` `visit:channel` `visit:referrer` `visit:utm_*` `visit:country` `visit:region` `visit:city` `visit:device` `visit:browser(_version)` `visit:os(_version)`、`time` `time:minute` `time:hour` `time:day` `time:week` `time:month`（`time:minute` 至多 1500 个桶，约 25 小时）；属性 `event:props:<k>`：取 `props[k]`，没有这个键的事件为 `(none)`，是事件级维度（不能配会话指标与 `time_on_page` `scroll_depth`），一次查询至多 8 个不同的键，键名只以参数出现，暂不走日汇总层 | — |
@@ -1013,7 +1013,7 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 | Q15 | 从 ClickHouse 预热时找不到分片 | 把 `routing % 32` 写入 `ingest_partition`，分片数固定为 32；预热按 `ingest_partition` 放回分片 | §4.5；§4.6（并发、预热）；§5.2 DDL 注释 |
 | Q16 | 写缓冲默认值 | 变量名取 `platform-and-ops.md` 的，默认值以 §4.7 为准：1000 ms、20000 行、8388608 字节、channel 20 万条；P2 压测后再调 | §4.7；`platform-and-ops.md` §7 |
 | Q17 | `visitors` 是否统计 engagement 事件 | 排除，与 `realtime` 同口径 | §5.5；§6.5 |
-| Q18 | 线协议的错误词表与测试清单 | 词表补一条 `has an invalid format`，用于 `s` 格式错、`n` 含控制字符、`$` 字段格式错；`u` 不限长，超长 query 被丢弃、pathname 截断到 1024 字节，不回 400 | `tracker-and-protocol.md` §6.2、§11.1 |
+| Q18 | 线协议的错误词表与测试清单 | `has an invalid format` 用于 `s` 格式错或 `n` 含控制字符。`u` 不限长，超长 query 被丢弃、pathname 截断到 1024 字节，不回 400 | `tracker-and-protocol.md` §6.2、§11.1 |
 | Q19 | 渠道取值集合与中英文名 | 取 GA4 默认渠道分组的 19 个渠道，**不含 `Unassigned`**：没有来源归 `Direct`，有来源但 medium 不认识归 `Referral`（偏离 Google 的 Unassigned，Source-D9）。英文标识写入 ClickHouse `channel` 列，发布后不改：`Direct` `Cross-network` `Paid Search` `Paid Social` `Paid Video` `Paid Shopping` `Paid Other` `Display` `Organic Search` `Organic Social` `Organic Video` `Organic Shopping` `AI Assistant` `Email` `Affiliates` `Audio` `SMS` `Mobile Push Notifications` `Referral`。中文名取 Google 官方简体中文帮助页，由 UI 按标识映射，不入库：直接、跨广告网络、付费搜索、付费社交媒体广告、付费视频、付费购物、其他付费渠道、展示广告、自然搜索、自然社交、自然视频、自然购物、AI 助理、邮件、联属营销方、音频、短信、移动推送通知、引荐。规则是 `rivu-source` 里一张 21 条的有序表（先匹配先赢，顺序以 GA4 帮助页为准，Display 在付费搜索 / 社交 / 视频之后，AI Assistant 在 Organic Search 之前）；规则、取值或来源数据任何一处变化，`RULES_VERSION` 加一，并用离线 mutation 回填历史数据 | §4.2 第 8 步；§5.2 `channel` 列；`docs/research/enrich-source.md` §3；看板维护 19 个中文名映射；新增或改名取值走 `RULES_VERSION` 加回填；Google Ads 等广告平台规则采集端拿不到，不实现（§6.10） |
 | Q20 | 来源数据用哪份，优先级怎样 | 来源名数据用 Matomo `searchengine-and-social-list`（CC0-1.0，固定 commit `4254b8d`，放在 `crates/source/data/matomo/`）加自维护补充表 `supplement.yml`（135 条，每条写明依据：`GA4-LIST`、`FACT`、`CONVENTION`）。**Snowplow `referers.yml` 不用**：其 README 写明数据按 GPL-3.0 提供，不能随 MIT 项目分发。Google GA4 来源清单无许可声明，只作对照不入库；Plausible 的 `custom_sources.json` 等在 AGPL-3.0 仓库里，不拷贝。数据在构建时核对 SHA-256 并编译成排序静态表，升级要同时改哈希、`PROVENANCE.md`、`RULES_VERSION`。来源优先级：`utm_source`（含 `source`、`ref` 回退）> referrer host > click id 推断；内部引荐由接入层判定后传 `None` | §4.2 第 8 步；§4.4 来源行；`platform-and-ops.md` §6 `sources_update`（来源库不在线更新）；`docs/research/enrich-source.md` §4、§5；Snowplow 的增量要先取得许可或自行核实后才能补 |
 | Q21 | 空 UA 与 `BotKind` | **空 UA（或只有空白）视为机器人**（`BotKind::Empty`），丢弃并记 `dropped_bot`。浏览器的 `fetch` / `sendBeacon` 一定带 `User-Agent`，空 UA 只来自脚本或被剥头的转发链。这是对 Plausible 的刻意偏离：它不解析不丢弃，事件入库（R01 §8.1）。`BotKind`（`spider` `headless` `automation` `empty`）只用于统计与排错，不进 `ingest_counters.metric`；将来要保守，只需在调用处忽略 `Empty` | §4.2 第 5 步；§4.4 机器人行；附录 C（UA-1）；`docs/research/enrich-ua.md` §4.2 |
