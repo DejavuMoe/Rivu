@@ -2540,6 +2540,7 @@ name = "rivu-mail"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "jiff",
  "lettre",
  "tokio",
 ]
