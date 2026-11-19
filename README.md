@@ -16,7 +16,7 @@ Rivu 是开源、自托管的网站分析系统（Plausible 的替代品）：�
 | 查询 | 统一查询内核 `rivu-query`（`QuerySpec`：指标、维度、过滤树、日期范围、时间序列、对比期、目标）；公开 API `POST /api/v1/query`（API key、按组织限流）与 `GET /api/v1/query/schema.json`；命令行 `rivu query` |
 | 看板（`apps/dashboard`） | 登录与首次初始化、站点列表、统计看板、安装与安装验证、站点设置（主机名、采集、脚本功能、隐私、屏蔽规则、目标、共享、危险操作）、接入诊断、成员与邀请、API key、账号与登录会话、共享链接与公开看板 |
 | 数据迁移与导出 | 从 Plausible 导入历史汇总数据、将统计视图导出为 CSV ZIP，支持看板和 CLI |
-| 邮件 | 配置 SMTP 后发送成员邀请与密码重置邮件 |
+| 邮件 | 配置 SMTP 后可发成员邀请、密码重置和站点周报。周报支持通过登录后的订阅接口开通，看板入口尚未接入 |
 | 后台任务 | 盐轮换、GeoIP 刷新、站点与日期范围的统计数据删除 |
 | 运维 | 单个二进制：`rivu serve` 运行实例，`rivu migrate` 执行迁移；PG 与 ClickHouse 迁移共用版本序列，带冻结校验与 schema 快照；内部端口 `/healthz` `/readyz` `/metrics` |
 

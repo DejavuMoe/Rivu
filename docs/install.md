@@ -79,6 +79,12 @@ RIVU_GEOIP_ATTRIBUTION_URL=https://www.maxmind.com
 
 也可以从 MaxMind 直接下载。在 `deploy/.env` 同时设置 `RIVU_MAXMIND_ACCOUNT_ID` 和 `RIVU_MAXMIND_LICENSE_KEY`。`RIVU_MAXMIND_EDITION` 默认为 `GeoLite2-City`，也可设为 `GeoLite2-Country`。授权密钥可通过 `RIVU_MAXMIND_LICENSE_KEY_FILE` 从挂载文件读取。两种来源都填时优先用直链，都留空时使用 DB-IP Lite。
 
+### 站点周报
+
+配置 `RIVU_SMTP_URL` 和 `RIVU_SMTP_FROM` 后，用户可为有权查看统计的站点订阅。默认关闭。用户先收取确认码，验证本人账号邮箱，再从下一次完整周结算开始收取访客数、访问次数和页面浏览量。周报按站点时区和每周起始日安排，在每周第一天当地 09:00 后发送。
+
+当前通过登录后的[周报订阅接口](architecture/platform-and-ops.md#周报订阅接口)管理，看板入口尚未接入。停机恢复后只处理最近一个完整周。发送前会再次核对订阅、邮箱和访问权限。同一人、同一站点、同一期最多尝试发送一次。若登记发送后进程退出，或 SMTP 应答丢失，该期可能漏发。
+
 ## 升级
 
 先用当前版本的 `deploy/backup.sh` 备份 PostgreSQL 与 ClickHouse，并保留旧镜像及配置。使用默认本地镜像时，可以先执行 `docker tag rivu:latest rivu:pre-upgrade` 保留回退用的标签。

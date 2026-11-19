@@ -19,6 +19,7 @@
 - 备份与恢复脚本（`deploy/backup.sh`、`deploy/restore.sh`）。
 - 自定义属性：查询维度与筛选，看板「属性」卡片。
 - 邮件（SMTP）：邀请邮件、找回密码。
+- 站点周报订阅 API：用户确认本人邮箱后，可订阅上一完整周的访客、访问和浏览量。
 - 两步验证（TOTP）与恢复码。
 - CSV 导出：当前时间范围与筛选下的趋势与各维度明细，打成一个 zip（`rivu export`）。
 - 从 Plausible 迁移：在站点设置「导入」上传 Plausible 的数据导出，或用 `rivu import plausible`。
