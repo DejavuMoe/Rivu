@@ -17,11 +17,10 @@ let cfg: Config;
 /** 从 `el` 起向上最多 3 层父元素里最近的 tagged 元素，转成事件。 */
 const tagged = (el: Element | null): [string, Opts, Element] | undefined => {
   for (let i = 0; i < 4 && el; i++, el = el.parentElement) {
-    const [name, props, amount, currency] = parseTag(el.classList);
+    const [name, props] = parseTag(el.classList);
     if (name) {
       const href = (el as HTMLAnchorElement).href;
       const o: Opts = { props: el.tagName == 'A' && href ? { ...props, url: href } : props };
-      if (amount) o.revenue = { amount, currency };
       return [name, o, el];
     }
   }

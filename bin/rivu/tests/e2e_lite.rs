@@ -980,7 +980,9 @@ async fn http_endpoint_end_to_end() {
     });
 
     let pageview = |key: &str, path: &str| {
-        json!({"v": 1, "s": key, "n": "pageview", "u": format!("https://{HOST}{path}")}).to_string()
+        json!({"v": 1, "s": key, "n": "pageview", "u": format!("https://{HOST}{path}"),
+               "$": {"a": "29.00", "c": "USD"}})
+        .to_string()
     };
     // 202 空体
     let r = http_post(addr, &pageview(&created.site_key, "/a")).await;
@@ -1021,20 +1023,32 @@ async fn http_endpoint_end_to_end() {
     assert_eq!(r.header("cache-control"), Some("public, max-age=300"));
     assert_eq!(http_get(addr, "/js/zzzzzzzzzzzz.js").await.status, 404);
 
-    // 自定义属性：三个带 plan 的事件（两个 pro）、一个不带
+    // 旧版 `$` 即使格式不符也不影响自定义事件及其属性。
     for p in [
         json!({"plan": "pro", "seats": 5}),
         json!({"plan": "pro"}),
         json!({"plan": "free"}),
         json!({}),
     ] {
-        let body = json!({"v": 1, "s": created.site_key, "n": "Signup", "u": format!("https://{HOST}/signup"), "p": p});
+        let body = json!({"v": 1, "s": created.site_key, "n": "Signup",
+                          "u": format!("https://{HOST}/signup"), "p": p,
+                          "$": {"a": "-1", "c": "USD"}});
         assert_eq!(http_post(addr, &body.to_string()).await.status, 202);
     }
 
     writer.shutdown().await.expect("关停");
     let reader = reader_client(&env.ch_url);
     assert_eq!(count(&reader, "events", created.id).await, 5);
+    let populated = reader
+        .query(
+            "SELECT count() FROM events WHERE site_id = {site:UInt64} \
+             AND (revenue_amount IS NOT NULL OR revenue_currency != '')",
+        )
+        .param("site", created.id)
+        .fetch_one::<u64>()
+        .await
+        .unwrap();
+    assert_eq!(populated, 0);
     let counters = counter_sums(&reader, created.id).await;
     assert_eq!(
         counters,

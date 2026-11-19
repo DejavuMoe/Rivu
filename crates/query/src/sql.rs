@@ -1154,7 +1154,7 @@ impl<'a> Builder<'a> {
                 s(Measure::Visitors),
                 s(Measure::CrBase)
             ),
-            Metric::GroupConversionRate | Metric::TotalRevenue | Metric::AverageRevenue => {
+            Metric::GroupConversionRate => {
                 unreachable!("不支持的指标已在 resolve 阶段被拒绝")
             }
         }

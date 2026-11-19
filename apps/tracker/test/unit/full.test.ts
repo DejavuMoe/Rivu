@@ -53,15 +53,12 @@ test('下载扩展名取 pathname 最后一段的最后一个点，转小写', (
   assert.equal(extOf(''), '');
 });
 
-test('tagged 标记：事件名（= 或 --）、属性（+ 换空格）、收入', () => {
+test('tagged 标记：事件名（= 或 --）、属性（+ 换空格），忽略旧收入标记', () => {
   assert.deepEqual(parseTag(['btn', 'rivu-event-name=Signup', 'rivu-event-plan=pro+plan', 'rivu-event-seats--5']), [
     'Signup',
     { plan: 'pro plan', seats: '5' },
   ]);
   assert.deepEqual(parseTag(['rivu-event-name--Sign+Up']), ['Sign Up']);
-  const t = parseTag(['rivu-event-name=Buy', 'rivu-revenue-amount=29.90', 'rivu-revenue-currency=EUR', 'rivu-revenue-junk=1']);
-  assert.equal(t[0], 'Buy');
-  assert.equal(t[2], '29.90');
-  assert.equal(t[3], 'EUR');
+  assert.deepEqual(parseTag(['rivu-event-name=Buy', 'rivu-revenue-amount=29.90', 'rivu-revenue-currency=EUR']), ['Buy']);
   assert.deepEqual(parseTag(['plain', 'rivu-event-', 'rivu-other-name=x']), []);
 });

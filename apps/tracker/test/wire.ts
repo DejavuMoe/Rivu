@@ -9,8 +9,8 @@ const MAX_BODY_BYTES = 8192;
 const hasControl = (s: string) => /[\u0000-\u001f\u007f-\u009f]/.test(s);
 const isInt = (v: unknown): v is number => typeof v === 'number' && Number.isInteger(v);
 
-/** 协议里出现过的全部键（未知键服务端忽略，但客户端不应发）。 */
-export const PROTOCOL_KEYS = ['v', 'sv', 's', 'n', 'u', 'r', 'p', 'i', 'h', 'sd', 'e', '$'];
+/** 当前客户端可发送的全部键。 */
+export const PROTOCOL_KEYS = ['v', 'sv', 's', 'n', 'u', 'r', 'p', 'i', 'h', 'sd', 'e'];
 
 export function validateWire(body: unknown, rawBytes?: number): string[] {
   const errs: string[] = [];
