@@ -1,5 +1,5 @@
 // 组装线协议请求体（规范 §5.1）。core 只发 pageview，所以只有 v/sv/s/n/u/r/h；
-// full 再按需补 p（属性）、i（非互动）、$（收入）、sd / e（engagement）。
+// full 再按需补 p（属性）、i（非互动）、sd / e（engagement）。
 // 时间戳由服务端生成，客户端不发任何时间字段；也不发屏幕、语言、时区等指纹字段。
 
 export interface Wire {
@@ -12,7 +12,6 @@ export interface Wire {
   h?: 1;
   p?: Record<string, string>;
   i?: false;
-  $?: { a: string; c: unknown };
   sd?: number;
   e?: number;
 }
