@@ -334,13 +334,17 @@
         loading={pending}
       />
       <div class="chart-head">
-        <div class="legend">
-          <span class="key" aria-hidden="true"></span>
-          <span>{t(`metric.${metric}`)}</span>
-          {#if prevValues}
-            <span class="key compare" aria-hidden="true"></span>
-            <span class="muted">{compareText}</span>
-          {/if}
+        <div class="lead">
+          <div class="legend">
+            <span class="key" aria-hidden="true"></span>
+            <span>{t(`metric.${metric}`)}</span>
+            {#if prevValues}
+              <span class="key compare" aria-hidden="true"></span>
+              <span class="muted">{compareText}</span>
+            {/if}
+          </div>
+          <!-- 访客、访问、浏览量容易混：选中哪个指标，就在图上方用一句话说明它怎么算 -->
+          <p class="def">{t(`metric.${metric}.def`)}</p>
         </div>
         <div class="tools">
           {#if grans(dash.range).length > 1}
@@ -478,17 +482,30 @@
   }
   .chart-head {
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     justify-content: space-between;
     gap: var(--sp-3);
     flex-wrap: wrap;
     padding: var(--sp-4) var(--sp-4) 0 var(--sp-5);
   }
+  .lead {
+    display: flex;
+    flex: 1 1 240px;
+    flex-direction: column;
+    gap: var(--sp-1);
+    min-width: 0;
+  }
   .legend {
     display: flex;
     align-items: center;
     gap: var(--sp-2);
+    /* 与右侧工具（28px 高）同一行居中 */
+    min-height: var(--control-sm);
     font-weight: var(--fw-medium);
+  }
+  .def {
+    color: var(--text-muted);
+    font-size: var(--fs-sm);
   }
   .legend .muted {
     font-weight: var(--fw-regular);

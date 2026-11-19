@@ -65,6 +65,8 @@
     cur.buckets.map((b) => (range === "7d" ? `${dateShort(b.t, app.lang)} ${pad(b.t.getHours())}:00` : range === "24h" ? `${dateShort(b.t, app.lang)} ${hm(b.t)}` : hm(b.t))),
   );
   let view = $state<"chart" | "table">("chart");
+  /** 原因代码（dropped_…）只在对照日志与监控指标时有用：默认不显示 */
+  let showCodes = $state(false);
 
   const lastEvent = $derived(
     cur.lastEventSec === null
@@ -191,6 +193,11 @@
       </section>
 
       <Card title={t("diag.reasons.title")} flush>
+        {#snippet actions()}
+          {#if !loading && !failed}
+            <Button size="sm" variant="ghost" active={showCodes} aria-pressed={showCodes} onclick={() => (showCodes = !showCodes)}>{t("diag.reasons.codes")}</Button>
+          {/if}
+        {/snippet}
         {#if loading}
           <div class="rows-sk">
             {#each [1, 2, 3, 4] as i (i)}<Skeleton height={40} radius={4} />{/each}
@@ -215,7 +222,7 @@
               {@const d = def(r.id)}
               {#if c.key === "reason"}
                 <div class="reason">
-                  <span class="rname">{reasonName(r.id)}<code class="rid">dropped_{r.id}</code></span>
+                  <span class="rname">{reasonName(r.id)}{#if showCodes}<code class="rid">dropped_{r.id}</code>{/if}</span>
                   {#if d?.why}<span class="rwhy">{t(`diag.r.${r.id}.why`)}</span>{/if}
                 </div>
               {:else if c.key === "count"}

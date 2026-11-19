@@ -36,7 +36,7 @@
 | 强调 | `--accent-bg(-hover/-active)` `--accent-border` `--accent-focus` `--accent-solid(-hover)` `--accent-text` | blue 3–5、7、8、9–10、11 |
 | 状态 | `--good-*` `--warn-*` `--bad-*` | grass / amber / red 3、11（危险按钮用 red 9） |
 | 在线 | `--live` | grass 9 |
-| 图表 | `--series-1/2/3` `--series-compare` `--chart-area` `--chart-bar` `--chart-grid` `--chart-axis` | blue 9、tomato 9、violet 9、gray 8、blue a3、gray a3、gray a4、gray a6 |
+| 图表 | `--series-1/2/3` `--series-compare` `--chart-area` `--chart-bar` `--chart-grid` `--chart-axis` | blue 9、tomato 9、violet 9、gray 8、blue a2、gray a4（悬停 a5）、gray a4、gray a6 |
 
 换强调色只改 `--accent-*` 与 `--series-1` 指向的色阶（例如 blue → iris），并在 `scripts/gen-radix.mjs` 里加上那个色阶。
 
@@ -62,7 +62,8 @@
 - 主序列 `--series-1`（blue 9），2px 线 + 平涂的 `--chart-area`，不用渐变；对比期 1.5px `--series-compare`。最多 3 个分类色（blue / tomato / violet，已做色觉缺陷校验，深浅两种模式全部通过）。
 - 一个纵轴；网格与轴线 0.5px；刻度 0 起、取整；坐标轴文字 12px。
 - 进行中的时间桶用虚线，这是虚线唯一的用途。
-- 条形列表的条是中性的 `--chart-bar`；文字永远是文字色。
+- 条形列表的条是中性的 `--chart-bar`；文字永远是文字色。条要在浅色模式下看得出长短（gray a3 太浅，肉眼分辨不出）。
+- 主图图例下面用一句 12px 的次要文字说明当前选中的指标怎么算；口径以 `docs/architecture/system-design.md` §6.5 为准。
 - 悬停：十字线 + 圆点 + 提示框；键盘左右键同样可用。每个图都有表格视图。
 - 展示地理数据的地方保留 DB-IP 署名（CC BY 4.0 要求），用 12px 次要文字。
 

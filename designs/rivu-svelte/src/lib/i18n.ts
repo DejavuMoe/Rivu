@@ -74,6 +74,13 @@ const dict = {
   "metric.views_per_visit": ["每次访问页数", "Views per visit"],
   "metric.bounce_rate": ["跳出率", "Bounce rate"],
   "metric.visit_duration": ["访问时长", "Visit duration"],
+  // 指标的一句话说明（口径见 docs/architecture/system-design.md §6.5）
+  "metric.visitors.def": ["不同的访客数。同一个人一天内来多次只算一次，隔天再来重新计数。", "Unique visitors. The same person counts once a day and again on another day."],
+  "metric.visits.def": ["访问次数。连续浏览算一次访问，停下一段时间（默认 30 分钟）再回来算新的一次。", "Number of visits. Continuous browsing is one visit; coming back after a pause (30 minutes by default) starts a new one."],
+  "metric.pageviews.def": ["页面被打开的总次数，同一个人重复打开也都算。", "Total page loads, including repeat views by the same person."],
+  "metric.views_per_visit.def": ["平均每次访问打开的页面数。", "Average number of pages opened per visit."],
+  "metric.bounce_rate.def": ["只看了一个页面、没有任何操作就离开的访问所占的比例。", "Share of visits that viewed a single page and left without doing anything."],
+  "metric.visit_duration.def": ["平均每次访问从开始到最后一次操作的时间。只打开一个页面、没有其他操作的访问记为 0 秒。", "Average time from the start of a visit to its last action. A visit with a single page and no other action counts as 0 seconds."],
   "metric.events": ["事件数", "Events"],
   "metric.conversion_rate": ["转化率", "Conversion rate"],
   "metric.percentage": ["占比", "Share"],
