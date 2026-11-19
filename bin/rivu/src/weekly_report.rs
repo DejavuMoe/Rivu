@@ -16,7 +16,7 @@ use jiff::civil::{Date, Weekday};
 use jiff::tz::TimeZone;
 use jiff::{Timestamp, ToSpan};
 use rivu_auth::session;
-use rivu_mail::Mail;
+use rivu_mail::weekly_report::{Report, confirmation, report};
 use rivu_query::result::MetricValue;
 use rivu_query::{ExecOptions, QueryResult, QuerySpec};
 use rivu_storage_pg::access::{self, SiteRef, UserSiteRoles};
@@ -91,6 +91,13 @@ impl Lang {
         match self {
             Self::Zh => "zh",
             Self::En => "en",
+        }
+    }
+
+    fn mail(self) -> rivu_mail::Lang {
+        match self {
+            Self::Zh => rivu_mail::Lang::Zh,
+            Self::En => rivu_mail::Lang::En,
         }
     }
 }
@@ -361,24 +368,7 @@ async fn request_confirmation(State(api): State<Arc<DashApi>>, req: Request) -> 
 
     let base = api.base_url.trim_end_matches('/');
     let link = format!("{base}{CONFIRM_PAGE}/{}", token.plaintext());
-    let (subject, intro, outro) = match lang {
-        Lang::Zh => (
-            "确认接收 Rivu 周报",
-            "点下面的链接，确认用这个邮箱接收 Rivu 周报。链接 1 小时内有效，只能用一次。",
-            "如果不是你本人操作，忽略这封邮件即可。",
-        ),
-        Lang::En => (
-            "Confirm your email for Rivu weekly reports",
-            "Open this link to confirm that this address should receive Rivu weekly reports. The link works once and expires in 1 hour.",
-            "If you didn't ask for this, you can ignore this email.",
-        ),
-    };
-    let mail = Mail {
-        to: email.clone(),
-        subject: subject.into(),
-        body: format!("{intro}\n\n{link}\n\n{outro}\n"),
-        unsubscribe_url: None,
-    };
+    let mail = confirmation(lang.mail(), &email, &link);
     if mailer.send(mail).await.is_err() {
         tracing::warn!(user_id, "weekly report confirmation email failed");
         // Nobody received the new link: put the earlier state back, but keep the request time
@@ -607,7 +597,9 @@ async fn unsubscribe_page(Path(token): Path<String>) -> Res<Response> {
     ))
 }
 
-/// Switches off only the site the report was about; the mailbox stays confirmed.
+/// Switches off only the site the report was about; the mailbox stays confirmed. The request
+/// body is ignored, so this is also the RFC 8058 one-click target: mailbox providers POST
+/// `List-Unsubscribe=One-Click` here without cookies.
 async fn unsubscribe_by_token(
     State(api): State<Arc<DashApi>>,
     Path(token): Path<String>,
@@ -811,9 +803,6 @@ async fn deliver(
         execute_cached(&api.reader, None, &context, spec, options, "weekly_report").await?;
     let (visitors, visits, pageviews) = totals(&result)?;
     let base = api.base_url.trim_end_matches('/');
-    let link = format!("{base}/s/{}", site.id);
-    let (from, to) = (period.from, period.to);
-    let name = &site.name;
     for user_id in candidates {
         let token = session::generate();
         let (email, lang) = match claim(api, site, user_id, period, &token.hash()).await {
@@ -825,33 +814,25 @@ async fn deliver(
             }
         };
         let unsubscribe_url = format!("{base}{UNSUBSCRIBE_PATH}/{}", token.plaintext());
-        let (subject, body) = if lang == "zh" {
-            (
-                "Rivu 周报",
-                format!(
-                    "{name}\n{from} 至 {to}（{}）\n\n访客：{visitors}\n访问：{visits}\n浏览量：{pageviews}\n\n查看仪表盘：{link}\n退订周报：{unsubscribe_url}\n",
-                    site.timezone
-                ),
-            )
-        } else {
-            (
-                "Rivu weekly report",
-                format!(
-                    "{name}\n{from} to {to} ({})\n\nVisitors: {visitors}\nVisits: {visits}\nPageviews: {pageviews}\n\nView dashboard: {link}\nUnsubscribe: {unsubscribe_url}\n",
-                    site.timezone
-                ),
-            )
-        };
-        if mailer
-            .send(Mail {
-                to: email,
-                subject: subject.into(),
-                body,
-                unsubscribe_url: Some(unsubscribe_url),
-            })
-            .await
-            .is_err()
-        {
+        let mail = report(&Report {
+            lang: if lang == "zh" {
+                rivu_mail::Lang::Zh
+            } else {
+                rivu_mail::Lang::En
+            },
+            to: &email,
+            base_url: base,
+            site_id: site.id,
+            site_name: &site.name,
+            timezone: &site.timezone,
+            from: period.from,
+            until: period.to,
+            visitors,
+            visits,
+            pageviews,
+            unsubscribe_url: &unsubscribe_url,
+        });
+        if mailer.send(mail).await.is_err() {
             tracing::warn!(
                 site_id = site.id,
                 user_id,
