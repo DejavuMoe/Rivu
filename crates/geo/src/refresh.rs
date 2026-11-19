@@ -84,44 +84,6 @@ impl HttpClient {
             client: b.build().context("创建 HTTP 客户端失败")?,
         })
     }
-
-    /// GET 一个不大的文件到内存：只接受 200，超过 `max_bytes` 中止（数据中心网段等文本清单用）。
-    pub async fn get_bytes(&self, url: &str, max_bytes: u64) -> Result<Vec<u8>> {
-        let mut resp = self.client.get(url).send().await.map_err(|e| {
-            anyhow!(
-                "请求 {} 失败：{}",
-                redact_url(url),
-                describe(&e.without_url())
-            )
-        })?;
-        let status = resp.status().as_u16();
-        ensure!(
-            status == 200,
-            "服务器返回 HTTP {status}（{}）",
-            redact_url(url)
-        );
-        if let Some(len) = resp.content_length() {
-            ensure!(
-                len <= max_bytes,
-                "Content-Length {len} 超过上限 {max_bytes} 字节（{}）",
-                redact_url(url)
-            );
-        }
-        let mut out = Vec::new();
-        while let Some(chunk) = resp
-            .chunk()
-            .await
-            .map_err(|e| anyhow!("读取响应失败：{}", describe(&e.without_url())))?
-        {
-            ensure!(
-                (out.len() + chunk.len()) as u64 <= max_bytes,
-                "下载内容超过上限 {max_bytes} 字节，中止（{}）",
-                redact_url(url)
-            );
-            out.extend_from_slice(&chunk);
-        }
-        Ok(out)
-    }
 }
 
 /// 刷新的可调参数；默认值就是生产值，测试用来指向本地服务器、缩小上限、固定「当前月份」。

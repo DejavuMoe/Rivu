@@ -8,7 +8,7 @@
 //! | 2 | 客户端 IP | — |
 //! | 3 | 站点查找、`collect_enabled`、hostname 白名单（空白名单 fail-closed）、hostname 屏蔽规则、按站点令牌桶限流、垃圾引荐（referrer 的 host 后缀匹配） | `unknown_site` `site_disabled` `hostname_not_allowed` `rate_limited` `spam_referrer` |
 //! | 4 | 规则：IP / CIDR（先），页面通配（后） | `ip_blocked` `page_blocked` |
-//! | 5 | 机器人：`UaParser::parse`，`bot` 非空即丢弃（空 UA 也是机器人）；开启时再查数据中心网段 | `bot` `datacenter_ip` |
+//! | 5 | 机器人：`UaParser::parse`，`bot` 非空即丢弃（空 UA 也是机器人） | `bot` |
 //! | 6 | 地理：`GeoDb::lookup(ip, site.geo_level)`，按站点精度截断；之后过国家规则 | `country_blocked` |
 //! | 7 | UA 富化：浏览器、系统、设备类别 | — |
 //! | 8 | 来源：内部引荐传 `None`，`rivu_source::classify` 给出 `referrer_source` 与 `channel` | — |
@@ -51,7 +51,6 @@ use rivu_domain::{
     DropReason, EventKind, METRIC_ACCEPTED, NormalizedEvent, SessionAttrs, UNKNOWN_SITE_ID,
 };
 use rivu_geo::GeoDb;
-use rivu_geo::datacenter::DcDb;
 use rivu_ratelimit::KeyedLimiter;
 use rivu_session::assigner::{Incoming, SessionAssigner, SessionConfig, Stamp};
 use rivu_session::identity::{Salt, local_date, routing_hash, visitor_hash};
@@ -181,8 +180,6 @@ pub struct Pipeline {
     /// 站点没有自己的 `ingest_rate_limit_per_min` 时用的全局默认（`RIVU_INGEST_RATE_LIMIT_PER_MIN`）；
     /// `None` 表示不限流。[`Pipeline::new`] 默认不限流，由装配代码用 [`Pipeline::with_default_ingest_rate`] 设置。
     default_ingest_rate: Option<u32>,
-    /// 数据中心网段（`RIVU_DATACENTER_FILTER=on` 时才有）：第 5 步在机器人判定之后查。
-    datacenter: Option<Arc<DcDb>>,
 }
 
 impl Pipeline {
@@ -209,14 +206,7 @@ impl Pipeline {
             stages: StageHistograms::new(),
             limiter: KeyedLimiter::new(),
             default_ingest_rate: None,
-            datacenter: None,
         }
-    }
-
-    /// 开启数据中心网段过滤（第 5 步，`datacenter_ip`）。网段表未加载时不丢弃任何事件。
-    pub fn with_datacenter(mut self, db: Arc<DcDb>) -> Self {
-        self.datacenter = Some(db);
-        self
     }
 
     /// 设置全局默认的采集限额（每站每分钟事件数）；`None` 不限流。站点自己的限额优先。
@@ -415,10 +405,6 @@ impl Pipeline {
         if let Some(kind) = ua.bot {
             tracing::trace!(bot = ?kind, "丢弃机器人事件");
             return Err(DropReason::Bot);
-        }
-        // 数据中心网段（可选）：放在 UA 之后，同时命中时记为 bot
-        if self.datacenter.as_ref().is_some_and(|dc| dc.contains(ip)) {
-            return Err(DropReason::DatacenterIp);
         }
 
         // 6. 地理：按站点的 geo_level 截断；私有地址、库未加载、查不到都是空值
@@ -1233,53 +1219,22 @@ mod tests {
     }
 
     #[test]
-    fn datacenter_ips_are_dropped_only_when_the_table_is_enabled_and_loaded() {
-        use rivu_geo::datacenter::{DcRanges, Prefix};
+    fn cloud_ip_accepts_browser_and_still_drops_bot() {
         let t = at(date(2026, 3, 28), 12, 0);
-        let dc = Arc::new(DcDb::new());
-        let mut r = rig(10);
-        r.pipeline = r.pipeline.with_datacenter(Arc::clone(&dc));
-        // 表还没加载：放行
+        let r = rig(10);
+        let ip = "3.5.141.7";
         assert_eq!(
-            r.pipeline
-                .process(&pageview("/"), ctx("3.5.140.9", CHROME_WIN, t)),
+            r.pipeline.process(&pageview("/"), ctx(ip, CHROME_WIN, t)),
             Outcome::Accepted
         );
-        dc.replace(
-            DcRanges::from_prefixes(&[Prefix::parse("3.5.140.0/22").unwrap()]),
-            None,
-        );
         assert_eq!(
             r.pipeline
-                .process(&pageview("/"), ctx("3.5.141.7", CHROME_WIN, t + 1)),
-            Outcome::Dropped(DropReason::DatacenterIp)
-        );
-        // 机器人优先记为 bot
-        assert_eq!(
-            r.pipeline
-                .process(&pageview("/"), ctx("3.5.141.7", GOOGLEBOT, t + 2)),
+                .process(&pageview("/"), ctx(ip, GOOGLEBOT, t + 1)),
             Outcome::Dropped(DropReason::Bot)
-        );
-        // 网段外照常
-        assert_eq!(
-            r.pipeline
-                .process(&pageview("/"), ctx("1.1.1.1", CHROME_WIN, t + 3)),
-            Outcome::Accepted
         );
         assert_eq!(
             counts(&r.writer),
-            BTreeMap::from([
-                (key(SITE, "accepted"), 2),
-                (key(SITE, "dropped_bot"), 1),
-                (key(SITE, "dropped_datacenter_ip"), 1),
-            ])
-        );
-        // 没有开启过滤的管线不受影响
-        let r2 = rig(10);
-        assert_eq!(
-            r2.pipeline
-                .process(&pageview("/"), ctx("3.5.141.7", CHROME_WIN, t)),
-            Outcome::Accepted
+            BTreeMap::from([(key(SITE, "accepted"), 1), (key(SITE, "dropped_bot"), 1)])
         );
     }
 

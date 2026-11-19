@@ -47,7 +47,7 @@ LABEL org.opencontainers.image.title="Rivu" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.version="${RIVU_VERSION}"
 
-# ca-certificates：下载 GeoIP 库与数据中心网段（HTTPS）；tzdata 不需要，时区规则编译在二进制里
+# ca-certificates：下载 GeoIP 库（HTTPS）；tzdata 不需要，时区规则编译在二进制里
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \

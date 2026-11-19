@@ -2468,7 +2468,6 @@ dependencies = [
  "jiff",
  "maxminddb",
  "metrics",
- "parking_lot",
  "reqwest",
  "rivu-common",
  "rustls",
