@@ -306,6 +306,7 @@ mod tests {
             g(b0 + 60, "accepted", 7, 3, b0 + 60),
             g(b0 + 60, "dropped_bot", 7, 2, b0 + 60),
             g(b0 + 60, "dropped_hostname_not_allowed", 8, 4, b0 + 60),
+            g(b0 + 60, "dropped_datacenter_ip", 7, 1, b0 + 60),
             g(b0 + 60, "dropped_unknown_site", 8, 100, b0 + 60),
             // 窗口之外
             g(b0 - 60, "accepted", 7, 999, b0 - 60),
@@ -314,15 +315,19 @@ mod tests {
         assert_eq!(v["buckets"].as_array().unwrap().len(), 60);
         assert_eq!(v["buckets"][0]["accepted"], 5);
         assert_eq!(v["buckets"][1]["accepted"], 3);
-        assert_eq!(v["buckets"][1]["dropped"], 6);
+        assert_eq!(v["buckets"][1]["dropped"], 7);
         assert_eq!(v["totals"]["accepted"], 8);
-        assert_eq!(v["totals"]["dropped"], 6);
+        assert_eq!(v["totals"]["dropped"], 7);
         assert_eq!(v["reasons"][0]["reason"], "hostname_not_allowed");
         assert_eq!(v["reasons"][0]["count"], 4);
-        assert_eq!(v["reasons"].as_array().unwrap().len(), 2);
+        assert_eq!(v["reasons"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            v["reasons"][2],
+            json!({"reason": "datacenter_ip", "count": 1})
+        );
         assert_eq!(v["versions"][0]["version"], 8);
         assert_eq!(v["versions"][0]["events"], 4);
-        assert_eq!(v["versions"][1]["events"], 10);
+        assert_eq!(v["versions"][1]["events"], 11);
         assert_eq!(v["last_event_at"], iso(i64::from(b0) + 60));
         assert_eq!(v["partial_last"], true);
     }
