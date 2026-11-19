@@ -102,8 +102,6 @@ git pull && docker build -t rivu:latest . && \
 
 `migrate` 先应用待执行的迁移，成功后才启动新版本的 `rivu`。跨迁移版本回退时，用目标版本的镜像和配置，将与该版本匹配的 PostgreSQL 与 ClickHouse 备份恢复到空的数据库卷。旧镜像的 `migrate` 会拒绝数据库中它不认识的迁移记录。恢复点之后写入的数据不会随备份恢复。
 
-周报迁移 `20261119100000` 已实测这一限制。升级后直接换回迁移前的镜像，旧 `migrate` 会在启动时返回错误，Compose 也会停止启动 `rivu`。准备回退时保留升级前的匹配备份。
-
 ## 备份与恢复
 
 数据在三个命名卷里：`rivu_pg-data`（账号、站点、设置）、`rivu_ch-data`（统计数据与日汇总）、`rivu_rivu-data`（GeoIP 库与会话快照，可重建）。
