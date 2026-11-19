@@ -19,30 +19,31 @@ jobs:
       version: ${{ steps.release.outputs.version }}
       commit: ${{ steps.release.outputs.commit }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
-          # 按事件 SHA 检出，保留单独获取的标签引用供校验。
+          # Check out the event SHA and keep the separately fetched tag ref for verification.
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - name: 校验标签、Cargo 版本和 master CI
+      - name: Verify tag, Cargo version and master CI
         id: release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           part='(0|[1-9][0-9]*)'
           if [[ ! "$GITHUB_REF" =~ ^refs/tags/v${part}\.${part}\.${part}$ ]]; then
-            echo "::error::发布标签必须是稳定版本 vX.Y.Z"
+            echo "::error::The release tag must be a stable version vX.Y.Z"
             exit 1
           fi
           version="${GITHUB_REF#refs/tags/v}"
           commit="$(git rev-parse --verify "${GITHUB_REF}^{commit}")"
           if [[ "$commit" != "$(git rev-parse HEAD)" ]]; then
-            echo "::error::标签指向的提交与本次推送提交不一致"
+            echo "::error::The tag's commit does not match the pushed commit"
             exit 1
           fi
           if ! git merge-base --is-ancestor "$commit" refs/remotes/origin/master; then
-            echo "::error::$commit 必须能从 origin/master 到达"
+            echo "::error::$commit must be reachable from origin/master"
             exit 1
           fi
 
@@ -51,7 +52,7 @@ jobs:
             | jq -er --arg manifest "$manifest" \
                 '.packages[] | select(.name == "rivu" and .manifest_path == $manifest) | .version')"
           if [[ "$version" != "$cargo_version" ]]; then
-            echo "::error::标签版本 $version 与 Cargo 的 rivu 版本 $cargo_version 不一致"
+            echo "::error::Tag version $version does not match the Cargo rivu version $cargo_version"
             exit 1
           fi
 
@@ -60,7 +61,7 @@ jobs:
             | jq -e --arg commit "$commit" 'any(.workflow_runs[];
                 .head_sha == $commit and .head_branch == "master" and .event == "push"
                 and .status == "completed" and .conclusion == "success")' >/dev/null; then
-            echo "::error::无法确认 $commit 的 master push CI（ci.yml）已成功"
+            echo "::error::Cannot confirm that the master push CI (ci.yml) succeeded for $commit"
             exit 1
           fi
           printf 'version=%s\ncommit=%s\n' "$version" "$commit" >> "$GITHUB_OUTPUT"
@@ -76,11 +77,12 @@ jobs:
       VERSION: ${{ needs.verify.outputs.version }}
       COMMIT: ${{ needs.verify.outputs.commit }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           ref: ${{ needs.verify.outputs.commit }}
           persist-credentials: false
-      - name: 构建镜像并验证版本
+      - name: Build the image and verify its version
         run: |
           DOCKER_BUILDKIT=1 docker build \
             --build-arg "RIVU_VERSION=$VERSION" \
@@ -91,11 +93,11 @@ jobs:
             -t "$IMAGE:$VERSION" .
           actual="$(docker run --rm "$IMAGE:$VERSION" --version)"
           if [[ "$actual" != "rivu $VERSION (commit $COMMIT)" ]]; then
-            echo "::error::镜像版本输出与发布版本或提交不一致"
+            echo "::error::The image version output does not match the release version or commit"
             printf '%s\n' "$actual"
             exit 1
           fi
-      - name: 推送版本标签和 latest
+      - name: Push the version tag and latest
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |

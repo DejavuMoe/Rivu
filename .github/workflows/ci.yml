@@ -23,19 +23,20 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Rust 工具链（版本由 rust-toolchain.toml 决定）
+      - name: Rust toolchain (pinned by rust-toolchain.toml)
         run: rustup show
       - name: cargo fmt --check
         run: cargo fmt --all --check
       - name: cargo clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
-      - name: cargo test（集成测试在没有 RIVU_TEST_* 变量时自动跳过）
+      - name: cargo test (integration tests skip themselves without RIVU_TEST_* variables)
         run: cargo test --locked --workspace
 
-  # 短时模糊测试。保留崩溃输入，作业失败不阻塞合并。
+  # Short fuzz run. Crash inputs are kept, and a failing job does not block merging.
   fuzz-smoke:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -44,16 +45,17 @@ jobs:
     env:
       FUZZ_SECONDS: "60"
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: nightly 工具链
+      - name: Nightly toolchain
         run: rustup toolchain install nightly --profile minimal
-      - name: 安装 cargo-fuzz
+      - name: Install cargo-fuzz
         run: cargo +nightly install cargo-fuzz --locked
-      - name: 构建全部模糊目标
+      - name: Build all fuzz targets
         run: cargo +nightly fuzz build
-      - name: 每个目标跑 ${{ env.FUZZ_SECONDS }} 秒（种子语料 fuzz/corpus，新语料写到临时目录）
+      - name: Fuzz each target for ${{ env.FUZZ_SECONDS }}s (seed corpus in fuzz/corpus, new inputs go to a temp dir)
         run: |
           work="${RUNNER_TEMP}/rivu-fuzz-corpus"
           for t in parse_event query_spec hostname shield_diff source_classify; do
@@ -65,7 +67,7 @@ jobs:
               -max_total_time="$FUZZ_SECONDS" -max_len=16384 "${dict[@]}"
             echo "::endgroup::"
           done
-      - name: 保存崩溃输入
+      - name: Upload crash inputs
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -102,7 +104,7 @@ jobs:
       RIVU_CLICKHOUSE_URL: http://127.0.0.1:18123
       RIVU_CH_MIGRATOR_USER: rivu_migrator
       RIVU_CH_MIGRATOR_PASSWORD: rivu_dev_migrator
-      # 集成测试
+      # Integration tests
       RIVU_TEST_DATABASE_URL: postgres://rivu_migrator:rivu_ci@127.0.0.1:15432/rivu
       RIVU_TEST_CLICKHOUSE_URL: http://127.0.0.1:18123
       RIVU_TEST_CH_MIGRATOR_USER: rivu_migrator
@@ -114,33 +116,35 @@ jobs:
       RIVU_TEST_CH_MAINTAINER_USER: rivu_maintainer
       RIVU_TEST_CH_MAINTAINER_PASSWORD: rivu_dev_maintainer
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # schema_snapshot 包含物化视图的 definer，query_security 检查 reader profile。
-      - name: 加载开发用 ClickHouse 账号与权限
+      # schema_snapshot covers materialized-view definers, and query_security checks the reader profile.
+      - name: Load the development ClickHouse users and grants
         env:
           CLICKHOUSE_CONTAINER: ${{ job.services.clickhouse.id }}
         run: |
           docker cp deploy/clickhouse/users.d/rivu-dev.xml "$CLICKHOUSE_CONTAINER:/etc/clickhouse-server/users.d/rivu-dev.xml"
           docker exec "$CLICKHOUSE_CONTAINER" clickhouse-client --query 'SYSTEM RELOAD CONFIG'
-      - name: Rust 工具链
+      - name: Rust toolchain
         run: rustup show
-      - name: 构建 rivu
+      - name: Build rivu
         run: cargo build --locked -p rivu
-      - name: rivu migrate（第一次：全部应用）
+      - name: rivu migrate (first run applies everything)
         run: ./target/debug/rivu migrate
-      - name: rivu migrate（第二次：必须幂等，没有待执行的迁移）
+      - name: rivu migrate (second run must be idempotent, nothing pending)
         run: |
           out="$(./target/debug/rivu migrate)"
           echo "$out"
+          # The CLI prints this Chinese line when no migration is pending.
           grep -Fx "没有待执行的迁移" <<<"$out"
       - name: rivu migrate status
         run: ./target/debug/rivu migrate status
-      - name: 全量 rivu 测试（含真实 DB schema_snapshot）
+      - name: Full rivu tests (including schema_snapshot against real databases)
         run: cargo test --locked -p rivu --tests --no-fail-fast -- --nocapture
 
-  # 浏览器采集脚本（apps/tracker）。与 Rust 的 job 互不依赖，可并行。
+  # Browser tracker script (apps/tracker). Independent of the Rust jobs, so it runs in parallel.
   tracker:
     runs-on: ubuntu-24.04
     timeout-minutes: 25
@@ -148,36 +152,38 @@ jobs:
       run:
         working-directory: apps/tracker
     env:
-      # 构建号：单调递增，随事件以 sv 上报（规范 §8）。
+      # Build number: monotonically increasing, reported with events as sv (spec §8).
       RIVU_SV: ${{ github.run_number }}
-      # 体积回归 > 64 B 需要 label 批准时，由流水线按 label 设为 1（规范 §3.3）；默认不批准。
+      # A size regression over 64 B needs label approval; the pipeline sets this to 1 from the label (spec §3.3). Not approved by default.
       RIVU_SIZE_APPROVED: "0"
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24"
-      - name: 安装 pnpm（版本与 package.json 的 packageManager 一致）
+      - name: Install pnpm (version matches packageManager in package.json)
         run: npm install -g pnpm@12.5.1
-      - name: 安装依赖（锁文件必须是最新的）
+      - name: Install dependencies (lockfile must be up to date)
         id: install
         run: pnpm install --frozen-lockfile
-      - name: 构建
+      - name: Build
         run: pnpm run build
-      - name: 产物检查（体积预算 gzip -9 ≤ 1024 B、模块泄漏、禁用 API、es2018、确定性）
+      - name: Check build output (size budget gzip -9 ≤ 1024 B, module leaks, banned APIs, es2018, determinism)
         run: pnpm run size
-      - name: 单元测试（node:test）
+      - name: Unit tests (node:test)
         run: node --test "test/unit/*.test.ts"
-      - name: 安装 Playwright 浏览器（chromium firefox webkit）
+      - name: Install Playwright browsers (chromium, firefox, webkit)
         run: bash ../../.github/scripts/install-playwright.sh
-      - name: 浏览器测试（chromium / firefox / webkit）
+      - name: Browser tests (chromium / firefox / webkit)
         run: pnpm exec playwright test
-      - name: 类型检查
+      - name: Type check
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm run typecheck
-      - name: 保存 Playwright 报告
+      - name: Upload Playwright report
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -193,22 +199,24 @@ jobs:
       run:
         working-directory: apps/dashboard
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24"
-      - name: 安装 pnpm
+      - name: Install pnpm
         run: npm install -g pnpm@12.5.1
-      - name: 安装依赖
+      - name: Install dependencies
         run: pnpm install --frozen-lockfile
-      - name: 类型检查
+      - name: Type check
         run: pnpm run check
-      - name: 单元测试
+      - name: Unit tests
         run: pnpm test
 
-  # 真实浏览器 -> rivu -> ClickHouse -> rivu query。
+  # Real browser -> rivu -> ClickHouse -> rivu query.
   e2e-rivu:
     runs-on: ubuntu-24.04
     timeout-minutes: 35
@@ -250,24 +258,26 @@ jobs:
       RIVU_CH_MAINTAINER_PASSWORD: rivu_ci
       RIVU_VISITOR_PEPPER: rivu-ci-visitor-pepper-not-for-production-use
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Rust 工具链
+      - name: Rust toolchain
         run: rustup show
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24"
-      - name: 安装 pnpm
+      - name: Install pnpm
         run: npm install -g pnpm@12.5.1
-      - name: 安装 Playwright 浏览器和系统依赖
+      - name: Install Playwright browsers and system dependencies
         run: |
           cd apps/tracker
           pnpm install --frozen-lockfile
           bash ../../.github/scripts/install-playwright.sh
-      - name: 真实浏览器端到端
+      - name: Real-browser end-to-end tests
         run: RIVU_E2E_SKIP_INSTALL=1 bash apps/tracker/scripts/e2e-rivu.sh
-      - name: 保存实服务 Playwright 报告
+      - name: Upload live-server Playwright report
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -276,22 +286,24 @@ jobs:
             apps/tracker/playwright-report-rivu
             apps/tracker/test-results
 
-  # 依赖的已知漏洞（RustSec 公告库）。有公告就失败；确认不受影响的公告在 audit.toml 里忽略并写明理由。
+  # Known vulnerabilities in dependencies (RustSec advisory database). Any advisory fails the job; advisories confirmed not to apply are ignored in audit.toml with the reason written down.
   audit:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: cargo audit
         run: |
           cargo install cargo-audit --locked
           cargo audit
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24"
-      - name: 安装 pnpm
+      - name: Install pnpm
         id: audit-pnpm
         run: npm install -g pnpm@12.5.1
       - name: pnpm audit (tracker)
@@ -308,10 +320,11 @@ jobs:
     env:
       CANDIDATE_IMAGE: rivu:ci-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: 构建候选镜像并检查版本
+      - name: Build the candidate image and check its version
         run: |
           DOCKER_BUILDKIT=1 docker build \
             --build-arg RIVU_VERSION=0.0.0-ci \
@@ -323,9 +336,9 @@ jobs:
             echo "::error::Image version does not identify commit $RIVU_GIT_COMMIT"
             exit 1
           fi
-      - name: 生产 Compose 空卷冒烟
+      - name: Production Compose smoke test (empty volumes)
         run: bash .github/scripts/compose-smoke.sh "$CANDIDATE_IMAGE" "$RUNNER_TEMP/rivu-compose-smoke.log"
-      - name: 保存 Compose 失败日志
+      - name: Upload Compose failure logs
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
