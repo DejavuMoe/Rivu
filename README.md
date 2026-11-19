@@ -140,9 +140,9 @@ curl -i http://127.0.0.1:8080/api/v1/query/schema.json     # 无需 key
 ### 5. 测试
 
 ```
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test        # 需要数据库的集成测试在缺少 RIVU_TEST_* 变量时跳过并打印原因
+cargo fmt --all --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked   # 需要数据库的集成测试在缺少 RIVU_TEST_* 变量时跳过并打印原因
 ```
 
 加载 `.env.example`（带 `RIVU_TEST_*`）后，`cargo test` 连真实的 PostgreSQL 和 ClickHouse 跑 `bin/rivu/tests/` 的集成测试，其中：
