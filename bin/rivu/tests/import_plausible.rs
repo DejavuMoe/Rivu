@@ -54,7 +54,7 @@ const FILES: [(&str, &str); 11] = [
         "\"date\",\"source\",\"referrer\",\"utm_source\",\"utm_medium\",\"utm_campaign\",\"utm_content\",\"utm_term\",\"pageviews\",\"visitors\",\"visits\",\"visit_duration\",\"bounces\"\n\
          \"2026-06-01\",\"Bing\",\"cn.bing.com\",\"\",\"\",\"\",\"\",\"\",12,6,7,400,3\n\
          \"2026-06-01\",\"\",\"\",\"\",\"\",\"\",\"\",\"\",8,4,5,200,2\n\
-         \"2026-06-02\",\"Bing\",\"www.bing.com\",\"\",\"\",\"\",\"\",\"\",15,8,9,300,4\n\
+         \"2026-06-02\",\"Google\",\"android-app://com.google.android.googlequicksearchbox/https/www.google.com\",\"\",\"\",\"\",\"\",\"\",15,8,9,300,4\n\
          \"2026-06-03\",\"newsletter\",\"\",\"newsletter\",\"email\",\"spring\",\"\",\"\",7,5,6,120,2\n",
     ),
     (
@@ -338,6 +338,9 @@ async fn plausible_export_is_imported_into_the_rollup_tier() {
         rows(&run(&reader, &site, by("visit:country")).await),
         vec![("CN".to_owned(), vec![15.0]), ("US".to_owned(), vec![8.0])]
     );
+    let sources = rows(&run(&reader, &site, by("visit:source")).await);
+    assert_eq!(sources[0], ("Google".to_owned(), vec![8.0]));
+    assert_eq!(sources[1], ("Bing".to_owned(), vec![6.0]));
     let channels = rows(&run(&reader, &site, by("visit:channel")).await);
     assert_eq!(channels[0], ("Organic Search".to_owned(), vec![14.0]));
     assert!(
