@@ -355,7 +355,7 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 | `ingest_counters` 过期 | 表级 TTL | 无 | 由 ClickHouse TTL 处理（默认 90 天，见 `system-design.md` §5.4），不需要单独任务 |
 | `tombstone_purge` | cron | 每日 | 硬删除 30 天前的软删除行（`sites` 除外） |
 | `jobs_reaper`、`jobs_prune` | cron | 每分钟 / 每日 | 租约回收；清理历史 |
-| `email_report`（第 4 阶段） | cron 调度 + 逐站入队 | 每小时调度 | `unique_key = report:{site}:{period}`，`max_attempts = 1`（04§3.2 `ScheduleEmailReports`/`SendEmailReport`） |
+| `weekly_report` | 已配置 SMTP 时启动 | 启动即检查，之后每分钟检查 | 按站点时区和每周起始日处理最近一个完整周，从下一周首日当地 09:00 起发送。用 reader 账号查询访客、访问和浏览量。有查询错误或覆盖警告时，跳过该次发送 |
 | `spike_notify`（第 4 阶段） | cron | 每 15 分钟 | 以站点最近发送时间去重（04§3.2 `TrafficChangeNotifier`，用途为推断） |
 
 `retention_purge` 通过 PG 站点行锁固定设置并协调显式擦除，ClickHouse writer 可继续写入。每个站点从 `rollup_site FINAL` 里第一个已过结算期的当前时区原生完成标记开始，逐日验证直到首个缺标记或未结算的本地日。设 `A`、`B` 分别为首个已验证日、首个未覆盖日的本地午夜，分别换算成 UTC。只有 `origin = 'native'`、`import_id = 0` 的站点标记能提供证明，空日的标记也有效。存在旧时区标记、站点被软删除、擦除任务未完成、缺少站点元数据或未取得行锁时，跳过该站点的自动清理。显式擦除按自身意图与恢复期限执行。
@@ -374,6 +374,21 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 - 若任务在首次领取时于写入前被拒绝（`rejected_before_write=true`），请先独立核实所需日期的时区。确认当前站点时区与预期一致后，在「站点设置 → 危险操作」按日期重新提交，或由组织 owner/admin 调用同一路径的 `POST`，仍需输入站点名称。失败记录保留供审计。
 - 既往尝试可能发出过 mutation 的意图继续阻挡同站点维护，即使 `partitions_done` 为空。检查 ClickHouse 的 `system.mutations` 和实际数据。对证据仍有效的超时任务，恢复 ClickHouse 后让 worker 退避重试。若已耗尽自动重试，核对证据和影响后可将该意图重设为 `running`、`not_before=now()`，保留原有证据和分区进度。缺失证据的历史尝试需要人工核对已执行的删除，尤其是恢复旧备份后重放的历史擦除。
 - 客户端超时无法撤回 ClickHouse 已执行的删除。持久化阻挡覆盖新版擦除 worker 提交的请求。在多表删除尚未完成时，读取仍可能遇到原始行已删除而旧汇总仍可见的中间状态。旧进程、直接写库及跨库备份恢复需要单独核对。
+
+### 周报订阅接口
+
+基础路径为 `/api/internal/sites/{site}/weekly-report`，`{site}` 接受站点 ID 或 `site_key`。需要登录会话和该站点的统计读权限，写操作沿用看板的 CSRF 校验。收件人为登录账号当前的邮箱。
+
+| 请求 | 用途 |
+|---|---|
+| `GET` | 返回 `available`、`status`（`off`、`pending` 或 `active`）、`email`、`timezone`、`week_starts_on`（`0` 为周日） |
+| `POST` + `{"lang":"zh"}` 或 `{"lang":"en"}` | 申请或重发确认码，每个账号每分钟最多一次。已订阅时更新报告语言 |
+| `POST /confirm` + `{"code":"…"}` | 用当前确认码开通。确认码有效 15 分钟，猜错 5 次失效，数据库只保存摘要 |
+| `DELETE` | 取消待确认或已激活的订阅，成功返回 `204` |
+
+两个 `POST` 成功时返回与 `GET` 相同的状态对象。SMTP 未配置时，`GET` 返回 `available: false`，`DELETE` 仍可用，两个 `POST` 返回 `503 mail_unavailable`。
+
+周报查询沿用站点隔离、导入与汇总层口径。有查询错误或警告时不领取发送记录，后续检查可重算。成功查询后再次核对邮箱、权限和订阅。PostgreSQL 在调用 SMTP 前提交领取记录，重复或重叠周期会被跳过。记录跨退订、重订和服务重启保留。若领取后进程退出或 SMTP 未返回明确结果，不会自动重发。
 
 ## 7. 配置
 规则：
@@ -424,7 +439,7 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 | `RIVU_LOG_FORMAT`、`RIVU_LOG_LEVEL` | `json`、`info` | 格式为 `json` 或 `pretty`。开发排障可提高到 `debug` 或 `trace`，见[排障](../install.md#排障) |
 | `RIVU_METRICS` | `on` | 内部口 `/metrics` 开关（Plausible 默认关，04§0#6） |
 | `RIVU_OTLP_ENDPOINT`、`RIVU_ERROR_REPORT_DSN` | 空（关闭） | OTLP 导出（同 04§4.2 `OTLP_ENDPOINT` 思路）；可选错误上报，脱敏见第 10 节 |
-| `RIVU_SMTP_HOST`、`_PORT`、`_USER`、`_PASSWORD`、`_FROM`、`_TLS` | 空；`587`；`starttls` | 未配置则邮件功能关闭（04§4.2 邮件段） |
+| `RIVU_SMTP_URL`、`RIVU_SMTP_FROM` | 两项须一起设置 | 邀请、密码重置、周报。支持 `smtps://` 或 `smtp://…?tls=required`，见[安装说明](../install.md#安装) |
 | `RIVU_S3_ENDPOINT`、`_REGION`、`_BUCKET`、`_ACCESS_KEY_ID`、`_SECRET_ACCESS_KEY` | 空 | 导出对象存储，未配置则落本地；启用后缺一即报错（04§4.2 S3 段） |
 
 ## 8. 数据库账号与权限
