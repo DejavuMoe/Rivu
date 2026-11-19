@@ -388,7 +388,7 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 
 两个 `POST` 成功时返回与 `GET` 相同的状态对象。SMTP 未配置时，`GET` 返回 `available: false`，`DELETE` 仍可用，两个 `POST` 返回 `503 mail_unavailable`。
 
-周报查询沿用站点隔离、导入与汇总层口径。有查询错误或警告时不领取发送记录，后续检查可重算。成功查询后再次核对邮箱、权限和订阅。PostgreSQL 在调用 SMTP 前提交领取记录，重复或重叠周期会被跳过。记录跨退订、重订和服务重启保留。若领取后进程退出或 SMTP 未返回明确结果，不会自动重发。
+周报查询沿用站点隔离、导入与汇总层口径。有查询错误或警告时不领取发送记录，后续检查可重算。成功查询后再次核对邮箱、权限和订阅。PostgreSQL 在调用 SMTP 前提交领取记录，重复或重叠周期会被跳过。每个已领取的收件人、站点和周期新增一行，记录跨退订、重订和服务重启保留。若领取后进程退出或 SMTP 未返回明确结果，不会自动重发。
 
 ## 7. 配置
 规则：
