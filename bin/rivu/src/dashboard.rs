@@ -316,7 +316,14 @@ mod tests {
 
     #[tokio::test]
     async fn pages_fall_back_to_index_and_assets_are_cached() {
-        for page in ["/", "/sites", "/s/12/settings/general", "/share/abc"] {
+        for page in [
+            "/",
+            "/sites",
+            "/s/12/settings/general",
+            "/share/abc",
+            // The weekly report confirmation email links here; the token is base64url, never a dot.
+            "/weekly-report/confirm/Zm9vYmFyLWJhei1xdXV4LTAxMjM0NTY3ODktYWJjZGVm_-",
+        ] {
             let r = get(page, &[]).await;
             assert_eq!(r.status(), 200, "{page}");
             assert_eq!(r.headers()[header::CACHE_CONTROL], REVALIDATE);

@@ -16,8 +16,8 @@
 {
 	log default {
 		format filter {
-			# 上游故障时保留错误详情，只遮盖退订凭据。
-			request>uri regexp /api/weekly-report/unsubscribe/.* /api/weekly-report/unsubscribe/REDACTED
+			# 上游故障时保留错误详情，只遮盖周报的退订与邮箱确认凭据（路径里的令牌）。
+			request>uri regexp /weekly-report/(unsubscribe|confirm)/.* /weekly-report/REDACTED
 		}
 	}
 	# servers {
@@ -37,6 +37,8 @@
 		}
 	}
 	log_skip /api/weekly-report/unsubscribe/*
+	log_skip /api/weekly-report/confirm/*
+	log_skip /weekly-report/confirm/*
 
 	header Strict-Transport-Security "max-age=31536000"
 

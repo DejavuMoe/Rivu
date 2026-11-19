@@ -3,19 +3,6 @@
   "designSystems": [],
   "primaryDesignSystem": null,
   "assets": {
-    "我的周报": {
-      "versions": [
-        {
-          "path": "index.html",
-          "createdAt": "2026-11-19T01:09:21.567Z",
-          "status": "needs-review",
-          "viewport": {
-            "width": 1440,
-            "height": 900
-          }
-        }
-      ]
-    },
     "周报邮件": {
       "versions": [
         {

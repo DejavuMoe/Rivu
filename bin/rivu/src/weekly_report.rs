@@ -1,5 +1,9 @@
 //! Account-bound weekly reports. A committed claim consumes the SMTP attempt.
+//!
+//! An account confirms its mailbox once through an emailed link; every site it may read is then an
+//! on/off switch, and a subscription row exists only while the switch is on.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -7,7 +11,7 @@ use axum::Router;
 use axum::extract::{Path, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use jiff::civil::{Date, Weekday};
 use jiff::tz::TimeZone;
 use jiff::{Timestamp, ToSpan};
@@ -17,36 +21,53 @@ use rivu_query::result::MetricValue;
 use rivu_query::{ExecOptions, QueryResult, QuerySpec};
 use rivu_storage_pg::access::{self, SiteRef, UserSiteRoles};
 use serde::Deserialize;
-use serde_json::json;
-use sqlx::{PgConnection, PgPool, Postgres, Transaction};
+use serde_json::{Value, json};
+use sqlx::{PgConnection, PgExecutor, PgPool, Postgres, Transaction};
 use tokio::sync::watch;
 
 use crate::dash_api::{
-    DashApi, DashError, SessionCtx, endpoint, json_response, may_read_stats, method_not_allowed,
-    read_json,
+    DashApi, DashError, endpoint, json_response, may_read_stats, method_not_allowed, read_json,
 };
 use crate::query_api::{execute_cached, load_site_context, no_store};
 
 type Res<T> = Result<T, DashError>;
 const UNSUBSCRIBE_PATH: &str = "/api/weekly-report/unsubscribe";
+/// Dashboard page that the confirmation email links to; it calls `/api/weekly-report/confirm/{token}`.
+const CONFIRM_PAGE: &str = "/weekly-report/confirm";
 
 pub(crate) fn routes(api: &Arc<DashApi>) -> Router {
     endpoint(
         api,
-        "internal.weekly_report",
-        "/api/internal/sites/{site}/weekly-report",
-        get(status)
-            .post(request)
-            .delete(unsubscribe)
-            .fallback(|| method_not_allowed("GET, HEAD, POST, DELETE")),
+        "internal.weekly_report_account",
+        "/api/internal/account/weekly-report",
+        get(account_status).fallback(|| method_not_allowed("GET, HEAD")),
     )
     .merge(endpoint(
         api,
-        "internal.weekly_report_confirm",
-        "/api/internal/sites/{site}/weekly-report/confirm",
-        post(confirm).fallback(|| method_not_allowed("POST")),
+        "internal.weekly_report_confirmation",
+        "/api/internal/account/weekly-report/confirmation",
+        post(request_confirmation)
+            .delete(cancel_confirmation)
+            .fallback(|| method_not_allowed("POST, DELETE")),
     ))
-    // This endpoint authorizes solely with the mail token, never cookies.
+    .merge(endpoint(
+        api,
+        "internal.weekly_report",
+        "/api/internal/sites/{site}/weekly-report",
+        put(subscribe)
+            .delete(unsubscribe)
+            .fallback(|| method_not_allowed("PUT, DELETE")),
+    ))
+    // These endpoints authorize solely with the mail token, never cookies.
+    .merge(crate::query_api::count_requests(
+        Router::new()
+            .route(
+                "/api/weekly-report/confirm/{token}",
+                get(confirm_info).post(confirm_by_token),
+            )
+            .with_state(Arc::clone(api)),
+        "weekly_report.confirm",
+    ))
     .merge(crate::query_api::count_requests(
         Router::new()
             .route(
@@ -76,14 +97,8 @@ impl Lang {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RequestCode {
+struct LangBody {
     lang: Lang,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ConfirmCode {
-    code: String,
 }
 
 struct Recipient {
@@ -92,21 +107,25 @@ struct Recipient {
     week_starts_on: i16,
 }
 
-// The user lock serializes requests across sites and serializes claims with opt-out.
+/// Locks an active account; every write to its mailbox or subscriptions holds this lock.
+async fn lock_user(tx: &mut PgConnection, user_id: i64) -> anyhow::Result<Option<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT email::text FROM users WHERE id = $1 AND disabled_at IS NULL
+         AND deleted_at IS NULL FOR NO KEY UPDATE",
+    )
+    .bind(user_id)
+    .fetch_optional(tx)
+    .await?)
+}
+
+// The user lock serializes mailbox and subscription changes with claims.
 // Share locks keep the account's site, calendar and access valid through commit.
 async fn lock_recipient(
     tx: &mut PgConnection,
     user_id: i64,
     site_id: i64,
 ) -> anyhow::Result<Option<Recipient>> {
-    let Some(email) = sqlx::query_scalar(
-        "SELECT email::text FROM users WHERE id = $1 AND disabled_at IS NULL
-         AND deleted_at IS NULL FOR NO KEY UPDATE",
-    )
-    .bind(user_id)
-    .fetch_optional(&mut *tx)
-    .await?
-    else {
+    let Some(email) = lock_user(&mut *tx, user_id).await? else {
         return Ok(None);
     };
     let Some((timezone, org_id)) = sqlx::query_as::<_, (String, i64)>(
@@ -164,73 +183,101 @@ async fn begin(
     Ok((tx, recipient))
 }
 
-enum Subscription {
-    Off,
-    Pending(Vec<u8>),
-    Active,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EmailStatus {
+    Confirmed,
+    Pending,
+    Unconfirmed,
 }
 
-async fn subscription(
-    tx: &mut PgConnection,
+impl EmailStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Confirmed => "confirmed",
+            Self::Pending => "pending",
+            Self::Unconfirmed => "unconfirmed",
+        }
+    }
+}
+
+/// The mailbox state for the account's current address.
+async fn email_status<'c>(
+    db: impl PgExecutor<'c>,
     user_id: i64,
-    site_id: i64,
     email: &str,
-) -> anyhow::Result<Subscription> {
-    let row = sqlx::query_as::<_, (bool, Option<Vec<u8>>)>(
+) -> anyhow::Result<EmailStatus> {
+    let row = sqlx::query_as::<_, (bool, bool)>(
         "SELECT confirmed_at IS NOT NULL,
-                CASE WHEN requested_at > statement_timestamp() - interval '15 minutes'
-                     THEN code_hash END
-         FROM weekly_report_subscriptions WHERE user_id = $1 AND site_id = $2 AND email = $3",
+                COALESCE(token_expires_at > statement_timestamp(), false)
+         FROM weekly_report_emails WHERE user_id = $1 AND email = $2",
     )
     .bind(user_id)
-    .bind(site_id)
     .bind(email)
-    .fetch_optional(tx)
+    .fetch_optional(db)
     .await?;
     Ok(match row {
-        Some((true, _)) => Subscription::Active,
-        Some((false, Some(hash))) => Subscription::Pending(hash),
-        _ => Subscription::Off,
+        Some((true, _)) => EmailStatus::Confirmed,
+        Some((false, true)) => EmailStatus::Pending,
+        _ => EmailStatus::Unconfirmed,
     })
 }
 
-fn status_response(
-    api: &DashApi,
-    ctx: &SessionCtx,
-    recipient: &Recipient,
-    status: &str,
-) -> Response {
-    api.finish(
-        json_response(
-            StatusCode::OK,
-            json!({
-                "available": api.mailer.is_some(),
-                "status": status,
-                "email": recipient.email,
-                "timezone": recipient.timezone,
-                "week_starts_on": recipient.week_starts_on,
-            }),
-        ),
-        ctx,
+/// `GET /api/internal/account/weekly-report`; the confirmation request returns it too.
+async fn account_body(api: &DashApi, user_id: i64, email: &str) -> Res<Value> {
+    let status = email_status(&api.pg, user_id, email).await?;
+    let mut sites: Vec<_> = access::list_visible_sites(&api.pg, user_id)
+        .await?
+        .into_iter()
+        .filter(|s| may_read_stats(&s.roles))
+        .collect();
+    // Case-insensitive, so "blog" does not sort after "Zeta"; the id keeps equal names stable.
+    sites.sort_by_cached_key(|s| (s.name.to_lowercase(), s.id));
+    let ids = sites
+        .iter()
+        .map(|s| i64::try_from(s.id))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(anyhow::Error::from)?;
+    let details: HashMap<i64, (i16, bool)> = sqlx::query_as::<_, (i64, i16, bool)>(
+        "SELECT s.id, COALESCE(ss.week_starts_on, 1)::smallint,
+                EXISTS (SELECT FROM weekly_report_subscriptions w
+                        WHERE w.user_id = $2 AND w.site_id = s.id)
+         FROM unnest($1::bigint[]) AS s (id)
+         LEFT JOIN site_settings ss ON ss.site_id = s.id",
     )
+    .bind(&ids)
+    .bind(user_id)
+    .fetch_all(&api.pg)
+    .await
+    .map_err(anyhow::Error::from)?
+    .into_iter()
+    .map(|(id, week_starts_on, subscribed)| (id, (week_starts_on, subscribed)))
+    .collect();
+    let sites: Vec<Value> = sites
+        .iter()
+        .zip(&ids)
+        .map(|(site, id)| {
+            let (week_starts_on, subscribed) = details.get(id).copied().unwrap_or((1, false));
+            json!({
+                "id": site.id,
+                "name": site.name,
+                "timezone": site.timezone,
+                "week_starts_on": week_starts_on,
+                "subscribed": subscribed,
+            })
+        })
+        .collect();
+    Ok(json!({
+        "available": api.mailer.is_some(),
+        "email": email,
+        "email_status": status.as_str(),
+        "sites": sites,
+    }))
 }
 
-async fn status(
-    State(api): State<Arc<DashApi>>,
-    Path(site): Path<String>,
-    headers: HeaderMap,
-) -> Res<Response> {
+async fn account_status(State(api): State<Arc<DashApi>>, headers: HeaderMap) -> Res<Response> {
     let ctx = api.require_session(&headers).await?;
-    let site_id = site_id(&api, &site).await?;
-    let user_id = ctx.s.user_id;
-    let (mut tx, recipient) = begin(&api, user_id, site_id).await?;
-    let state = match subscription(&mut tx, user_id, site_id, &recipient.email).await? {
-        Subscription::Off => "off",
-        Subscription::Pending(_) => "pending",
-        Subscription::Active => "active",
-    };
-    tx.commit().await.map_err(anyhow::Error::from)?;
-    Ok(status_response(&api, &ctx, &recipient, state))
+    let body = account_body(&api, ctx.s.user_id, &ctx.s.email).await?;
+    Ok(api.finish(json_response(StatusCode::OK, body), &ctx))
 }
 
 fn mail_unavailable() -> Response {
@@ -240,135 +287,192 @@ fn mail_unavailable() -> Response {
     )
 }
 
-async fn request(
-    State(api): State<Arc<DashApi>>,
-    Path(site): Path<String>,
-    req: Request,
-) -> Res<Response> {
+/// The mailbox row before a new link replaced it, restored if the email cannot be sent.
+/// Timestamps travel as text so they round-trip exactly.
+type SavedEmail = (
+    String,
+    String,
+    Option<Vec<u8>>,
+    Option<String>,
+    Option<String>,
+);
+
+async fn request_confirmation(State(api): State<Arc<DashApi>>, req: Request) -> Res<Response> {
     let ctx = api.require_session(req.headers()).await?;
-    let RequestCode { lang } = read_json(req, 256).await?;
-    let site_id = site_id(&api, &site).await?;
-    let user_id = ctx.s.user_id;
-    let (mut tx, recipient) = begin(&api, user_id, site_id).await?;
-    let Some(mailer) = &api.mailer else {
-        return Ok(mail_unavailable());
+    let LangBody { lang } = read_json(req, 256).await?;
+    let Some(mailer) = api.mailer.clone() else {
+        return Ok(api.finish(mail_unavailable(), &ctx));
     };
-    if matches!(
-        subscription(&mut tx, user_id, site_id, &recipient.email).await?,
-        Subscription::Active
-    ) {
-        sqlx::query(
-            "UPDATE weekly_report_subscriptions SET lang = $3 WHERE user_id = $1 AND site_id = $2",
-        )
-        .bind(user_id)
-        .bind(site_id)
-        .bind(lang.as_str())
-        .execute(&mut *tx)
-        .await
-        .map_err(anyhow::Error::from)?;
+    let user_id = ctx.s.user_id;
+    let mut tx = api.pg.begin().await.map_err(anyhow::Error::from)?;
+    let email = lock_user(&mut tx, user_id)
+        .await?
+        .ok_or(DashError::Unauthorized)?;
+    if email_status(&mut *tx, user_id, &email).await? == EmailStatus::Confirmed {
+        sqlx::query("UPDATE weekly_report_emails SET lang = $2 WHERE user_id = $1")
+            .bind(user_id)
+            .bind(lang.as_str())
+            .execute(&mut *tx)
+            .await
+            .map_err(anyhow::Error::from)?;
         tx.commit().await.map_err(anyhow::Error::from)?;
-        return Ok(status_response(&api, &ctx, &recipient, "active"));
+        let body = account_body(&api, user_id, &email).await?;
+        return Ok(api.finish(json_response(StatusCode::OK, body), &ctx));
     }
     let wait: Option<f64> = sqlx::query_scalar(
-        "SELECT extract(epoch FROM max(requested_at) + interval '1 minute' - statement_timestamp())::float8
-         FROM weekly_report_subscriptions WHERE user_id = $1",
+        "SELECT extract(epoch FROM requested_at + interval '1 minute' - statement_timestamp())::float8
+         FROM weekly_report_emails WHERE user_id = $1",
     )
     .bind(user_id)
-    .fetch_one(&mut *tx)
+    .fetch_optional(&mut *tx)
     .await
-    .map_err(anyhow::Error::from)?;
+    .map_err(anyhow::Error::from)?
+    .flatten();
     if let Some(wait) = wait.filter(|w| *w > 0.0) {
         return Err(DashError::RateLimited(Duration::from_secs_f64(wait)));
     }
-    let token = session::generate();
-    sqlx::query(
-        "INSERT INTO weekly_report_subscriptions (user_id, site_id, email, lang, requested_at, code_hash)
-         VALUES ($1, $2, $3, $4, statement_timestamp(), $5)
-         ON CONFLICT (user_id, site_id) DO UPDATE
-         SET email = excluded.email, lang = excluded.lang, requested_at = excluded.requested_at,
-             code_hash = excluded.code_hash, attempts = 0, confirmed_at = NULL",
+    let saved: Option<SavedEmail> = sqlx::query_as(
+        "SELECT email, lang, token_hash, token_expires_at::text, confirmed_at::text
+         FROM weekly_report_emails WHERE user_id = $1",
     )
     .bind(user_id)
-    .bind(site_id)
-    .bind(&recipient.email)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(anyhow::Error::from)?;
+    let token = session::generate();
+    let hash = token.hash();
+    sqlx::query(
+        "INSERT INTO weekly_report_emails
+             (user_id, email, lang, requested_at, token_hash, token_expires_at)
+         VALUES ($1, $2, $3, statement_timestamp(), $4, statement_timestamp() + interval '1 hour')
+         ON CONFLICT (user_id) DO UPDATE
+         SET email = excluded.email, lang = excluded.lang, requested_at = excluded.requested_at,
+             token_hash = excluded.token_hash, token_expires_at = excluded.token_expires_at,
+             confirmed_at = NULL",
+    )
+    .bind(user_id)
+    .bind(&email)
     .bind(lang.as_str())
-    .bind(token.hash().as_slice())
+    .bind(hash.as_slice())
     .execute(&mut *tx)
     .await
     .map_err(anyhow::Error::from)?;
     tx.commit().await.map_err(anyhow::Error::from)?;
 
-    let (subject, message) = match lang {
+    let base = api.base_url.trim_end_matches('/');
+    let link = format!("{base}{CONFIRM_PAGE}/{}", token.plaintext());
+    let (subject, intro, outro) = match lang {
         Lang::Zh => (
-            "Rivu 周报验证码",
-            "请将下面的验证码粘贴到 Rivu。验证码在 15 分钟内有效。",
+            "确认接收 Rivu 周报",
+            "点下面的链接，确认用这个邮箱接收 Rivu 周报。链接 1 小时内有效，只能用一次。",
+            "如果不是你本人操作，忽略这封邮件即可。",
         ),
         Lang::En => (
-            "Rivu weekly report confirmation code",
-            "Paste this code into Rivu within 15 minutes.",
+            "Confirm your email for Rivu weekly reports",
+            "Open this link to confirm that this address should receive Rivu weekly reports. The link works once and expires in 1 hour.",
+            "If you didn't ask for this, you can ignore this email.",
         ),
     };
     let mail = Mail {
-        to: recipient.email.clone(),
+        to: email.clone(),
         subject: subject.into(),
-        body: format!("{message}\n\n{}\n", token.plaintext()),
+        body: format!("{intro}\n\n{link}\n\n{outro}\n"),
         unsubscribe_url: None,
     };
     if mailer.send(mail).await.is_err() {
-        tracing::warn!(site_id, user_id, "weekly report confirmation email failed");
-        return Ok(json_response(
-            StatusCode::BAD_GATEWAY,
-            json!({"error": "mail_failed", "message": "the confirmation email could not be delivered"}),
+        tracing::warn!(user_id, "weekly report confirmation email failed");
+        // Nobody received the new link: put the earlier state back, but keep the request time
+        // so the rate limit still counts this attempt.
+        let (email, lang, token_hash, expires_at, confirmed_at) = match saved {
+            Some((email, lang, hash, expires, confirmed)) => {
+                (Some(email), Some(lang), hash, expires, confirmed)
+            }
+            None => (None, None, None, None, None),
+        };
+        sqlx::query(
+            "UPDATE weekly_report_emails
+             SET email = COALESCE($3, email), lang = COALESCE($4, lang), token_hash = $5,
+                 token_expires_at = $6::timestamptz, confirmed_at = $7::timestamptz
+             WHERE user_id = $1 AND token_hash = $2",
+        )
+        .bind(user_id)
+        .bind(hash.as_slice())
+        .bind(email)
+        .bind(lang)
+        .bind(token_hash)
+        .bind(expires_at)
+        .bind(confirmed_at)
+        .execute(&api.pg)
+        .await
+        .map_err(anyhow::Error::from)?;
+        return Ok(api.finish(
+            json_response(
+                StatusCode::BAD_GATEWAY,
+                json!({"error": "mail_failed", "message": "the confirmation email could not be delivered"}),
+            ),
+            &ctx,
         ));
     }
-    Ok(status_response(&api, &ctx, &recipient, "pending"))
+    let body = account_body(&api, user_id, &email).await?;
+    Ok(api.finish(json_response(StatusCode::OK, body), &ctx))
 }
 
-async fn confirm(
+async fn cancel_confirmation(State(api): State<Arc<DashApi>>, headers: HeaderMap) -> Res<Response> {
+    let ctx = api.require_session(&headers).await?;
+    let mut tx = api.pg.begin().await.map_err(anyhow::Error::from)?;
+    lock_user(&mut tx, ctx.s.user_id)
+        .await?
+        .ok_or(DashError::Unauthorized)?;
+    sqlx::query(
+        "UPDATE weekly_report_emails SET token_hash = NULL, token_expires_at = NULL
+         WHERE user_id = $1",
+    )
+    .bind(ctx.s.user_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(anyhow::Error::from)?;
+    tx.commit().await.map_err(anyhow::Error::from)?;
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    no_store(&mut response);
+    Ok(api.finish(response, &ctx))
+}
+
+async fn subscribe(
     State(api): State<Arc<DashApi>>,
     Path(site): Path<String>,
     req: Request,
 ) -> Res<Response> {
     let ctx = api.require_session(req.headers()).await?;
-    let ConfirmCode { code } = read_json(req, 256).await?;
+    let LangBody { lang } = read_json(req, 256).await?;
     let site_id = site_id(&api, &site).await?;
     let user_id = ctx.s.user_id;
     let (mut tx, recipient) = begin(&api, user_id, site_id).await?;
-    if api.mailer.is_none() {
-        return Ok(mail_unavailable());
+    if email_status(&mut *tx, user_id, &recipient.email).await? != EmailStatus::Confirmed {
+        return Err(DashError::Conflict(
+            "email_unconfirmed",
+            "confirm your email address before subscribing to weekly reports".into(),
+        ));
     }
-    let invalid = || {
-        DashError::BadRequest(
-            "invalid_code",
-            "the confirmation code is invalid or expired",
-        )
-    };
-    let Subscription::Pending(stored) =
-        subscription(&mut tx, user_id, site_id, &recipient.email).await?
-    else {
-        return Err(invalid());
-    };
-    let matches = rivu_auth::key::ct_eq(&stored, &session::hash_token(code.trim()));
-    let confirmed = sqlx::query_scalar::<_, bool>(
-        "UPDATE weekly_report_subscriptions
-         SET confirmed_at = CASE WHEN $3 THEN statement_timestamp() END,
-             code_hash = CASE WHEN $3 OR attempts = 4 THEN NULL ELSE code_hash END,
-             attempts = CASE WHEN $3 THEN 0 ELSE attempts + 1 END
-         WHERE user_id = $1 AND site_id = $2
-           AND requested_at > statement_timestamp() - interval '15 minutes'
-         RETURNING confirmed_at IS NOT NULL",
+    // An unchanged address keeps its subscription time, so earlier unsubscribe links stay valid.
+    sqlx::query(
+        "INSERT INTO weekly_report_subscriptions AS w (user_id, site_id, email, lang, confirmed_at)
+         VALUES ($1, $2, $3, $4, statement_timestamp())
+         ON CONFLICT (user_id, site_id) DO UPDATE
+         SET lang = excluded.lang, email = excluded.email,
+             confirmed_at = CASE WHEN w.email = excluded.email THEN w.confirmed_at
+                                 ELSE excluded.confirmed_at END",
     )
     .bind(user_id)
     .bind(site_id)
-    .bind(matches)
-    .fetch_optional(&mut *tx)
+    .bind(&recipient.email)
+    .bind(lang.as_str())
+    .execute(&mut *tx)
     .await
     .map_err(anyhow::Error::from)?;
     tx.commit().await.map_err(anyhow::Error::from)?;
-    if confirmed != Some(true) {
-        return Err(invalid());
-    }
-    Ok(status_response(&api, &ctx, &recipient, "active"))
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    no_store(&mut response);
+    Ok(api.finish(response, &ctx))
 }
 
 async fn unsubscribe(
@@ -380,19 +484,102 @@ async fn unsubscribe(
     let site_id = site_id(&api, &site).await?;
     let user_id = ctx.s.user_id;
     let (mut tx, _) = begin(&api, user_id, site_id).await?;
-    sqlx::query(
-        "UPDATE weekly_report_subscriptions SET email = NULL, code_hash = NULL, attempts = 0,
-         confirmed_at = NULL WHERE user_id = $1 AND site_id = $2",
-    )
-    .bind(user_id)
-    .bind(site_id)
-    .execute(&mut *tx)
-    .await
-    .map_err(anyhow::Error::from)?;
+    sqlx::query("DELETE FROM weekly_report_subscriptions WHERE user_id = $1 AND site_id = $2")
+        .bind(user_id)
+        .bind(site_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(anyhow::Error::from)?;
     tx.commit().await.map_err(anyhow::Error::from)?;
     let mut response = StatusCode::NO_CONTENT.into_response();
     no_store(&mut response);
     Ok(api.finish(response, &ctx))
+}
+
+/// Token endpoints answer every failure with the same 404 and never leak the link to a referrer.
+fn token_response(result: Res<Value>) -> Response {
+    let mut response = match result {
+        Ok(body) => json_response(StatusCode::OK, body),
+        Err(error) => error.into_response(),
+    };
+    response
+        .headers_mut()
+        .insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    response
+}
+
+/// Reading the link changes nothing, so a mail client that prefetches it confirms nothing.
+async fn confirm_info(State(api): State<Arc<DashApi>>, Path(token): Path<String>) -> Response {
+    token_response(pending_email(&api, &token).await)
+}
+
+async fn pending_email(api: &DashApi, token: &str) -> Res<Value> {
+    if !session::is_well_formed(token) {
+        return Err(DashError::NotFound);
+    }
+    let email: Option<String> = sqlx::query_scalar(
+        "SELECT e.email FROM weekly_report_emails e
+         JOIN users u ON u.id = e.user_id AND u.disabled_at IS NULL AND u.deleted_at IS NULL
+                     AND u.email::text = e.email
+         WHERE e.token_hash = $1 AND e.token_expires_at > statement_timestamp()",
+    )
+    .bind(session::hash_token(token).as_slice())
+    .fetch_optional(&api.pg)
+    .await
+    .map_err(anyhow::Error::from)?;
+    let email = email.ok_or(DashError::NotFound)?;
+    Ok(json!({ "email": email }))
+}
+
+async fn confirm_by_token(State(api): State<Arc<DashApi>>, Path(token): Path<String>) -> Response {
+    token_response(confirm_email(&api, &token).await)
+}
+
+async fn confirm_email(api: &DashApi, token: &str) -> Res<Value> {
+    if !session::is_well_formed(token) {
+        return Err(DashError::NotFound);
+    }
+    let hash = session::hash_token(token);
+    let mut tx = api.pg.begin().await.map_err(anyhow::Error::from)?;
+    let user_id: i64 =
+        sqlx::query_scalar("SELECT user_id FROM weekly_report_emails WHERE token_hash = $1")
+            .bind(hash.as_slice())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(anyhow::Error::from)?
+            .ok_or(DashError::NotFound)?;
+    let email = lock_user(&mut tx, user_id)
+        .await?
+        .ok_or(DashError::NotFound)?;
+    let confirmed = sqlx::query(
+        "UPDATE weekly_report_emails
+         SET confirmed_at = statement_timestamp(), token_hash = NULL, token_expires_at = NULL
+         WHERE user_id = $1 AND token_hash = $2 AND email = $3
+           AND token_expires_at > statement_timestamp()",
+    )
+    .bind(user_id)
+    .bind(hash.as_slice())
+    .bind(&email)
+    .execute(&mut *tx)
+    .await
+    .map_err(anyhow::Error::from)?
+    .rows_affected();
+    if confirmed == 0 {
+        return Err(DashError::NotFound);
+    }
+    // Sites switched on under an earlier address follow the newly confirmed mailbox. The new
+    // subscription time retires unsubscribe links that were mailed to the earlier address.
+    sqlx::query(
+        "UPDATE weekly_report_subscriptions SET email = $2, confirmed_at = statement_timestamp()
+         WHERE user_id = $1 AND email <> $2",
+    )
+    .bind(user_id)
+    .bind(&email)
+    .execute(&mut *tx)
+    .await
+    .map_err(anyhow::Error::from)?;
+    tx.commit().await.map_err(anyhow::Error::from)?;
+    Ok(json!({ "email": email }))
 }
 
 fn unsubscribe_response(page: &'static str) -> Response {
@@ -420,6 +607,7 @@ async fn unsubscribe_page(Path(token): Path<String>) -> Res<Response> {
     ))
 }
 
+/// Switches off only the site the report was about; the mailbox stays confirmed.
 async fn unsubscribe_by_token(
     State(api): State<Arc<DashApi>>,
     Path(token): Path<String>,
@@ -427,10 +615,9 @@ async fn unsubscribe_by_token(
     if !session::is_well_formed(&token) {
         return Err(DashError::NotFound);
     }
-    let updated = sqlx::query(
-        "UPDATE weekly_report_subscriptions w
-         SET email = NULL, code_hash = NULL, attempts = 0, confirmed_at = NULL
-         FROM weekly_report_claims c
+    let deleted = sqlx::query(
+        "DELETE FROM weekly_report_subscriptions w
+         USING weekly_report_claims c
          WHERE c.unsubscribe_hash = $1 AND w.user_id = c.user_id AND w.site_id = c.site_id
            AND w.confirmed_at = c.confirmed_at",
     )
@@ -439,7 +626,7 @@ async fn unsubscribe_by_token(
     .await
     .map_err(anyhow::Error::from)?
     .rows_affected();
-    if updated == 0 {
+    if deleted == 0 {
         return Ok(unsubscribe_response(
             r#"<!doctype html><html lang="en"><meta charset="utf-8"><title>Rivu weekly reports</title>
             <p>This link has expired or the subscription is already off.</p><p lang="zh">退订链接已过期，或订阅已关闭。</p></html>"#,
@@ -501,6 +688,8 @@ async fn candidates(pg: &PgPool, site_id: i64, period: Period) -> anyhow::Result
         "SELECT w.user_id FROM weekly_report_subscriptions w
          JOIN users u ON u.id = w.user_id AND u.disabled_at IS NULL AND u.deleted_at IS NULL
          JOIN sites s ON s.id = w.site_id
+         JOIN weekly_report_emails e ON e.user_id = w.user_id AND e.email = w.email
+                                     AND e.confirmed_at IS NOT NULL
          WHERE w.site_id = $1 AND w.email = u.email::text
            AND w.confirmed_at < to_timestamp($2)
            AND (EXISTS (SELECT FROM memberships m WHERE m.organization_id = s.organization_id
@@ -541,6 +730,8 @@ async fn claim(
              SELECT lang, confirmed_at FROM weekly_report_subscriptions
              WHERE user_id = $1 AND site_id = $2 AND email = $3
                AND confirmed_at < to_timestamp($4)
+               AND EXISTS (SELECT FROM weekly_report_emails
+                   WHERE user_id = $1 AND email = $3 AND confirmed_at IS NOT NULL)
                AND NOT EXISTS (SELECT FROM weekly_report_claims
                    WHERE user_id = $1 AND site_id = $2 AND period_end > to_timestamp($5))
          ), claimed AS (
@@ -682,7 +873,7 @@ pub async fn run_once(api: &DashApi) -> anyhow::Result<()> {
          FROM sites s JOIN organizations o ON o.id = s.organization_id AND o.deleted_at IS NULL
          LEFT JOIN site_settings ss ON ss.site_id = s.id
          WHERE s.deleted_at IS NULL AND EXISTS (
-             SELECT FROM weekly_report_subscriptions w WHERE w.site_id = s.id AND w.confirmed_at IS NOT NULL)
+             SELECT FROM weekly_report_subscriptions w WHERE w.site_id = s.id)
          ORDER BY s.id",
     )
     .fetch_all(&api.pg)

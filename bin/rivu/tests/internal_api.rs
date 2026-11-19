@@ -195,6 +195,11 @@ impl Iso {
 
 /// 一个空的临时 schema，里面应用了全部 PG 迁移。
 async fn isolated(env: &TestEnv) -> Iso {
+    isolated_with(env, |_| true).await
+}
+
+/// 临时 schema 里只应用版本满足 `keep` 的 PG 迁移（测迁移的数据处理时，先停在它之前）。
+async fn isolated_with(env: &TestEnv, keep: impl Fn(u64) -> bool) -> Iso {
     let admin = rivu_storage_pg::connect(&env.pg_url, 2).await.unwrap();
     let schema = format!("t_internal_{:08x}", rand::random::<u32>());
     sqlx::query(AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
@@ -216,21 +221,29 @@ async fn isolated(env: &TestEnv) -> Iso {
         .connect(&env.pg_url)
         .await
         .unwrap();
-    // 不走 `apply_migration`：它会往 `schema_migrations` 里记账，而 search_path 里的 public 已经有那张表（开发库自己的记录）
+    apply_pg_migrations(&pool, keep).await;
+    Iso {
+        pool,
+        admin,
+        schema,
+    }
+}
+
+/// 按版本顺序应用满足 `keep` 的 PG 迁移。
+/// 不走 `apply_migration`：它会往 `schema_migrations` 里记账，而 search_path 里的 public 已经有那张表（开发库自己的记录）
+async fn apply_pg_migrations(pool: &PgPool, keep: impl Fn(u64) -> bool) {
     let mut migrations = migration::embedded().expect("迁移");
     migrations.sort_by_key(|m| m.version);
-    for m in migrations.iter().filter(|m| m.store == Store::Postgres) {
+    for m in migrations
+        .iter()
+        .filter(|m| m.store == Store::Postgres && keep(m.version))
+    {
         let mut tx = pool.begin().await.unwrap();
         sqlx::raw_sql(AssertSqlSafe(m.sql.clone()))
             .execute(&mut *tx)
             .await
             .unwrap_or_else(|e| panic!("在临时 schema 里应用 {} 失败：{e:#}", m.file));
         tx.commit().await.unwrap();
-    }
-    Iso {
-        pool,
-        admin,
-        schema,
     }
 }
 
@@ -394,6 +407,13 @@ impl Http {
     /// 带 JSON 的 `Content-Type` 与同源的 `Origin`（CSRF 判定要的）。
     fn post(&self, path: &str, body: &Value) -> Rb<'_> {
         self.rb("POST", path, body.to_string().into_bytes())
+            .header("Content-Type", "application/json")
+            .header("Origin", &self.origin)
+    }
+
+    /// 带 JSON 请求体的 `PUT`（同样带 CSRF 要的头）。
+    fn put(&self, path: &str, body: &Value) -> Rb<'_> {
+        self.rb("PUT", path, body.to_string().into_bytes())
             .header("Content-Type", "application/json")
             .header("Origin", &self.origin)
     }
@@ -572,41 +592,80 @@ async fn login_cookie(http: &Http, email: &str) -> String {
     r.cookie_pair("rivu_session").expect("会话 cookie")
 }
 
-async fn weekly_code(
+const WEEKLY_ACCOUNT: &str = "/api/internal/account/weekly-report";
+const WEEKLY_CONFIRMATION: &str = "/api/internal/account/weekly-report/confirmation";
+
+fn weekly_site(site: impl std::fmt::Display) -> String {
+    format!("/api/internal/sites/{site}/weekly-report")
+}
+
+fn weekly_token_path(token: &str) -> String {
+    format!("/api/weekly-report/confirm/{token}")
+}
+
+async fn weekly_account(http: &Http, cookie: &str) -> Value {
+    let response = http.get(WEEKLY_ACCOUNT).cookie(cookie).send().await;
+    assert_eq!(response.status, 200, "{}", response.body);
+    assert_eq!(response.header("cache-control"), Some("no-store"));
+    response.json()
+}
+
+/// Requests a confirmation email and returns the token from its only link, plus the email.
+async fn weekly_link(
     http: &Http,
     outbox: &rivu_mail::Outbox,
-    path: &str,
     cookie: &str,
     lang: &str,
     email: &str,
-) -> String {
+) -> (String, rivu_mail::Mail) {
     let response = http
-        .post(path, &json!({"lang": lang}))
+        .post(WEEKLY_CONFIRMATION, &json!({"lang": lang}))
         .cookie(cookie)
         .send()
         .await;
     assert_eq!(response.status, 200, "{}", response.body);
-    assert_eq!(response.json()["status"], "pending");
-    let mails = outbox.take();
+    assert_eq!(response.json()["email_status"], "pending");
+    let mut mails = outbox.take();
     assert_eq!(mails.len(), 1);
-    let mail = &mails[0];
+    let mail = mails.remove(0);
     assert_eq!(mail.to, email);
+    assert_eq!(mail.unsubscribe_url, None);
+    let links: Vec<&str> = mail
+        .body
+        .lines()
+        .filter(|line| line.contains("://"))
+        .collect();
+    assert_eq!(links.len(), 1, "{}", mail.body);
+    let token = links[0]
+        .strip_prefix(&format!("{HTTP_ORIGIN}/weekly-report/confirm/"))
+        .expect("the link is built from RIVU_BASE_URL")
+        .to_owned();
+    assert!(rivu_auth::session::is_well_formed(&token));
     assert!(!mail.body.contains("internal-api-e2e"));
-    assert!(!mail.body.contains(path));
-    assert!(!mail.body.contains("http://"));
-    assert!(!mail.body.contains("https://"));
-    mail.body.lines().last().unwrap().to_owned()
+    assert!(!mail.body.contains("/api/"));
+    (token, mail)
 }
 
-async fn weekly_confirm(http: &Http, path: &str, cookie: &str, code: &str) -> Resp {
-    http.post(&format!("{path}/confirm"), &json!({"code": code}))
-        .cookie(cookie)
+/// Token endpoints are called without cookies, `Origin` or a JSON content type.
+async fn weekly_token(http: &Http, method: &'static str, token: &str) -> Resp {
+    http.rb(method, &weekly_token_path(token), Vec::new())
         .send()
         .await
 }
 
+async fn age_weekly_request(pg: &PgPool, user_id: i64) {
+    sqlx::query(
+        "UPDATE weekly_report_emails SET requested_at = requested_at - interval '2 minutes'
+         WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .execute(pg)
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
-async fn weekly_report_requires_account_access_csrf_and_fresh_email_proof() {
+async fn weekly_report_confirms_the_mailbox_once_and_switches_sites() {
     let Some(env) = test_env("weekly_report_subscription") else {
         return;
     };
@@ -614,16 +673,34 @@ async fn weekly_report_requires_account_access_csrf_and_fresh_email_proof() {
     let iso = isolated(&env).await;
     let pg = &iso.pool;
     let org = make_org(pg).await;
+    let owner = make_user(pg, Some((&org, "owner"))).await;
     let member = make_user(pg, Some((&org, "viewer"))).await;
     let guest = make_user(pg, None).await;
     let site = make_site(pg, &org, true).await;
     let other = make_site(pg, &org, false).await;
-    sqlx::query("INSERT INTO site_memberships (site_id, user_id, role) VALUES ($1, $2, 'viewer')")
-        .bind(site.id as i64)
-        .bind(guest.id)
+    let foreign = make_site(pg, &make_org(pg).await, false).await;
+    // Name order differs from id order; `other` starts its week on Sunday.
+    for (s, name) in [(&site, "beta"), (&other, "alpha")] {
+        sqlx::query("UPDATE sites SET name = $1 WHERE id = $2")
+            .bind(name)
+            .bind(s.id as i64)
+            .execute(pg)
+            .await
+            .unwrap();
+    }
+    sqlx::query("UPDATE site_settings SET week_starts_on = 0 WHERE site_id = $1")
+        .bind(other.id as i64)
         .execute(pg)
         .await
         .unwrap();
+    let guest_grant: i64 = sqlx::query_scalar(
+        "INSERT INTO site_memberships (site_id, user_id, role) VALUES ($1, $2, 'viewer') RETURNING id",
+    )
+    .bind(site.id as i64)
+    .bind(guest.id)
+    .fetch_one(pg)
+    .await
+    .unwrap();
     let cfg = config(&env, &[]);
     let reader = rivu_storage_ch::client(&env.ch_url, &account("reader"), Some(&ch_database()));
     let (mailer, outbox) = rivu_mail::Mailer::memory("rivu@example.test");
@@ -633,10 +710,10 @@ async fn weekly_report_requires_account_access_csrf_and_fresh_email_proof() {
     let http = serve_dashboard(Arc::new(api), &cfg.base_url).await;
     let cookie = login_cookie(&http, &member.email).await;
     let guest_cookie = login_cookie(&http, &guest.email).await;
-    let path = format!("/api/internal/sites/{}/weekly-report", site.key);
-    let other_path = format!("/api/internal/sites/{}/weekly-report", other.id);
-    let confirm_path = format!("{path}/confirm");
-    let request = json!({"lang": "en"});
+    let path = weekly_site(&site.key);
+    let other_path = weekly_site(other.id);
+    let lang = json!({"lang": "en"});
+
     let share = user_cmd::issue_link(pg, &site.key, None, None)
         .await
         .unwrap();
@@ -654,18 +731,20 @@ async fn weekly_report_requires_account_access_csrf_and_fresh_email_proof() {
     .unwrap();
     let bearer = format!("Bearer {}", key.plaintext);
     for req in [
-        http.get(&path),
-        http.get(&path).header("Authorization", &bearer),
-        http.get(&path).share(&share.slug),
-        http.post(&path, &request),
-        http.post(&confirm_path, &json!({"code": "anything"})),
+        http.get(WEEKLY_ACCOUNT),
+        http.get(WEEKLY_ACCOUNT).header("Authorization", &bearer),
+        http.get(WEEKLY_ACCOUNT).share(&share.slug),
+        http.post(WEEKLY_CONFIRMATION, &lang),
+        http.delete(WEEKLY_CONFIRMATION),
+        http.put(&path, &lang),
         http.delete(&path),
     ] {
         assert_eq!(req.send().await.status, 401);
     }
     for req in [
-        http.post(&path, &request),
-        http.post(&confirm_path, &json!({"code": "anything"})),
+        http.post(WEEKLY_CONFIRMATION, &lang),
+        http.delete(WEEKLY_CONFIRMATION),
+        http.put(&path, &lang),
         http.delete(&path),
     ] {
         let rejected = req
@@ -676,9 +755,16 @@ async fn weekly_report_requires_account_access_csrf_and_fresh_email_proof() {
         assert_eq!(rejected.status, 403);
         assert_eq!(rejected.json()["error"], "csrf_rejected");
     }
+    assert!(outbox.take().is_empty());
+    // The per-site code flow is gone.
+    assert_eq!(http.get(&path).cookie(&cookie).send().await.status, 405);
     assert_eq!(
-        http.get(&other_path)
-            .cookie(&guest_cookie)
+        http.post(&path, &lang).cookie(&cookie).send().await.status,
+        405
+    );
+    assert_eq!(
+        http.post(&format!("{path}/confirm"), &json!({"code": "x"}))
+            .cookie(&cookie)
             .send()
             .await
             .status,
@@ -686,8 +772,8 @@ async fn weekly_report_requires_account_access_csrf_and_fresh_email_proof() {
     );
     assert_eq!(
         http.post(
-            &path,
-            &json!({"lang":"en", "email":"elsewhere@example.test"})
+            WEEKLY_CONFIRMATION,
+            &json!({"lang": "en", "email": "elsewhere@example.test"})
         )
         .cookie(&cookie)
         .send()
@@ -695,68 +781,346 @@ async fn weekly_report_requires_account_access_csrf_and_fresh_email_proof() {
         .status,
         400
     );
-    let status = http.get(&path).cookie(&cookie).send().await;
-    assert_eq!(status.header("cache-control"), Some("no-store"));
+
+    let site_entry = |s: &Site, name: &str, week_starts_on: i64, subscribed: bool| {
+        json!({"id": s.id, "name": name, "timezone": "UTC",
+               "week_starts_on": week_starts_on, "subscribed": subscribed})
+    };
     assert_eq!(
-        status.json(),
-        json!({"available":true, "status":"off", "email":member.email,
-                                    "timezone":"UTC", "week_starts_on":1})
+        weekly_account(&http, &cookie).await,
+        json!({"available": true, "email": member.email, "email_status": "unconfirmed",
+               "sites": [site_entry(&other, "alpha", 0, false), site_entry(&site, "beta", 1, false)]})
     );
+    assert_eq!(
+        weekly_account(&http, &guest_cookie).await["sites"],
+        json!([site_entry(&site, "beta", 1, false)])
+    );
+    let unconfirmed = http.put(&path, &lang).cookie(&cookie).send().await;
+    assert_eq!(unconfirmed.status, 409);
+    assert_eq!(unconfirmed.json()["error"], "email_unconfirmed");
+    for (target, who) in [
+        (weekly_site(foreign.id), &cookie),
+        (weekly_site(999_999_999_999_u64), &cookie),
+        (weekly_site("not-a-site"), &cookie),
+        (other_path.clone(), &guest_cookie),
+    ] {
+        assert_eq!(
+            http.put(&target, &lang).cookie(who).send().await.status,
+            404
+        );
+        assert_eq!(http.delete(&target).cookie(who).send().await.status, 404);
+    }
+
+    // The first link: exact copy, stored as a one-hour hash only.
+    let (first, mail) = weekly_link(&http, &outbox, &cookie, "en", &member.email).await;
+    assert_eq!(mail.subject, "Confirm your email for Rivu weekly reports");
+    assert_eq!(
+        mail.body,
+        format!(
+            "Open this link to confirm that this address should receive Rivu weekly reports. The link works once and expires in 1 hour.\n\n{HTTP_ORIGIN}/weekly-report/confirm/{first}\n\nIf you didn't ask for this, you can ignore this email.\n"
+        )
+    );
+    let (hash, lifetime): (Vec<u8>, f64) = sqlx::query_as(
+        "SELECT token_hash, extract(epoch FROM token_expires_at - requested_at)::float8
+         FROM weekly_report_emails WHERE user_id = $1",
+    )
+    .bind(member.id)
+    .fetch_one(pg)
+    .await
+    .unwrap();
+    assert_eq!(hash, rivu_auth::session::hash_token(&first));
+    assert_eq!(lifetime, 3600.0);
+    let limited = http
+        .post(WEEKLY_CONFIRMATION, &lang)
+        .cookie(&cookie)
+        .send()
+        .await;
+    assert_eq!(limited.status, 429);
+    assert!(limited.header("retry-after").is_some());
     assert!(outbox.take().is_empty());
-    let code = weekly_code(&http, &outbox, &path, &cookie, "en", &member.email).await;
-    assert!(rivu_auth::session::is_well_formed(&code));
-    let hash: Vec<u8> =
-        sqlx::query_scalar("SELECT code_hash FROM weekly_report_subscriptions WHERE user_id = $1")
-            .bind(member.id)
-            .fetch_one(pg)
-            .await
-            .unwrap();
-    assert_eq!(hash, rivu_auth::session::hash_token(&code));
+
+    // Reading the link changes nothing, however often a mail client prefetches it.
+    for _ in 0..2 {
+        let info = weekly_token(&http, "GET", &first).await;
+        assert_eq!(info.status, 200, "{}", info.body);
+        assert_eq!(info.json(), json!({"email": member.email}));
+        assert_eq!(info.header("cache-control"), Some("no-store"));
+        assert_eq!(info.header("referrer-policy"), Some("no-referrer"));
+    }
     assert_eq!(
-        http.post(&other_path, &request)
-            .cookie(&cookie)
-            .send()
-            .await
-            .status,
-        429
-    );
-    assert_eq!(
-        weekly_confirm(&http, &other_path, &cookie, &code)
-            .await
-            .status,
-        400
-    );
-    let guest_code = weekly_code(&http, &outbox, &path, &guest_cookie, "zh", &guest.email).await;
-    assert_eq!(
-        weekly_confirm(&http, &path, &guest_cookie, &code)
-            .await
-            .status,
-        400
-    );
-    sqlx::query("UPDATE site_memberships SET deleted_at = now() WHERE user_id = $1")
-        .bind(guest.id)
-        .execute(pg)
-        .await
-        .unwrap();
-    assert_eq!(
-        weekly_confirm(&http, &path, &guest_cookie, &guest_code)
-            .await
-            .status,
-        404
+        weekly_account(&http, &cookie).await["email_status"],
+        "pending"
     );
 
+    // Every failure is the same 404.
+    let missing = weekly_token(&http, "GET", "not-a-token").await;
+    assert_eq!(missing.status, 404);
+    assert_eq!(missing.header("cache-control"), Some("no-store"));
+    assert_eq!(missing.header("referrer-policy"), Some("no-referrer"));
+    let not_found = missing.body.clone();
+    let gone = |r: Resp| {
+        assert_eq!(r.status, 404, "{}", r.body);
+        assert_eq!(r.body, not_found);
+        assert_eq!(r.header("referrer-policy"), Some("no-referrer"));
+    };
+    gone(weekly_token(&http, "POST", "not-a-token").await);
+    let unknown = rivu_auth::session::generate();
+    gone(weekly_token(&http, "GET", unknown.plaintext()).await);
+    gone(weekly_token(&http, "POST", unknown.plaintext()).await);
+
+    // Sending again retires the earlier link.
+    age_weekly_request(pg, member.id).await;
+    let (second, mail) = weekly_link(&http, &outbox, &cookie, "zh", &member.email).await;
+    assert_eq!(mail.subject, "确认接收 Rivu 周报");
+    assert_eq!(
+        mail.body,
+        format!(
+            "点下面的链接，确认用这个邮箱接收 Rivu 周报。链接 1 小时内有效，只能用一次。\n\n{HTTP_ORIGIN}/weekly-report/confirm/{second}\n\n如果不是你本人操作，忽略这封邮件即可。\n"
+        )
+    );
+    gone(weekly_token(&http, "GET", &first).await);
+    gone(weekly_token(&http, "POST", &first).await);
+
+    // An expired link is gone and no longer pending.
     sqlx::query(
-        "UPDATE weekly_report_subscriptions SET requested_at = now() - interval '16 minutes'
-                 WHERE user_id = $1",
+        "UPDATE weekly_report_emails SET token_expires_at = now() - interval '1 second'
+         WHERE user_id = $1",
     )
     .bind(member.id)
     .execute(pg)
     .await
     .unwrap();
-    let expired = weekly_confirm(&http, &path, &cookie, &code).await;
-    assert_eq!(expired.status, 400);
-    assert_eq!(expired.json()["error"], "invalid_code");
-    let code = weekly_code(&http, &outbox, &path, &cookie, "en", &member.email).await;
+    gone(weekly_token(&http, "GET", &second).await);
+    gone(weekly_token(&http, "POST", &second).await);
+    assert_eq!(
+        weekly_account(&http, &cookie).await["email_status"],
+        "unconfirmed"
+    );
+
+    // Cancelling retires the pending link.
+    age_weekly_request(pg, member.id).await;
+    let (third, _) = weekly_link(&http, &outbox, &cookie, "en", &member.email).await;
+    let cancelled = http
+        .delete(WEEKLY_CONFIRMATION)
+        .cookie(&cookie)
+        .send()
+        .await;
+    assert_eq!(cancelled.status, 204);
+    assert_eq!(cancelled.header("cache-control"), Some("no-store"));
+    gone(weekly_token(&http, "GET", &third).await);
+    assert_eq!(
+        weekly_account(&http, &cookie).await["email_status"],
+        "unconfirmed"
+    );
+
+    // Confirming works once, with no session involved.
+    age_weekly_request(pg, member.id).await;
+    let (fourth, _) = weekly_link(&http, &outbox, &cookie, "en", &member.email).await;
+    let confirmed = weekly_token(&http, "POST", &fourth).await;
+    assert_eq!(confirmed.status, 200, "{}", confirmed.body);
+    assert_eq!(confirmed.json(), json!({"email": member.email}));
+    assert_eq!(confirmed.header("cache-control"), Some("no-store"));
+    assert_eq!(confirmed.header("referrer-policy"), Some("no-referrer"));
+    assert!(confirmed.set_cookie("rivu_session").is_none());
+    gone(weekly_token(&http, "POST", &fourth).await);
+    gone(weekly_token(&http, "GET", &fourth).await);
+    assert_eq!(
+        weekly_account(&http, &cookie).await["email_status"],
+        "confirmed"
+    );
+    // Once confirmed, a request only records the language: no email and no rate limit.
+    let relabel = http
+        .post(WEEKLY_CONFIRMATION, &json!({"lang": "zh"}))
+        .cookie(&cookie)
+        .send()
+        .await;
+    assert_eq!(relabel.status, 200, "{}", relabel.body);
+    assert_eq!(relabel.json(), weekly_account(&http, &cookie).await);
+    assert!(outbox.take().is_empty());
+    let stored: String =
+        sqlx::query_scalar("SELECT lang FROM weekly_report_emails WHERE user_id = $1")
+            .bind(member.id)
+            .fetch_one(pg)
+            .await
+            .unwrap();
+    assert_eq!(stored, "zh");
+
+    // Each site is its own switch; the mailbox stays confirmed.
+    let subscription = |site: &Site, user: i64| {
+        sqlx::query_as::<_, (String, String, String)>(
+            "SELECT email, lang, confirmed_at::text FROM weekly_report_subscriptions
+             WHERE user_id = $1 AND site_id = $2",
+        )
+        .bind(user)
+        .bind(site.id as i64)
+        .fetch_optional(pg)
+    };
+    for target in [&path, &other_path] {
+        let on = http.put(target, &lang).cookie(&cookie).send().await;
+        assert_eq!(on.status, 204, "{}", on.body);
+        assert_eq!(on.header("cache-control"), Some("no-store"));
+    }
+    let (email, stored, since) = subscription(&site, member.id).await.unwrap().unwrap();
+    assert_eq!(
+        (email.as_str(), stored.as_str()),
+        (member.email.as_str(), "en")
+    );
+    assert_eq!(
+        http.put(&path, &json!({"lang": "zh"}))
+            .cookie(&cookie)
+            .send()
+            .await
+            .status,
+        204
+    );
+    let (_, stored, unchanged) = subscription(&site, member.id).await.unwrap().unwrap();
+    assert_eq!(stored, "zh");
+    assert_eq!(
+        unchanged, since,
+        "re-subscribing keeps the subscription time"
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            http.delete(&other_path).cookie(&cookie).send().await.status,
+            204
+        );
+    }
+    assert_eq!(
+        weekly_account(&http, &cookie).await,
+        json!({"available": true, "email": member.email, "email_status": "confirmed",
+               "sites": [site_entry(&other, "alpha", 0, false), site_entry(&site, "beta", 1, true)]})
+    );
+
+    // A site guest confirms and subscribes the one site it can read.
+    let (guest_token, _) = weekly_link(&http, &outbox, &guest_cookie, "zh", &guest.email).await;
+    assert_eq!(weekly_token(&http, "POST", &guest_token).await.status, 200);
+    assert_eq!(
+        http.put(&path, &lang)
+            .cookie(&guest_cookie)
+            .send()
+            .await
+            .status,
+        204
+    );
+    assert_eq!(
+        weekly_account(&http, &guest_cookie).await["sites"],
+        json!([site_entry(&site, "beta", 1, true)])
+    );
+
+    // Mail failures leave the previous status: from unconfirmed and from a still-valid link.
+    let refused = rivu_mail::Mailer::smtp("smtp://127.0.0.1:1", "rivu@example.test").unwrap();
+    let failing = DashApi::new(&cfg, pg.clone(), reader.clone(), None)
+        .unwrap()
+        .with_mailer(refused);
+    let failing = serve_dashboard(Arc::new(failing), &cfg.base_url).await;
+    let fresh = make_user(pg, Some((&org, "viewer"))).await;
+    let fresh_cookie = login_cookie(&http, &fresh.email).await;
+    let before = weekly_account(&http, &fresh_cookie).await;
+    let failed = failing
+        .post(WEEKLY_CONFIRMATION, &lang)
+        .cookie(&fresh_cookie)
+        .send()
+        .await;
+    assert_eq!(failed.status, 502);
+    assert_eq!(failed.json()["error"], "mail_failed");
+    assert_eq!(weekly_account(&http, &fresh_cookie).await, before);
+    assert_eq!(before["email_status"], "unconfirmed");
+    assert_eq!(
+        http.post(WEEKLY_CONFIRMATION, &lang)
+            .cookie(&fresh_cookie)
+            .send()
+            .await
+            .status,
+        429,
+        "a failed send still counts toward the limit"
+    );
+
+    // A link stops working while the account is disabled and for good once its address changes.
+    age_weekly_request(pg, fresh.id).await;
+    let (link, _) = weekly_link(&http, &outbox, &fresh_cookie, "en", &fresh.email).await;
+    assert_eq!(weekly_token(&http, "GET", &link).await.status, 200);
+    for (change, undo) in [
+        (
+            "UPDATE users SET disabled_at = now() WHERE id = $1",
+            Some("UPDATE users SET disabled_at = NULL WHERE id = $1"),
+        ),
+        (
+            "UPDATE users SET email = 'moved-' || email::text WHERE id = $1",
+            None,
+        ),
+    ] {
+        sqlx::query(change)
+            .bind(fresh.id)
+            .execute(pg)
+            .await
+            .unwrap();
+        for method in ["GET", "POST"] {
+            assert_eq!(
+                weekly_token(&http, method, &link).await.status,
+                404,
+                "{method} after {change}"
+            );
+        }
+        if let Some(undo) = undo {
+            sqlx::query(undo).bind(fresh.id).execute(pg).await.unwrap();
+            assert_eq!(weekly_token(&http, "GET", &link).await.status, 200);
+        }
+    }
+    let pending = make_user(pg, Some((&org, "viewer"))).await;
+    let pending_cookie = login_cookie(&http, &pending.email).await;
+    let (earlier, _) = weekly_link(&http, &outbox, &pending_cookie, "en", &pending.email).await;
+    age_weekly_request(pg, pending.id).await;
+    let before = weekly_account(&http, &pending_cookie).await;
+    assert_eq!(before["email_status"], "pending");
+    let failed = failing
+        .post(WEEKLY_CONFIRMATION, &json!({"lang": "zh"}))
+        .cookie(&pending_cookie)
+        .send()
+        .await;
+    assert_eq!(failed.status, 502);
+    assert_eq!(weekly_account(&http, &pending_cookie).await, before);
+    assert_eq!(weekly_token(&http, "GET", &earlier).await.status, 200);
+    assert_eq!(weekly_token(&http, "POST", &earlier).await.status, 200);
+    assert_eq!(
+        weekly_account(&http, &pending_cookie).await["email_status"],
+        "confirmed"
+    );
+
+    // Without SMTP nothing is sent, but a confirmed account can still switch sites.
+    let disabled = DashApi::new(&cfg, pg.clone(), reader, None).unwrap();
+    let disabled = serve_dashboard(Arc::new(disabled), &cfg.base_url).await;
+    let status = weekly_account(&disabled, &cookie).await;
+    assert_eq!(status["available"], false);
+    assert_eq!(status["email_status"], "confirmed");
+    let unavailable = disabled
+        .post(WEEKLY_CONFIRMATION, &lang)
+        .cookie(&cookie)
+        .send()
+        .await;
+    assert_eq!(unavailable.status, 503);
+    assert_eq!(unavailable.json()["error"], "mail_unavailable");
+    assert_eq!(
+        disabled.delete(&path).cookie(&cookie).send().await.status,
+        204
+    );
+    assert!(subscription(&site, member.id).await.unwrap().is_none());
+    assert_eq!(
+        disabled
+            .put(&path, &lang)
+            .cookie(&cookie)
+            .send()
+            .await
+            .status,
+        204
+    );
+    let (_, _, renewed) = subscription(&site, member.id).await.unwrap().unwrap();
+    assert_ne!(
+        renewed, since,
+        "switching on again starts a new subscription"
+    );
+    assert!(subscription(&site, guest.id).await.unwrap().is_some());
+
+    // A new address needs a new confirmation; the switches then follow it.
     let replacement = format!("{}@example.test", unique("replacement"));
     sqlx::query("UPDATE users SET email = $1 WHERE id = $2")
         .bind(&replacement)
@@ -764,97 +1128,111 @@ async fn weekly_report_requires_account_access_csrf_and_fresh_email_proof() {
         .execute(pg)
         .await
         .unwrap();
-    assert_eq!(
-        weekly_confirm(&http, &path, &cookie, &code).await.status,
-        400
-    );
-    let status = http.get(&path).cookie(&cookie).send().await.json();
-    assert_eq!(status["status"], "off");
-    assert_eq!(status["email"], replacement);
+    let cookie = login_cookie(&http, &replacement).await;
+    let status = weekly_account(&http, &cookie).await;
+    assert_eq!(status["email"], replacement.as_str());
+    assert_eq!(status["email_status"], "unconfirmed");
+    assert_eq!(status["sites"][1]["subscribed"], true);
+    let blocked = http.put(&other_path, &lang).cookie(&cookie).send().await;
+    assert_eq!(blocked.status, 409);
+    age_weekly_request(pg, member.id).await;
+    let (token, _) = weekly_link(&http, &outbox, &cookie, "en", &replacement).await;
+    assert_eq!(weekly_token(&http, "POST", &token).await.status, 200);
+    let (email, _, moved) = subscription(&site, member.id).await.unwrap().unwrap();
+    assert_eq!(email, replacement);
+    assert_ne!(moved, renewed);
 
-    let age_request = || {
+    // Losing access removes the subscription but not the mailbox confirmation.
+    assert!(
+        rivu_storage_pg::members::remove_guest(pg, org.id, guest_grant)
+            .await
+            .unwrap()
+    );
+    assert!(subscription(&site, guest.id).await.unwrap().is_none());
+    let status = weekly_account(&http, &guest_cookie).await;
+    assert_eq!(status["sites"], json!([]));
+    assert_eq!(status["email_status"], "confirmed");
+    let outcome =
+        rivu_storage_pg::members::remove_member(pg, org.id, owner.id, member.id, |_, _| true)
+            .await
+            .unwrap();
+    assert!(matches!(
+        outcome,
+        rivu_storage_pg::members::MemberChange::Done { .. }
+    ));
+    assert!(subscription(&site, member.id).await.unwrap().is_none());
+    iso.drop().await;
+}
+
+#[tokio::test]
+async fn weekly_report_migration_keeps_only_active_subscriptions() {
+    const ACCOUNT_EMAIL: u64 = 20261119120000;
+    let Some(env) = test_env("weekly_report_migration") else {
+        return;
+    };
+    migrate_once(&env).await;
+    let iso = isolated_with(&env, |v| v < ACCOUNT_EMAIL).await;
+    let pg = &iso.pool;
+    let org = make_org(pg).await;
+    let site = make_site(pg, &org, false).await;
+    let other = make_site(pg, &org, false).await;
+    let active = make_user(pg, Some((&org, "viewer"))).await;
+    let pending = make_user(pg, Some((&org, "viewer"))).await;
+    let stale = make_user(pg, Some((&org, "viewer"))).await;
+    let off = make_user(pg, Some((&org, "viewer"))).await;
+    let old = |user: &User, site: &Site, email: Option<&str>, confirmed: Option<&str>| {
         sqlx::query(
-            "UPDATE weekly_report_subscriptions SET requested_at = now() - interval '2 minutes'
-         WHERE user_id = $1",
+            "INSERT INTO weekly_report_subscriptions
+                 (user_id, site_id, email, lang, requested_at, code_hash, confirmed_at)
+             VALUES ($1, $2, $3, 'zh', now(), CASE WHEN $4::text IS NULL THEN $5 END,
+                     $4::text::timestamptz)",
         )
-        .bind(member.id)
+        .bind(user.id)
+        .bind(site.id as i64)
+        .bind(email.map(str::to_owned))
+        .bind(confirmed.map(str::to_owned))
+        .bind(vec![7_u8; 32])
         .execute(pg)
     };
-    age_request().await.unwrap();
-    let code = weekly_code(&http, &outbox, &path, &cookie, "en", &replacement).await;
-    for _ in 0..5 {
-        assert_eq!(
-            weekly_confirm(&http, &path, &cookie, "incorrect")
-                .await
-                .status,
-            400
-        );
-    }
+    let at = "2026-03-01T00:00:00Z";
+    old(&active, &site, Some(&active.email), Some(at))
+        .await
+        .unwrap();
+    old(&active, &other, Some(&active.email), None)
+        .await
+        .unwrap();
+    old(&pending, &site, Some(&pending.email), None)
+        .await
+        .unwrap();
+    old(&stale, &site, Some("previous@example.test"), Some(at))
+        .await
+        .unwrap();
+    old(&off, &site, None, None).await.unwrap();
+
+    apply_pg_migrations(pg, |v| v >= ACCOUNT_EMAIL).await;
+    let emails: Vec<(i64, String, String, bool, bool)> = sqlx::query_as(
+        "SELECT user_id, email, lang, confirmed_at = $1::text::timestamptz, token_hash IS NULL
+         FROM weekly_report_emails ORDER BY user_id",
+    )
+    .bind(at)
+    .fetch_all(pg)
+    .await
+    .unwrap();
     assert_eq!(
-        weekly_confirm(&http, &path, &cookie, &code).await.status,
-        400
+        emails,
+        vec![(active.id, active.email.clone(), "zh".into(), true, true)]
     );
+    let subscriptions: Vec<(i64, i64, String, bool)> = sqlx::query_as(
+        "SELECT user_id, site_id, email, confirmed_at = $1::text::timestamptz
+         FROM weekly_report_subscriptions ORDER BY user_id, site_id",
+    )
+    .bind(at)
+    .fetch_all(pg)
+    .await
+    .unwrap();
     assert_eq!(
-        http.get(&path).cookie(&cookie).send().await.json()["status"],
-        "off"
-    );
-    age_request().await.unwrap();
-    let code = weekly_code(&http, &outbox, &path, &cookie, "en", &replacement).await;
-    let active = weekly_confirm(&http, &path, &cookie, &code).await;
-    assert_eq!(active.status, 200, "{}", active.body);
-    assert_eq!(active.json()["status"], "active");
-    assert_eq!(
-        weekly_confirm(&http, &path, &cookie, &code).await.status,
-        400
-    );
-    assert_eq!(
-        http.post(&path, &json!({"lang":"zh"}))
-            .cookie(&cookie)
-            .send()
-            .await
-            .json()["status"],
-        "active"
-    );
-    assert!(outbox.take().is_empty());
-    let disabled = DashApi::new(&cfg, pg.clone(), reader, None).unwrap();
-    let disabled = serve_dashboard(Arc::new(disabled), &cfg.base_url).await;
-    let status = disabled.get(&path).cookie(&cookie).send().await.json();
-    assert_eq!(status["available"], false);
-    assert_eq!(status["status"], "active");
-    assert_eq!(
-        disabled
-            .post(&path, &request)
-            .cookie(&cookie)
-            .send()
-            .await
-            .status,
-        503
-    );
-    assert_eq!(
-        weekly_confirm(&disabled, &path, &cookie, &code)
-            .await
-            .status,
-        503
-    );
-    assert_eq!(
-        disabled.delete(&path).cookie(&cookie).send().await.status,
-        204
-    );
-    assert_eq!(
-        disabled.delete(&path).cookie(&cookie).send().await.status,
-        204
-    );
-    assert_eq!(
-        http.post(&path, &request)
-            .cookie(&cookie)
-            .send()
-            .await
-            .status,
-        429
-    );
-    assert_eq!(
-        http.get(&path).cookie(&cookie).send().await.json()["status"],
-        "off"
+        subscriptions,
+        vec![(active.id, site.id as i64, active.email.clone(), true)]
     );
     iso.drop().await;
 }
@@ -894,10 +1272,60 @@ async fn weekly_report_rechecks_recipients_and_claims_survive_restart() {
         (&late, "en", "2026-03-16T00:00:00Z"),
     ] {
         sqlx::query(
-            "INSERT INTO weekly_report_subscriptions (user_id, site_id, email, lang, requested_at, confirmed_at)
-             VALUES ($1, $2, $3, $4, now() - interval '2 minutes', $5::text::timestamptz)",
-        ).bind(user.id).bind(id).bind(&user.email).bind(lang).bind(confirmed_at)
-            .execute(pg).await.unwrap();
+            "INSERT INTO weekly_report_emails (user_id, email, lang, confirmed_at)
+             VALUES ($1, $2, $3, '2026-03-01T00:00:00Z')",
+        )
+        .bind(user.id)
+        .bind(&user.email)
+        .bind(lang)
+        .execute(pg)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO weekly_report_subscriptions (user_id, site_id, email, lang, confirmed_at)
+             VALUES ($1, $2, $3, $4, $5::text::timestamptz)",
+        )
+        .bind(user.id)
+        .bind(id)
+        .bind(&user.email)
+        .bind(lang)
+        .bind(confirmed_at)
+        .execute(pg)
+        .await
+        .unwrap();
+    }
+    // The mailbox proof gates delivery on its own: a subscription for the current address is not
+    // enough while the account's proof is still pending or belongs to another address.
+    let unproven = make_user(pg, Some((&org, "viewer"))).await;
+    let elsewhere = make_user(pg, Some((&org, "viewer"))).await;
+    for (user, proven, confirmed) in [
+        (&unproven, unproven.email.clone(), None),
+        (
+            &elsewhere,
+            format!("{}@example.test", unique("elsewhere")),
+            Some("2026-03-01T00:00:00Z"),
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO weekly_report_emails (user_id, email, lang, confirmed_at)
+             VALUES ($1, $2, 'en', $3::text::timestamptz)",
+        )
+        .bind(user.id)
+        .bind(proven)
+        .bind(confirmed)
+        .execute(pg)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO weekly_report_subscriptions (user_id, site_id, email, lang, confirmed_at)
+             VALUES ($1, $2, $3, 'en', '2026-03-10T00:00:00Z')",
+        )
+        .bind(user.id)
+        .bind(id)
+        .bind(&user.email)
+        .execute(pg)
+        .await
+        .unwrap();
     }
     let cfg = config(&env, &[]);
     let reader = rivu_storage_ch::client(&env.ch_url, &account("reader"), Some(&ch_database()));
@@ -1001,28 +1429,58 @@ async fn weekly_report_rechecks_recipients_and_claims_survive_restart() {
     assert!(en.body.contains(link));
     let opt_out = link.strip_prefix(HTTP_ORIGIN).unwrap();
     assert_eq!(http.get(opt_out).send().await.status, 200);
-    let active: bool = sqlx::query_scalar(
-        "SELECT confirmed_at IS NOT NULL FROM weekly_report_subscriptions WHERE user_id = $1",
-    )
-    .bind(owner.id)
-    .fetch_one(pg)
-    .await
-    .unwrap();
+    let subscribed = |site_id: i64| {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT FROM weekly_report_subscriptions WHERE user_id = $1 AND site_id = $2)",
+        )
+        .bind(owner.id)
+        .bind(site_id)
+        .fetch_one(pg)
+    };
     assert!(
-        active,
+        subscribed(id).await.unwrap(),
         "mail previewing a link must not change the subscription"
     );
+    // The link switches off only the site the report was about.
+    let second = make_site(pg, &org, false).await;
+    sqlx::query(
+        "INSERT INTO weekly_report_subscriptions (user_id, site_id, email, lang, confirmed_at)
+         VALUES ($1, $2, $3, 'en', '2026-03-10T00:00:00Z')",
+    )
+    .bind(owner.id)
+    .bind(second.id as i64)
+    .bind(&owner.email)
+    .execute(pg)
+    .await
+    .unwrap();
     let response = http.post(opt_out, &json!({})).send().await;
     assert_eq!(response.status, 200);
     assert!(response.body.contains("You have unsubscribed"));
+    assert!(!subscribed(id).await.unwrap());
+    assert!(subscribed(second.id as i64).await.unwrap());
     let cookie = login_cookie(&http, &owner.email).await;
-    let path = format!("/api/internal/sites/{}/weekly-report", site.key);
-    assert_eq!(http.delete(&path).cookie(&cookie).send().await.status, 204);
-    let code = weekly_code(&http, &restarted_outbox, &path, &cookie, "en", &owner.email).await;
+    let status = weekly_account(&http, &cookie).await;
+    assert_eq!(status["email_status"], "confirmed");
     assert_eq!(
-        weekly_confirm(&http, &path, &cookie, &code).await.status,
-        200
+        http.delete(&weekly_site(second.id))
+            .cookie(&cookie)
+            .send()
+            .await
+            .status,
+        204
     );
+    // Switching back on needs no new confirmation.
+    let path = weekly_site(&site.key);
+    assert_eq!(http.delete(&path).cookie(&cookie).send().await.status, 204);
+    assert_eq!(
+        http.put(&path, &json!({"lang": "en"}))
+            .cookie(&cookie)
+            .send()
+            .await
+            .status,
+        204
+    );
+    assert!(restarted_outbox.take().is_empty());
     assert_eq!(iso.count("weekly_report_claims").await, 2);
     let stale = http.post(opt_out, &json!({})).send().await;
     assert!(stale.body.contains("already off"));

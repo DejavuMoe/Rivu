@@ -418,22 +418,33 @@ TABLE weekly_report_claims
   CONSTRAINT weekly_report_claims_user_id_fkey FOREIGN KEY (user_id) REFERENCES users(id)
   CREATE UNIQUE INDEX weekly_report_unsubscribe_hash ON public.weekly_report_claims USING btree (unsubscribe_hash) WHERE (unsubscribe_hash IS NOT NULL)
 
+TABLE weekly_report_emails
+  user_id bigint NOT NULL
+  email text NOT NULL
+  lang text NOT NULL
+  requested_at timestamp with time zone
+  token_hash bytea
+  token_expires_at timestamp with time zone
+  confirmed_at timestamp with time zone
+  CONSTRAINT weekly_report_emails_check CHECK (((token_hash IS NULL) = (token_expires_at IS NULL)))
+  CONSTRAINT weekly_report_emails_check1 CHECK (((token_hash IS NULL) OR (confirmed_at IS NULL)))
+  CONSTRAINT weekly_report_emails_lang_check CHECK ((lang = ANY (ARRAY['zh'::text, 'en'::text])))
+  CONSTRAINT weekly_report_emails_pkey PRIMARY KEY (user_id)
+  CONSTRAINT weekly_report_emails_token_hash_check CHECK ((octet_length(token_hash) = 32))
+  CONSTRAINT weekly_report_emails_user_id_fkey FOREIGN KEY (user_id) REFERENCES users(id)
+  CREATE UNIQUE INDEX weekly_report_email_token ON public.weekly_report_emails USING btree (token_hash) WHERE (token_hash IS NOT NULL)
+
 TABLE weekly_report_subscriptions
   user_id bigint NOT NULL
   site_id bigint NOT NULL
-  email text
+  email text NOT NULL
   lang text NOT NULL
-  requested_at timestamp with time zone NOT NULL
-  code_hash bytea
-  attempts smallint NOT NULL DEFAULT 0
-  confirmed_at timestamp with time zone
-  CONSTRAINT weekly_report_subscriptions_attempts_check CHECK (((attempts >= 0) AND (attempts <= 5)))
-  CONSTRAINT weekly_report_subscriptions_code_hash_check CHECK ((octet_length(code_hash) = 32))
+  confirmed_at timestamp with time zone NOT NULL
   CONSTRAINT weekly_report_subscriptions_lang_check CHECK ((lang = ANY (ARRAY['zh'::text, 'en'::text])))
   CONSTRAINT weekly_report_subscriptions_pkey PRIMARY KEY (user_id, site_id)
   CONSTRAINT weekly_report_subscriptions_site_id_fkey FOREIGN KEY (site_id) REFERENCES sites(id)
   CONSTRAINT weekly_report_subscriptions_user_id_fkey FOREIGN KEY (user_id) REFERENCES users(id)
-  CREATE INDEX weekly_report_active_site ON public.weekly_report_subscriptions USING btree (site_id) WHERE (confirmed_at IS NOT NULL)
+  CREATE INDEX weekly_report_subscriptions_site ON public.weekly_report_subscriptions USING btree (site_id)
 
 EXTENSION citext
 

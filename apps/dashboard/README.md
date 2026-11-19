@@ -11,6 +11,7 @@
 | 路径 | 内容 |
 |---|---|
 | `/login`、`/setup`、`/invite/{token}` | 登录、首次初始化、接受邀请 |
+| `/weekly-report/confirm/{token}` | 确认周报邮箱（确认邮件里的链接，不需要登录） |
 | `/sites` | 当前组织的站点与 24 小时访客 |
 | `/s/{id}` | 看板：指标、趋势、来源、页面、地区、设备；范围与筛选都在查询串里 |
 | `/sites/new` | 添加站点（组织 owner / admin） |
@@ -18,7 +19,7 @@
 | `/s/{id}/diagnostics` | 接入诊断（接受与各丢弃原因的计数） |
 | `/s/{id}/settings/{section}` | 站点设置：常规、主机名、数据采集、隐私、屏蔽规则、目标、共享、危险操作（按角色显示） |
 | `/org/members`、`/org/api-keys` | 成员与邀请、API key |
-| `/account` | 密码与登录会话 |
+| `/account` | 密码、两步验证、邮件周报订阅与登录会话 |
 | `/share/{slug}`、`/public/{site_key}` | 共享链接（可带密码）与公开看板，只读 |
 ## 开发
 
