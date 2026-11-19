@@ -4,7 +4,8 @@
 export interface Org {
   id: string;
   name: string;
-  role: "owner" | "admin" | "editor" | "viewer";
+  /** 当前用户在该组织里的角色；null 表示不是成员，只以站点访客身份看到其中被邀请的站点 */
+  role: "owner" | "admin" | "editor" | "viewer" | null;
 }
 
 export interface Site {
@@ -15,8 +16,10 @@ export interface Site {
   siteKey: string;
   timezone: string;
   isPublic: boolean;
-  /** 访客权限：通过站点邀请获得，不是组织成员 */
+  /** 访客权限：通过站点邀请获得，不是组织成员（只出现在 role 为 null 的组织里） */
   guest?: boolean;
+  /** 访客在这个站点上的角色（组织成员的角色由评审面板的「角色」决定） */
+  guestRole?: "editor" | "viewer";
   /** 规模系数：决定模拟流量的大小；0 表示刚创建、尚无数据 */
   scale: number;
   live: number;
@@ -30,6 +33,7 @@ export const USER = { name: "林夏", email: "lin.xia@example.com", initials: "�
 export const ORGS: Org[] = [
   { id: "o1", name: "Northwind Labs", role: "owner" },
   { id: "o2", name: "开源文档社区", role: "editor" },
+  { id: "o3", name: "Fabrikam Studio", role: null },
 ];
 
 export const SEED_SITES: Site[] = [
@@ -38,7 +42,10 @@ export const SEED_SITES: Site[] = [
   { id: 3, org: "o1", name: "Status", domain: "status.northwind.dev", siteKey: "s2ty7hr5mvka", timezone: "UTC", isPublic: false, scale: 0.08, live: 2, createdDaysAgo: 200 },
   { id: 4, org: "o1", name: "Launch Week", domain: "launch.northwind.dev", siteKey: "l6wk3bf7xq2p", timezone: "Asia/Shanghai", isPublic: false, scale: 0, live: 0, createdDaysAgo: 0 },
   { id: 5, org: "o2", name: "rustdoc-zh", domain: "rustdoc.cn", siteKey: "r5zh2kd6mnpq", timezone: "Asia/Shanghai", isPublic: true, scale: 0.85, live: 14, createdDaysAgo: 600 },
-  { id: 6, org: "o1", name: "合作方博客", domain: "blog.partner.io", siteKey: "b3pt7nw2rlx4", timezone: "Europe/Berlin", isPublic: false, guest: true, scale: 0.3, live: 4, createdDaysAgo: 90 },
+  { id: 6, org: "o1", name: "合作方博客", domain: "blog.partner.io", siteKey: "b3pt7nw2rlx4", timezone: "Europe/Berlin", isPublic: false, scale: 0.3, live: 4, createdDaysAgo: 90 },
+  // o3 里当前用户不是成员，只是被邀请进两个站点的访客：没有成员页、不能添加站点，看不到设置里的大部分分区
+  { id: 10, org: "o3", name: "Fabrikam 品牌站", domain: "brand.fabrikam.example", siteKey: "f7bk3qz8wnd5", timezone: "Europe/London", isPublic: false, guest: true, guestRole: "viewer", scale: 0.2, live: 3, createdDaysAgo: 120 },
+  { id: 11, org: "o3", name: "Fabrikam 活动页", domain: "events.fabrikam.example", siteKey: "f2ev6mx9ktc4", timezone: "Europe/London", isPublic: false, guest: true, guestRole: "editor", scale: 0.12, live: 1, createdDaysAgo: 45 },
 ];
 
 // ---------- 伪随机 ----------

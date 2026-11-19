@@ -1,10 +1,11 @@
 <!--
   分解卡片：标题 + 维度标签页 + 条形列表（前 8 项）+ 「查看全部」。
   点击行即按该值筛选；国家行前面是两字母代码徽标（不用 emoji 国旗：Windows 上不显示）。
+  取值是服务端的原始取值，显示名在这里翻译（values.ts）。
 -->
 <script lang="ts">
   import type { Snippet } from "svelte";
-  import { Maximize2 } from "@lucide/svelte";
+  import { CircleAlert, Inbox, Maximize2 } from "@lucide/svelte";
   import Card from "../../lib/ui/Card.svelte";
   import Tabs from "../../lib/ui/Tabs.svelte";
   import Button from "../../lib/ui/Button.svelte";
@@ -15,9 +16,9 @@
   import { t } from "../../lib/i18n";
   import { app } from "../../lib/state.svelte";
   import { compact, percent } from "../../lib/format";
-  import type { Row } from "../../lib/data/fixtures";
+  import { simulateFetch, type Row } from "./query";
+  import { displayValue, valueCode } from "./values";
   import BreakdownDialog from "./BreakdownDialog.svelte";
-  import { Inbox } from "@lucide/svelte";
 
   interface Props {
     title: string;
@@ -26,13 +27,13 @@
     total: number;
     onpick: (dim: string, value: string) => void;
     loading?: boolean;
+    /** 这张卡片的查询失败（出错、排队、超时都显示成同一个错误） */
+    failed?: boolean;
     footer?: Snippet;
-    /** 维度取值的显示名（设备类型等枚举） */
-    display?: (dim: string, label: string) => string;
     /** 补空行到这个行数，让并排的卡片等高；单独一行的卡片传 0 */
     minRows?: number;
   }
-  let { title, dims, rowsOf, total, onpick, loading = false, footer, display = (_d, l) => l, minRows = 8 }: Props = $props();
+  let { title, dims, rowsOf, total, onpick, loading = false, failed = false, footer, minRows = 8 }: Props = $props();
 
   let dim = $state("");
   $effect.pre(() => {
@@ -41,9 +42,9 @@
   let full = $state(false);
 
   const rows = $derived(rowsOf(dim));
-  const bars: BarRow[] = $derived(
-    rows.map((r) => ({ key: r.label, label: display(dim, r.label), sub: r.sub, code: r.code, value: r.visitors })),
-  );
+  const toBars = (d: string, rs: Row[]): BarRow[] =>
+    rs.map((r) => ({ key: r.label, label: displayValue(d, r.label, app.lang), code: valueCode(d, r.label), value: r.visitors }));
+  const bars = $derived(toBars(dim, rows));
 </script>
 
 <Card {footer}>
@@ -62,7 +63,7 @@
         aria-label={t("common.viewAll")}
         title={t("common.viewAll")}
         onclick={() => (full = true)}
-        disabled={!rows.length}
+        disabled={loading || failed || !rows.length}
       />
     </div>
   {/snippet}
@@ -70,6 +71,8 @@
     <div class="sk">
       {#each [92, 74, 60, 48, 40, 33, 28, 22] as w, i (i)}<Skeleton width="{w}%" height={28} radius={4} />{/each}
     </div>
+  {:else if failed}
+    <EmptyState compact icon={CircleAlert} tone="bad" title={t("dash.error.title")} />
   {:else if !rows.length}
     <EmptyState compact icon={Inbox} title={t("dash.noRows")} />
   {:else}
@@ -85,23 +88,25 @@
       onpick={(r) => onpick(dim, r.key)}
     >
       {#snippet leading(r)}
-        {#if r.code}<span class="code">{r.code.slice(0, 2)}</span>{/if}
+        {#if r.code}<span class="code">{r.code}</span>{/if}
       {/snippet}
     </BarList>
   {/if}
 </Card>
 
-<BreakdownDialog
-  bind:open={full}
-  title={t(`dim.${dim}`)}
-  dimLabel={t(`fdim.${dim}`)}
-  rows={bars}
-  {total}
-  onpick={(v) => {
-    full = false;
-    onpick(dim, v);
-  }}
-/>
+{#if full}
+  <BreakdownDialog
+    bind:open={full}
+    title={t(`dim.${dim}`)}
+    dimLabel={t(`fdim.${dim}`)}
+    load={(signal) => simulateFetch(() => toBars(dim, rowsOf(dim)), signal)}
+    {total}
+    onpick={(v) => {
+      full = false;
+      onpick(dim, v);
+    }}
+  />
+{/if}
 
 <style>
   /* 标签文字左缘（18 + 选项内边距 10）与下方条目文字左缘（卡片内边距 20 + 行内边距 8）对齐 */

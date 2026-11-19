@@ -1,6 +1,6 @@
 <!--
-  数据采集：开关类设置（启用采集、去除查询参数、脚本功能）立即生效；
-  每分钟上限与允许的事件属性是一组文本字段，有改动时才出现「保存」。
+  数据采集：开关（启用采集、脚本功能）立即生效；每分钟上限与允许的事件属性是一组文本字段，有改动时才出现「保存」。
+  上限留空 = 用实例默认值（placeholder 显示默认值）。脚本功能开了 Hash 路由以外的任一项，站点脚本就是 full 版。
 -->
 <script lang="ts">
   import { untrack } from "svelte";
@@ -15,17 +15,17 @@
   import type { Site } from "../../lib/data/fixtures";
   import SaveBar from "./SaveBar.svelte";
   import TagInput from "./TagInput.svelte";
-  import { cfgs, GLOBAL_RATE, type ScriptFeatures } from "./store.svelte";
+  import { cfgs, GLOBAL_RATE, RATE_MAX, type ScriptFeatures } from "./store.svelte";
   import "./strings";
 
-  let { site, readOnly = false }: { site: Site; readOnly?: boolean } = $props();
+  let { site }: { site: Site } = $props();
   const cfg = $derived(cfgs[site.id]);
 
   let rate = $state(untrack(() => cfgs[site.id].rateLimit));
   let evProps = $state<string[]>(untrack(() => [...cfgs[site.id].eventProps]));
 
   const rateNum = $derived(rate.trim() === "" ? null : Number(rate));
-  const rateBad = $derived(rateNum !== null && (!Number.isInteger(rateNum) || rateNum <= 0));
+  const rateBad = $derived(rateNum !== null && (!Number.isInteger(rateNum) || rateNum < 1 || rateNum > RATE_MAX));
   const dirty = $derived(rate.trim() !== cfg.rateLimit || evProps.join("\n") !== cfg.eventProps.join("\n"));
 
   const features: (keyof ScriptFeatures)[] = ["outbound", "downloads", "forms", "hash", "tagged", "engagement"];
@@ -55,7 +55,6 @@
         id="s-enabled"
         label={t("set.coll.enabled")}
         checked={cfg.collectEnabled}
-        disabled={readOnly}
         onchange={(v) => {
           cfg.collectEnabled = v;
           toast(v ? t("set.coll.on") : t("set.coll.off"), "good");
@@ -65,20 +64,6 @@
     {#if !cfg.collectEnabled}
       <Callout tone="warn">{t("set.coll.offWarn")}</Callout>
     {/if}
-  </Field>
-  <Field layout="row" label={t("set.coll.strip")} for="s-strip" hint={t("set.coll.stripHint")}>
-    <div class="sw">
-      <Switch
-        id="s-strip"
-        label={t("set.coll.strip")}
-        checked={cfg.stripQuery}
-        disabled={readOnly}
-        onchange={(v) => {
-          cfg.stripQuery = v;
-          toast(t("common.saved"), "good");
-        }}
-      />
-    </div>
   </Field>
 </Card>
 
@@ -90,7 +75,6 @@
           id="s-f-{f}"
           label={t(`set.coll.script.${f}`)}
           checked={cfg.script[f]}
-          disabled={readOnly}
           onchange={(v) => {
             cfg.script[f] = v;
             toast(t("common.saved"), "good");
@@ -102,13 +86,12 @@
 </Card>
 
 <Card title={t("set.coll.limits")}>
-  <Field layout="row" label={t("set.coll.rate")} for="s-rate" error={rateBad ? t("set.coll.rateBad") : undefined}>
+  <Field layout="row" label={t("set.coll.rate")} for="s-rate" error={rateBad ? t("set.coll.rateBad", { max: full(RATE_MAX, app.lang) }) : undefined}>
     <Input
       id="s-rate"
       type="text"
       inputmode="numeric"
       bind:value={rate}
-      disabled={readOnly}
       invalid={rateBad}
       placeholder={t("set.coll.ratePlaceholder", { n: full(GLOBAL_RATE, app.lang) })}
     >
@@ -116,9 +99,9 @@
     </Input>
   </Field>
   <Field layout="row" label={t("set.coll.props")} for="s-props" hint={t("set.coll.propsHint")}>
-    <TagInput id="s-props" label={t("set.coll.props")} bind:tags={evProps} disabled={readOnly} placeholder={t("set.coll.propsPlaceholder")} validate={validateProp} />
+    <TagInput id="s-props" label={t("set.coll.props")} bind:tags={evProps} placeholder={t("set.coll.propsPlaceholder")} validate={validateProp} />
   </Field>
-  <SaveBar {dirty} invalid={rateBad} {readOnly} onsave={save} onreset={reset} />
+  <SaveBar {dirty} invalid={rateBad} onsave={save} onreset={reset} />
 </Card>
 
 <style>

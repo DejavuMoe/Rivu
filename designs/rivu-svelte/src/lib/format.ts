@@ -19,8 +19,8 @@ export function compact(n: number, lang: Lang): string {
 }
 
 function trim(x: number) {
-  const s = x >= 100 ? x.toFixed(0) : x >= 10 ? x.toFixed(1) : x.toFixed(2);
-  return s.replace(/\.?0+$/, "");
+  if (x >= 100) return x.toFixed(0);
+  return x.toFixed(x >= 10 ? 1 : 2).replace(/\.?0+$/, "");
 }
 
 export function full(n: number, lang: Lang): string {
@@ -50,11 +50,13 @@ export function duration(sec: number, lang: Lang): string {
 }
 
 /** 环比变化：返回带符号的百分比文字与方向。 */
-export function delta(cur: number, prev: number): { text: string; dir: "up" | "down" | "flat" } {
-  if (!prev) return { text: "—", dir: "flat" };
-  const d = (cur - prev) / prev;
-  if (Math.abs(d) < 0.0005) return { text: "0%", dir: "flat" };
-  return { text: (d > 0 ? "+" : "−") + percent(Math.abs(d)), dir: d > 0 ? "up" : "down" };
+export function delta(cur: number, prev: number, points?: Lang): { text: string; dir: "up" | "down" | "flat" } {
+  if (!points && !prev) return { text: "—", dir: "flat" };
+  const d = points ? cur - prev : (cur - prev) / prev;
+  const value = percent(Math.abs(d));
+  const label = points ? value.slice(0, -1) + (points === "zh" ? " 个百分点" : " pp") : value;
+  if (Math.abs(d) < 0.0005) return { text: label, dir: "flat" };
+  return { text: (d > 0 ? "+" : "−") + label, dir: d > 0 ? "up" : "down" };
 }
 
 export function dateShort(d: Date, lang: Lang): string {

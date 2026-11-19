@@ -18,7 +18,7 @@
   import { cfgs, checkPattern, hostExamples, ymd } from "./store.svelte";
   import "./strings";
 
-  let { site, readOnly = false }: { site: Site; readOnly?: boolean } = $props();
+  let { site }: { site: Site } = $props();
   const cfg = $derived(cfgs[site.id]);
 
   let addOpen = $state(false);
@@ -50,7 +50,14 @@
 
 <Card title={t("set.host.title")} flush>
   {#snippet actions()}
-    {#if !readOnly}<Button variant="primary" icon={Plus} onclick={() => { draft = ""; addOpen = true; }}>{t("set.host.add")}</Button>{/if}
+    <Button
+      variant="primary"
+      icon={Plus}
+      onclick={() => {
+        draft = "";
+        addOpen = true;
+      }}>{t("set.host.add")}</Button
+    >
   {/snippet}
   {#if cfg.hostnames.length === 0}
     <div class="warn"><Callout tone="warn">{t("set.host.empty")}</Callout></div>
@@ -62,7 +69,7 @@
       columns={[
         { key: "p", label: t("set.host.col.pattern") },
         { key: "a", label: t("set.host.col.added"), width: "130px", optional: true },
-        ...(readOnly ? [] : [{ key: "x", label: "", width: "56px", align: "right" as const }]),
+        { key: "x", label: "", width: "56px", align: "right" },
       ]}
     >
       {#snippet cell(h, c)}

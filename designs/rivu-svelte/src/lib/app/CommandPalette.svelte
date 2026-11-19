@@ -4,28 +4,15 @@
   方向键移动，Enter 执行，Esc 关闭（原生 dialog 自带）。站点范围：在某个站点里时取该站点所在组织，否则取当前组织。
 -->
 <script lang="ts">
-  import {
-    Activity,
-    BookOpen,
-    ChartSpline,
-    CornerDownLeft,
-    KeyRound,
-    LayoutGrid,
-    Languages,
-    Moon,
-    Plus,
-    Search,
-    Settings2,
-    ShieldCheck,
-    Sun,
-    Users,
-  } from "@lucide/svelte";
+  import { Activity, CornerDownLeft, KeyRound, LayoutGrid, Languages, Moon, Plus, Search, Settings2, ShieldCheck, Sun, Users } from "@lucide/svelte";
   import Avatar from "../ui/Avatar.svelte";
   import Kbd from "../ui/Kbd.svelte";
   import type { IconType } from "../ui/types";
+  import { ORGS } from "../data/fixtures";
   import { SITES } from "../data/sites.svelte";
+  import { visibleSections } from "../data/sections";
   import { t } from "../i18n";
-  import { app, canManage, setLang, setTheme } from "../state.svelte";
+  import { app, canAddSite, canEdit, setLang, setTheme } from "../state.svelte";
   import { navigate, route } from "../router.svelte";
   import "./shell-strings";
 
@@ -59,8 +46,8 @@
 
   const seg = $derived(route.current.seg);
   const current = $derived(seg[0] === "s" ? SITES.find((s) => s.id === Number(seg[1])) : undefined);
-  const scopedSites = $derived(SITES.filter((s) => s.org === (current?.org ?? orgId)));
-  const target = $derived(current ?? scopedSites[0]);
+  const scopedOrg = $derived(current?.org ?? orgId);
+  const scopedSites = $derived(SITES.filter((s) => s.org === scopedOrg));
 
   const isDark = $derived(
     app.theme === "dark" || (app.theme === "system" && typeof matchMedia === "function" && matchMedia("(prefers-color-scheme: dark)").matches),
@@ -73,23 +60,41 @@
         id: `site-${s.id}`,
         group: "site",
         label: s.name,
-        keywords: s.domain,
+        keywords: s.siteKey,
         siteName: s.name,
         run: () => navigate(`/s/${s.id}`),
       });
     }
     out.push({ id: "p-sites", group: "page", label: t("nav.allSites"), icon: LayoutGrid, run: () => navigate("/sites") });
-    if (target) {
-      out.push({ id: "p-dash", group: "page", label: `${target.name} ${t("nav.dashboard")}`, icon: ChartSpline, run: () => navigate(`/s/${target.id}`) });
-      out.push({ id: "p-diag", group: "page", label: `${target.name} ${t("nav.diagnostics")}`, icon: Activity, run: () => navigate(`/s/${target.id}/diagnostics`) });
-      if (canManage())
-        out.push({ id: "p-set", group: "page", label: `${target.name} ${t("nav.settings")}`, icon: Settings2, run: () => navigate(`/s/${target.id}/settings/general`) });
+    const first = current ? visibleSections(current)[0] : undefined;
+    if (current && canEdit(current)) {
+      out.push({
+        id: "p-diag",
+        group: "page",
+        label: t("nav.diagnostics"),
+        keywords: current.name,
+        icon: Activity,
+        run: () => navigate(`/s/${current.id}/diagnostics`),
+      });
     }
-    out.push({ id: "p-mem", group: "page", label: t("nav.members"), icon: Users, run: () => navigate("/org/members") });
-    out.push({ id: "p-key", group: "page", label: t("nav.apiKeys"), icon: KeyRound, run: () => navigate("/org/api-keys") });
+    if (current && first) {
+      out.push({
+        id: "p-settings",
+        group: "page",
+        label: t("nav.settings"),
+        keywords: current.name,
+        icon: Settings2,
+        run: () => navigate(`/s/${current.id}/settings/${first}`),
+      });
+    }
+    if (canAddSite(scopedOrg)) {
+      out.push({ id: "p-add", group: "page", label: t("nav.addSite"), icon: Plus, run: () => navigate("/sites/new") });
+    }
+    if (ORGS.find((o) => o.id === orgId)?.role) {
+      out.push({ id: "p-mem", group: "page", label: t("nav.members"), icon: Users, run: () => navigate("/org/members") });
+      out.push({ id: "p-key", group: "page", label: t("nav.apiKeys"), icon: KeyRound, run: () => navigate("/org/api-keys") });
+    }
     out.push({ id: "p-acc", group: "page", label: t("nav.account"), icon: ShieldCheck, run: () => navigate("/account") });
-    out.push({ id: "p-doc", group: "page", label: t("nav.docs"), icon: BookOpen, run: () => window.open("https://github.com/", "_blank", "noreferrer") });
-    if (canManage()) out.push({ id: "a-add", group: "action", label: t("nav.addSite"), icon: Plus, run: () => navigate("/sites/new") });
     out.push({
       id: "a-theme",
       group: "action",

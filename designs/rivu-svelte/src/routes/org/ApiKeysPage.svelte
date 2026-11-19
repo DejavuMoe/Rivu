@@ -1,9 +1,11 @@
 <!--
   我的 API 密钥：密钥表、创建对话框（创建后在同一对话框里只显示一次完整密钥，并附 curl 示例）、
-  表格下方一行限额说明。所有角色（包括查看者）都能管理自己的密钥。
+  表格下方一行限额说明。所有组织角色（包括查看者）都能管理自己的密钥，只列出自己的。
+  只以站点访客身份看到的组织：访客不能有 API 密钥，没有这一页。
+  创建过程中、以及展示一次性密钥时，对话框不能用遮罩、Esc、关闭按钮退出，只能点「完成」。
 -->
 <script lang="ts">
-  import { Inbox, Plus, TriangleAlert } from "@lucide/svelte";
+  import { Inbox, Plus, TriangleAlert, Users } from "@lucide/svelte";
   import OrgHeader from "../../lib/app/OrgHeader.svelte";
   import Badge from "../../lib/ui/Badge.svelte";
   import Button from "../../lib/ui/Button.svelte";
@@ -16,13 +18,14 @@
   import Field from "../../lib/ui/Field.svelte";
   import Input from "../../lib/ui/Input.svelte";
   import Segmented from "../../lib/ui/Segmented.svelte";
-  import Select from "../../lib/ui/Select.svelte";
   import Skeleton from "../../lib/ui/Skeleton.svelte";
   import Table from "../../lib/ui/Table.svelte";
   import type { Column } from "../../lib/ui/types";
+  import { ORGS } from "../../lib/data/fixtures";
   import { SITES } from "../../lib/data/sites.svelte";
-  import { relativeTime } from "../../lib/format";
+  import { full, relativeTime } from "../../lib/format";
   import { t } from "../../lib/i18n";
+  import { href } from "../../lib/router.svelte";
   import { app, toast } from "../../lib/state.svelte";
   import { API_KEYS, daysFromNow, isoDate, type ApiKey } from "./data";
   import "./strings";
@@ -30,10 +33,16 @@
   let { orgId }: { orgId: string } = $props();
 
   let keys = $state<ApiKey[]>(structuredClone(API_KEYS));
+  let busy = $state(false);
+
+  const org = $derived(ORGS.find((o) => o.id === orgId));
   const sites = $derived(SITES.filter((s) => s.org === orgId));
   const mine = $derived(app.review.dataState === "empty" ? [] : keys.filter((k) => k.org === orgId));
   const loading = $derived(app.review.dataState === "loading");
   const failed = $derived(["error", "busy", "timeout"].includes(app.review.dataState));
+  /** 用户在这个组织里没有角色（只以站点访客身份可见）：访客不能有 API 密钥 */
+  const notMember = $derived(!org?.role);
+  const ready = $derived(!loading && !notMember && !failed);
   const siteName = (id: string) => SITES.find((s) => s.id === Number(id))?.name ?? id;
 
   /** 范围描述：全部站点、站点名或站点数。 */
@@ -62,10 +71,13 @@
   let expiry = $state<"30" | "90" | "365" | "never">("90");
   let tried = $state(false);
   let minted = $state("");
+  /** 示例请求里的站点标识：所选的第一个站点，没选就用组织的第一个站点 */
+  let mintedSite = $state("");
   let seq = 0;
 
   const pickedIds = $derived(sites.filter((s) => picked[s.id]).map((s) => s.id));
-  const nameError = $derived(name.trim() ? "" : t("ak.name.required"));
+  const nameLen = $derived([...name.trim()].length);
+  const nameError = $derived(nameLen < 1 || nameLen > 100 ? t("ak.name.required") : "");
   const pickError = $derived(scopeMode === "pick" && pickedIds.length === 0 ? t("ak.scope.pick.required") : "");
   const expiryDate = $derived(expiry === "never" ? null : daysFromNow(Number(expiry)));
 
@@ -88,26 +100,35 @@
     picked = {};
     expiry = "90";
     tried = false;
+    minted = "";
     createOpen = true;
   }
 
   function create(e: SubmitEvent) {
     e.preventDefault();
     tried = true;
-    if (nameError || pickError) return;
-    minted = mint(++seq);
-    keys.unshift({
-      id: `k${Date.now()}`,
-      org: orgId,
-      name: name.trim(),
-      prefix: minted.slice(0, 12),
-      scopes: scopeMode === "all" ? ["stats:read:*"] : pickedIds.map((id) => `stats:read:site/${id}`),
-      createdDaysAgo: 0,
-      lastUsedMinutesAgo: null,
-      expiresInDays: expiry === "never" ? null : Number(expiry),
-    });
-    phase = "done";
-    toast(t("ak.created.toast", { name: name.trim() }), "good");
+    if (nameError || pickError || busy) return;
+    const label = name.trim();
+    const ids = scopeMode === "pick" ? [...pickedIds] : [];
+    const days = expiry === "never" ? null : Number(expiry);
+    busy = true;
+    setTimeout(() => {
+      minted = mint(++seq);
+      mintedSite = sites.find((s) => s.id === ids[0])?.siteKey ?? sites[0]?.siteKey ?? "<site_key>";
+      keys.unshift({
+        id: `k${Date.now()}`,
+        org: orgId,
+        name: label,
+        prefix: minted.slice(0, 12),
+        scopes: ids.length === 0 ? ["stats:read:*"] : ids.map((id) => `stats:read:site/${id}`),
+        createdDaysAgo: 0,
+        lastUsedMinutesAgo: null,
+        expiresInDays: days,
+      });
+      busy = false;
+      phase = "done";
+      toast(t("ak.created.toast", { name: label }), "good");
+    }, 600);
   }
 
   // ---- 撤销 ----
@@ -118,33 +139,43 @@
     revokeOpen = true;
   }
   function confirmRevoke() {
-    if (!revoking) return;
     const k = revoking;
-    keys = keys.filter((x) => x.id !== k.id);
-    revokeOpen = false;
-    toast(t("ak.revoked", { name: k.name }));
+    if (!k || busy) return;
+    busy = true;
+    setTimeout(() => {
+      keys = keys.filter((x) => x.id !== k.id);
+      busy = false;
+      revokeOpen = false;
+      toast(t("ak.revoked", { name: k.name }));
+    }, 400);
   }
 
   const curl = $derived(`curl -X POST https://stats.example.com/api/v1/query \\
   -H "Authorization: Bearer ${minted}" \\
   -H "Content-Type: application/json" \\
-  -d '{"site":"k7qm2xv9atbr","metrics":["visitors"],"date_range":"7d"}'`);
+  -d '{"site":"${mintedSite}","metrics":["visitors"],"date_range":"7d"}'`);
 </script>
 
 <div class="page">
   <OrgHeader {orgId}>
     {#snippet actions()}
-      <Button variant="primary" icon={Plus} onclick={openCreate}>{t("ak.create")}</Button>
+      {#if ready}<Button variant="primary" icon={Plus} onclick={openCreate}>{t("ak.create")}</Button>{/if}
     {/snippet}
   </OrgHeader>
 
   {#if loading}
     <Card flush>
-      <div class="sk">
+      <div class="sk" aria-busy="true">
         {#each [0, 1, 2] as i (i)}
           <div class="sk-row"><Skeleton width="22%" height={12} /><Skeleton width="14%" height={12} /><Skeleton width="20%" height={12} /></div>
         {/each}
       </div>
+    </Card>
+  {:else if notMember}
+    <Card>
+      <EmptyState icon={Users} title={t("mb.noOrg")}>
+        {#snippet actions()}<Button href={href("/sites")}>{t("nav.allSites")}</Button>{/snippet}
+      </EmptyState>
     </Card>
   {:else if failed}
     <Card>
@@ -173,6 +204,8 @@
           {:else if c.key === "expires"}
             {#if k.expiresInDays === null}
               <span class="muted">{t("ak.never")}</span>
+            {:else if k.expiresInDays <= 0}
+              <Badge tone="warn">{t("ak.expired")}</Badge>
             {:else if k.expiresInDays <= 7}
               <Badge tone="warn">{t("ak.expiresSoon", { n: k.expiresInDays })}</Badge>
             {:else}
@@ -184,11 +217,11 @@
         {/snippet}
       </Table>
     </Card>
-    <p class="limits">{t("ak.limits", { hourly: "10,000", burst: 60, concurrent: 4 })}</p>
+    <p class="limits">{t("ak.limits", { hourly: full(10000, app.lang), burst: 60, concurrent: 4 })}</p>
   {/if}
 </div>
 
-<Dialog bind:open={createOpen} title={phase === "form" ? t("ak.dialog.title") : t("ak.created.title")}>
+<Dialog bind:open={createOpen} requireConfirmation={busy || phase !== "form"} title={phase === "form" ? t("ak.dialog.title") : t("ak.created.title")} onclose={() => (minted = "")}>
   {#if phase === "form"}
     <form id="key-form" class="form" onsubmit={create} novalidate>
       <Field label={t("ak.name")} for="key-name" error={tried ? nameError : ""}>
@@ -201,13 +234,13 @@
           onchange={(v: "all" | "pick") => (scopeMode = v)}
           options={[
             { value: "all", label: t("ak.scope.optAll") },
-            { value: "pick", label: t("ak.scope.optPick") },
+            { value: "pick", label: t("ak.scope.optPick"), disabled: sites.length === 0 },
           ]}
         />
         {#if scopeMode === "pick"}
           <div class="picks">
             {#each sites as s (s.id)}
-              <Checkbox bind:checked={picked[s.id]} hint={s.domain}>{s.name}</Checkbox>
+              <Checkbox bind:checked={picked[s.id]}>{s.name}</Checkbox>
             {/each}
           </div>
         {/if}
@@ -238,8 +271,8 @@
   {/if}
   {#snippet footer()}
     {#if phase === "form"}
-      <Button variant="ghost" onclick={() => (createOpen = false)}>{t("common.cancel")}</Button>
-      <Button type="submit" form="key-form" variant="primary">{t("ak.create")}</Button>
+      <Button variant="ghost" disabled={busy} onclick={() => (createOpen = false)}>{t("common.cancel")}</Button>
+      <Button type="submit" form="key-form" variant="primary" loading={busy}>{t("ak.create")}</Button>
     {:else}
       <Button variant="primary" onclick={() => (createOpen = false)}>{t("common.done")}</Button>
     {/if}
@@ -247,12 +280,13 @@
 </Dialog>
 
 <Dialog bind:open={revokeOpen} size="sm" title={t("ak.revoke.title", { name: revoking?.name ?? "" })} description={t("ak.revoke.body")}>
-  {#snippet children()}<span class="sr-only">{revoking?.prefix}</span>{/snippet}
+  <span class="sr-only">{revoking?.prefix}</span>
   {#snippet footer()}
     <Button variant="ghost" onclick={() => (revokeOpen = false)}>{t("common.cancel")}</Button>
-    <Button variant="danger" onclick={confirmRevoke}>{t("ak.revoke")}</Button>
+    <Button variant="danger" loading={busy} onclick={confirmRevoke}>{t("ak.revoke")}</Button>
   {/snippet}
 </Dialog>
+
 <style>
   .page {
     display: flex;

@@ -1,9 +1,11 @@
 <!--
-  目标：事件 / 页面 / 滚动深度，每个目标最多 3 个属性条件。编辑者可写，没有写权限时不显示添加与删除入口。
+  目标：事件（事件名）与页面（路径，* 是通配），另有滚动深度；每个目标最多 3 个属性条件。
+  看板的目标卡片按目标的名字（显示名，否则目标值）列出转化，所以名字不能重复。
+  添加对话框做初筛；上限 100 个，用量显示在表头右侧。
+  editor 起（含站点访客 editor）可写；没有写权限时不显示添加与删除入口。
 -->
 <script lang="ts">
-  import { Plus, Trash2, X } from "@lucide/svelte";
-  import Badge from "../../lib/ui/Badge.svelte";
+  import { CircleAlert, Plus, Trash2, X } from "@lucide/svelte";
   import Button from "../../lib/ui/Button.svelte";
   import Card from "../../lib/ui/Card.svelte";
   import Dialog from "../../lib/ui/Dialog.svelte";
@@ -12,15 +14,32 @@
   import Input from "../../lib/ui/Input.svelte";
   import Segmented from "../../lib/ui/Segmented.svelte";
   import Select from "../../lib/ui/Select.svelte";
+  import Skeleton from "../../lib/ui/Skeleton.svelte";
   import Table from "../../lib/ui/Table.svelte";
   import { t } from "../../lib/i18n";
-  import { toast } from "../../lib/state.svelte";
+  import { app, toast } from "../../lib/state.svelte";
   import type { Site } from "../../lib/data/fixtures";
-  import { cfgs, nextId, type Goal, type GoalKind } from "./store.svelte";
+  import {
+    cfgs,
+    eventNameError,
+    goalLabel,
+    goalTarget,
+    MAX_GOALS,
+    nextId,
+    normalizePagePath,
+    pagePathError,
+    type Goal,
+    type GoalKind,
+  } from "./store.svelte";
   import "./strings";
 
   let { site, readOnly = false }: { site: Site; readOnly?: boolean } = $props();
   const cfg = $derived(cfgs[site.id]);
+
+  const loading = $derived(app.review.dataState === "loading");
+  const failed = $derived(["error", "busy", "timeout"].includes(app.review.dataState));
+  const used = $derived(cfg.goals.length);
+  const full = $derived(used >= MAX_GOALS);
 
   let open = $state(false);
   let kind = $state<GoalKind>("event");
@@ -31,19 +50,17 @@
   let display = $state("");
   let conds = $state<{ key: string; value: string }[]>([]);
 
-  const target = $derived(kind === "event" ? eventName.trim() : kind === "page" ? pagePath.trim() : depth);
-  const targetErr = $derived.by((): string | null => {
-    if (!target) return null;
-    if (kind === "event") return target.length > 120 ? "set.goals.err.eventLen" : null;
-    if (kind === "page") return /^\/\S*$/.test(target) ? null : "set.goals.err.page";
-    return depthPath.trim() && !/^\/\S*$/.test(depthPath.trim()) ? "set.goals.err.page" : null;
-  });
+  const target = $derived(kind === "event" ? eventName.trim() : kind === "page" ? normalizePagePath(pagePath) : depth);
+  const scrollPath = $derived(normalizePagePath(depthPath));
+  const targetErr = $derived(kind === "event" ? eventNameError(eventName) : kind === "page" ? pagePathError(pagePath) : pagePathError(depthPath));
   const dup = $derived(
-    !!target && cfg.goals.some((g) => g.kind === kind && g.target === target && g.path === (kind === "scroll" ? depthPath.trim() : "")),
+    !!target && cfg.goals.some((g) => g.kind === kind && g.target === target && g.path === (kind === "scroll" ? scrollPath : "")),
   );
+  const label = $derived(display.trim() || (kind === "scroll" ? `≥ ${depth}%` : target));
+  const nameTaken = $derived(!dup && !!label && cfg.goals.some((g) => goalLabel(g) === label));
   const condsBad = $derived(conds.some((c) => !c.key.trim() || !c.value.trim()));
   const errKey = $derived(targetErr ?? (dup ? "set.goals.err.dup" : null));
-  const canAdd = $derived(!!target && !errKey && !condsBad);
+  const canAdd = $derived(!!target && !errKey && !nameTaken && !condsBad && !full);
 
   function openAdd() {
     kind = "event";
@@ -58,7 +75,7 @@
       id: nextId(),
       kind,
       target,
-      path: kind === "scroll" ? depthPath.trim() : "",
+      path: kind === "scroll" ? scrollPath : "",
       display: display.trim(),
       props: conds.map((c) => ({ key: c.key.trim(), value: c.value.trim() })),
     };
@@ -75,15 +92,22 @@
     removeOpen = false;
     toast(t("set.goals.removed"));
   }
-
-  const targetText = (g: Goal) => (g.kind === "scroll" ? `≥ ${g.target}%` : g.target);
 </script>
 
 <Card title={t("set.goals.title")} flush>
   {#snippet actions()}
-    {#if !readOnly}<Button variant="primary" icon={Plus} onclick={openAdd}>{t("set.goals.add")}</Button>{/if}
+    {#if !loading && !failed}
+      <span class="used num">{t("set.goals.used", { n: used, max: MAX_GOALS })}</span>
+      {#if !readOnly}<Button variant="primary" icon={Plus} disabled={full} onclick={openAdd}>{t("set.goals.add")}</Button>{/if}
+    {/if}
   {/snippet}
-  {#if cfg.goals.length === 0}
+  {#if failed}
+    <EmptyState compact icon={CircleAlert} tone="bad" title={t("set.loadFailed")}>
+      {#snippet actions()}<Button onclick={() => toast(t("common.retry"))}>{t("common.retry")}</Button>{/snippet}
+    </EmptyState>
+  {:else if loading}
+    <div class="sk" aria-busy="true"><Skeleton height={32} radius={6} /><Skeleton height={32} radius={6} /></div>
+  {:else if cfg.goals.length === 0}
     <EmptyState compact title={t("set.goals.none")} />
   {:else}
     <Table
@@ -102,7 +126,7 @@
           {t(`set.goals.kind.${g.kind}`)}
         {:else if c.key === "target"}
           <div class="tg">
-            <code>{targetText(g)}</code>
+            <code>{goalTarget(g)}</code>
             {#if g.path}<span class="muted">{g.path}</span>{/if}
             {#if g.props.length}
               <span class="conds">
@@ -117,7 +141,7 @@
             variant="ghost"
             size="sm"
             icon={Trash2}
-            aria-label="{t('common.delete')} {g.display || g.target}"
+            aria-label="{t('common.delete')} {goalLabel(g)}"
             onclick={() => {
               removing = g.id;
               removeOpen = true;
@@ -156,7 +180,7 @@
         <Input id="g-event" mono bind:value={eventName} placeholder="Signup" invalid={!!target && !!errKey} autocomplete="off" spellcheck={false} />
       </Field>
     {:else if kind === "page"}
-      <Field label={t("set.goals.pagePath")} for="g-page" error={target && errKey ? t(errKey) : undefined}>
+      <Field label={t("set.goals.pagePath")} for="g-page" hint={t("set.goals.pageHint")} error={target && errKey ? t(errKey) : undefined}>
         <Input id="g-page" mono bind:value={pagePath} placeholder="/pricing" invalid={!!target && !!errKey} autocomplete="off" spellcheck={false} />
       </Field>
     {:else}
@@ -168,13 +192,13 @@
           options={["25", "50", "75", "90", "100"].map((d) => ({ value: d, label: `${d}%` }))}
         />
       </Field>
-      <Field label={t("set.goals.depthPath")} for="g-dpath" optional error={errKey === "set.goals.err.page" ? t(errKey) : undefined}>
+      <Field label={t("set.goals.depthPath")} for="g-dpath" optional hint={t("set.goals.pageHint")} error={errKey === "set.goals.err.page" ? t(errKey) : undefined}>
         <Input id="g-dpath" mono bind:value={depthPath} placeholder="/blog/*" invalid={errKey === "set.goals.err.page"} autocomplete="off" spellcheck={false} />
       </Field>
     {/if}
 
-    <Field label={t("set.goals.col.display")} for="g-display" optional>
-      <Input id="g-display" bind:value={display} maxlength={80} placeholder={t("set.goals.displayPlaceholder")} />
+    <Field label={t("set.goals.col.display")} for="g-display" optional error={nameTaken ? t("set.goals.err.name") : undefined}>
+      <Input id="g-display" bind:value={display} maxlength={100} invalid={nameTaken} placeholder={t("set.goals.displayPlaceholder")} />
     </Field>
 
     <Field label={t("set.goals.conds")} optional>
@@ -189,7 +213,8 @@
       {#if conds.length < 3}
         <div><Button size="sm" variant="ghost" icon={Plus} onclick={() => (conds = [...conds, { key: "", value: "" }])}>{t("set.goals.addCond")}</Button></div>
       {/if}
-    </Field>  </form>
+    </Field>
+  </form>
   {#snippet footer()}
     <Button onclick={() => (open = false)}>{t("common.cancel")}</Button>
     <Button variant="primary" type="submit" form="goal-form" disabled={!canAdd}>{t("common.add")}</Button>
@@ -197,7 +222,7 @@
 </Dialog>
 
 <Dialog bind:open={removeOpen} size="sm" title={t("set.goals.rm.title")}>
-  <p>{t("set.goals.rm.body", { g: removingGoal?.display || removingGoal?.target || "" })}</p>
+  <p>{t("set.goals.rm.body", { g: removingGoal ? goalLabel(removingGoal) : "" })}</p>
   {#snippet footer()}
     <Button onclick={() => (removeOpen = false)}>{t("common.cancel")}</Button>
     <Button variant="danger" onclick={confirmRemove}>{t("common.delete")}</Button>
@@ -205,12 +230,25 @@
 </Dialog>
 
 <style>
+  .used {
+    color: var(--text-muted);
+    font-size: var(--fs-sm);
+  }
+  .sk {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-3);
+    padding: var(--sp-4) var(--sp-5);
+  }
   .tg {
     display: flex;
     flex-direction: column;
     gap: 2px;
     padding: 6px 0;
     min-width: 0;
+  }
+  .tg code {
+    overflow-wrap: anywhere;
   }
   .tg .muted {
     font-family: var(--font-mono);

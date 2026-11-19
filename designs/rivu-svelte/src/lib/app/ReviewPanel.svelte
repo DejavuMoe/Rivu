@@ -17,17 +17,21 @@
     ["/reset-password/t0k3n", "重设密码"],
     ["/reset-password/expired", "重设链接失效"],
     ["/setup", "初始化"],
-    ["/invite", "接受邀请"],
+    ["/invite/t0k3n", "接受邀请"],
     ["/sites", "站点"],
     ["/sites/new", "添加站点"],
     ["/s/4/install", "安装"],
     ["/s/1", "看板"],
     ["/s/1/diagnostics", "诊断"],
     ["/s/1/settings/general", "设置"],
+    ["/s/10", "访客站点"],
     ["/org/members", "成员"],
     ["/org/api-keys", "API 密钥"],
     ["/account", "账号"],
     ["/share/9f3k2m7q8w1x4z6c5v0b2n8m", "共享链接"],
+    ["/share/locked-7h2x9d4k", "共享链接（要密码）"],
+    ["/share/missing", "链接无效"],
+    ["/public/d4pl6nq2wzce", "公开看板"],
   ];
 </script>
 
@@ -71,6 +75,19 @@
         />
       </div>
       <div class="row">
+        <span>应用加载</span>
+        <Segmented
+          size="sm"
+          label="应用加载"
+          value={app.review.shell}
+          onchange={(v) => setReview({ shell: v })}
+          options={[
+            { value: "ready", label: "正常" },
+            { value: "failed", label: "失败" },
+          ]}
+        />
+      </div>
+      <div class="row">
         <span>安装检测</span>
         <Segmented
           size="sm"
@@ -80,7 +97,6 @@
           options={[
             { value: "waiting", label: "等待" },
             { value: "received", label: "已收到" },
-            { value: "dropped", label: "被丢弃" },
           ]}
         />
       </div>
@@ -96,6 +112,24 @@
             { value: "invalid", label: "密码错误" },
             { value: "rateLimited", label: "尝试过多" },
             { value: "totp", label: "要验证码" },
+            { value: "network", label: "断网" },
+            { value: "failed", label: "失败" },
+          ]}
+        />
+      </div>
+      <div class="row">
+        <span>验证码步骤</span>
+        <Segmented
+          size="sm"
+          label="验证码步骤"
+          value={app.review.loginCode}
+          onchange={(v) => setReview({ loginCode: v })}
+          options={[
+            { value: "ok", label: "正常" },
+            { value: "expired", label: "已超时" },
+            { value: "unavailable", label: "不可用" },
+            { value: "rateLimited", label: "尝试过多" },
+            { value: "failed", label: "失败" },
           ]}
         />
       </div>
@@ -127,15 +161,16 @@
         />
       </div>
       <div class="row">
-        <span>初始化令牌</span>
+        <span>初始化</span>
         <Segmented
           size="sm"
-          label="初始化令牌"
-          value={app.review.setupToken ? "on" : "off"}
-          onchange={(v) => setReview({ setupToken: v === "on" })}
+          label="初始化"
+          value={app.review.setup}
+          onchange={(v) => setReview({ setup: v })}
           options={[
-            { value: "on", label: "需要" },
-            { value: "off", label: "不需要" },
+            { value: "token", label: "有令牌" },
+            { value: "open", label: "无令牌" },
+            { value: "done", label: "已初始化" },
           ]}
         />
       </div>
@@ -149,6 +184,7 @@
           options={[
             { value: "loading", label: "加载" },
             { value: "invalid", label: "无效" },
+            { value: "failed", label: "出错" },
             { value: "new", label: "新账号" },
             { value: "existing", label: "已登录" },
             { value: "other", label: "他人" },
@@ -222,6 +258,8 @@
   }
   .panel {
     width: min(460px, calc(100vw - 32px));
+    max-height: calc(100vh - 88px);
+    overflow-y: auto;
     padding: 12px 14px;
     border-radius: var(--r-lg);
     background: var(--bg-app);

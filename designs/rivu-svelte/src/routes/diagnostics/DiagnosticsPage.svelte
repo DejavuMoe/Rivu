@@ -1,21 +1,13 @@
 <!--
   接入诊断：页头（标题、最后收到事件、时间范围）→ 指标与趋势 → 丢弃原因 → 脚本版本。
   数据来自 ClickHouse ingest_counters（每分钟，按 metric 与 script_version 计数，保留 90 天）。
+  editor 起可见（viewer 看到 404）；只有能改设置的角色才有「处理」链接。
   状态：加载（骨架）、空（未接入 / 无事件）、出错 / 排队 / 超时。
 -->
 <script lang="ts">
-  import {
-    ArrowDownRight,
-    ArrowUpRight,
-    ChartSpline,
-    CircleAlert,
-    Clock,
-    Hourglass,
-    Inbox,
-    Table2,
-  } from "@lucide/svelte";
+  import { ChartSpline, CircleAlert, Clock, Hourglass, Inbox, Table2 } from "@lucide/svelte";
   import SiteHeader from "../../lib/app/SiteHeader.svelte";
-  import Badge from "../../lib/ui/Badge.svelte";
+  import NotFound from "../NotFound.svelte";
   import Button from "../../lib/ui/Button.svelte";
   import Card from "../../lib/ui/Card.svelte";
   import EmptyState from "../../lib/ui/EmptyState.svelte";
@@ -24,8 +16,8 @@
   import Table from "../../lib/ui/Table.svelte";
   import TrendChart from "../../lib/charts/TrendChart.svelte";
   import { t } from "../../lib/i18n";
-  import { app, canManage, toast } from "../../lib/state.svelte";
-  import { compact, dateShort, delta, full, percent, relativeTime } from "../../lib/format";
+  import { app, canEdit, canManage, toast } from "../../lib/state.svelte";
+  import { compact, dateShort, full, percent, relativeTime } from "../../lib/format";
   import { href, route, setQuery } from "../../lib/router.svelte";
   import type { Site } from "../../lib/data/fixtures";
   import { diagnose, REASONS, type RangeId, type ReasonDef } from "./data";
@@ -33,13 +25,17 @@
 
   let { site }: { site: Site; section?: string } = $props();
 
+  /** 服务端要求有效角色 editor 起；viewer 与不存在的站点一样显示 404 */
+  const allowed = $derived(canEdit(site));
+
   const rangeParam = $derived(route.current.query.get("range"));
   const range = $derived<RangeId>(rangeParam === "1h" || rangeParam === "7d" ? rangeParam : "24h");
 
   const ds = $derived(app.review.dataState);
-  const noData = $derived(site.scale === 0 || ds === "empty");
   const loading = $derived(ds === "loading");
   const failed = $derived(ds === "error" || ds === "busy" || ds === "timeout");
+  /** 所有时间都没有事件（包括很久以前）：还没接入。数据到齐之后才判断 */
+  const noData = $derived(!loading && !failed && (site.scale === 0 || ds === "empty"));
   const failure = $derived(
     {
       error: { icon: CircleAlert, tone: "bad" as const, title: t("diag.error.title"), body: t("diag.error.body") },
@@ -49,15 +45,12 @@
   );
 
   const cur = $derived(diagnose(site, range));
-  const prev = $derived(diagnose(site, range, 1));
   const rate = $derived(cur.accepted + cur.dropped ? cur.dropped / (cur.accepted + cur.dropped) : 0);
-  const prevRate = $derived(prev.accepted + prev.dropped ? prev.dropped / (prev.accepted + prev.dropped) : 0);
 
   const reasonRows = $derived([...cur.reasons].sort((a, b) => b.count - a.count));
-  const mayManage = $derived(canManage());
-  const def = (id: string) => REASONS.find((r) => r.id === id);
-  /** 名称看不出含义的原因才给一行说明 */
-  const WHY = new Set(["hostname_not_allowed", "rate_limited", "spam_referrer", "datacenter_ip", "no_session"]);
+  const mayManage = $derived(canManage(site));
+  const def = (id: string) => REASONS[id];
+  const reasonName = (id: string) => (def(id) ? t(`diag.r.${id}.name`) : id);
 
   // ---- 图表 ----
   const unit = $derived(range === "1h" ? "minute" : range === "24h" ? "hour" : "6h");
@@ -77,225 +70,203 @@
     cur.lastEventSec === null
       ? t("diag.lastEvent.none")
       : t("diag.lastEvent", {
-          when:
-            cur.lastEventSec < 60
-              ? t("diag.secAgo", { n: cur.lastEventSec })
-              : relativeTime(Math.round(cur.lastEventSec / 60), app.lang),
+          when: relativeTime(Math.floor(cur.lastEventSec / 60), app.lang),
         }),
   );
 
   const kpis = $derived([
-    { key: "accepted", value: full(cur.accepted, app.lang), d: delta(cur.accepted, prev.accepted), lowerBetter: false },
-    { key: "dropped", value: full(cur.dropped, app.lang), d: delta(cur.dropped, prev.dropped), lowerBetter: true },
-    { key: "rate", value: percent(rate), d: delta(rate, prevRate), lowerBetter: true },
+    { key: "accepted", value: full(cur.accepted, app.lang) },
+    { key: "dropped", value: full(cur.dropped, app.lang) },
+    { key: "rate", value: percent(rate) },
   ]);
-  const anyOutdated = $derived(cur.versions.some((v) => v.outdated));
-
-  function relSeen(min: number) {
-    return min < 1 ? t("diag.secAgo", { n: 8 }) : relativeTime(min, app.lang);
-  }
 </script>
 
-<div class="page">
-  <SiteHeader {site}>
-    {#snippet actions()}
-      {#if !noData}
-        <span class="last">{lastEvent}</span>
-        <Segmented
-          label={t("diag.range.label")}
-          value={range}
-          onchange={(v: RangeId) => setQuery({ range: v === "24h" ? null : v })}
-          options={[
-            { value: "1h", label: t("diag.range.1h") },
-            { value: "24h", label: t("diag.range.24h") },
-            { value: "7d", label: t("diag.range.7d") },
-          ]}
-        />
-      {/if}
-    {/snippet}
-  </SiteHeader>
-
-  {#if noData}
-    <Card>
-      <EmptyState icon={Inbox} title={t("diag.empty.title")} body={t("diag.empty.body")}>
-        {#snippet actions()}
-          <Button variant="primary" href={href(`/s/${site.id}/install`)}>{t("diag.empty.action")}</Button>
-        {/snippet}
-      </EmptyState>
-    </Card>
-  {:else}
-    <section class="main" aria-label={t("diag.chart.title", { unit: t(`diag.unit.${unit}`) })}>
-      <div class="strip">
-        {#each kpis as k (k.key)}
-          {@const good = k.d.dir !== "flat" && (k.d.dir === "up") !== k.lowerBetter}
-          <div class="kpi">
-            <span class="label">{t(`diag.kpi.${k.key}`)}</span>
-            {#if loading || failed}
-              <Skeleton width="72px" height={28} />
-            {:else}
-              <span class="row">
-                <span class="value">{k.value}</span>
-                {#if k.d.dir !== "flat"}
-                  <span class="delta" class:good class:bad={!good} title={t("diag.vsPrev")}>
-                    {#if k.d.dir === "up"}<ArrowUpRight size={12} strokeWidth={2} aria-hidden="true" />{:else}<ArrowDownRight size={12} strokeWidth={2} aria-hidden="true" />{/if}
-                    {k.d.text}
-                  </span>
-                {/if}
-              </span>
-            {/if}
-          </div>
-        {/each}
-      </div>
-
-      <div class="chart-head">
-        <div class="legend">
-          <span class="item"><span class="key s1" aria-hidden="true"></span>{t("diag.kpi.accepted")}</span>
-          <span class="item"><span class="key s2" aria-hidden="true"></span>{t("diag.kpi.dropped")}</span>
-        </div>
-        <Segmented
-          size="sm"
-          label={t("common.view")}
-          bind:value={view}
-          options={[
-            { value: "chart", label: "", icon: ChartSpline, hint: t("common.chart") },
-            { value: "table", label: "", icon: Table2, hint: t("common.table") },
-          ]}
-        />
-      </div>
-      <div class="chart-body">
-        {#if loading}
-          <Skeleton height={248} radius={4} />
-        {:else if failed && failure}
-          <EmptyState icon={failure.icon} tone={failure.tone} title={failure.title} body={failure.body}>
-            {#snippet actions()}<Button size="sm" onclick={() => toast(t("common.retry"))}>{t("common.retry")}</Button>{/snippet}
-          </EmptyState>
-        {:else if view === "chart"}
-          <TrendChart
-            height={264}
-            summary={t("diag.chart.summary", { a: tipLabels[0], b: tipLabels[tipLabels.length - 1] })}
-            {xLabels}
-            {tipLabels}
-            format={(n) => compact(n, app.lang)}
-            partialLast={cur.partialLast}
-            partialText={t("diag.chart.partial")}
-            series={[
-              { key: "accepted", label: t("diag.kpi.accepted"), values: cur.buckets.map((b) => b.accepted) },
-              { key: "dropped", label: t("diag.kpi.dropped"), values: cur.buckets.map((b) => b.dropped) },
+{#if !allowed}
+  <NotFound />
+{:else}
+  <div class="page">
+    <SiteHeader {site}>
+      {#snippet actions()}
+        {#if !noData && !loading && !failed}
+          <span class="last">{lastEvent}</span>
+        {/if}
+        {#if !noData}
+          <Segmented
+            label={t("diag.range.label")}
+            value={range}
+            onchange={(v: RangeId) => setQuery({ range: v === "24h" ? null : v })}
+            options={[
+              { value: "1h", label: t("diag.range.1h") },
+              { value: "24h", label: t("diag.range.24h") },
+              { value: "7d", label: t("diag.range.7d") },
             ]}
           />
-        {:else}
-          <div class="tbl">
-            <Table
-              sticky
-              caption={t("diag.chart.title", { unit: t(`diag.unit.${unit}`) })}
-              rows={[...cur.buckets].reverse().map((b, i) => ({ b, label: [...tipLabels].reverse()[i] }))}
-              rowKey={(r) => r.label}
-              columns={[
-                { key: "t", label: t("common.time") },
-                { key: "a", label: t("diag.kpi.accepted"), align: "right" },
-                { key: "d", label: t("diag.kpi.dropped"), align: "right" },
-                { key: "r", label: t("diag.kpi.rate"), align: "right", optional: true },
-              ]}
-            >
-              {#snippet cell(r, c)}
-                {#if c.key === "t"}{r.label}
-                {:else if c.key === "a"}{full(r.b.accepted, app.lang)}
-                {:else if c.key === "d"}{full(r.b.dropped, app.lang)}
-                {:else}{percent(r.b.accepted + r.b.dropped ? r.b.dropped / (r.b.accepted + r.b.dropped) : 0)}{/if}
-              {/snippet}
-            </Table>
-          </div>
-        {/if}
-      </div>
-    </section>
-
-    <Card title={t("diag.reasons.title")} flush>
-      {#if loading}
-        <div class="rows-sk">
-          {#each [1, 2, 3, 4] as i (i)}<Skeleton height={40} radius={4} />{/each}
-        </div>
-      {:else if failed && failure}
-        <EmptyState compact icon={failure.icon} tone={failure.tone} title={failure.title} body={failure.body} />
-      {:else if !reasonRows.length}
-        <EmptyState compact icon={Inbox} title={t("diag.reasons.none")} />
-      {:else}
-        <Table
-          caption={t("diag.reasons.title")}
-          rows={reasonRows}
-          rowKey={(r) => r.id}
-          columns={[
-            { key: "reason", label: t("diag.col.reason") },
-            { key: "count", label: t("diag.col.count"), align: "right", width: "96px" },
-            { key: "share", label: t("diag.col.share"), align: "right", width: "80px" },
-            { key: "fix", label: t("diag.col.fix"), width: "136px", optional: true },
-          ]}
-        >
-          {#snippet cell(r, c)}
-            {@const d = def(r.id)}
-            {#if c.key === "reason"}
-              <div class="reason">
-                <span class="rname">{t(`diag.r.${r.id}.name`)}<code class="rid">dropped_{r.id}</code></span>
-                {#if WHY.has(r.id)}<span class="rwhy">{t(`diag.r.${r.id}.why`)}</span>{/if}
-              </div>
-            {:else if c.key === "count"}
-              {full(r.count, app.lang)}
-            {:else if c.key === "share"}
-              {percent(r.count / cur.dropped)}
-            {:else}
-              {@render fix(d)}
-            {/if}
-          {/snippet}
-        </Table>
-      {/if}
-    </Card>
-
-    <Card title={t("diag.ver.title")} flush>
-      {#snippet actions()}
-        {#if anyOutdated && mayManage}
-          <Button size="sm" variant="ghost" href={href(`/s/${site.id}/install`)}>{t("diag.ver.reinstall")}</Button>
         {/if}
       {/snippet}
-      {#if loading}
-        <div class="rows-sk">
-          {#each [1, 2, 3] as i (i)}<Skeleton height={40} radius={4} />{/each}
-        </div>
-      {:else if failed && failure}
-        <EmptyState compact icon={failure.icon} tone={failure.tone} title={failure.title} body={failure.body} />
-      {:else}
-        <Table
-          caption={t("diag.ver.title")}
-          rows={cur.versions}
-          rowKey={(v) => `${v.version}-${v.build}`}
-          columns={[
-            { key: "v", label: t("diag.ver.version") },
-            { key: "b", label: t("diag.ver.build"), width: "120px" },
-            { key: "e", label: t("diag.ver.events"), align: "right", width: "120px" },
-            { key: "l", label: t("diag.ver.last"), align: "right", width: "120px", optional: true },
-          ]}
-        >
-          {#snippet cell(v, c)}
-            {#if c.key === "v"}
-              <span class="ver">
-                <code>{v.version}</code>
-                {#if v.outdated}<Badge tone="warn">{t("diag.ver.outdated")}</Badge>{/if}
-              </span>
-            {:else if c.key === "b"}
-              <code>{v.build}</code>
-            {:else if c.key === "e"}
-              {full(v.events, app.lang)}
-            {:else}
-              {relSeen(v.lastSeenMin)}
-            {/if}
+    </SiteHeader>
+
+    {#if noData}
+      <Card>
+        <EmptyState icon={Inbox} title={t("diag.empty.title")} body={t("diag.empty.body")}>
+          {#snippet actions()}
+            <Button variant="primary" href={href(`/s/${site.id}/install`)}>{t("diag.empty.action")}</Button>
           {/snippet}
-        </Table>
-      {/if}
-    </Card>
-  {/if}
-</div>
+        </EmptyState>
+      </Card>
+    {:else}
+      <section class="main" aria-label={t("diag.chart.title", { unit: t(`diag.unit.${unit}`) })}>
+        <div class="strip">
+          {#each kpis as k (k.key)}
+            <div class="kpi">
+              <span class="label">{t(`diag.kpi.${k.key}`)}</span>
+              {#if loading || failed}
+                <Skeleton width="72px" height={28} />
+              {:else}
+                <span class="value">{k.value}</span>
+              {/if}
+            </div>
+          {/each}
+        </div>
+
+        <div class="chart-head">
+          <div class="legend">
+            <span class="item"><span class="key s1" aria-hidden="true"></span>{t("diag.kpi.accepted")}</span>
+            <span class="item"><span class="key s2" aria-hidden="true"></span>{t("diag.kpi.dropped")}</span>
+          </div>
+          <Segmented
+            size="sm"
+            label={t("common.view")}
+            bind:value={view}
+            options={[
+              { value: "chart", label: "", icon: ChartSpline, hint: t("common.chart") },
+              { value: "table", label: "", icon: Table2, hint: t("common.table") },
+            ]}
+          />
+        </div>
+        <div class="chart-body">
+          {#if loading}
+            <Skeleton height={248} radius={4} />
+          {:else if failed && failure}
+            <EmptyState icon={failure.icon} tone={failure.tone} title={failure.title} body={failure.body}>
+              {#snippet actions()}<Button size="sm" onclick={() => toast(t("common.retry"))}>{t("common.retry")}</Button>{/snippet}
+            </EmptyState>
+          {:else if view === "chart"}
+            <TrendChart
+              height={264}
+              summary={t("diag.chart.summary", { a: tipLabels[0], b: tipLabels[tipLabels.length - 1] })}
+              {xLabels}
+              {tipLabels}
+              format={(n) => compact(n, app.lang)}
+              partialLast={cur.partialLast}
+              partialText={t("diag.chart.partial")}
+              series={[
+                { key: "accepted", label: t("diag.kpi.accepted"), values: cur.buckets.map((b) => b.accepted) },
+                { key: "dropped", label: t("diag.kpi.dropped"), values: cur.buckets.map((b) => b.dropped) },
+              ]}
+            />
+          {:else}
+            <div class="tbl">
+              <Table
+                sticky
+                caption={t("diag.chart.title", { unit: t(`diag.unit.${unit}`) })}
+                rows={[...cur.buckets].reverse().map((b, i) => ({ b, label: [...tipLabels].reverse()[i] }))}
+                rowKey={(r) => r.label}
+                columns={[
+                  { key: "t", label: t("common.time") },
+                  { key: "a", label: t("diag.kpi.accepted"), align: "right" },
+                  { key: "d", label: t("diag.kpi.dropped"), align: "right" },
+                  { key: "r", label: t("diag.kpi.rate"), align: "right", optional: true },
+                ]}
+              >
+                {#snippet cell(r, c)}
+                  {#if c.key === "t"}{r.label}
+                  {:else if c.key === "a"}{full(r.b.accepted, app.lang)}
+                  {:else if c.key === "d"}{full(r.b.dropped, app.lang)}
+                  {:else}{percent(r.b.accepted + r.b.dropped ? r.b.dropped / (r.b.accepted + r.b.dropped) : 0)}{/if}
+                {/snippet}
+              </Table>
+            </div>
+          {/if}
+        </div>
+      </section>
+
+      <Card title={t("diag.reasons.title")} flush>
+        {#if loading}
+          <div class="rows-sk">
+            {#each [1, 2, 3, 4] as i (i)}<Skeleton height={40} radius={4} />{/each}
+          </div>
+        {:else if failed && failure}
+          <EmptyState compact icon={failure.icon} tone={failure.tone} title={failure.title} body={failure.body} />
+        {:else if !reasonRows.length}
+          <EmptyState compact icon={Inbox} title={t("diag.reasons.none")} />
+        {:else}
+          <Table
+            caption={t("diag.reasons.title")}
+            rows={reasonRows}
+            rowKey={(r) => r.id}
+            columns={[
+              { key: "reason", label: t("diag.col.reason") },
+              { key: "count", label: t("diag.col.count"), align: "right", width: "96px" },
+              { key: "share", label: t("diag.col.share"), align: "right", width: "80px" },
+              { key: "fix", label: t("diag.col.fix"), width: "136px", optional: true },
+            ]}
+          >
+            {#snippet cell(r, c)}
+              {@const d = def(r.id)}
+              {#if c.key === "reason"}
+                <div class="reason">
+                  <span class="rname">{reasonName(r.id)}<code class="rid">dropped_{r.id}</code></span>
+                  {#if d?.why}<span class="rwhy">{t(`diag.r.${r.id}.why`)}</span>{/if}
+                </div>
+              {:else if c.key === "count"}
+                {full(r.count, app.lang)}
+              {:else if c.key === "share"}
+                {percent(r.count / cur.dropped)}
+              {:else}
+                {@render fix(d)}
+              {/if}
+            {/snippet}
+          </Table>
+        {/if}
+      </Card>
+
+      <Card title={t("diag.ver.title")} flush>
+        {#if loading}
+          <div class="rows-sk">
+            {#each [1, 2, 3] as i (i)}<Skeleton height={40} radius={4} />{/each}
+          </div>
+        {:else if failed && failure}
+          <EmptyState compact icon={failure.icon} tone={failure.tone} title={failure.title} body={failure.body} />
+        {:else}
+          <Table
+            caption={t("diag.ver.title")}
+            rows={cur.versions}
+            rowKey={(v) => v.version}
+            columns={[
+              { key: "v", label: t("diag.ver.version") },
+              { key: "e", label: t("diag.ver.events"), align: "right", width: "120px" },
+              { key: "l", label: t("diag.ver.last"), align: "right", width: "120px", optional: true },
+            ]}
+          >
+            {#snippet cell(v, c)}
+              {#if c.key === "v"}
+                {#if v.version === 0}<span class="muted">{t("diag.ver.unknown")}</span>{:else}<code>{v.version}</code>{/if}
+              {:else if c.key === "e"}
+                {full(v.events, app.lang)}
+              {:else}
+                {relativeTime(v.lastSeenMin, app.lang)}
+              {/if}
+            {/snippet}
+          </Table>
+        {/if}
+      </Card>
+    {/if}
+  </div>
+{/if}
 
 {#snippet fix(d: ReasonDef | undefined)}
   {#if d?.fix && mayManage}
-    <a class="text-link" href={href(`/s/${site.id}/settings/${d.fix.section}`)}>{t(`diag.fix.${d.fix.section}`)}</a>
+    <a class="text-link" href={href(`/s/${site.id}/settings/${d.fix}`)}>{t(`diag.fix.${d.fix}`)}</a>
   {:else if d?.admin}
     <span class="muted">{t("diag.fix.admin")}</span>
   {/if}
@@ -341,33 +312,11 @@
   .label {
     color: var(--text-muted);
   }
-  .row {
-    display: flex;
-    align-items: baseline;
-    gap: var(--sp-2);
-    min-width: 0;
-  }
   .value {
     font-size: var(--fs-xl);
     font-weight: var(--fw-semibold);
     line-height: var(--lh-tight);
     white-space: nowrap;
-  }
-  .delta {
-    display: inline-flex;
-    align-items: center;
-    gap: 1px;
-    color: var(--text-muted);
-    font-size: var(--fs-sm);
-    font-weight: var(--fw-medium);
-    font-variant-numeric: tabular-nums;
-    white-space: nowrap;
-  }
-  .good {
-    color: var(--good-text);
-  }
-  .bad {
-    color: var(--bad-text);
   }
   .chart-head {
     display: flex;
@@ -438,14 +387,6 @@
   .rwhy {
     color: var(--text-muted);
     font-size: var(--fs-sm);
-  }
-  .ver {
-    display: inline-flex;
-    align-items: center;
-    gap: var(--sp-2);
-  }
-  .muted {
-    color: var(--text-muted);
   }
   @media (max-width: 720px) {
     .page {

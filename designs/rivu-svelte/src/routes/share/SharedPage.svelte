@@ -1,111 +1,90 @@
 <!--
-  共享看板（独立页，没有侧栏）。路径：
+  共享看板与公开看板（独立页，没有侧栏）。路径：
     /share/:slug            共享链接（正常）
-    /share/expired…         链接已过期
     /share/locked…          密码门（原型里输入 rivu 视为正确）
-    /share/public/:siteKey  公开看板（站点设置里开了「公开看板」）
+    /share/missing…         链接无效、过期、吊销：服务端一律 404，界面上也不区分
+    /public/:siteKey        公开看板（站点设置里开了「公开看板」）
   共享链接与公开看板都只授予只读统计权限；站点取 fixtures 里的公开站点。
-  注意：App 把 seg[1] 当作 slug 传进来，公开看板的 seg[1] 是 "public"，所以这里直接读路由。
+  评审面板的「数据状态」演示入口信息的请求：加载是一块骨架，出错是「无法连接到服务器」加重试。
+  App 把路径的第一个参数交给 param：共享链接是 slug，公开看板是站点密钥。
 -->
 <script lang="ts">
-  import { Clock, Link2, Monitor, Moon, Sun } from "@lucide/svelte";
+  import { CircleAlert, Link2 } from "@lucide/svelte";
+  import ShareShell from "../../lib/app/ShareShell.svelte";
   import Button from "../../lib/ui/Button.svelte";
   import Card from "../../lib/ui/Card.svelte";
   import EmptyState from "../../lib/ui/EmptyState.svelte";
   import Field from "../../lib/ui/Field.svelte";
   import Input from "../../lib/ui/Input.svelte";
-  import Logo from "../../lib/ui/Logo.svelte";
-  import Segmented from "../../lib/ui/Segmented.svelte";
+  import Skeleton from "../../lib/ui/Skeleton.svelte";
   import DashboardPage from "../dashboard/DashboardPage.svelte";
   import { t } from "../../lib/i18n";
-  import { app, setTheme, type ThemePref } from "../../lib/state.svelte";
-  import { route } from "../../lib/router.svelte";
+  import { app, toast } from "../../lib/state.svelte";
   import { SITES } from "../../lib/data/sites.svelte";
-  import "./strings";
+  import "../../lib/app/share-strings";
 
-  // slug 由 App 传入，但公开看板的路径需要第二段，所以以路由为准
-  let { slug: _slug }: { slug: string } = $props();
+  let { kind, param }: { kind: "shared" | "public"; param: string } = $props();
 
-  const seg = $derived(route.current.seg);
-  const isPublic = $derived(seg[1] === "public");
-  const slug = $derived(isPublic ? "" : (seg[1] ?? ""));
-
-  const site = $derived(
-    isPublic ? SITES.find((s) => s.siteKey === seg[2] && s.isPublic) : SITES.find((s) => s.id === 2),
-  );
-  const kind = $derived<"ok" | "expired" | "locked" | "missing">(
-    isPublic
-      ? site
-        ? "ok"
-        : "missing"
-      : !slug
-        ? "missing"
-        : slug.startsWith("expired")
-          ? "expired"
-          : slug.startsWith("locked")
-            ? "locked"
-            : "ok",
-  );
+  const site = $derived(kind === "public" ? SITES.find((s) => s.siteKey === param && s.isPublic) : SITES.find((s) => s.id === 2));
 
   // 密码门
   let unlocked = $state(false);
   let pw = $state("");
-  let wrong = $state(0);
+  let busy = $state(false);
+  let wrong = $state(false);
+  let failed = $state(false);
+  /** 模拟服务端的限流：连续输错 5 次锁 60 秒 */
+  let tries = $state(0);
   let lockedFor = $state(0);
-  let showError = $state(false);
-
   const blocked = $derived(lockedFor > 0);
+
+  const ds = $derived(app.review.dataState);
+  const phase = $derived.by<"loading" | "locked" | "ok" | "missing" | "failed">(() => {
+    if (ds === "loading") return "loading";
+    if (ds === "error" || ds === "busy" || ds === "timeout") return "failed";
+    if (kind === "public") return site ? "ok" : "missing";
+    if (!param || /^(missing|expired|revoked)/.test(param)) return "missing";
+    if (param.startsWith("locked") && !unlocked) return "locked";
+    return site ? "ok" : "missing";
+  });
 
   $effect(() => {
     if (lockedFor <= 0) return;
     const id = setInterval(() => {
       lockedFor -= 1;
-      if (lockedFor <= 0) wrong = 0;
+      if (lockedFor <= 0) {
+        tries = 0;
+        clearInterval(id);
+      }
     }, 1000);
     return () => clearInterval(id);
   });
 
   function submit(e: SubmitEvent) {
     e.preventDefault();
-    if (blocked) return;
-    if (app.review.login === "rateLimited") {
-      lockedFor = 47;
-      return;
-    }
-    if (pw === "rivu") {
-      unlocked = true;
-      showError = false;
-      return;
-    }
-    wrong += 1;
-    showError = true;
-    pw = "";
-    if (wrong >= 5) lockedFor = 60;
+    if (blocked || busy || !pw) return;
+    busy = true;
+    wrong = failed = false;
+    setTimeout(() => {
+      busy = false;
+      const r = app.review.login;
+      if (r === "rateLimited") lockedFor = 47;
+      else if (r === "network" || r === "failed") failed = true;
+      else if (pw === "rivu") unlocked = true;
+      else {
+        wrong = true;
+        tries += 1;
+        if (tries >= 5) lockedFor = 60;
+      }
+      pw = "";
+    }, 450);
   }
 </script>
 
-<div class="shell">
-  <header class="bar">
-    <div class="brand">
-      <Logo size={20} />
-      <span class="what">{isPublic ? t("share.brandPublic") : t("share.brand")}</span>
-    </div>
-    <Segmented
-      size="sm"
-      label={t("share.theme")}
-      value={app.theme}
-      onchange={(v: ThemePref) => setTheme(v)}
-      options={[
-        { value: "system", label: "", icon: Monitor, hint: t("theme.system") },
-        { value: "light", label: "", icon: Sun, hint: t("theme.light") },
-        { value: "dark", label: "", icon: Moon, hint: t("theme.dark") },
-      ]}
-    />
-  </header>
-
-  {#if kind === "ok" && site}
+<ShareShell {kind}>
+  {#if phase === "ok" && site}
     {#key site.id}<DashboardPage {site} mode="shared" />{/key}
-  {:else if kind === "locked" && !unlocked}
+  {:else if phase === "locked"}
     <div class="center">
       <Card>
         <form class="gate" onsubmit={submit}>
@@ -113,65 +92,43 @@
           <Field
             label={t("share.lock.label")}
             for="share-pw"
-            error={blocked ? t("share.lock.tooMany", { s: lockedFor }) : showError ? t("share.lock.wrong") : undefined}
+            error={blocked ? t("share.lock.tooMany", { s: lockedFor }) : wrong ? t("share.lock.wrong") : failed ? t("share.lock.failed") : undefined}
           >
             <Input
               id="share-pw"
               type="password"
               autocomplete="current-password"
               bind:value={pw}
-              invalid={blocked || showError}
+              invalid={blocked || wrong || failed}
               disabled={blocked}
             />
-            {#if showError && !blocked && wrong > 0}
-              <p class="left">{t("share.lock.left", { n: 5 - wrong })}</p>
-            {/if}
           </Field>
-          <Button type="submit" variant="primary" block disabled={blocked || !pw}>{t("share.lock.submit")}</Button>
+          <Button type="submit" variant="primary" block loading={busy} disabled={blocked || !pw}>{t("share.lock.submit")}</Button>
         </form>
       </Card>
     </div>
-  {:else if kind === "locked"}
-    {#if site}{#key site.id}<DashboardPage {site} mode="shared" />{/key}{/if}
-  {:else if kind === "expired"}
-    <div class="center">
-      <Card>
-        <EmptyState icon={Clock} tone="warn" title={t("share.expired.title")} />
-      </Card>
-    </div>
-  {:else}
+  {:else if phase === "missing"}
     <div class="center">
       <Card>
         <EmptyState icon={Link2} title={t("share.notFound.title")} />
       </Card>
     </div>
+  {:else if phase === "failed"}
+    <div class="center">
+      <Card>
+        <EmptyState icon={CircleAlert} tone="bad" title={t("app.loadFailed")}>
+          {#snippet actions()}<Button onclick={() => toast(t("common.retry"))}>{t("common.retry")}</Button>{/snippet}
+        </EmptyState>
+      </Card>
+    </div>
+  {:else}
+    <div class="center" aria-busy="true">
+      <Skeleton width="min(400px, 100%)" height={120} radius={8} />
+    </div>
   {/if}
-</div>
+</ShareShell>
 
 <style>
-  .shell {
-    min-height: 100vh;
-  }
-  .bar {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: var(--sp-3);
-    height: 48px;
-    padding: 0 var(--sp-8);
-    border-bottom: var(--hairline) solid var(--border-subtle);
-    background: var(--bg-app);
-  }
-  .brand {
-    display: flex;
-    align-items: center;
-    gap: var(--sp-3);
-    min-width: 0;
-  }
-  .what {
-    font-weight: var(--fw-medium);
-    white-space: nowrap;
-  }
   .center {
     display: grid;
     place-items: start center;
@@ -189,14 +146,7 @@
   h1 {
     font-size: var(--fs-lg);
   }
-  .left {
-    color: var(--text-muted);
-    font-size: var(--fs-sm);
-  }
   @media (max-width: 720px) {
-    .bar {
-      padding: 0 var(--sp-4);
-    }
     .center {
       padding-top: var(--sp-10);
     }

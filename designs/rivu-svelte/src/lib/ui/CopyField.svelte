@@ -14,18 +14,20 @@
   }
   let { value, label, multiline = false, secret = false }: Props = $props();
 
-  let copied = $state(false);
+  let feedback = $state<"common.copied" | "common.copyFailed" | null>(null);
+  let reset: ReturnType<typeof setTimeout>;
   let revealed = $state(false);
   const shown = $derived(secret && !revealed ? value.slice(0, 12) + "•".repeat(24) : value);
 
   async function copy() {
     try {
       await navigator.clipboard.writeText(value);
+      feedback = "common.copied";
     } catch {
-      /* 原型里剪贴板不可用时照样给反馈 */
+      feedback = "common.copyFailed";
     }
-    copied = true;
-    setTimeout(() => (copied = false), 1600);
+    clearTimeout(reset);
+    reset = setTimeout(() => (feedback = null), 3000);
   }
 </script>
 
@@ -41,11 +43,12 @@
         {#if revealed}<EyeOff size={14} strokeWidth={1.75} />{:else}<Eye size={14} strokeWidth={1.75} />{/if}
       </button>
     {/if}
-    <button type="button" class:ok={copied} onclick={copy} aria-label={t("common.copy")}>
-      {#if copied}<Check size={14} strokeWidth={2} />{t("common.copied")}{:else}<Copy size={14} strokeWidth={1.75} />{t("common.copy")}{/if}
+    <button type="button" class:ok={feedback === "common.copied"} class:failed={feedback === "common.copyFailed"} onclick={copy} aria-label={t("common.copy")}>
+      {#if feedback === "common.copied"}<Check size={14} strokeWidth={2} />{:else}<Copy size={14} strokeWidth={1.75} />{/if}
+      {t(feedback ?? "common.copy")}
     </button>
   </div>
-  <span class="sr-only" aria-live="polite">{copied ? t("common.copied") : ""}</span>
+  <span class="sr-only" aria-live="polite">{feedback ? t(feedback) : ""}</span>
 </div>
 
 <style>
@@ -108,6 +111,9 @@
   }
   .ok {
     color: var(--good-text);
+  }
+  .failed {
+    color: var(--bad-text);
   }
   /* 窄屏：复制按钮移到代码下方，不再盖住代码 */
   @media (max-width: 560px) {

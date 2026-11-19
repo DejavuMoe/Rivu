@@ -23,7 +23,8 @@
           "apps/dashboard/src/routes/(app)/s/[id]/settings/+page.ts",
           "apps/dashboard/src/routes/(app)/s/[id]/settings/[section]/+page.svelte",
           "apps/dashboard/src/routes/(app)/s/[id]/settings/strings.ts",
-          "bin/rivu/src/weekly_report.rs"
+          "bin/rivu/src/weekly_report.rs",
+          "crates/storage-pg/src/members.rs"
         ],
         "interfaces": [
           "Implemented API (bin/rivu/src/weekly_report.rs, docs/architecture/platform-and-ops.md#周报订阅接口): GET /api/internal/sites/{site}/weekly-report returns {available, status: off|pending|active, email, timezone, week_starts_on}. POST with {lang: zh|en} requests a code, DELETE cancels a pending confirmation or an active subscription (204), POST .../confirm with {code} activates. Unknown site or no stats access returns 404.",
@@ -32,6 +33,9 @@
           "Codes are 43-character base64url strings, valid for 15 minutes. The server answers 400 invalid_code for wrong, expired and used-up codes alike, so the page shows one message. The fifth wrong code clears the pending code; when the confirm call fails the page re-reads status, and status off means the code is void: show the void message and return to Not subscribed.",
           "The request body carries the current dashboard language; confirmation and report emails use it. A POST while active only updates the stored language.",
           "Signed-in users with effective site access can enter My weekly report, including site viewers. Existing settings permissions still govern every other section; the SiteHeader Settings link and the bare settings route use the first visible section. Public and shared-link viewers have no personal subscription controls.",
+          "Not implemented in apps/dashboard today: there is no weekly-report section, route, strings entry or SiteHeader link. The route and files above are implementation targets; only the API, the plain-text emails and the unsubscribe pages exist in production.",
+          "Unsubscribing does not need this page: every report email links to a signed-out unsubscribe page (see weekly-report-email) that turns the subscription off and clears the stored address. The next status read then returns off, so this page shows Not subscribed and offers Send confirmation code. Cancel here stays the signed-in way to unsubscribe (DELETE, 204) and also works while mail is unavailable.",
+          "Losing access removes the subscription: removing an organization member, or a site guest, deletes that user's subscription for the affected sites unless another access route remains (crates/storage-pg/src/members.rs; asserted in internal_api.rs). Status, request, confirm and cancel all answer 404 without stats access, so the access-denied state shows the same unavailable-site message as an unknown site. If access returns later, the page starts at Not subscribed.",
           "Schedule uses the configured site time zone and first weekday, after local 09:00, covering the previous complete site-local week. The date shown is an example, without an exact send or delivery promise.",
           "Primary actions use Button variant primary (solid accent), as in apps/dashboard/src/lib/ui/Button.svelte.",
           "The preview has two Taipei site fixtures (Monday and Sunday start), two accounts with site access, and one denied access fixture. Shell destinations are context only. Preview controls simulate mail failures, expiry, the request wait and load errors locally; state resets on reload."
@@ -47,20 +51,26 @@
         "entry": "email.html",
         "assetPath": "email.html",
         "files": ["email.html"],
-        "states": ["report-typical", "report-no-visits", "report-year-boundary-large-values", "confirmation-code", "html-600", "html-360", "html-dark", "plain-text", "current-plain-text"],
+        "states": ["report-typical", "report-no-visits", "report-year-boundary-large-values", "confirmation-code", "html-600", "html-360", "html-dark", "plain-text", "current-plain-text", "unsubscribe-page-current"],
         "stableIds": ["weekly-report-email"]
       },
       "production": {
         "routeOrWindow": "SMTP: confirmation code and weekly report emails",
-        "files": ["bin/rivu/src/weekly_report.rs", "crates/mail/src/lib.rs"],
+        "files": ["bin/rivu/src/weekly_report.rs", "crates/mail/src/lib.rs", "schema/postgres.sql", "docs/architecture/platform-and-ops.md"],
         "interfaces": [
-          "Current production sends text/plain only (crates/mail/src/lib.rs Mailer::send). The Current plain text version reproduces today's subjects and bodies exactly; verify.cjs asserts them.",
-          "Proposed: send multipart/alternative with the HTML part and the Plain text part shown here. HTML is table-based with inline styles, no scripts, images or remote resources, under 100 KB, and a dark scheme under prefers-color-scheme.",
+          "Current production sends text/plain only (crates/mail/src/lib.rs Mailer::send builds the message in Mailer::message). The Current plain text version reproduces today's subjects, bodies and List-Unsubscribe header exactly, including the unsubscribe line; verify.cjs asserts them.",
+          "Implemented unsubscribe (bin/rivu/src/weekly_report.rs, crates/mail/src/lib.rs): every weekly report body ends with the line Unsubscribe: {url} (Chinese 退订周报：{url}) after the dashboard line, and the SMTP message carries List-Unsubscribe: <{url}>. There is no List-Unsubscribe-Post header, so this is not RFC 8058 one-click unsubscribe. The confirmation code email has neither the line nor the header.",
+          "The link is {RIVU_BASE_URL without trailing slashes}/api/weekly-report/unsubscribe/{token}; the dashboard link uses the same base, {base}/s/{site_id}. A new 43-character base64url token is generated for each send record; only its SHA-256 hash is stored (weekly_report_claims.unsubscribe_hash), bound to the user, the site and the confirmation time of that subscription. The link has no time limit and stops working once that subscription is off or confirmed again.",
+          "Unsubscribe pages (production, unstyled, not redesigned here): GET only shows a confirmation page, so a client that previews mail links cannot unsubscribe anyone; POST turns the subscription off. No sign-in and no cookie are involved, and a malformed token answers 404. The pages are fixed bilingual HTML (lang=en, Chinese in lang=zh paragraphs) that does not follow the email language, served with Content-Security-Policy default-src 'none'; form-action 'self'; frame-ancestors 'none', so they cannot carry styles, scripts or images. Copy: confirmation page title Unsubscribe · Rivu, heading Unsubscribe from Rivu weekly reports, line 退订 Rivu 周报, button Unsubscribe · 退订; success You have unsubscribed from Rivu weekly reports for this site. / 你已退订此站点的 Rivu 周报。; expired, already off or re-subscribed This link has expired or the subscription is already off. / 退订链接已过期，或订阅已关闭。 The unsubscribe-page-current state shows these three pages as served; the form is inert in the preview.",
+          "Unsubscribing clears the stored address and confirmation (status off) and keeps the send records used for de-duplication; the user can subscribe again from the settings page. A link from before a re-subscribe stays dead because the new subscription has a different confirmation time.",
+          "Production evidence for the unsubscribe flow: internal_api.rs weekly_report_rechecks_recipients_and_claims_survive_restart (the body carries the List-Unsubscribe URL, GET leaves the subscription active, POST answers You have unsubscribed, a stale link answers already off, removing a member deletes the subscription while send records stay) and crates/mail/src/lib.rs smtp_message_contains_a_list_unsubscribe_uri.",
+          "Proposed: change Mailer::message to send multipart/alternative with the HTML part and the Plain text part shown here. HTML is table-based with inline styles, no scripts, images or remote resources, under 100 KB, and a dark scheme under prefers-color-scheme.",
           "Proposed copy changes, all from data the sender already has: the report subject names the site and the week (today every report is titled Rivu 周报, which threads all sites and weeks together in some clients); numbers use locale grouping; dates are written out in the email language; the link text uses the dashboard term 看板 instead of 仪表盘; the confirmation email uses 确认码, matching the settings page, and names the site; a zero week adds one line saying no visits were recorded.",
-          "Proposed footer: the reason for the email, the recipient address, and a Manage weekly report link to /s/{site_id}/settings/weekly-report. That route is the settings surface above and does not exist yet; unsubscribing still requires signing in.",
-          "Report data is exactly what deliver() queries: site name, period from/to, site time zone, visitors, visits, pageviews, and {RIVU_BASE_URL}/s/{site_id}. No comparison with the previous week is shown because none is queried."
+          "Proposed footer: the reason for the email, the recipient address, a Manage weekly report link to /s/{site_id}/settings/weekly-report, and an unsubscribe link to the production URL above, labelled as today's body line (退订周报 / Unsubscribe). The manage route is the settings surface above and does not exist yet. The HTML and Plain text versions both carry the unsubscribe link and keep the List-Unsubscribe header unchanged; the confirmation email stays without one.",
+          "Open decision, not shown in the design: adding List-Unsubscribe-Post (RFC 8058) would let mailbox providers unsubscribe on the recipient's behalf without the confirmation page. Production does not send it today.",
+          "Report data is exactly what deliver() queries: site name, period from/to, site time zone, visitors, visits, pageviews, and {base}/s/{site_id}; the unsubscribe token is generated separately. No comparison with the previous week is shown because none is queried."
         ],
-        "tests": []
+        "tests": ["bin/rivu/tests/internal_api.rs", "crates/mail/src/lib.rs"]
       },
       "status": "needs-review"
     }

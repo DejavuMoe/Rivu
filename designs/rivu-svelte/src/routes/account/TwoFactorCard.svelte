@@ -1,20 +1,23 @@
 <!--
-  账号页的「两步验证」卡片。状态来自评审面板 app.review.twofa：未开启、已开启、不可用（服务器没配 RIVU_SECRET_KEY）。
-  开启在一个对话框里分三步：确认当前密码 → 扫码并输入第一个验证码 → 保存恢复码（只显示这一次，「我已保存」才算完成）。
-  换恢复码：密码 → 恢复码。关闭：密码。原型里验证码 000000 演示错误，密码随便填。
+  账号页的「两步验证」卡片。状态来自评审面板 app.review.twofa：未开启、已开启、不可用（服务器没配 RIVU_SECRET_KEY）；
+  「数据状态」为加载时是骨架，为出错时是「加载失败」加重试。
+  开启在一个对话框里分三步：确认当前密码 → 扫码并输入第一个验证码 → 保存恢复码（只显示这一次，「我已保存」才关闭）。
+  换恢复码：密码 → 恢复码。关闭：密码。原型里验证码 000000 演示错误，密码的校验结果由「登录结果」演示（密码错误、被限流、其他失败）。
+  放弃设置（第二步关掉对话框）时不影响登录；处理中与保存恢复码这一步不能误关对话框。
 -->
 <script lang="ts">
-  import { Copy, Download } from "@lucide/svelte";
+  import { CircleAlert, Copy, Download } from "@lucide/svelte";
   import Badge from "../../lib/ui/Badge.svelte";
   import Button from "../../lib/ui/Button.svelte";
   import Card from "../../lib/ui/Card.svelte";
   import CopyField from "../../lib/ui/CopyField.svelte";
   import Dialog from "../../lib/ui/Dialog.svelte";
+  import EmptyState from "../../lib/ui/EmptyState.svelte";
   import Field from "../../lib/ui/Field.svelte";
   import Input from "../../lib/ui/Input.svelte";
-  import { USER } from "../../lib/data/fixtures";
+  import Skeleton from "../../lib/ui/Skeleton.svelte";
   import { t } from "../../lib/i18n";
-  import { app, setReview, toast } from "../../lib/state.svelte";
+  import { app, passwordResult, setReview, toast } from "../../lib/state.svelte";
   import "./strings";
 
   const SECRET = "JBSW Y3DP EHPK 3PXP 4KQY 6ZQK LM3T 2NAB";
@@ -22,6 +25,8 @@
 
   let remaining = $state(10);
   const status = $derived(app.review.twofa);
+  const loading = $derived(app.review.dataState === "loading");
+  const failed = $derived(["error", "busy", "timeout"].includes(app.review.dataState));
 
   // ---- 对话框 ----
   let open = $state(false);
@@ -31,11 +36,13 @@
   let code = $state("");
   let error = $state("");
   let busy = $state(false);
+  let copyStatus = $state<"tf.copied" | "common.copyFailed" | null>(null);
 
   function start(m: typeof mode) {
     mode = m;
     step = "password";
     password = code = error = "";
+    copyStatus = null;
     open = true;
   }
 
@@ -57,21 +64,29 @@
     if (step === "password") {
       if (!password) return;
       wait(() => {
-        error = "";
-        if (mode === "enable") step = "scan";
-        else if (mode === "regenerate") {
-          remaining = 10;
-          step = "codes";
-        } else {
+        const r = passwordResult();
+        if (r === "wrong") error = t("ac.pw.wrong");
+        else if (r === "rate") error = t("ac.pw.rate");
+        else if (r === "failed") {
           open = false;
-          setReview({ twofa: "off" });
-          toast(t("tf.disabled"));
+          toast(t("ac.failed"), "bad");
+        } else {
+          error = "";
+          if (mode === "enable") step = "scan";
+          else if (mode === "regenerate") {
+            remaining = 10;
+            step = "codes";
+          } else {
+            open = false;
+            setReview({ twofa: "off" });
+            toast(t("tf.disabled"));
+          }
         }
       });
     } else if (step === "scan") {
-      if (!/^\d{6}$/.test(code)) return;
+      if (!/^\d{6}$/.test(code.trim())) return;
       wait(() => {
-        if (code === "000000") {
+        if (code.trim() === "000000") {
           error = t("tf.codeInvalid");
           code = "";
           return;
@@ -94,10 +109,10 @@
   async function copyCodes() {
     try {
       await navigator.clipboard.writeText(CODES.join("\n"));
+      copyStatus = "tf.copied";
     } catch {
-      /* 原型里剪贴板不可用时照样给反馈 */
+      copyStatus = "common.copyFailed";
     }
-    toast(t("tf.copied"), "good");
   }
 
   function downloadCodes() {
@@ -133,9 +148,15 @@
 
 <Card title={t("tf.title")}>
   {#snippet actions()}
-    {#if status === "on"}<Badge tone="good">{t("tf.onBadge")}</Badge>{/if}
+    {#if status === "on" && !loading && !failed}<Badge tone="good">{t("tf.onBadge")}</Badge>{/if}
   {/snippet}
-  {#if status === "unavailable"}
+  {#if failed}
+    <EmptyState compact icon={CircleAlert} tone="bad" title={t("tf.loadFailed")}>
+      {#snippet actions()}<Button size="sm" onclick={() => toast(t("common.retry"))}>{t("common.retry")}</Button>{/snippet}
+    </EmptyState>
+  {:else if loading}
+    <div class="sk" aria-busy="true"><Skeleton width="60%" height={14} /></div>
+  {:else if status === "unavailable"}
     <p class="muted">{t("tf.unavailable")}</p>
   {:else if status === "off"}
     <div class="row">
@@ -158,24 +179,27 @@
   {/if}
 </Card>
 
-<Dialog bind:open {title} size={mode === "enable" ? "md" : "sm"}>
+<Dialog bind:open {title} requireConfirmation={busy || step === "codes"} size={mode === "enable" ? "md" : "sm"}>
   {#key step}
     <div class="step">
       {#if step === "password"}
         <form id="tf-form" class="form" onsubmit={next} novalidate>
           {#if mode === "disable"}<p>{t("tf.disableBody")}</p>{:else if mode === "regenerate"}<p>{t("tf.regenerateBody")}</p>{/if}
           <Field label={t("tf.password")} for="tf-pw" hint={mode === "enable" ? t("tf.passwordHint") : undefined} error={error || undefined}>
-            <Input id="tf-pw" type="password" autocomplete="current-password" bind:value={password} autofocus />
+            <Input id="tf-pw" type="password" autocomplete="current-password" bind:value={password} invalid={!!error} />
           </Field>
         </form>
       {:else if step === "scan"}
         <form id="tf-form" class="form" onsubmit={next} novalidate>
           <p>{t("tf.scan")}</p>
           <div class="qr-row">
-            <svg class="qr" viewBox="-2 -2 {N + 4} {N + 4}" role="img" aria-label="QR">
-              <rect x="-2" y="-2" width={N + 4} height={N + 4} fill="#fff" />
-              {#each cells as [x, y] (`${x},${y}`)}<rect {x} {y} width="1" height="1" fill="#000" />{/each}
-            </svg>
+            <!-- 服务端生成的二维码（白底黑码，暗色主题下也能扫） -->
+            <div class="qr">
+              <svg viewBox="-2 -2 {N + 4} {N + 4}" role="img" aria-label="QR">
+                <rect x="-2" y="-2" width={N + 4} height={N + 4} fill="#fff" />
+                {#each cells as [x, y] (`${x},${y}`)}<rect {x} {y} width="1" height="1" fill="#000" />{/each}
+              </svg>
+            </div>
             <div class="manual">
               <CopyField label={t("tf.manual")} value={SECRET} />
               <Field label={t("tf.code")} for="tf-code" error={error || undefined}>
@@ -200,8 +224,9 @@
             {#each CODES as c (c)}<li>{c}</li>{/each}
           </ol>
           <div class="code-acts">
-            <Button size="sm" icon={Copy} onclick={copyCodes}>{t("tf.copy")}</Button>
+            <Button size="sm" icon={Copy} aria-label={t("tf.copy")} onclick={copyCodes}>{t(copyStatus ?? "tf.copy")}</Button>
             <Button size="sm" icon={Download} onclick={downloadCodes}>{t("tf.download")}</Button>
+            <span class="sr-only" role="status">{copyStatus ? t(copyStatus) : ""}</span>
           </div>
         </div>
       {/if}
@@ -211,13 +236,13 @@
     {#if step === "codes"}
       <Button variant="primary" onclick={finish}>{t("tf.saved")}</Button>
     {:else}
-      <Button variant="ghost" onclick={() => (open = false)}>{t("common.cancel")}</Button>
+      <Button variant="ghost" disabled={busy} onclick={() => (open = false)}>{t("common.cancel")}</Button>
       <Button
         type="submit"
         form="tf-form"
         variant={mode === "disable" ? "danger" : "primary"}
         loading={busy}
-        disabled={step === "password" ? !password : !/^\d{6}$/.test(code)}
+        disabled={step === "password" ? !password : !/^\d{6}$/.test(code.trim())}
       >
         {step === "scan" ? t("tf.verify") : mode === "disable" ? t("tf.disable") : t("tf.continue")}
       </Button>
@@ -245,6 +270,9 @@
     gap: var(--sp-2);
     flex: none;
   }
+  .sk {
+    padding: var(--sp-1) 0;
+  }
   .step {
     animation: fade var(--dur-pop) var(--ease);
   }
@@ -268,8 +296,15 @@
     flex: none;
     width: 168px;
     height: 168px;
+    overflow: hidden;
     border-radius: var(--r-sm);
+    background: #fff;
     box-shadow: 0 0 0 var(--hairline) var(--border);
+  }
+  .qr svg {
+    display: block;
+    width: 100%;
+    height: 100%;
   }
   .manual {
     display: flex;
@@ -292,6 +327,7 @@
   }
   .code-acts {
     display: flex;
+    flex-wrap: wrap;
     gap: var(--sp-2);
   }
   @media (max-width: 560px) {

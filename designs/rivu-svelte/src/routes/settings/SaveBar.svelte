@@ -1,6 +1,5 @@
 <!--
-  卡片底部的保存行：只在有改动时出现，右对齐「还原」与「保存」。
-  放在 Card 的内容区末尾，不使用 footer。
+  卡片底部的保存行：只在有改动时出现，右对齐「还原」与「保存」。放在 Card 的内容区末尾，不使用 footer。
 -->
 <script lang="ts">
   import Button from "../../lib/ui/Button.svelte";
@@ -13,15 +12,15 @@
     onreset: () => void;
     /** 有校验错误时保存不可点 */
     invalid?: boolean;
-    readOnly?: boolean;
+    busy?: boolean;
   }
-  let { dirty, onsave, onreset, invalid = false, readOnly = false }: Props = $props();
+  let { dirty, onsave, onreset, invalid = false, busy = false }: Props = $props();
 </script>
 
-{#if dirty && !readOnly}
+{#if dirty}
   <div class="bar">
-    <Button variant="ghost" onclick={onreset}>{t("set.reset")}</Button>
-    <Button variant="primary" disabled={invalid} onclick={onsave}>{t("common.save")}</Button>
+    <Button variant="ghost" onclick={onreset} disabled={busy}>{t("set.reset")}</Button>
+    <Button variant="primary" disabled={invalid} loading={busy} onclick={onsave}>{t("common.save")}</Button>
   </div>
 {/if}
 

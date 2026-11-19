@@ -1,20 +1,21 @@
 <!--
   属性卡片：标题 + 属性键下拉（范围里出现过的键，事件多的在前）+ 条形列表（前 8 个取值）+ 「查看全部」。
   点击行即按「这个键 = 这个取值」筛选；没有这个键的事件归为 (none)。范围里没有任何属性时整张卡片不显示。
+  加载中也不显示（键列表还没回来）；查询失败时是带标题的错误卡片。
 -->
 <script lang="ts">
-  import { Inbox, Maximize2 } from "@lucide/svelte";
+  import { CircleAlert, Inbox, Maximize2 } from "@lucide/svelte";
   import Card from "../../lib/ui/Card.svelte";
   import Select from "../../lib/ui/Select.svelte";
   import Button from "../../lib/ui/Button.svelte";
   import EmptyState from "../../lib/ui/EmptyState.svelte";
-  import Skeleton from "../../lib/ui/Skeleton.svelte";
   import BarList from "../../lib/charts/BarList.svelte";
   import type { BarRow } from "../../lib/charts/types";
   import { t } from "../../lib/i18n";
   import { app } from "../../lib/state.svelte";
   import { compact, percent } from "../../lib/format";
-  import type { Row } from "../../lib/data/fixtures";
+  import { PROP_PREFIX, simulateFetch, type Row } from "./query";
+  import { displayValue } from "./values";
   import BreakdownDialog from "./BreakdownDialog.svelte";
 
   interface Props {
@@ -23,9 +24,10 @@
     total: number;
     onpick: (dim: string, value: string) => void;
     loading?: boolean;
-    minRows?: number;
+    /** 查询失败（出错、排队、超时都显示成同一个错误） */
+    failed?: boolean;
   }
-  let { keys, rowsOf, total, onpick, loading = false, minRows = 8 }: Props = $props();
+  let { keys, rowsOf, total, onpick, loading = false, failed = false }: Props = $props();
 
   let key = $state("");
   $effect.pre(() => {
@@ -33,12 +35,18 @@
   });
   let full = $state(false);
 
-  const dim = $derived(`prop:${key}`);
+  const dim = $derived(`${PROP_PREFIX}${key}`);
   const rows = $derived(key ? rowsOf(dim) : []);
-  const bars: BarRow[] = $derived(rows.map((r) => ({ key: r.label, label: r.label, value: r.visitors })));
+  const toBars = (rs: Row[]): BarRow[] =>
+    rs.map((r) => ({ key: r.label, label: displayValue(dim, r.label, app.lang), value: r.visitors }));
+  const bars = $derived(toBars(rows));
 </script>
 
-{#if keys.length}
+{#if failed}
+  <Card title={t("dash.card.props")}>
+    <EmptyState compact icon={CircleAlert} tone="bad" title={t("dash.error.title")} />
+  </Card>
+{:else if keys.length && !loading}
   <Card>
     {#snippet header()}
       <div class="head">
@@ -64,16 +72,11 @@
         </div>
       </div>
     {/snippet}
-    {#if loading}
-      <div class="sk">
-        {#each [92, 74, 60, 48, 40, 33, 28, 22] as w, i (i)}<Skeleton width="{w}%" height={28} radius={4} />{/each}
-      </div>
-    {:else if !rows.length}
+    {#if !rows.length}
       <EmptyState compact icon={Inbox} title={t("dash.noRows")} />
     {:else}
       <BarList
         rows={bars.slice(0, 8)}
-        {minRows}
         dimLabel={key}
         metricLabel={t("metric.visitors")}
         format={(n) => compact(n, app.lang)}
@@ -85,17 +88,19 @@
     {/if}
   </Card>
 
-  <BreakdownDialog
-    bind:open={full}
-    title={key}
-    dimLabel={key}
-    rows={bars}
-    {total}
-    onpick={(v) => {
-      full = false;
-      onpick(dim, v);
-    }}
-  />
+  {#if full}
+    <BreakdownDialog
+      bind:open={full}
+      title={key}
+      dimLabel={key}
+      load={(signal) => simulateFetch(() => toBars(rowsOf(dim)), signal)}
+      {total}
+      onpick={(v) => {
+        full = false;
+        onpick(dim, v);
+      }}
+    />
+  {/if}
 {/if}
 
 <style>
@@ -115,11 +120,5 @@
     align-items: center;
     gap: var(--sp-1);
     min-width: 0;
-  }
-  .sk {
-    display: flex;
-    flex-direction: column;
-    gap: var(--sp-2);
-    padding-top: 26px;
   }
 </style>

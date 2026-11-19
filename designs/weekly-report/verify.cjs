@@ -10,6 +10,8 @@ const pages = Object.fromEntries(Object.values(files).map((name) => [name, readF
 const output = process.env.REVIEW_OUTPUT;
 const collector = process.env.COLLECTOR_PATH;
 const CODE = /^[A-Za-z0-9_-]{43}$/;
+const UNSUBSCRIBE = /^https:\/\/rivu\.example\.com\/api\/weekly-report\/unsubscribe\/[A-Za-z0-9_-]{43}$/;
+const UNSUBSCRIBE_LABEL = { zh: '退订周报', en: 'Unsubscribe' };
 const redactPatterns = ['[A-Za-z0-9_-]{43}'];
 const waitFor = (page, id, text) => page.locator(`#${id}`).getByText(text, { exact: true }).waitFor();
 
@@ -207,7 +209,7 @@ async function settings(page, mobile, address) {
   save(`settings-${mobile ? 'mobile' : 'desktop'}`, captures);
 }
 
-function expectedCurrent(kind, f, lang, code) {
+function expectedCurrent(kind, f, lang, code, unsubscribe) {
   const link = `https://rivu.example.com/s/${f.id}`;
   if (kind === 'code') {
     return lang === 'zh'
@@ -215,8 +217,8 @@ function expectedCurrent(kind, f, lang, code) {
       : ['Rivu weekly report confirmation code', `Paste this code into Rivu within 15 minutes.\n\n${code}\n`];
   }
   return lang === 'zh'
-    ? ['Rivu 周报', `${f.site}\n${f.from} 至 ${f.to}（${f.tz}）\n\n访客：${f.visitors}\n访问：${f.visits}\n浏览量：${f.pageviews}\n\n查看仪表盘：${link}\n`]
-    : ['Rivu weekly report', `${f.site}\n${f.from} to ${f.to} (${f.tz})\n\nVisitors: ${f.visitors}\nVisits: ${f.visits}\nPageviews: ${f.pageviews}\n\nView dashboard: ${link}\n`];
+    ? ['Rivu 周报', `${f.site}\n${f.from} 至 ${f.to}（${f.tz}）\n\n访客：${f.visitors}\n访问：${f.visits}\n浏览量：${f.pageviews}\n\n查看仪表盘：${link}\n退订周报：${unsubscribe}\n`]
+    : ['Rivu weekly report', `${f.site}\n${f.from} to ${f.to} (${f.tz})\n\nVisitors: ${f.visitors}\nVisits: ${f.visits}\nPageviews: ${f.pageviews}\n\nView dashboard: ${link}\nUnsubscribe: ${unsubscribe}\n`];
 }
 
 async function emails(page, address, mobile) {
@@ -232,6 +234,13 @@ async function emails(page, address, mobile) {
   const fixtures = await api.evaluate((x) => x.fixtures);
   const code = await api.evaluate((x) => x.sampleCode);
   assert.match(code, CODE);
+  const unsubscribe = await api.evaluate((x) => x.unsubscribeUrl);
+  assert.match(unsubscribe, UNSUBSCRIBE);
+  // The report carries the List-Unsubscribe header in every version; the confirmation email has none.
+  const header = async (kind) => {
+    assert.equal(await control('list-unsubscribe-row').isHidden(), kind === 'code');
+    if (kind === 'report') assert.equal(await control('list-unsubscribe').innerText(), `<${unsubscribe}>`);
+  };
 
   const expected = {
     zh: {
@@ -277,11 +286,16 @@ async function emails(page, address, mobile) {
               for (const value of values) assert(text.includes(value), `${value} in ${text}`);
               assert.equal(text.includes(lang === 'zh' ? '这一周没有记录到访问。' : 'No visits were recorded this week.'), fixture === 'quiet');
               assert.equal(await frame.locator(`a[href="https://rivu.example.com/s/${f.id}/settings/weekly-report"]`).count(), 1);
+              assert.equal(await frame.locator(`a[href="${unsubscribe}"]`).count(), 1);
+              assert.equal(await frame.locator(`a[href="${unsubscribe}"]`).innerText(), UNSUBSCRIBE_LABEL[lang]);
+              assert.equal(await frame.locator('a').count(), 3);
             } else {
               assert.equal(await control('subject').innerText(), lang === 'zh' ? 'Rivu 周报确认码' : 'Rivu weekly report confirmation code');
               assert(text.includes(code));
               assert(text.includes(lang === 'zh' ? '15 分钟' : '15 minutes'));
+              assert(!/unsubscribe|退订/i.test(html) && await frame.locator('a').count() === 0);
             }
+            await header(kind);
             const fits = await frame.locator('html').evaluate((element) => element.scrollWidth <= element.clientWidth + 1);
             assert(fits, `${kind} ${lang} ${fixture} ${width} overflows`);
             const background = await frame.locator('.card').first().evaluate((element) => getComputedStyle(element).backgroundColor);
@@ -304,19 +318,50 @@ async function emails(page, address, mobile) {
           assert(plain.includes(range));
           for (const value of values) assert(plain.includes(value));
           assert(plain.includes(`https://rivu.example.com/s/${f.id}/settings/weekly-report`));
+          assert(plain.includes(`${UNSUBSCRIBE_LABEL[lang]}${lang === 'zh' ? '：' : ': '}${unsubscribe}`));
         } else {
           assert(plain.includes(code));
+          assert(!/unsubscribe|退订/i.test(plain));
         }
         assert(await control('preheader-row').isHidden());
+        await header(kind);
         await capture();
         await control('version').selectOption('current');
-        const [subject, body] = expectedCurrent(kind, f, lang, code);
+        const [subject, body] = expectedCurrent(kind, f, lang, code, unsubscribe);
         assert.equal(await control('subject').innerText(), subject);
         assert.equal(await control('plain').evaluate((element) => element.textContent), body);
+        await header(kind);
         await capture();
         await control('version').selectOption('html');
       }
     }
+  }
+
+  // The current unsubscribe pages are unstyled, bilingual and fixed: no style, script, image or link, and no form action.
+  await control('language').selectOption('zh-CN');
+  await control('mail').selectOption('unsubscribe');
+  assert(await control('envelope').isHidden());
+  assert(await control('version-field').isHidden());
+  assert.equal(await control('unsubscribe-frame').getAttribute('sandbox'), 'allow-same-origin');
+  const notice = page.frameLocator('#unsubscribe-frame');
+  const pages = {
+    confirm: ['Unsubscribe · Rivu', ['Unsubscribe from Rivu weekly reports', '退订 Rivu 周报', 'Unsubscribe · 退订'], 2],
+    done: ['Rivu weekly reports', ['You have unsubscribed from Rivu weekly reports for this site.', '你已退订此站点的 Rivu 周报。'], 1],
+    expired: ['Rivu weekly reports', ['This link has expired or the subscription is already off.', '退订链接已过期，或订阅已关闭。'], 1],
+  };
+  for (const [name, [title, visible, zh]] of Object.entries(pages)) {
+    await control('unsubscribe-page').selectOption(name);
+    await page.waitForFunction((value) => document.querySelector('#unsubscribe-frame').contentDocument?.title === value, title);
+    assert.equal(await control('unsubscribe-frame').getAttribute('title'), title);
+    assert(!/<style|<script|<img|<link|<iframe|style=|src=|href=|@import|url\(/i.test(await control('unsubscribe-frame').getAttribute('srcdoc')));
+    assert.equal(await notice.locator('html').getAttribute('lang'), 'en');
+    assert.deepEqual((await notice.locator('h1, p, button').allInnerTexts()).map(normalize), visible);
+    assert.equal(await notice.locator('[lang="zh"]').count(), zh);
+    assert.equal(await notice.locator('form[method="post"]').count(), name === 'confirm' ? 1 : 0);
+    assert.equal(await notice.locator('form[action], a').count(), 0);
+    assert(await notice.locator('html').evaluate((element) => element.scrollWidth <= element.clientWidth + 1), `${name} overflows`);
+    await capture();
+    if (output && !mobile) await page.screenshot({ path: join(output, `email-unsubscribe-${name}.png`), fullPage: true });
   }
   assert.deepEqual(errors, []);
   save('email', captures);
@@ -363,7 +408,7 @@ async function main() {
       await offline.goto(pathToFileURL(join(__dirname, 'email.html')).href);
       await offline.frameLocator('#message').locator('h1').waitFor();
       assert(await offline.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth));
-      console.log('Passed: settings (1440px zh light, 360px en dark), emails (2 languages x 4 mails x 2 widths x 2 schemes, text and current versions), 320px offline files.');
+      console.log('Passed: settings (1440px zh light, 360px en dark), emails (2 languages x 4 mails x 2 widths x 2 schemes, text and current versions), 3 current unsubscribe pages, 320px offline files.');
     } finally {
       await browser.close();
     }

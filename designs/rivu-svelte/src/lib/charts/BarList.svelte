@@ -23,6 +23,8 @@
     /** 行数不足时补空行，保持卡片等高 */
     minRows?: number;
     deltaOf?: (cur: number, prev: number) => { text: string; dir: "up" | "down" | "flat" };
+    /** 主数值右侧附加列的表头（行里的值在 BarRow.extra） */
+    extras?: string[];
   }
 
   let {
@@ -37,7 +39,10 @@
     leading,
     minRows = 0,
     deltaOf,
+    extras = [],
   }: Props = $props();
+
+  const extraText = (r: BarRow) => extras.map((h, i) => `，${h} ${r.extra?.[i] ?? ""}`).join("");
 
   const max = $derived(Math.max(1, ...rows.map((r) => r.value)));
 </script>
@@ -45,14 +50,21 @@
 <div class="barlist">
   <div class="head" aria-hidden="true">
     <span>{dimLabel}</span>
-    <span class="r">{metricLabel}</span>
+    {#if extras.length}
+      <span class="vals">
+        <span class="val hv">{metricLabel}</span>
+        {#each extras as h, i (i)}<span class="ex">{h}</span>{/each}
+      </span>
+    {:else}
+      <span class="r">{metricLabel}</span>
+    {/if}
   </div>
   <div class="rows" role="group" aria-label={dimLabel}>
     {#each rows as r (r.key)}
       <button
         type="button"
         class="row"
-        aria-label="{r.label}：{format(r.value)}{total && percent ? `（${percent(r.value / total)}）` : ''}"
+        aria-label="{r.label}：{format(r.value)}{total && percent ? `（${percent(r.value / total)}）` : ''}{extraText(r)}"
         onclick={() => onpick?.(r)}
         disabled={!onpick}
         title={r.sub ? `${r.label}（${r.sub}）` : r.label}
@@ -71,6 +83,7 @@
           {/if}
           {#if total && percent}<span class="pct">{percent(r.value / total)}</span>{/if}
           <span class="val">{format(r.value)}</span>
+          {#each extras as _, i (i)}<span class="ex">{r.extra?.[i] ?? ""}</span>{/each}
         </span>
       </button>
     {/each}
@@ -180,6 +193,14 @@
     min-width: 44px;
     text-align: right;
     font-weight: var(--fw-medium);
+  }
+  .ex {
+    min-width: 72px;
+    text-align: right;
+  }
+  .head .val,
+  .head .ex {
+    font-weight: var(--fw-regular);
   }
   .pct {
     min-width: 40px;

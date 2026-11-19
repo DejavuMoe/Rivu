@@ -10,7 +10,9 @@
   import Select from "../../lib/ui/Select.svelte";
   import Button from "../../lib/ui/Button.svelte";
   import { t } from "../../lib/i18n";
-  import { RANGES, type CompareKey, type DashState, type Filter, type RangeKey } from "./query";
+  import { app } from "../../lib/state.svelte";
+  import { displayValue } from "./values";
+  import { PROP_PREFIX, RANGES, isPropDim, type CompareKey, type DashState, type Filter, type RangeKey } from "./query";
   import FilterDialog from "./FilterDialog.svelte";
 
   interface Props {
@@ -18,8 +20,12 @@
     onrange: (r: RangeKey) => void;
     oncompare: (c: CompareKey) => void;
     onfilters: (fs: Filter[]) => void;
+    /** 可以筛选的维度 */
+    dims: string[];
+    /** 维度的候选值（原始取值） */
+    suggest: (dim: string) => string[];
   }
-  let { dash, onrange, oncompare, onfilters }: Props = $props();
+  let { dash, onrange, oncompare, onfilters, dims, suggest }: Props = $props();
 
   let dialogOpen = $state(false);
   let editing: number | null = $state(null);
@@ -43,7 +49,7 @@
   }
 
   // 属性筛选直接显示键名（`prop:plan` → `plan`）
-  const dimName = (d: string) => (d.startsWith("prop:") ? d.slice(5) : t(`fdim.${d}`));
+  const dimName = (d: string) => (isPropDim(d) ? d.slice(PROP_PREFIX.length) : t(`fdim.${d}`));
   const opName = (o: string) => t(`op.${o}`);
 </script>
 
@@ -90,7 +96,7 @@
       <button type="button" class="chip-main" onclick={() => openEdit(i)}>
         <span class="chip-dim">{dimName(f.dim)}</span>
         <span class="chip-op">{opName(f.op)}</span>
-        <span class="chip-val">{f.values.join(t("filter.or"))}</span>
+        <span class="chip-val">{f.values.map((v) => displayValue(f.dim, v, app.lang)).join(t("filter.or"))}</span>
       </button>
       <button
         type="button"
@@ -110,7 +116,14 @@
   {/if}
 </div>
 
-<FilterDialog bind:open={dialogOpen} initial={editing === null ? null : dash.filters[editing]} onsave={save} />
+<!-- 编辑属性筛选时，维度下拉里补上这个属性（新建筛选只列固定维度；属性从属性卡片点选） -->
+<FilterDialog
+  bind:open={dialogOpen}
+  initial={editing === null ? null : dash.filters[editing]}
+  dims={editing !== null && isPropDim(dash.filters[editing].dim) ? [...dims, dash.filters[editing].dim] : dims}
+  {suggest}
+  onsave={save}
+/>
 
 <style>
   .bar {

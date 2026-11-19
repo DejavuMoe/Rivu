@@ -6,12 +6,24 @@ import { DELETED_SITES, SITES } from "../../lib/data/sites.svelte";
 
 /** 实例对外地址，只用于拼接分享链接的展示。 */
 export const INSTANCE = "https://rivu.northwind.dev";
+/** 实例默认的每分钟上限（站点留空时用它）与站点能设的上限。 */
 export const GLOBAL_RATE = 300000;
+export const RATE_MAX = 1_000_000;
+/** 原始数据保留天数的实例默认值，也是站点能设的上限；站点最少 30 天。 */
 export const INSTANCE_RETENTION = 731;
+export const MIN_RETENTION = 30;
 export const MAX_RULES = 500;
+export const MAX_GOALS = 100;
 
 export type RuleType = "ip" | "cidr" | "country" | "hostname" | "page";
 export type GoalKind = "event" | "page" | "scroll";
+
+/** 地理库能力：国家级库只能选国家，城市级库可选国家、地区、城市，没有库不记录位置。真实里是实例级，原型按站点放几种以便评审。 */
+export function geoCapability(site: Site): "country" | "city" | null {
+  if (site.id === 3) return null;
+  if (site.id === 5) return "country";
+  return "city";
+}
 
 export interface Hostname {
   pattern: string;
@@ -37,10 +49,10 @@ export interface Goal {
 }
 export interface ShareLink {
   id: number;
+  /** 名称可选，留空的链接在列表里显示「未命名」 */
   name: string;
   slug: string;
   password: boolean;
-  segment: string;
   expires: Date | null;
   by: string;
   createdAt: Date;
@@ -49,7 +61,7 @@ export interface DeletionJob {
   id: number;
   from: string;
   to: string;
-  status: "pending" | "running" | "done";
+  status: "pending" | "running" | "done" | "failed" | "cancelled";
   createdAt: Date;
 }
 
@@ -60,7 +72,8 @@ export interface Import {
   status: "importing" | "completed" | "failed";
   from: string;
   to: string;
-  error: string;
+  /** 失败原因的代码（invalid_zip、not_plausible、invalid_csv、no_days、overlap、interrupted、internal），文案按语言在界面里取 */
+  errorCode: string;
   by: string;
   createdAt: Date;
 }
@@ -74,14 +87,11 @@ export interface ScriptFeatures {
   engagement: boolean;
 }
 
+/** 站点的名称、时区、公开状态存在站点本身（Site）上，改了侧栏、站点列表等都跟着变；这里只放设置页自己的内容。 */
 export interface Cfg {
-  name: string;
-  timezone: string;
   weekStart: string;
-  isPublic: boolean;
   hostnames: Hostname[];
   collectEnabled: boolean;
-  stripQuery: boolean;
   script: ScriptFeatures;
   rateLimit: string;
   eventProps: string[];
@@ -93,8 +103,6 @@ export interface Cfg {
   jobs: DeletionJob[];
   imports: Import[];
 }
-
-export const SEGMENTS = ["中国大陆访客", "移动端访客", "来自搜索引擎"];
 
 const day = (n: number) => new Date(NOW.getTime() - n * 864e5);
 const ahead = (n: number) => new Date(NOW.getTime() + n * 864e5);
@@ -166,7 +174,6 @@ function links(site: Site): ShareLink[] {
       name: "季度复盘（只读）",
       slug: "9f3k2m7q8w1x4z6c5v0b2n8m",
       password: false,
-      segment: "",
       expires: null,
       by: "林夏",
       createdAt: day(41),
@@ -176,7 +183,6 @@ function links(site: Site): ShareLink[] {
       name: "合作方增长看板",
       slug: "t5r8y2u6i0o3p7a1s4d9f2g6",
       password: true,
-      segment: "移动端访客",
       expires: ahead(7),
       by: "林夏",
       createdAt: day(6),
@@ -186,11 +192,29 @@ function links(site: Site): ShareLink[] {
       name: "发布周对外同步",
       slug: "expiredq2w3e4r5t6y7u8i9o0p1",
       password: false,
-      segment: "",
       expires: day(9),
       by: "周远",
       createdAt: day(40),
     },
+    {
+      id: 4,
+      name: "",
+      slug: "m8c2x6v1b5n9q3w7e4r0t2y6",
+      password: false,
+      expires: null,
+      by: "周远",
+      createdAt: day(3),
+    },
+  ];
+}
+
+/** 删除统计数据的任务：站点 1 放几条已结束的，演示各种状态。新提交的排在最前。 */
+function jobs(site: Site): DeletionJob[] {
+  if (site.id !== 1) return [];
+  return [
+    { id: 1, from: ymd(day(120)), to: ymd(day(110)), status: "done", createdAt: day(60) },
+    { id: 2, from: ymd(day(300)), to: ymd(day(280)), status: "failed", createdAt: day(35) },
+    { id: 3, from: ymd(day(30)), to: ymd(day(30)), status: "cancelled", createdAt: day(29) },
   ];
 }
 
@@ -208,7 +232,7 @@ function imports(site: Site): Import[] {
         status: "completed",
         from: before(912),
         to: before(1),
-        error: "",
+        errorCode: "",
         by: "林夏",
         createdAt: day(site.createdDaysAgo - 2),
       },
@@ -221,7 +245,7 @@ function imports(site: Site): Import[] {
         status: "failed",
         from: "",
         to: "",
-        error: "压缩包里没有 imported_visitors 开头的 CSV，确认它是 Plausible 导出的原始 zip",
+        errorCode: "not_plausible",
         by: "周远",
         createdAt: day(12),
       },
@@ -231,22 +255,18 @@ function imports(site: Site): Import[] {
 
 function make(site: Site): Cfg {
   return {
-    name: site.name,
-    timezone: site.timezone,
     weekStart: "1",
-    isPublic: site.isPublic,
     hostnames: hosts(site),
     collectEnabled: true,
-    stripQuery: true,
     script: { outbound: false, downloads: false, forms: false, hash: false, tagged: true, engagement: true },
     rateLimit: "",
     eventProps: site.id === 1 ? ["plan", "type", "variant"] : [],
-    geo: "city",
+    geo: geoCapability(site) === "country" ? "country" : "city",
     retention: "",
     rules: rules(site),
     goals: goals(site),
     links: links(site),
-    jobs: [],
+    jobs: jobs(site),
     imports: imports(site),
   };
 }
@@ -297,4 +317,107 @@ export function hostExamples(pattern: string): { host: string; match: boolean }[
     ? [`blog.${base}`, `a.b.${base}`, base, `www.${base}`]
     : [base, `www.${base}`, `${base}:8443`, `shop.${base}`];
   return hosts.map((host) => ({ host, match: hostMatches(pattern, host) }));
+}
+
+// ---------- 目标表单的初筛（与生产的 lib/admin/goals.ts 一致） ----------
+
+export const EVENT_NAME_MAX = 120;
+export const PAGE_PATH_MAX_BYTES = 250;
+
+/** 页面路径的规范化：trim，连续的 * 合并成一个。 */
+export function normalizePagePath(raw: string): string {
+  return raw.trim().replace(/\*{2,}/g, "*");
+}
+
+export function eventNameError(raw: string): string | null {
+  const s = raw.trim();
+  if (!s) return null;
+  if ([...s].length > EVENT_NAME_MAX) return "set.goals.err.eventLen";
+  if (s === "engagement") return "set.goals.err.engagement";
+  return null;
+}
+
+export function pagePathError(raw: string): string | null {
+  const s = normalizePagePath(raw);
+  if (!s) return null;
+  if (!s.startsWith("/") || /[\s\p{Cc}]/u.test(s)) return "set.goals.err.page";
+  if (new TextEncoder().encode(s).length > PAGE_PATH_MAX_BYTES) return "set.goals.err.page";
+  return null;
+}
+
+/** 目标值：事件名、页面路径，滚动深度写成「≥ 75%」。 */
+export function goalTarget(g: Goal): string {
+  return g.kind === "scroll" ? `≥ ${g.target}%` : g.target;
+}
+
+/** 看板按名字区分目标：显示名，否则目标值。 */
+export const goalLabel = (g: Goal) => g.display || goalTarget(g);
+
+// ---------- 共享链接有效期（与生产的 lib/admin/expiry.ts 一致；「现在」用原型固定的 NOW） ----------
+
+export type ExpiryKind = "never" | "7" | "30" | "custom";
+
+/** 某个本地日期（YYYY-MM-DD）当天 23:59:59 的时刻；格式不对或不存在的日期返回 null。 */
+export function endOfLocalDay(value: string): Date | null {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (!m) return null;
+  const [y, mo, d] = [Number(m[1]), Number(m[2]), Number(m[3])];
+  const date = new Date(y, mo - 1, d, 23, 59, 59);
+  // 排除 2 月 31 日这类被 Date 自动进位的输入
+  return date.getFullYear() === y && date.getMonth() === mo - 1 && date.getDate() === d ? date : null;
+}
+
+export interface Expiry {
+  /** null：永久有效（或输入无效，此时 error 非空） */
+  at: Date | null;
+  error: "invalid" | "past" | null;
+}
+
+export function computeExpiry(kind: ExpiryKind, custom: string, now: Date): Expiry {
+  if (kind === "never") return { at: null, error: null };
+  let end: Date | null;
+  if (kind === "custom") end = endOfLocalDay(custom);
+  else end = endOfLocalDay(ymd(new Date(now.getFullYear(), now.getMonth(), now.getDate() + Number(kind))));
+  if (!end) return { at: null, error: "invalid" };
+  if (end.getTime() <= now.getTime()) return { at: null, error: "past" };
+  return { at: end, error: null };
+}
+
+// ---------- 删除统计数据的日期范围（与生产的 lib/admin/deletion.ts 一致） ----------
+
+/** 某个时刻在 IANA 时区里的日期 YYYY-MM-DD；时区无效时按 UTC。 */
+export function ymdInZone(at: Date, timeZone: string): string {
+  const fmt = (tz: string) => new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" }).format(at);
+  try {
+    return fmt(timeZone);
+  } catch {
+    return fmt("UTC");
+  }
+}
+
+/** 一次最多删除的天数（含两端）。 */
+export const MAX_RANGE_DAYS = 731;
+
+/** 严格的 YYYY-MM-DD 且是真实存在的日期，返回 UTC 零点的毫秒数；否则 null。 */
+function dayMs(value: string): number | null {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (!m) return null;
+  const [y, mo, d] = [Number(m[1]), Number(m[2]), Number(m[3])];
+  const ms = Date.UTC(y, mo - 1, d);
+  const back = new Date(ms);
+  return back.getUTCFullYear() === y && back.getUTCMonth() === mo - 1 && back.getUTCDate() === d ? ms : null;
+}
+
+export type RangeProblem = "invalid" | "order" | "future" | "tooLong";
+
+/** 校验日期范围（站点本地日期）；任一端为空时不报错（还没填完）。`today` 是站点时区的今天。 */
+export function rangeError(from: string, to: string, today: string): RangeProblem | null {
+  if (!from || !to) return null;
+  const a = dayMs(from);
+  const b = dayMs(to);
+  if (a === null || b === null) return "invalid";
+  if (a > b) return "order";
+  if (to > today) return "future";
+  if ((b - a) / 86_400_000 + 1 > MAX_RANGE_DAYS) return "tooLong";
+  return null;
 }

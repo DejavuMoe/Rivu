@@ -1,13 +1,16 @@
 <!--
   找回密码：填邮箱 → 「查看你的邮箱」。不论账号是否存在都显示同样的结果（服务端也一样回 202）。
-  实例没有配置邮件（app.review.mail 关）时只说明去找管理员。
+  实例没有配置邮件（app.review.mail 关）时只说明去找管理员。评审面板的「数据状态」为加载时是骨架（正在查实例有没有配置邮件）；
+  「登录结果」演示提交时被限流、连不上服务器与其他失败。
 -->
 <script lang="ts">
   import { MailCheck } from "@lucide/svelte";
   import AuthShell from "./AuthShell.svelte";
   import Button from "../../lib/ui/Button.svelte";
+  import Callout from "../../lib/ui/Callout.svelte";
   import Field from "../../lib/ui/Field.svelte";
   import Input from "../../lib/ui/Input.svelte";
+  import Skeleton from "../../lib/ui/Skeleton.svelte";
   import { t } from "../../lib/i18n";
   import { app } from "../../lib/state.svelte";
   import { href } from "../../lib/router.svelte";
@@ -17,6 +20,8 @@
   let tried = $state(false);
   let busy = $state(false);
   let sent = $state(false);
+  let error = $state<"" | "rate" | "network" | "failed">("");
+  let retry = $state(0);
   const valid = $derived(/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim()));
 
   function submit(e: SubmitEvent) {
@@ -24,15 +29,23 @@
     tried = true;
     if (!valid || busy) return;
     busy = true;
+    error = "";
     setTimeout(() => {
       busy = false;
-      sent = true;
+      const r = app.review.login;
+      if (r === "rateLimited") {
+        error = "rate";
+        retry = 30;
+      } else if (r === "network" || r === "failed") error = r;
+      else sent = true;
     }, 600);
   }
 </script>
 
 <AuthShell>
-  {#if !app.review.mail}
+  {#if app.review.dataState === "loading"}
+    <div class="col" aria-busy="true"><Skeleton width="50%" height={20} /><Skeleton height={40} radius={6} /></div>
+  {:else if !app.review.mail}
     <div class="col">
       <h1>{t("forgot.title")}</h1>
       <p class="muted">{t("forgot.unavailable")}</p>
@@ -52,6 +65,11 @@
         <h1>{t("forgot.title")}</h1>
         <p class="muted">{t("forgot.body")}</p>
       </div>
+      {#if error === "rate"}
+        <Callout tone="warn">{t("login.rate", { n: retry })}</Callout>
+      {:else if error !== ""}
+        <Callout tone="bad">{t(`login.${error}`)}</Callout>
+      {/if}
       <Field label={t("login.email")} for="forgot-email" error={tried && !valid ? t("setup.email.invalid") : undefined}>
         <Input id="forgot-email" type="email" size="lg" autocomplete="username" bind:value={email} invalid={tried && !valid} />
       </Field>
@@ -59,7 +77,7 @@
     </form>
   {/if}
 
-  {#snippet below()}{#if app.review.mail && !sent}<a href={href("/login")}>{t("forgot.back")}</a>{/if}{/snippet}
+  {#snippet below()}{#if app.review.mail && !sent && app.review.dataState !== "loading"}<a href={href("/login")}>{t("forgot.back")}</a>{/if}{/snippet}
 </AuthShell>
 
 <style>

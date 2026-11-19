@@ -1,10 +1,17 @@
 <!--
-  站点列表：当前组织的站点网格；所有者和管理员在网格下方还能看到 7 天恢复期内的已删除站点并恢复。卡片整体可点进看板；未接入的站点链到安装页。
-  状态：加载（骨架）、空组织、出错、搜索无结果。只有所有者和管理员能看到「添加站点」。
-  站点多于 6 个时才出现搜索框。
+  站点列表：当前组织的站点网格。卡片整体可点进看板；24 小时内没有数据的站点链到安装页。
+  每张卡片显示按小时的访客走势，以及 24 小时去重访客总数（分小时的访客数不能相加）。
+  站点多于 6 个时才出现搜索框。所有者和管理员在页头和空状态里有「添加站点」入口，列表下方是恢复期内的已删除站点。
+  只以站点访客身份看到的组织：没有「添加站点」，站点带「访客权限」标记，也没有安装指引的链接。
+
+  状态由评审面板的数据状态驱动：
+    加载：卡片里的访客数据显示骨架
+    无数据：组织没有站点
+    出错、排队、超时：站点名单已经在会话里，只有各卡片的访客查询失败
+  会话本身加载失败（app.loadFailed）是应用外壳的状态，见评审面板的「应用加载」，不在本页。
 -->
 <script lang="ts">
-  import { ArrowDownRight, ArrowUpRight, Inbox, Plus, Search, TriangleAlert, X } from "@lucide/svelte";
+  import { Inbox, Plus, Search, X } from "@lucide/svelte";
   import PageHeader from "../../lib/app/PageHeader.svelte";
   import Sparkline from "../../lib/charts/Sparkline.svelte";
   import Avatar from "../../lib/ui/Avatar.svelte";
@@ -17,65 +24,70 @@
   import Skeleton from "../../lib/ui/Skeleton.svelte";
   import Dialog from "../../lib/ui/Dialog.svelte";
   import Table from "../../lib/ui/Table.svelte";
-  import { daily, type Site } from "../../lib/data/fixtures";
+  import { hourly, type Site } from "../../lib/data/fixtures";
   import { DELETED_SITES, SITES, daysUntilPurge, restoreSite } from "../../lib/data/sites.svelte";
-  import { compact, delta } from "../../lib/format";
+  import { compact } from "../../lib/format";
   import { t } from "../../lib/i18n";
-  import { app, canManage, toast } from "../../lib/state.svelte";
+  import { app, canAddSite, toast } from "../../lib/state.svelte";
   import { href } from "../../lib/router.svelte";
   import "./strings";
 
   let { orgId }: { orgId: string } = $props();
 
+  type Stat = { values: number[]; total: number } | "loading" | "error";
+
   let q = $state("");
 
   const ds = $derived(app.review.dataState);
-  const loading = $derived(ds === "loading");
-  const failed = $derived(ds === "error" || ds === "busy" || ds === "timeout");
-  const orgSites = $derived(ds === "empty" ? [] : SITES.filter((s) => s.org === orgId));
+  const all = $derived(ds === "empty" ? [] : SITES.filter((s) => s.org === orgId));
   const shown = $derived.by(() => {
     const k = q.trim().toLowerCase();
-    return k ? orgSites.filter((s) => s.name.toLowerCase().includes(k) || s.domain.toLowerCase().includes(k)) : orgSites;
+    return k ? all.filter((s) => s.name.toLowerCase().includes(k)) : all;
   });
+  // 只有组织的所有者和管理员能添加站点；只以站点访客身份可见的组织不行
+  const canAdd = $derived(canAddSite(orgId));
+
+  /** 过去 24 小时按小时的访客走势与去重总数。同一访客会出现在多个小时里，总数不是各小时之和，这里按 0.8 折算。 */
+  function stat(s: Site): Stat {
+    if (ds === "loading") return "loading";
+    if (ds === "error" || ds === "busy" || ds === "timeout") return "error";
+    const values = hourly(s, 24).map((p) => p.visitors);
+    return { values, total: Math.round(values.reduce((a, b) => a + b, 0) * 0.8) };
+  }
 
   // 已删除、仍在恢复期内的站点：只有所有者和管理员看得到
-  const trash = $derived(
-    !loading && !failed && canManage() && app.review.deleted === "some" ? DELETED_SITES.filter((s) => s.org === orgId) : [],
-  );
+  const trash = $derived(ds !== "loading" && canAdd && app.review.deleted === "some" ? DELETED_SITES.filter((s) => s.org === orgId) : []);
   let restoring = $state<Site | null>(null);
   let restoreOpen = $state(false);
+  let restoreBusy = $state(false);
 
-  function purgeText(s: Site) {
-    const n = daysUntilPurge(s);
-    return n === 0 ? t("sl.deleted.purge.today") : n === 1 ? t("sl.deleted.purge.one") : t("sl.deleted.purge", { n });
+  function askRestore(s: Site) {
+    restoring = s;
+    restoreOpen = true;
   }
-  function confirmRestore() {
-    if (!restoring) return;
-    const name = restoring.name;
-    restoreSite(restoring.id);
-    restoreOpen = false;
-    toast(t("sl.restore.done", { name }), "good");
-  }
-
-  /** 过去 7 天（不含今天）与前 7 天的访客数、走势。 */
-  function stats(s: Site) {
-    const cur = daily(s, 7, 1);
-    const prev = daily(s, 7, 8);
-    const sum = (p: typeof cur) => p.reduce((a, b) => a + b.visitors, 0);
-    return { values: cur.map((p) => p.visitors), total: sum(cur), delta: delta(sum(cur), sum(prev)) };
+  function restore() {
+    const s = restoring;
+    if (!s || restoreBusy) return;
+    restoreBusy = true;
+    setTimeout(() => {
+      restoreSite(s.id);
+      restoreBusy = false;
+      restoreOpen = false;
+      toast(t("sl.deleted.restored", { name: s.name }), "good");
+    }, 500);
   }
 </script>
 
 <div class="page">
   <PageHeader title={t("sites.title")}>
     {#snippet actions()}
-      {#if canManage()}
+      {#if canAdd}
         <Button variant="primary" icon={Plus} href={href("/sites/new")}>{t("nav.addSite")}</Button>
       {/if}
     {/snippet}
   </PageHeader>
 
-  {#if !loading && !failed && orgSites.length > 6}
+  {#if all.length > 6}
     <div class="search">
       <Input icon={Search} type="search" placeholder={t("sl.search")} aria-label={t("sl.search")} bind:value={q}>
         {#snippet suffix()}
@@ -85,27 +97,11 @@
     </div>
   {/if}
 
-  {#if loading}
-    <div class="grid" aria-busy="true">
-      {#each [0, 1, 2] as i (i)}
-        <div class="site">
-          <div class="head"><Skeleton width="32px" height={32} radius={4} /><Skeleton width="55%" height={14} /></div>
-          <Skeleton width="40%" height={24} />
-          <Skeleton height={32} radius={6} />
-        </div>
-      {/each}
-    </div>
-  {:else if failed}
+  {#if all.length === 0}
     <Card>
-      <EmptyState icon={TriangleAlert} tone="bad" title={t("sl.error.title")}>
-        {#snippet actions()}<Button onclick={() => toast(t("common.retry"))}>{t("common.retry")}</Button>{/snippet}
-      </EmptyState>
-    </Card>
-  {:else if orgSites.length === 0}
-    <Card>
-      <EmptyState icon={Inbox} title={t("sl.empty.title")} body={canManage() ? undefined : t("sl.empty.viewer")}>
+      <EmptyState icon={Inbox} title={t("sites.empty.title")} body={canAdd ? undefined : t("sl.empty.viewer")}>
         {#snippet actions()}
-          {#if canManage()}<Button variant="primary" icon={Plus} href={href("/sites/new")}>{t("nav.addSite")}</Button>{/if}
+          {#if canAdd}<Button variant="primary" icon={Plus} href={href("/sites/new")}>{t("nav.addSite")}</Button>{/if}
         {/snippet}
       </EmptyState>
     </Card>
@@ -118,13 +114,12 @@
   {:else}
     <ul class="grid">
       {#each shown as s (s.id)}
-        {@const st = stats(s)}
+        {@const st = stat(s)}
         <li class="site">
           <div class="head">
             <Avatar name={s.name} shape="square" size={32} />
             <div class="names">
               <a class="name" href={href(`/s/${s.id}`)} aria-label={t("sl.openSite", { name: s.name })}>{s.name}</a>
-              <span class="domain">{s.domain}</span>
             </div>
             {#if s.isPublic || s.guest}
               <div class="badges">
@@ -134,31 +129,31 @@
             {/if}
           </div>
 
-          {#if s.scale === 0}
+          {#if st === "loading"}
+            <div class="metric" aria-busy="true">
+              <div class="num-block">
+                <span class="label">{t("sites.visitors24h")}</span>
+                <Skeleton width="64px" height={24} />
+              </div>
+              <Skeleton width="112px" height={40} radius={6} />
+            </div>
+          {:else if st === "error"}
+            <p class="failed">{t("sl.statsFailed")}</p>
+          {:else if st.total === 0 && st.values.every((v) => v === 0)}
             <div class="wait">
-              <span class="wait-title"><LiveDot off size={8} />{t("sl.waiting")}</span>
-              <a class="text-link" href={href(`/s/${s.id}/install`)}>{t("sl.install")}</a>
+              <span class="wait-title"><LiveDot off size={8} />{t("sites.noData")}</span>
+              {#if !s.guest}
+                <a class="text-link" href={href(`/s/${s.id}/install`)}>{t("sl.install")}</a>
+              {/if}
             </div>
           {:else}
             <div class="metric">
               <div class="num-block">
-                <span class="label">{t("sl.visitors7d")}</span>
-                <span class="row">
-                  <span class="value">{compact(st.total, app.lang)}</span>
-                  {#if st.delta.dir !== "flat"}
-                    <span class="delta" class:good={st.delta.dir === "up"} class:bad={st.delta.dir === "down"}>
-                      {#if st.delta.dir === "up"}<ArrowUpRight size={12} strokeWidth={2} aria-hidden="true" />{:else}<ArrowDownRight size={12} strokeWidth={2} aria-hidden="true" />{/if}
-                      {st.delta.text}
-                    </span>
-                  {/if}
-                </span>
+                <span class="label">{t("sites.visitors24h")}</span>
+                <span class="value">{compact(st.total, app.lang)}</span>
               </div>
-              <Sparkline values={st.values} width={112} height={40} label={t("sl.visitors7d")} />
+              <Sparkline values={st.values} width={112} height={40} label={t("sites.visitors24h")} />
             </div>
-            <span class="live" class:off={s.live === 0}>
-              <LiveDot off={s.live === 0} size={8} />
-              {s.live > 0 ? t("sl.online", { n: s.live }) : t("sl.offline")}
-            </span>
           {/if}
         </li>
       {/each}
@@ -172,35 +167,30 @@
         rows={trash}
         rowKey={(s) => s.id}
         columns={[
-          { key: "name", label: t("sl.deleted.name") },
-          { key: "domain", label: t("sl.deleted.domain"), optional: true },
-          { key: "purge", label: "", optional: true },
-          { key: "act", label: "", align: "right", width: "96px" },
+          { key: "n", label: t("sl.deleted.name") },
+          { key: "d", label: t("as.domain"), optional: true },
+          { key: "p", label: t("sl.deleted.purge"), width: "160px" },
+          { key: "a", label: "", width: "88px", align: "right" },
         ]}
       >
         {#snippet cell(s, c)}
-          {#if c.key === "name"}<span class="strong">{s.name}</span>
-          {:else if c.key === "domain"}<span class="muted">{s.domain}</span>
-          {:else if c.key === "purge"}<span class="muted">{purgeText(s)}</span>
-          {:else}<Button
-              size="sm"
-              aria-label="{t('sl.restore')} {s.name}"
-              onclick={() => {
-                restoring = s;
-                restoreOpen = true;
-              }}>{t("sl.restore")}</Button
-            >{/if}
+          {#if c.key === "n"}{s.name}
+          {:else if c.key === "d"}<span class="muted">{s.domain || "—"}</span>
+          {:else if c.key === "p"}
+            {@const n = daysUntilPurge(s)}
+            <span class="muted">{n === 0 ? t("sl.deleted.today") : t("sl.deleted.days", { n })}</span>
+          {:else}<Button size="sm" aria-label="{t('sl.deleted.restore')} {s.name}" onclick={() => askRestore(s)}>{t("sl.deleted.restore")}</Button>{/if}
         {/snippet}
       </Table>
     </Card>
   {/if}
 </div>
 
-<Dialog bind:open={restoreOpen} size="sm" title={t("sl.restore.title", { name: restoring?.name ?? "" })}>
-  <p>{t("sl.restore.body")}</p>
+<Dialog bind:open={restoreOpen} size="sm" title={t("sl.deleted.dlg.title", { name: restoring?.name ?? "" })}>
+  <p>{t("sl.deleted.dlg.body")}</p>
   {#snippet footer()}
     <Button onclick={() => (restoreOpen = false)}>{t("common.cancel")}</Button>
-    <Button variant="primary" onclick={confirmRestore}>{t("sl.restore")}</Button>
+    <Button variant="primary" loading={restoreBusy} onclick={restore}>{t("sl.deleted.restore")}</Button>
   {/snippet}
 </Dialog>
 
@@ -216,9 +206,6 @@
   }
   .search {
     max-width: 360px;
-  }
-  .strong {
-    font-weight: var(--fw-medium);
   }
   .grid {
     display: grid;
@@ -276,13 +263,6 @@
     inset: 0;
     border-radius: var(--r-md);
   }
-  .domain {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    color: var(--text-muted);
-    font-size: var(--fs-sm);
-  }
   .badges {
     display: flex;
     flex-wrap: wrap;
@@ -306,37 +286,12 @@
     color: var(--text-muted);
     font-size: var(--fs-sm);
   }
-  .row {
-    display: flex;
-    align-items: baseline;
-    gap: var(--sp-2);
-  }
   .value {
     font-size: var(--fs-xl);
     font-weight: var(--fw-semibold);
     line-height: var(--lh-tight);
   }
-  .delta {
-    display: inline-flex;
-    align-items: center;
-    gap: 1px;
-    font-size: var(--fs-sm);
-    font-weight: var(--fw-medium);
-    font-variant-numeric: tabular-nums;
-  }
-  .good {
-    color: var(--good-text);
-  }
-  .bad {
-    color: var(--bad-text);
-  }
-  .live {
-    display: inline-flex;
-    align-items: center;
-    gap: var(--sp-2);
-    font-variant-numeric: tabular-nums;
-  }
-  .live.off {
+  .failed {
     color: var(--text-muted);
   }
   .wait {

@@ -13,11 +13,12 @@
     description?: string;
     size?: "sm" | "md" | "lg";
     onclose?: () => void;
+    requireConfirmation?: boolean;
     children: Snippet;
     footer?: Snippet;
   }
 
-  let { open = $bindable(), title, description, size = "md", onclose, children, footer }: Props = $props();
+  let { open = $bindable(), title, description, size = "md", onclose, requireConfirmation = false, children, footer }: Props = $props();
 
   let dlg: HTMLDialogElement;
   const titleId = `dlg-${Math.random().toString(36).slice(2, 8)}`;
@@ -38,8 +39,11 @@
   class={size}
   aria-labelledby={titleId}
   onclose={handleClose}
+  oncancel={(e) => {
+    if (requireConfirmation) e.preventDefault();
+  }}
   onclick={(e) => {
-    if (e.target === dlg) dlg.close();
+    if (!requireConfirmation && e.target === dlg) dlg.close();
   }}
 >
   {#if open}
@@ -49,7 +53,9 @@
           <h2 id={titleId}>{title}</h2>
           {#if description}<p>{description}</p>{/if}
         </div>
-        <button type="button" class="x" aria-label={t("common.close")} onclick={() => dlg.close()}><X size={16} strokeWidth={1.75} /></button>
+        {#if !requireConfirmation}
+          <button type="button" class="x" aria-label={t("common.close")} onclick={() => dlg.close()}><X size={16} strokeWidth={1.75} /></button>
+        {/if}
       </header>
       <div class="body">{@render children()}</div>
       {#if footer}<footer>{@render footer()}</footer>{/if}

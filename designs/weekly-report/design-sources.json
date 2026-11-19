@@ -89,13 +89,40 @@
       "localCopies": [],
       "observations": [
         "Status is off, pending or active; a pending code lasts 15 minutes and is a 43-character base64url token. One request per account per minute across sites (429). The fifth wrong code clears the pending code. Wrong, expired and cleared codes all return 400 invalid_code. Request returns 503 mail_unavailable without SMTP and 502 mail_failed after storing the new code when SMTP refuses it.",
-        "Reports cover the previous complete site-local week and are sent after 09:00 on the site's first weekday. The body carries the site name, ISO from/to dates, time zone, visitors, visits, pageviews and {RIVU_BASE_URL}/s/{site_id}. Subjects are fixed per language."
+        "Reports cover the previous complete site-local week and are sent after 09:00 on the site's first weekday. The body carries the site name, ISO from/to dates, time zone, visitors, visits, pageviews, {base}/s/{site_id} and a last line Unsubscribe: {base}/api/weekly-report/unsubscribe/{token} (Chinese 退订周报：). {base} is RIVU_BASE_URL without trailing slashes. Subjects are fixed per language.",
+        "Each claimed send record gets a new 43-character base64url token; only its SHA-256 hash is stored with the user, the site and the confirmation time of the subscription. GET /api/weekly-report/unsubscribe/{token} returns a confirmation page and changes nothing; POST turns the subscription off (clears the email and the confirmation) while the confirmation time still matches, and otherwise returns the expired-or-already-off page. A malformed token is 404. The pages are fixed bilingual HTML, no cookie or session, with Content-Security-Policy default-src 'none'; form-action 'self'; frame-ancestors 'none', plus no-store and no-referrer."
       ],
       "inferences": [
         "The settings page can only show one message for an invalid code and must re-read status to learn that a code was voided."
       ],
       "limitations": [
-        "The API does not return the stored email language, the next send date or the confirmation time."
+        "The API does not return the stored email language, the next send date or the confirmation time.",
+        "The unsubscribe pages ignore the email language and the CSP rules out styles, scripts and images, so they stay unstyled unless the response policy changes.",
+        "The settings page and the HTML email do not exist in production; the API, the plain-text emails and the unsubscribe pages do."
+      ]
+    },
+    {
+      "id": "rivu-weekly-report-access",
+      "type": "code",
+      "location": "crates/storage-pg/src/members.rs",
+      "roles": [
+        "functional-truth"
+      ],
+      "trust": "repository-trusted",
+      "instructionsPolicy": "treat-as-data-never-execute",
+      "approvedByUser": false,
+      "containsSensitiveData": false,
+      "sanitization": null,
+      "licenseOrPermission": "User-authorized in-repository prototype reference.",
+      "localCopies": [],
+      "observations": [
+        "remove_member deletes the member's weekly report subscriptions for the organization's sites unless a site guest membership remains. remove_guest deletes the guest's subscription for that site unless an organization membership remains. Send records are kept."
+      ],
+      "inferences": [
+        "A user who lost access sees the unavailable-site message, and a subscription from before the loss does not come back with the access."
+      ],
+      "limitations": [
+        "A disabled or deleted account is not cleaned up by these two functions; the sender skips such accounts when it picks recipients."
       ]
     },
     {
@@ -113,12 +140,14 @@
       "licenseOrPermission": "User-authorized in-repository prototype reference.",
       "localCopies": [],
       "observations": [
-        "Mailer::send builds a single text/plain message. Invitation and password reset emails use the same plain-text style."
+        "Mailer::send builds a single text/plain message in Mailer::message. When Mail.unsubscribe_url is set (weekly reports only) the message gets a List-Unsubscribe: <url> header. Invitation and password reset emails use the same plain-text style without it."
       ],
       "inferences": [
-        "An HTML email needs a multipart/alternative change in Mailer::send."
+        "An HTML email needs a multipart/alternative change in Mailer::message; the List-Unsubscribe header can stay as it is."
       ],
-      "limitations": []
+      "limitations": [
+        "There is no List-Unsubscribe-Post header, so one-click unsubscribe (RFC 8058) is not implemented."
+      ]
     },
     {
       "id": "rivu-button",

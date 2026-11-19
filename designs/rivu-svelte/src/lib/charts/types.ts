@@ -18,4 +18,6 @@ export interface BarRow {
   prev?: number;
   /** 行首的小图标、国旗等 */
   code?: string;
+  /** 主数值右侧的附加列（已格式化），与 BarList 的 extras 表头对应 */
+  extra?: string[];
 }
