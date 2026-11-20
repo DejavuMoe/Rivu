@@ -5,3 +5,6 @@
 *.gif binary
 *.ico binary
 *.woff2 binary
+
+# 第三方与 AI Agent 技能包不计入 GitHub 语言统计（否则 JavaScript 占比会被虚高）。
+.agents/skills/** linguist-vendored
