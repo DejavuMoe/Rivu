@@ -5,18 +5,9 @@ import { breakdown, daily, hourly, monthly, NOW, type Point, type Row as Fixture
 import { dateShort, hourLabel, dateLong } from "../../lib/format";
 import { app, type Lang } from "../../lib/state.svelte";
 import { cfgs, INSTANCE_RETENTION } from "../settings/store.svelte";
+import { capped, comparePeriod, dayCount, readRange, resolve, type Period, type RangeKey, type RangeParam } from "./period";
 
-export type RangeKey =
-  | "realtime"
-  | "day"
-  | "24h"
-  | "7d"
-  | "30d"
-  | "month"
-  | "6mo"
-  | "12mo"
-  | "year"
-  | "all";
+export type { RangeKey } from "./period";
 export type CompareKey = "off" | "previous_period" | "year_over_year";
 export type Gran = "minute" | "hour" | "day" | "week" | "month";
 export type MetricKey = "visitors" | "visits" | "pageviews" | "views_per_visit" | "bounce_rate" | "visit_duration";
@@ -28,19 +19,20 @@ export interface Filter {
   values: string[];
 }
 
-export interface DashState {
-  range: RangeKey;
+/** 范围（range，自定义时还有 from、to）+ 对比、粒度、指标、筛选。 */
+export interface DashState extends RangeParam {
   compare: CompareKey;
   gran: Gran;
   metric: MetricKey;
   filters: Filter[];
 }
 
+/** 范围菜单里的预设，按组分隔；自定义范围在菜单最后单独一项。 */
 export const RANGES: RangeKey[][] = [
   ["realtime"],
-  ["day", "24h"],
+  ["day", "yesterday", "24h"],
   ["7d", "30d"],
-  ["month", "6mo", "12mo", "year"],
+  ["month", "last_month", "6mo", "12mo", "year"],
   ["all"],
 ];
 
@@ -85,18 +77,20 @@ export function opsFor(dim: string): Op[] {
   return EXACT_ONLY_DIMS.has(dim) ? ["is", "is_not"] : ["is", "is_not", "contains", "contains_not"];
 }
 
-/** 每个范围允许的粒度，第一个是默认值。 */
-export function grans(range: RangeKey): Gran[] {
-  switch (range) {
+/** 每个范围允许的粒度，第一个是默认值。自定义范围按天数定（与预设的长度对应）。 */
+export function grans(r: RangeParam): Gran[] {
+  switch (r.range) {
     case "realtime":
       return ["minute"];
     case "day":
+    case "yesterday":
     case "24h":
       return ["hour"];
     case "7d":
       return ["day", "hour"];
     case "30d":
     case "month":
+    case "last_month":
       return ["day", "week"];
     case "6mo":
     case "12mo":
@@ -104,13 +98,21 @@ export function grans(range: RangeKey): Gran[] {
       return ["month", "week", "day"];
     case "all":
       return ["month", "week"];
+    case "custom": {
+      if (r.from?.includes("T")) return ["hour"];
+      const n = dayCount(resolve(r, NOW, NOW));
+      if (n <= 1) return ["hour"];
+      if (n <= 7) return ["day", "hour"];
+      if (n <= 92) return ["day", "week"];
+      if (n <= 731) return ["month", "week", "day"];
+      return ["month", "week"];
+    }
   }
 }
 
 // ---------- URL 编解码 ----------
 
 const OPS = new Set<Op>(["is", "is_not", "contains", "contains_not"]);
-const RANGE_SET = new Set(RANGES.flat());
 
 export function decodeFilters(s: string | null): Filter[] {
   if (!s) return [];
@@ -153,9 +155,9 @@ export function encodeFilters(fs: Filter[]): string {
 }
 
 export function readState(q: URLSearchParams): DashState {
-  const rawRange = q.get("range") as RangeKey;
-  const range: RangeKey = RANGE_SET.has(rawRange) ? rawRange : "30d";
-  const allowed = grans(range);
+  const r = readRange(q, NOW);
+  const range = r.range;
+  const allowed = grans(r);
   const gran = allowed.includes(q.get("gran") as Gran) ? (q.get("gran") as Gran) : allowed[0];
   const rawMetric = q.get("metric") as MetricKey;
   let metric: MetricKey = METRICS.includes(rawMetric) ? rawMetric : "visitors";
@@ -163,7 +165,7 @@ export function readState(q: URLSearchParams): DashState {
   if (range === "realtime" && metric !== "pageviews") metric = "visitors";
   const rawCmp = q.get("cmp") as CompareKey;
   return {
-    range,
+    ...r,
     compare: rawCmp === "off" || rawCmp === "year_over_year" ? rawCmp : "previous_period",
     gran,
     metric,
@@ -197,6 +199,9 @@ export interface GoalRow {
 }
 
 export interface DashResult {
+  /** 主区间与对比期（站点本地日；图例、导出文件名用） */
+  period: Period;
+  comparePeriod: Period | null;
   points: Point[];
   prevPoints: Point[] | null;
   xLabels: string[];
@@ -340,34 +345,24 @@ function importedSpan(site: Site): Span | null {
   return { start: new Date(from), end: new Date(to) };
 }
 
-/** 每个范围的时间区间（大致：只用来判断它和保留期、导入的日期有没有交集）。 */
-function intervalOf(site: Site, s: DashState): Span {
-  const y = NOW.getFullYear();
-  const m = NOW.getMonth();
-  const today = new Date(y, m, NOW.getDate());
-  const daysAgo = (n: number) => new Date(today.getTime() - n * DAY);
-  const start = {
-    realtime: new Date(NOW.getTime() - 30 * 60_000),
-    "24h": new Date(NOW.getTime() - DAY),
-    day: today,
-    "7d": daysAgo(6),
-    "30d": daysAgo(29),
-    month: new Date(y, m, 1),
-    "6mo": new Date(y, m - 5, 1),
-    "12mo": new Date(y, m - 11, 1),
-    year: new Date(y, 0, 1),
-    all: importedSpan(site)?.start ?? daysAgo(site.createdDaysAgo),
-  }[s.range];
-  return { start, end: NOW };
+/** 站点最早有数据的本地日：「全部时间」的起点。 */
+export function firstDay(site: Site): Date {
+  const imported = importedSpan(site)?.start;
+  const created = new Date(NOW.getFullYear(), NOW.getMonth(), NOW.getDate() - site.createdDaysAgo);
+  return imported && imported < created ? imported : created;
 }
 
-function compareOf(s: DashState, iv: Span): Span | null {
-  if (s.compare === "off" || s.range === "realtime") return null;
-  if (s.compare === "year_over_year") {
-    const back = (d: Date) => new Date(d.getFullYear() - 1, d.getMonth(), d.getDate(), d.getHours(), d.getMinutes());
-    return { start: back(iv.start), end: back(iv.end) };
-  }
-  return { start: new Date(iv.start.getTime() - (iv.end.getTime() - iv.start.getTime())), end: iv.start };
+/** 范围的区间：起点与终点（不含），终点封顶到现在。 */
+function spanOf(p: Period): Span {
+  if (p.kind === "instant") return { start: p.from, end: p.to < NOW ? p.to : NOW };
+  const end = new Date(p.to.getFullYear(), p.to.getMonth(), p.to.getDate() + 1);
+  return { start: p.from, end: end < NOW ? end : NOW };
+}
+
+function periodsOf(site: Site, s: DashState): { cur: Period; cmp: Period | null } {
+  const cur = resolve(s, NOW, firstDay(site));
+  const cmp = s.compare === "off" || s.range === "realtime" ? null : comparePeriod(cur, s.compare, NOW);
+  return { cur, cmp };
 }
 
 /**
@@ -375,11 +370,10 @@ function compareOf(s: DashState, iv: Span): Span | null {
  * 汇总层能答的查询（整本地日的范围、天以上的粒度、没有筛选）没有这两个提示；规则见 system-design §6.4。
  */
 function warningsOf(site: Site, s: DashState): { beyondRetention: boolean; importedExcluded: boolean } {
-  const compatible = !s.filters.length && s.range !== "realtime" && s.range !== "24h" && s.gran !== "minute" && s.gran !== "hour";
+  const compatible = !s.filters.length && s.range !== "realtime" && s.range !== "24h" && !s.from?.includes("T") && s.gran !== "minute" && s.gran !== "hour";
   if (compatible) return { beyondRetention: false, importedExcluded: false };
-  const iv = intervalOf(site, s);
-  const cmp = compareOf(s, iv);
-  const spans = cmp ? [iv, cmp] : [iv];
+  const { cur, cmp } = periodsOf(site, s);
+  const spans = cmp ? [spanOf(cur), spanOf(cmp)] : [spanOf(cur)];
   const keep = Number(cfgs[site.id]?.retention) || INSTANCE_RETENTION;
   const since = NOW.getTime() - keep * DAY;
   const imported = importedSpan(site);
@@ -429,6 +423,53 @@ function weeks(points: Point[]): Point[] {
   return out;
 }
 
+/** 按月合并按天的点（自定义的长范围按月看）。 */
+function monthsOf(points: Point[]): Point[] {
+  const out: Point[][] = [];
+  for (const p of points) {
+    const last = out.at(-1);
+    if (last && last[0].t.getMonth() === p.t.getMonth() && last[0].t.getFullYear() === p.t.getFullYear()) last.push(p);
+    else out.push([p]);
+  }
+  return out.map((chunk) => {
+    const visits = chunk.reduce((a, p) => a + p.visits, 0);
+    const pv = chunk.reduce((a, p) => a + p.pageviews, 0);
+    return {
+      t: new Date(chunk[0].t.getFullYear(), chunk[0].t.getMonth(), 1),
+      visitors: Math.round(chunk.reduce((a, p) => a + p.visitors, 0) * 0.8),
+      visits,
+      pageviews: pv,
+      bounce_rate: chunk.reduce((a, p) => a + p.bounce_rate * p.visits, 0) / (visits || 1),
+      visit_duration: chunk.reduce((a, p) => a + p.visit_duration * p.visits, 0) / (visits || 1),
+      views_per_visit: pv / (visits || 1),
+    };
+  });
+}
+
+const HOUR = 36e5;
+const floorHour = (d: Date) => new Date(d.getFullYear(), d.getMonth(), d.getDate(), d.getHours());
+
+/**
+ * 任意区间的序列（昨天、上个月、自定义范围，以及它们的对比期）：未来的部分不出点。
+ * 预设走下面的 series()，保持原来的样子。
+ */
+function periodSeries(site: Site, p: Period, gran: Gran, factor: number): Point[] {
+  const today = new Date(NOW.getFullYear(), NOW.getMonth(), NOW.getDate());
+  if (gran === "hour" || gran === "minute") {
+    const end = p.kind === "instant" ? new Date(p.to.getTime() - 1) : new Date(p.to.getFullYear(), p.to.getMonth(), p.to.getDate(), 23);
+    const last = floorHour(end < NOW ? end : NOW);
+    const first = floorHour(p.from);
+    const hours = Math.round((last.getTime() - first.getTime()) / HOUR) + 1;
+    if (hours <= 0) return [];
+    return hourly(site, hours, Math.round((floorHour(NOW).getTime() - last.getTime()) / HOUR), factor);
+  }
+  const last = p.to > today ? today : p.to;
+  const days = Math.round((last.getTime() - p.from.getTime()) / DAY) + 1;
+  if (days <= 0) return [];
+  const d = daily(site, days, Math.round((today.getTime() - last.getTime()) / DAY), factor);
+  return gran === "week" ? weeks(d) : gran === "month" ? monthsOf(d) : d;
+}
+
 function series(site: Site, s: DashState, factor: number, prev: boolean): Point[] {
   const yoy = s.compare === "year_over_year";
   const off = prev ? 1 : 0;
@@ -460,6 +501,11 @@ function series(site: Site, s: DashState, factor: number, prev: boolean): Point[
       if (s.gran === "day") return daily(site, months * 30, off * months * 30, k);
       if (s.gran === "week") return weeks(daily(site, months * 30, off * months * 30, k));
       return monthly(site, months, k, off);
+    }
+    default: {
+      // 昨天、上个月、自定义范围：按区间生成；对比期就是对比区间里的数据
+      const { cur, cmp } = periodsOf(site, s);
+      return periodSeries(site, prev && cmp ? cmp : cur, s.gran, factor);
     }
   }
 }
@@ -512,10 +558,11 @@ export function runQuery(site: Site, s: DashState, lang: Lang, blank = false): D
   const points = blank ? zeroed(series(site, s, factor, false)) : series(site, s, factor, false);
   const cmpOn = s.compare !== "off" && s.range !== "realtime";
   const prevPoints = cmpOn ? series(site, s, factor, true).slice(-points.length) : null;
+  const { cur, cmp } = periodsOf(site, s);
   const { x, tip } = labels(points, s.gran, lang);
   const prevTip = prevPoints ? labels(prevPoints, s.gran, lang).tip : [];
-  // 每个范围都包含「现在」（过去 N 天含今天，6mo、12mo 含本月），最后一个桶都不完整
-  const partialLast = true;
+  // 包含「现在」的范围（过去 N 天含今天，6mo、12mo 含本月）最后一个桶不完整；昨天、上个月这类过去的范围是完整的
+  const partialLast = spanOf(cur).end >= NOW;
   let kpis: Kpi[] = METRICS.map((key) => ({
     key,
     value: total(points, key),
@@ -544,6 +591,8 @@ export function runQuery(site: Site, s: DashState, lang: Lang, blank = false): D
       }));
 
   return {
+    period: capped(cur, NOW),
+    comparePeriod: cmp,
     points,
     prevPoints,
     xLabels: x,

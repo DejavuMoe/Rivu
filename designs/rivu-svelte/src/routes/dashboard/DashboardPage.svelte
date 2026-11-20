@@ -39,6 +39,7 @@
     DIMS,
     GEO_ATTRIBUTION,
     encodeFilters,
+    firstDay,
     geoHasRegions,
     grans,
     readState,
@@ -49,6 +50,9 @@
     type MetricKey,
   } from "./query";
   import { fmtAxis, fmtMetric, lowerIsBetter } from "./metrics";
+  import { NOW } from "../../lib/data/fixtures";
+  import { periodText, rangeQuery, ymd, type RangeParam } from "./period";
+  import { rangeUi } from "./range";
 
   let { site, mode = "app" }: { site: Site; mode?: "app" | "shared" } = $props();
   const shared = $derived(mode === "shared");
@@ -130,6 +134,17 @@
     notesOpen = true;
   }
 
+  // 范围：按钮文字、上一周期 / 下一周期、自定义对话框的初始值。图例里写出主区间和对比期的具体日期，
+  // 让人知道「过去 30 天」「对比上一周期」到底是哪几天；导出的文件名用同样的日期
+  const first = $derived(firstDay(site));
+  const periodLabel = $derived(realtime ? "" : periodText(res.period, app.lang, NOW));
+  const compareLabel = $derived(res.comparePeriod ? periodText(res.comparePeriod, app.lang, NOW) : "");
+  const ru = $derived(rangeUi(dash, res.period, first, site.timezone, app.lang));
+  function setRange(r: RangeParam) {
+    // 换范围时粒度回到默认（不同范围允许的粒度不同）
+    setQuery({ ...rangeQuery(r), gran: null });
+  }
+
   /** 导出：有效角色 editor 起（含站点访客 editor）；分享：组织成员里的 editor 起，站点访客不行 */
   const mayExport = $derived(canEdit(site));
   const mayShare = $derived(canEdit(site) && siteAccess(site).access === "member");
@@ -163,8 +178,8 @@
         toast(t("dash.exportFailed"), "bad");
         return;
       }
-      const day = (d: Date | undefined) => (d ? d.toISOString().slice(0, 10) : "");
-      const span = `${day(res.points[0]?.t)}-${day(res.points.at(-1)?.t)}`;
+      // 文件名带区间的起止日（站点本地日，终点封顶到今天），和看板上的范围一致
+      const span = `${ymd(res.period.from)}-${ymd(res.period.kind === "instant" ? new Date(res.period.to.getTime() - 1) : res.period.to)}`;
       toast(t("dash.exportedFile", { f: `rivu-${site.domain}-${span}.zip` }), "good");
     }, 900);
   }
@@ -191,7 +206,11 @@
       {dash}
       dims={filterDims}
       suggest={(dim) => suggestValues(site, dim)}
-      onrange={(r) => setQuery({ range: r === "30d" ? null : r, gran: null })}
+      rangeText={ru.rangeText}
+      prev={ru.prev}
+      next={ru.next}
+      custom={ru.custom}
+      onrange={setRange}
       oncompare={(c) => setQuery({ cmp: c === "previous_period" ? null : c })}
       onfilters={(fs: Filter[]) => setQuery({ f: fs.length ? encodeFilters(fs) : null })}
     >
@@ -235,7 +254,7 @@
             <Button variant="primary" href={href(`/s/${site.id}/install`)}>{t("dash.installGuide")}</Button>
           {:else if !neverReceived && dash.range !== "all"}
             <!-- 所选范围没有数据，但站点以前收到过 -->
-            <Button onclick={() => setQuery({ range: "all", gran: null })}>{t("dash.viewAll")}</Button>
+            <Button onclick={() => setRange({ range: "all" })}>{t("dash.viewAll")}</Button>
           {/if}
         {/snippet}
       </EmptyState>
@@ -251,24 +270,30 @@
       <div class="chart-head">
         <div class="lead">
           <div class="legend">
-            <span class="key" aria-hidden="true"></span>
-            <span>{t(`metric.${metric}`)}</span>
+            <span class="item">
+              <span class="key" aria-hidden="true"></span>
+              <span>{t(`metric.${metric}`)}</span>
+              {#if periodLabel}<span class="muted num">{periodLabel}</span>{/if}
+            </span>
             {#if prevValues}
-              <span class="key compare" aria-hidden="true"></span>
-              <span class="muted">{compareText}</span>
+              <span class="item">
+                <span class="key compare" aria-hidden="true"></span>
+                <span class="muted">{compareText}</span>
+                <span class="muted num">{compareLabel}</span>
+              </span>
             {/if}
           </div>
           <!-- 访客、访问、浏览量容易混：选中哪个指标，就在图上方用一句话说明它怎么算 -->
           <p class="def">{t(`metric.${metric}.def`)}</p>
         </div>
         <div class="tools">
-          {#if grans(dash.range).length > 1}
+          {#if grans(dash).length > 1}
             <Segmented
               size="sm"
               label={t("gran.label")}
               value={dash.gran}
-              onchange={(g: Gran) => setQuery({ gran: g === grans(dash.range)[0] ? null : g })}
-              options={grans(dash.range).map((g) => ({ value: g, label: t(`gran.${g}`) }))}
+              onchange={(g: Gran) => setQuery({ gran: g === grans(dash)[0] ? null : g })}
+              options={grans(dash).map((g) => ({ value: g, label: t(`gran.${g}`) }))}
             />
           {/if}
           {#if mayNote}
@@ -431,7 +456,9 @@
   .legend {
     display: flex;
     align-items: center;
-    gap: var(--sp-2);
+    flex-wrap: wrap;
+    column-gap: var(--sp-4);
+    row-gap: var(--sp-1);
     /* 与右侧工具（28px 高）同一行居中 */
     min-height: var(--control-sm);
     font-weight: var(--fw-medium);
@@ -439,6 +466,11 @@
   .def {
     color: var(--text-muted);
     font-size: var(--fs-sm);
+  }
+  .legend .item {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--sp-2);
   }
   .legend .muted {
     font-weight: var(--fw-regular);
@@ -450,7 +482,6 @@
     background: var(--series-1);
   }
   .key.compare {
-    margin-left: var(--sp-2);
     background: var(--series-compare);
   }
   .tools {

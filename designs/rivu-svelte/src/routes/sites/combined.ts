@@ -5,7 +5,9 @@
 import type { Point, Site } from "../../lib/data/fixtures";
 import { SITES } from "../../lib/data/sites.svelte";
 import type { Lang } from "../../lib/state.svelte";
-import { RANGES, grans, runQuery, type Gran, type Kpi, type MetricKey, type RangeKey } from "../dashboard/query";
+import { NOW } from "../../lib/data/fixtures";
+import { RANGES, firstDay, grans, runQuery, type Gran, type Kpi, type MetricKey, type RangeKey } from "../dashboard/query";
+import { readRange, type Period, type RangeParam } from "../dashboard/period";
 
 /** 组织里当前用户能读的站点（原型里侧栏与站点列表列出的就是能读的）。 */
 export function readableSites(orgId: string): Site[] {
@@ -22,19 +24,20 @@ export const COMBINED_RANGES: RangeKey[][] = RANGES.filter((g) => !g.includes("r
 
 export const COMBINED_METRICS: MetricKey[] = ["visitors", "visits", "pageviews", "bounce_rate", "visit_duration"];
 
-export interface CombinedState {
-  range: RangeKey;
+/** 范围（range，自定义时还有 from、to）+ 粒度、指标。 */
+export interface CombinedState extends RangeParam {
   gran: Gran;
   metric: MetricKey;
 }
 
 export function readCombined(q: URLSearchParams): CombinedState {
-  const raw = q.get("range") as RangeKey;
-  const range = COMBINED_RANGES.flat().includes(raw) ? raw : "30d";
-  const allowed = grans(range);
+  // 范围的写法与站点看板相同（含自定义的 from、to），只是没有实时
+  const read = readRange(q, NOW);
+  const r: RangeParam = read.range === "realtime" ? { range: "30d" } : read;
+  const allowed = grans(r);
   const gran = allowed.includes(q.get("gran") as Gran) ? (q.get("gran") as Gran) : allowed[0];
   const m = q.get("metric") as MetricKey;
-  return { range, gran, metric: COMBINED_METRICS.includes(m) ? m : "visitors" };
+  return { ...r, gran, metric: COMBINED_METRICS.includes(m) ? m : "visitors" };
 }
 
 export interface SiteRow {
@@ -49,6 +52,8 @@ export interface SiteRow {
 }
 
 export interface CombinedResult {
+  /** 查询区间（终点封顶到今天）：范围按钮文字、前后周期用 */
+  period: Period;
   points: Point[];
   xLabels: string[];
   tipLabels: string[];
@@ -64,7 +69,7 @@ const kpi = (k: Kpi[], key: MetricKey) => k.find((x) => x.key === key)?.value ??
 export function runCombined(sites: Site[], s: CombinedState, lang: Lang, blank = false): CombinedResult {
   const per = sites.map((site) => ({
     site,
-    res: runQuery(site, { range: s.range, compare: "off", gran: s.gran, metric: s.metric, filters: [] }, lang, blank),
+    res: runQuery(site, { range: s.range, from: s.from, to: s.to, compare: "off", gran: s.gran, metric: s.metric, filters: [] }, lang, blank),
   }));
   const base = per[0].res;
 
@@ -122,5 +127,10 @@ export function runCombined(sites: Site[], s: CombinedState, lang: Lang, blank =
     { key: "visit_duration", value: visits ? raw.reduce((a, r) => a + r.visit_duration * r.visits, 0) / visits : 0, prev: null },
   ];
 
-  return { points, xLabels: base.xLabels, tipLabels: base.tipLabels, partialLast: base.partialLast, kpis, rows, visitorsSum };
+  return { period: base.period, points, xLabels: base.xLabels, tipLabels: base.tipLabels, partialLast: base.partialLast, kpis, rows, visitorsSum };
+}
+
+/** 几个站点里最早有数据的本地日：「全部时间」的起点。 */
+export function combinedFirstDay(sites: Site[]): Date {
+  return new Date(Math.min(...sites.map((s) => firstDay(s).getTime())));
 }
