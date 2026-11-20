@@ -18,7 +18,8 @@
   import Field from "../../lib/ui/Field.svelte";
   import Skeleton from "../../lib/ui/Skeleton.svelte";
   import Switch from "../../lib/ui/Switch.svelte";
-  import { USER, type Site } from "../../lib/data/fixtures";
+  import type { Site } from "../../lib/data/fixtures";
+  import { account } from "./email.svelte";
   import { SITES } from "../../lib/data/sites.svelte";
   import { t } from "../../lib/i18n";
   import { app, toast } from "../../lib/state.svelte";
@@ -110,7 +111,7 @@
     {:else}
       <div class="rows">
         <Field layout="row" label={t("ac.weekly.recipient")}>
-          <span class="val">{USER.email}</span>
+          <span class="val">{account.email}</span>
         </Field>
         <Field layout="row" label={t("ac.weekly.content")}>
           <span class="val">{t("ac.weekly.metrics")}</span>
@@ -121,7 +122,7 @@
         <div class="note"><Callout tone="bad">{t("ac.weekly.sendFailed")}</Callout></div>
       {/if}
       {#if weekly.email === "pending"}
-        <p class="note">{t("ac.weekly.pendingBody", { email: USER.email })}</p>
+        <p class="note">{t("ac.weekly.pendingBody", { email: account.email })}</p>
       {:else if weekly.email === "confirmed"}
         {#if !mail}
           <div class="note"><Callout tone="warn">{t("ac.weekly.paused")}</Callout></div>

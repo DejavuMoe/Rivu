@@ -9,6 +9,10 @@
 | [`rivu-svelte/`](rivu-svelte/) | **主原型**。整个看板和管理后台，可以点、可以切换角色和各种状态。用的令牌和共享组件与生产逐字节相同 | 已确认。「账号 → 邮件周报」和确认链接页于 2026-11-19 确认，已按它实现 |
 | [`weekly-report/`](weekly-report/) | 周报相关的邮件（`email.html`）：周报邮件、确认邮件，以及现行的退订页 | 待确认 |
 
+### 账号页与邮件：待确认的部分
+
+- 修改登录邮箱（#37）：待确认。`rivu-svelte` 的「账号 → 个人资料 → 邮箱 → 修改」，以及发到新邮箱的确认链接页（`#/email-change/confirm/t0k3n`，失效：`#/email-change/confirm/expired`）。评审面板：「邮件」「两步验证」「改邮箱」「改邮箱链接」「确认邮件」「登录结果」。
+
 ### 周报为什么分两处
 
 - **订阅界面在主原型里，已经实现**：`rivu-svelte` 的「账号 → 邮件周报」，以及邮件链接打开的确认页（`#/weekly-report/confirm/t0k3n`）。邮箱确认一次，之后每个站点一个开关。生产里对应 `apps/dashboard` 的账号页和 `(auth)/weekly-report/confirm/[token]` 页。

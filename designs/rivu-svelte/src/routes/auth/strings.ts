@@ -100,4 +100,19 @@ extend({
   "wconfirm.invalidTitle": ["链接已失效", "This link has expired"],
   "wconfirm.invalidBody": ["确认链接已过期，或者已经用过。可以在账号页重新发送。", "This confirmation link has expired or was already used. You can send a new one from your account page."],
   "wconfirm.toAccount": ["去账号页", "Go to account"],
+
+  // ---- 确认新的登录邮箱（邮件里的链接）----
+  "econfirm.title": ["确认新的登录邮箱", "Confirm your new sign-in email"],
+  "econfirm.body": ["确认后，你要用 {email} 登录，不能再用 {old}。其他设备会退出登录。", "After you confirm, you'll sign in with {email} instead of {old}. Other devices will be signed out."],
+  "econfirm.bodySignedOut": ["确认后，你要用 {email} 登录，不能再用 {old}。所有设备都会退出登录。", "After you confirm, you'll sign in with {email} instead of {old}. Every device will be signed out."],
+  "econfirm.submit": ["确认修改", "Confirm change"],
+  "econfirm.failed": ["确认失败，请稍后重试。", "Couldn't confirm. Try again shortly."],
+  "econfirm.doneTitle": ["登录邮箱已修改", "Sign-in email changed"],
+  "econfirm.doneBody": ["现在用 {email} 登录。其他设备已退出登录。", "You now sign in with {email}. Other devices were signed out."],
+  "econfirm.doneBodySignedOut": ["所有设备都已退出，用 {email} 重新登录。", "You've been signed out everywhere. Sign in again with {email}."],
+  "econfirm.reportsMoved": ["周报也改发到这个邮箱。", "Weekly reports now go to this email too."],
+  "econfirm.toAccount": ["回到账号页", "Back to account"],
+  "econfirm.toLogin": ["去登录", "Sign in"],
+  "econfirm.invalidTitle": ["链接已失效", "This link has expired"],
+  "econfirm.invalidBody": ["确认链接已过期、已经用过，或者这次修改已取消。可以在账号页重新修改。", "This confirmation link has expired, was already used, or the change was cancelled. You can start again from your account page."],
 });

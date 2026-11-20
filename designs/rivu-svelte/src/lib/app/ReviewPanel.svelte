@@ -9,6 +9,7 @@
   import { app, setLang, setReview, setTheme, type DataState, type Role } from "../state.svelte";
   import { navigate } from "../router.svelte";
   import { weekly, type WeeklyEmail } from "../../routes/account/weekly.svelte";
+  import { account, DEMO_NEW_EMAIL } from "../../routes/account/email.svelte";
 
   let open = $state(false);
 
@@ -31,6 +32,8 @@
     ["/account", "账号"],
     ["/weekly-report/confirm/t0k3n", "周报确认链接"],
     ["/weekly-report/confirm/expired", "周报链接失效"],
+    ["/email-change/confirm/t0k3n", "改邮箱确认链接"],
+    ["/email-change/confirm/expired", "改邮箱链接失效"],
     ["/share/9f3k2m7q8w1x4z6c5v0b2n8m", "共享链接"],
     ["/share/locked-7h2x9d4k", "共享链接（要密码）"],
     ["/share/missing", "链接无效"],
@@ -236,15 +239,44 @@
         />
       </div>
       <div class="row">
-        <span>周报确认邮件</span>
+        <span>确认邮件</span>
         <Segmented
           size="sm"
-          label="周报确认邮件"
+          label="确认邮件"
           value={app.review.weeklyMail}
           onchange={(v) => setReview({ weeklyMail: v })}
           options={[
             { value: "ok", label: "发出" },
             { value: "fails", label: "发送失败" },
+          ]}
+        />
+      </div>
+      <div class="row">
+        <span>改邮箱</span>
+        <Segmented
+          size="sm"
+          label="改邮箱"
+          value={account.pending ? "pending" : "none"}
+          onchange={(v) => {
+            account.pending = v === "pending" ? DEMO_NEW_EMAIL : "";
+            account.delivered = true;
+          }}
+          options={[
+            { value: "none", label: "无" },
+            { value: "pending", label: "待确认" },
+          ]}
+        />
+      </div>
+      <div class="row">
+        <span>改邮箱链接</span>
+        <Segmented
+          size="sm"
+          label="改邮箱链接"
+          value={app.review.emailLink}
+          onchange={(v) => setReview({ emailLink: v })}
+          options={[
+            { value: "signedIn", label: "已登录" },
+            { value: "signedOut", label: "未登录" },
           ]}
         />
       </div>
