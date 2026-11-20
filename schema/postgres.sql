@@ -57,6 +57,22 @@ TABLE auth_tokens
   CREATE UNIQUE INDEX auth_tokens_token ON public.auth_tokens USING btree (token_hash)
   CREATE INDEX auth_tokens_user ON public.auth_tokens USING btree (user_id)
 
+TABLE email_changes
+  user_id bigint NOT NULL
+  old_email citext NOT NULL
+  new_email citext NOT NULL
+  lang text NOT NULL
+  token_hash bytea NOT NULL
+  expires_at timestamp with time zone NOT NULL
+  created_at timestamp with time zone NOT NULL DEFAULT now()
+  CONSTRAINT email_changes_lang_check CHECK ((lang = ANY (ARRAY['zh'::text, 'en'::text])))
+  CONSTRAINT email_changes_new_email_check CHECK (((char_length((new_email)::text) >= 3) AND (char_length((new_email)::text) <= 320)))
+  CONSTRAINT email_changes_pkey PRIMARY KEY (user_id)
+  CONSTRAINT email_changes_token_hash_check CHECK ((octet_length(token_hash) = 32))
+  CONSTRAINT email_changes_user_id_fkey FOREIGN KEY (user_id) REFERENCES users(id)
+  CREATE INDEX email_changes_expires ON public.email_changes USING btree (expires_at)
+  CREATE UNIQUE INDEX email_changes_token ON public.email_changes USING btree (token_hash)
+
 TABLE goals
   id bigint NOT NULL GENERATED ALWAYS AS IDENTITY
   site_id bigint NOT NULL

@@ -1,6 +1,6 @@
-//! 发邮件：邀请、找回密码和周报（`RIVU_SMTP_URL`、`RIVU_SMTP_FROM`）。
+//! 发邮件：邀请、找回密码、更换登录邮箱和周报（`RIVU_SMTP_URL`、`RIVU_SMTP_FROM`）。
 //!
-//! 邀请和找回密码只发纯文本。周报的两封邮件（[`weekly_report`]）另带一个 HTML 部分，
+//! 邀请和找回密码只发纯文本。周报的两封邮件（[`weekly_report`]）和更换登录邮箱的两封邮件（[`email_change`]）另带一个 HTML 部分，
 //! 以 `multipart/alternative` 发出，纯文本在前；HTML 也没有跟踪像素、远程图片和脚本。
 //! 语言跟随触发它的请求（`Accept-Language` 以 `zh` 开头用中文，其余英文）。
 //! 测试用 [`Mailer::memory`]，邮件存在内存里。
@@ -15,6 +15,7 @@ use lettre::message::{
 };
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 
+pub mod email_change;
 pub mod weekly_report;
 
 /// 一次 SMTP 会话的超时。

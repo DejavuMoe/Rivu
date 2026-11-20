@@ -97,6 +97,7 @@ pub async fn reset_password(
         .await
         .context("更新 users.password_hash 失败")?;
     invalidate_password_resets(&mut tx, user_id).await?;
+    crate::email_changes::invalidate(&mut tx, user_id).await?;
     sqlx::query(
         "UPDATE auth_sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL",
     )

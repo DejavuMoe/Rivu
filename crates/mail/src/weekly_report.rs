@@ -249,7 +249,7 @@ const DARK_RULES: &str = "
         .metric + .metric { border-top-color: #3a3a3a !important; }";
 
 /// 外框：标题、摘要（收件箱列表里显示的那一行，正文里隐藏）、卡片和左上角的 Rivu。
-fn shell(lang: Lang, title: &str, preheader: &str, body: &str) -> String {
+pub(crate) fn shell(lang: Lang, title: &str, preheader: &str, body: &str) -> String {
     let lang = match lang {
         Lang::Zh => "zh-CN",
         Lang::En => "en",
@@ -278,13 +278,13 @@ fn shell(lang: Lang, title: &str, preheader: &str, body: &str) -> String {
 }
 
 #[derive(Clone, Copy)]
-enum Tone {
+pub(crate) enum Tone {
     Body,
     Muted,
 }
 
 /// 一段文字。`content` 已经是 HTML（调用方负责转义）。
-fn para(tone: Tone, content: &str, extra: &str) -> String {
+pub(crate) fn para(tone: Tone, content: &str, extra: &str) -> String {
     let (class, size, color) = match tone {
         Tone::Body => ("tx", "14px;line-height:22px", TEXT),
         Tone::Muted => ("mu", "12px;line-height:18px", MUTED),
@@ -295,14 +295,14 @@ fn para(tone: Tone, content: &str, extra: &str) -> String {
 }
 
 /// `content` 已经转义。
-fn heading(content: &str) -> String {
+pub(crate) fn heading(content: &str) -> String {
     format!(
         "<h1 class=\"tx\" style=\"margin:0;font-family:{SANS};font-size:16px;line-height:24px;font-weight:600;color:{TEXT};mso-line-height-rule:exactly;\">{content}</h1>"
     )
 }
 
 /// 蓝色主按钮。
-fn button(href: &str, label: &str) -> String {
+pub(crate) fn button(href: &str, label: &str) -> String {
     format!(
         "<table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" border=\"0\"><tr>\n\
          <td bgcolor=\"#0090ff\" style=\"border-radius:6px;background:#0090ff;\">\n\
@@ -314,7 +314,7 @@ fn button(href: &str, label: &str) -> String {
 }
 
 /// 分隔线下面的页脚，每项一行。
-fn footer(lines: &[String]) -> String {
+pub(crate) fn footer(lines: &[String]) -> String {
     format!(
         "<tr><td class=\"px\" style=\"padding:28px 32px 28px;\">\n\
          <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" border=\"0\"><tr><td class=\"line\" style=\"border-top:1px solid {LINE};padding-top:16px;\">\n\
@@ -324,7 +324,7 @@ fn footer(lines: &[String]) -> String {
 }
 
 /// 把控制字符（换行、制表等）换成空格并收拢成一行，过长的截断：用在主题和纯文本正文里。
-fn single_line(value: &str) -> String {
+pub(crate) fn single_line(value: &str) -> String {
     const MAX_CHARS: usize = 200;
     let cleaned: String = value
         .chars()
@@ -344,7 +344,7 @@ fn single_line(value: &str) -> String {
 }
 
 /// 正文和属性值里都能用的转义。
-fn escape(value: &str) -> String {
+pub(crate) fn escape(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for c in value.chars() {
         match c {
