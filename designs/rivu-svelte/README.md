@@ -4,9 +4,9 @@
 
 2026-11-19 确认、正在实现的部分：「账号 → 邮件周报」（`src/routes/account/WeeklyReportsCard.svelte`）和邮件里的确认链接页（`src/routes/auth/WeeklyConfirmPage.svelte`，路径 `#/weekly-report/confirm/t0k3n`）。
 
-待确认的部分（等所有者确认后再进 `apps/dashboard`）：
+v0.2.0 的部分，2026-11-20 确认按原型实现（修改登录邮箱和世界地图按意见改过，等再看一眼）：
 
-- 修改登录邮箱（#37）：`src/routes/account/LoginEmail.svelte`（账号页个人资料的「邮箱」一行和对话框）与确认链接页 `src/routes/auth/EmailChangeConfirmPage.svelte`（`#/email-change/confirm/t0k3n`）。
+- 修改登录邮箱（#37）：`src/routes/account/LoginEmail.svelte`（账号页个人资料的「邮箱」一行和对话框）与确认链接页 `src/routes/auth/EmailChangeConfirmPage.svelte`（`#/email-change/confirm/t0k3n`）。只要新邮箱和当前密码，开了两步验证也不要验证码。
 - 月报（#38）：`src/routes/account/WeeklyReportsCard.svelte` 改成「邮件订阅」卡片，站点 × 周报 / 月报的开关表（文件名沿用）。
 - 流量突增通知（#39）：站点设置的「通知」分区 `src/routes/settings/AlertsSection.svelte`（`#/s/1/settings/alerts`，所有者 / 管理员，且「邮件」为已配置），以及「邮件订阅」表里的「流量突增」一列。
 - 分群（#40）：`src/routes/dashboard/SegmentMenu.svelte`，`#/s/1` 筛选栏的「分群」；评审面板「看板分群」切换有 / 无，「角色」切到查看者只剩套用。
@@ -15,7 +15,7 @@
 - 自定义日期范围、「昨天」「上个月」、上一周期 / 下一周期（#32）：`src/routes/dashboard/period.ts`、`RangeDialog.svelte`、`FilterBar.svelte`。范围按钮菜单最后一项「自定义范围…」；箭头按范围自己的长度前后平移，按月的范围按自然月平移；实时和全部时间没有箭头。合并看板 `#/sites/combined` 也用这个控件（`RangeControl.svelte`），自定义日期每个站点按自己的时区算。
 - 页面报表的平均滚动深度、平均停留时间（#34）：只在「页面」卡片的明细表（「查看全部」）里，窄屏收进页面名下面的一行小字；口径写在表格下方。卡片本身不变。
 - 位置报表的城市（#35）：评审面板新增「地理库」（按站点 / 城市级 / 国家级）。城市级：国家、地区、城市三个标签页，城市行是城市名加国家，筛选里有地区和城市；国家级（默认的 DB-IP Lite）：只有国家，卡片底部「为什么只有国家」弹出一句原因和配置说明的链接（共享链接和公开看板不显示）。站点设置里地理精度选「国家」时也只有国家，不另作说明。
-- 位置报表的世界地图（#43）：共享图表 `src/lib/charts/WorldMap.svelte`，形状数据 `src/lib/charts/world/countries-110m.ts`（Natural Earth 1:110m，公有领域，来源见同目录 `PROVENANCE.md`，用 `scripts/gen-world-map.mjs` 生成），已逐字节复制到 `apps/dashboard/src/lib/charts`（那边暂未使用）。看板按需动态加载地图，不进首屏；单文件原型会把它内联，所以原型的 `dist/index.html` 变大不代表看板首屏变大。
+- 位置报表的世界地图（#43）：共享图表 `src/lib/charts/WorldMap.svelte`，形状数据 `src/lib/charts/world/countries-110m.ts`（Natural Earth 1:110m，公有领域，来源见同目录 `PROVENANCE.md`，用 `scripts/gen-world-map.mjs` 生成），已逐字节复制到 `apps/dashboard/src/lib/charts`（那边暂未使用）。位置卡片保持半宽，地图是最后一个标签页「地图」（`BreakdownCard` 的 `visualTab`），数据同国家。看板按需动态加载地图，不进首屏；单文件原型会把它内联，所以原型的 `dist/index.html` 变大不代表看板首屏变大。
 
 ## 运行
 

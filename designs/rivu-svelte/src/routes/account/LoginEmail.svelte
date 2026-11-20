@@ -1,10 +1,10 @@
 <!--
-  个人资料卡里的「邮箱」一行：显示登录邮箱，旁边「修改」打开对话框（新邮箱 + 当前密码，开了两步验证时再加 6 位验证码）。
+  个人资料卡里的「邮箱」一行：显示登录邮箱，旁边「修改」打开对话框（新邮箱 + 当前密码；开了两步验证也不要验证码，与关闭两步验证一致）。
   - 配置了邮件：提交后给新邮箱发确认链接，邮箱暂时不变；这一行下面显示「确认链接已发到 …」，可以重新发送或取消。
     打开链接、在确认页点按钮后才生效（routes/auth/EmailChangeConfirmPage.svelte），其他设备随之退出，原邮箱收到一封通知。
   - 没配置邮件：校验密码后立即生效，对话框里提前说明原邮箱不能再用来登录。
   - 周报邮箱已确认时，周报跟着改发到新邮箱，对话框里说一句；周报邮箱还在待确认时，旧的确认链接作废，回到未确认。
-  原型里：密码的校验结果由评审面板的「登录结果」演示，验证码 000000 演示错误，组织成员的邮箱（如 zhou.qiming@northwind.dev）演示已被使用，
+  原型里：密码的校验结果由评审面板的「登录结果」演示，组织成员的邮箱（如 zhou.qiming@northwind.dev）演示已被使用，
   「确认邮件」演示发送失败，「改邮箱」直接切到待确认。
 -->
 <script lang="ts">
@@ -20,7 +20,6 @@
   import "./strings";
 
   const mail = $derived(app.review.mail);
-  const needCode = $derived(app.review.twofa === "on");
   /** 没配置邮件时不会有待确认的修改 */
   const pending = $derived(mail ? account.pending : "");
 
@@ -28,11 +27,10 @@
   let open = $state(false);
   let email = $state("");
   let password = $state("");
-  let code = $state("");
   let tried = $state(false);
   let busy = $state(false);
   /** 服务端返回的字段错误（输入变了就清掉） */
-  let serverErr = $state<{ email?: string; password?: string; code?: string }>({});
+  let serverErr = $state<{ email?: string; password?: string }>({});
   let sendFailed = $state(false);
 
   const err = $derived({
@@ -46,11 +44,10 @@
             ? t("ac.email.same")
             : ""),
     password: serverErr.password ?? (password ? "" : t("ac.pw.currentRequired")),
-    code: serverErr.code ?? (!needCode || /^\d{6}$/.test(code.trim()) ? "" : t("ac.email.codeRequired")),
   });
 
   function start() {
-    email = password = code = "";
+    email = password = "";
     tried = false;
     serverErr = {};
     sendFailed = false;
@@ -60,7 +57,7 @@
   function submit(e: SubmitEvent) {
     e.preventDefault();
     tried = true;
-    if (err.email || err.password || err.code || busy) return;
+    if (err.email || err.password || busy) return;
     busy = true;
     sendFailed = false;
     setTimeout(() => {
@@ -71,8 +68,7 @@
       else if (r === "failed") {
         open = false;
         toast(t("ac.failed"), "bad");
-      } else if (needCode && code.trim() === "000000") serverErr = { code: t("ac.email.codeWrong") };
-      else if (emailTaken(email)) serverErr = { email: t("ac.email.taken") };
+      } else if (emailTaken(email)) serverErr = { email: t("ac.email.taken") };
       else if (mail && app.review.weeklyMail === "fails") sendFailed = true;
       else done(email.trim());
     }, 500);
@@ -170,21 +166,6 @@
         invalid={tried && !!err.password}
       />
     </Field>
-    {#if needCode}
-      <Field label={t("ac.email.code")} for="ec-code" error={tried ? err.code : ""}>
-        <Input
-          id="ec-code"
-          mono
-          inputmode="numeric"
-          autocomplete="one-time-code"
-          maxlength={6}
-          placeholder="000000"
-          bind:value={code}
-          oninput={() => (serverErr = { ...serverErr, code: undefined })}
-          invalid={tried && !!err.code}
-        />
-      </Field>
-    {/if}
     {#if sendFailed}<Callout tone="bad">{t("ac.email.sendFailed")}</Callout>{/if}
     {#if !mail || weekly.email === "confirmed"}
       <div class="notes">

@@ -3,7 +3,7 @@
   点击行即按该值筛选；国家行前面是两字母代码徽标（不用 emoji 国旗：Windows 上不显示）。
   取值是服务端的原始取值，显示名在这里翻译（values.ts）。
   details：某些维度在「查看全部」的明细表里多几列（页面的滚动深度、停留时间），卡片本身保持一列访客数。
-  visual：某些维度在列表旁边多一个图（国家的世界地图）；卡片窄于 720px 时图在列表上面。
+  visual：多一个只放图的标签页（位置卡片最后的「地图」，用国家的数据）；点图里的国家同样按它筛选，「查看全部」打开国家明细。
 -->
 <script module lang="ts">
   /** 明细表的附加列 */
@@ -48,21 +48,25 @@
     failed?: boolean;
     footer?: Snippet;
     details?: Details;
-    /** 列表旁边的图（拿到这个维度的全部行）与它出现的维度 */
+    /** 只放图的标签页：key 是标签页（也是 dim.<key> 文案），of 是图用的维度（拿到它的全部行） */
     visual?: Snippet<[BarRow[]]>;
-    visualDims?: string[];
+    visualTab?: { key: string; of: string };
     /** 补空行到这个行数，让并排的卡片等高；单独一行的卡片传 0 */
     minRows?: number;
   }
-  let { title, dims, rowsOf, total, onpick, loading = false, failed = false, footer, details, visual, visualDims = [], minRows = 8 }: Props = $props();
+  let { title, dims, rowsOf, total, onpick, loading = false, failed = false, footer, details, visual, visualTab, minRows = 8 }: Props = $props();
 
+  const tabs = $derived(visual && visualTab ? [...dims, visualTab.key] : dims);
   let dim = $state("");
   $effect.pre(() => {
-    if (!dims.includes(dim)) dim = dims[0];
+    if (!tabs.includes(dim)) dim = tabs[0];
   });
+  /** 图的标签页：取数、明细都按图用的那个维度 */
+  const onVisual = $derived(!!visual && dim === visualTab?.key);
+  const dataDim = $derived(onVisual && visualTab ? visualTab.of : dim);
   let full = $state(false);
 
-  const rows = $derived(rowsOf(dim));
+  const rows = $derived(rowsOf(dataDim));
   const toBars = (d: string, rs: Row[]): BarRow[] =>
     rs.map((r) => ({
       key: r.label,
@@ -72,10 +76,10 @@
       sub: r.country ? displayValue("country", r.country, app.lang) : undefined,
       value: r.visitors,
     }));
-  const bars = $derived(toBars(dim, rows));
+  const bars = $derived(toBars(dataDim, rows));
 
   /** 明细表：这个维度有附加列时，每行带上附加列；没有数据的显示「—」 */
-  const extras = $derived(details?.dims.includes(dim) ? details : undefined);
+  const extras = $derived(details?.dims.includes(dataDim) ? details : undefined);
   function withExtras(rs: BarRow[]): BarRow[] {
     if (!extras) return rs;
     return rs.map((r) => ({ ...r, extra: extras.values(r.key) ?? extras.headers.map(() => "—") }));
@@ -86,9 +90,9 @@
 <Card {footer}>
   {#snippet header()}
     <div class="head">
-      {#if dims.length > 1}
+      {#if tabs.length > 1}
         <h2 class="sr-only">{title}</h2>
-        <Tabs size="sm" label={title} bind:value={dim} options={dims.map((d) => ({ value: d, label: t(`dim.${d}`) }))} />
+        <Tabs size="sm" label={title} bind:value={dim} options={tabs.map((d) => ({ value: d, label: t(`dim.${d}`) }))} />
       {:else}
         <h2 class="title">{title}</h2>
       {/if}
@@ -111,13 +115,8 @@
     <EmptyState compact icon={CircleAlert} tone="bad" title={t("dash.error.title")} />
   {:else if !rows.length}
     <EmptyState compact icon={Inbox} title={t("dash.noRows")} />
-  {:else if visual && visualDims.includes(dim)}
-    <div class="wrap">
-      <div class="split">
-        <div class="vis">{@render visual(bars)}</div>
-        <div class="lst">{@render list()}</div>
-      </div>
-    </div>
+  {:else if onVisual && visual}
+    <div class="vis">{@render visual(bars)}</div>
   {:else}
     {@render list()}
   {/if}
@@ -127,13 +126,13 @@
     <BarList
       rows={bars.slice(0, 8)}
       {minRows}
-      dimLabel={t(`fdim.${dim}`)}
+      dimLabel={t(`fdim.${dataDim}`)}
       metricLabel={t("metric.visitors")}
       format={(n) => compact(n, app.lang)}
       {total}
       percent={(r) => percent(r, 0)}
       pickLabel={t("dash.addAsFilter")}
-      onpick={(r) => onpick(dim, r.key)}
+      onpick={(r) => onpick(dataDim, r.key)}
     >
       {#snippet leading(r)}
         {#if r.code}<span class="code">{r.code}</span>{/if}
@@ -144,15 +143,15 @@
 {#if full}
   <BreakdownDialog
     bind:open={full}
-    title={t(`dim.${dim}`)}
-    dimLabel={t(`fdim.${dim}`)}
-    load={(signal) => simulateFetch(() => withExtras(toBars(dim, rowsOf(dim))), signal)}
+    title={t(`dim.${dataDim}`)}
+    dimLabel={t(`fdim.${dataDim}`)}
+    load={(signal) => simulateFetch(() => withExtras(toBars(dataDim, rowsOf(dataDim))), signal)}
     extras={extras?.headers}
     notes={extras ? (allMissing(bars) ? [extras.missing] : extras.notes) : undefined}
     {total}
     onpick={(v) => {
       full = false;
-      onpick(dim, v);
+      onpick(dataDim, v);
     }}
   />
 {/if}
@@ -171,27 +170,9 @@
     padding-left: 10px;
     font-weight: var(--fw-semibold);
   }
-  /* 图和列表：宽卡片里左右排（图占 7 份），窄了上下排 */
-  .wrap {
-    container-type: inline-size;
-  }
-  .split {
-    display: grid;
-    grid-template-columns: minmax(0, 7fr) minmax(0, 5fr);
-    align-items: start;
-    gap: var(--sp-6);
-  }
+  /* 地图标签页：上方留出与列表表头相同的距离 */
   .vis {
-    padding-top: var(--sp-6);
-  }
-  @container (max-width: 720px) {
-    .split {
-      grid-template-columns: 1fr;
-      gap: var(--sp-4);
-    }
-    .vis {
-      padding-top: var(--sp-4);
-    }
+    padding-top: var(--sp-4);
   }
   .sk {
     display: flex;
