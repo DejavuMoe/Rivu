@@ -1,7 +1,8 @@
-//! Account-bound weekly reports. A committed claim consumes the SMTP attempt.
+//! Account-bound weekly and monthly reports. A committed claim consumes the SMTP attempt.
 //!
-//! An account confirms its mailbox once through an emailed link; every site it may read is then an
-//! on/off switch, and a subscription row exists only while the switch is on.
+//! An account confirms its mailbox once through an emailed link; every site it may read then has
+//! one on/off switch per [`Kind`], and a subscription row exists only while that switch is on.
+//! The tables keep their weekly names; the `kind` column tells the reports apart.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -11,12 +12,12 @@ use axum::Router;
 use axum::extract::{Path, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{MethodRouter, get, post, put};
 use jiff::civil::{Date, Weekday};
 use jiff::tz::TimeZone;
 use jiff::{Timestamp, ToSpan};
 use rivu_auth::session;
-use rivu_mail::weekly_report::{Report, confirmation, report};
+use rivu_mail::weekly_report::{Cadence, Report, confirmation, report};
 use rivu_query::result::MetricValue;
 use rivu_query::{ExecOptions, QueryResult, QuerySpec};
 use rivu_storage_pg::access::{self, SiteRef, UserSiteRoles};
@@ -31,9 +32,81 @@ use crate::dash_api::{
 use crate::query_api::{execute_cached, load_site_context, no_store};
 
 type Res<T> = Result<T, DashError>;
-const UNSUBSCRIBE_PATH: &str = "/api/weekly-report/unsubscribe";
 /// Dashboard page that the confirmation email links to; it calls `/api/weekly-report/confirm/{token}`.
 const CONFIRM_PAGE: &str = "/weekly-report/confirm";
+
+/// Which report a switch, a claim or an unsubscribe link belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Kind {
+    Weekly,
+    Monthly,
+}
+
+impl Kind {
+    const ALL: [Kind; 2] = [Kind::Weekly, Kind::Monthly];
+
+    /// The `kind` column value.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Weekly => "weekly",
+            Self::Monthly => "monthly",
+        }
+    }
+
+    fn cadence(self) -> Cadence {
+        match self {
+            Self::Weekly => Cadence::Weekly,
+            Self::Monthly => Cadence::Monthly,
+        }
+    }
+
+    /// Metric route label of the totals query.
+    fn route(self) -> &'static str {
+        match self {
+            Self::Weekly => "weekly_report",
+            Self::Monthly => "monthly_report",
+        }
+    }
+
+    fn unsubscribe_path(self) -> &'static str {
+        match self {
+            Self::Weekly => "/api/weekly-report/unsubscribe",
+            Self::Monthly => "/api/monthly-report/unsubscribe",
+        }
+    }
+}
+
+/// `PUT`/`DELETE /api/internal/sites/{site}/{weekly,monthly}-report`.
+fn switch(kind: Kind) -> MethodRouter<Arc<DashApi>> {
+    put(
+        move |api: State<Arc<DashApi>>, site: Path<String>, req: Request| {
+            subscribe(kind, api, site, req)
+        },
+    )
+    .delete(
+        move |api: State<Arc<DashApi>>, site: Path<String>, headers: HeaderMap| {
+            unsubscribe(kind, api, site, headers)
+        },
+    )
+    .fallback(|| method_not_allowed("PUT, DELETE"))
+}
+
+/// The unsubscribe link mailed with a report; it authorizes solely with the token, never cookies.
+fn unsubscribe_link(api: &Arc<DashApi>, kind: Kind, route: &'static str) -> Router {
+    crate::query_api::count_requests(
+        Router::new()
+            .route(
+                &format!("{}/{{token}}", kind.unsubscribe_path()),
+                get(move |token: Path<String>| unsubscribe_page(kind, token)).post(
+                    move |api: State<Arc<DashApi>>, token: Path<String>| {
+                        unsubscribe_by_token(kind, api, token)
+                    },
+                ),
+            )
+            .with_state(Arc::clone(api)),
+        route,
+    )
+}
 
 pub(crate) fn routes(api: &Arc<DashApi>) -> Router {
     endpoint(
@@ -54,9 +127,13 @@ pub(crate) fn routes(api: &Arc<DashApi>) -> Router {
         api,
         "internal.weekly_report",
         "/api/internal/sites/{site}/weekly-report",
-        put(subscribe)
-            .delete(unsubscribe)
-            .fallback(|| method_not_allowed("PUT, DELETE")),
+        switch(Kind::Weekly),
+    ))
+    .merge(endpoint(
+        api,
+        "internal.monthly_report",
+        "/api/internal/sites/{site}/monthly-report",
+        switch(Kind::Monthly),
     ))
     // These endpoints authorize solely with the mail token, never cookies.
     .merge(crate::query_api::count_requests(
@@ -68,14 +145,15 @@ pub(crate) fn routes(api: &Arc<DashApi>) -> Router {
             .with_state(Arc::clone(api)),
         "weekly_report.confirm",
     ))
-    .merge(crate::query_api::count_requests(
-        Router::new()
-            .route(
-                "/api/weekly-report/unsubscribe/{token}",
-                get(unsubscribe_page).post(unsubscribe_by_token),
-            )
-            .with_state(Arc::clone(api)),
+    .merge(unsubscribe_link(
+        api,
+        Kind::Weekly,
         "weekly_report.unsubscribe",
+    ))
+    .merge(unsubscribe_link(
+        api,
+        Kind::Monthly,
+        "monthly_report.unsubscribe",
     ))
 }
 
@@ -244,10 +322,12 @@ async fn account_body(api: &DashApi, user_id: i64, email: &str) -> Res<Value> {
         .map(|s| i64::try_from(s.id))
         .collect::<Result<Vec<_>, _>>()
         .map_err(anyhow::Error::from)?;
-    let details: HashMap<i64, (i16, bool)> = sqlx::query_as::<_, (i64, i16, bool)>(
+    let details: HashMap<i64, (i16, bool, bool)> = sqlx::query_as::<_, (i64, i16, bool, bool)>(
         "SELECT s.id, COALESCE(ss.week_starts_on, 1)::smallint,
                 EXISTS (SELECT FROM weekly_report_subscriptions w
-                        WHERE w.user_id = $2 AND w.site_id = s.id)
+                        WHERE w.user_id = $2 AND w.site_id = s.id AND w.kind = 'weekly'),
+                EXISTS (SELECT FROM weekly_report_subscriptions w
+                        WHERE w.user_id = $2 AND w.site_id = s.id AND w.kind = 'monthly')
          FROM unnest($1::bigint[]) AS s (id)
          LEFT JOIN site_settings ss ON ss.site_id = s.id",
     )
@@ -257,19 +337,22 @@ async fn account_body(api: &DashApi, user_id: i64, email: &str) -> Res<Value> {
     .await
     .map_err(anyhow::Error::from)?
     .into_iter()
-    .map(|(id, week_starts_on, subscribed)| (id, (week_starts_on, subscribed)))
+    .map(|(id, week_starts_on, weekly, monthly)| (id, (week_starts_on, weekly, monthly)))
     .collect();
     let sites: Vec<Value> = sites
         .iter()
         .zip(&ids)
         .map(|(site, id)| {
-            let (week_starts_on, subscribed) = details.get(id).copied().unwrap_or((1, false));
+            let (week_starts_on, weekly, monthly) =
+                details.get(id).copied().unwrap_or((1, false, false));
+            // `subscribed` is the weekly switch; it predates the monthly report.
             json!({
                 "id": site.id,
                 "name": site.name,
                 "timezone": site.timezone,
                 "week_starts_on": week_starts_on,
-                "subscribed": subscribed,
+                "subscribed": weekly,
+                "monthly_subscribed": monthly,
             })
         })
         .collect();
@@ -428,6 +511,7 @@ async fn cancel_confirmation(State(api): State<Arc<DashApi>>, headers: HeaderMap
 }
 
 async fn subscribe(
+    kind: Kind,
     State(api): State<Arc<DashApi>>,
     Path(site): Path<String>,
     req: Request,
@@ -440,14 +524,18 @@ async fn subscribe(
     if email_status(&mut *tx, user_id, &recipient.email).await? != EmailStatus::Confirmed {
         return Err(DashError::Conflict(
             "email_unconfirmed",
-            "confirm your email address before subscribing to weekly reports".into(),
+            format!(
+                "confirm your email address before subscribing to {} reports",
+                kind.as_str()
+            ),
         ));
     }
     // An unchanged address keeps its subscription time, so earlier unsubscribe links stay valid.
     sqlx::query(
-        "INSERT INTO weekly_report_subscriptions AS w (user_id, site_id, email, lang, confirmed_at)
-         VALUES ($1, $2, $3, $4, statement_timestamp())
-         ON CONFLICT (user_id, site_id) DO UPDATE
+        "INSERT INTO weekly_report_subscriptions AS w
+             (user_id, site_id, kind, email, lang, confirmed_at)
+         VALUES ($1, $2, $5, $3, $4, statement_timestamp())
+         ON CONFLICT (user_id, site_id, kind) DO UPDATE
          SET lang = excluded.lang, email = excluded.email,
              confirmed_at = CASE WHEN w.email = excluded.email THEN w.confirmed_at
                                  ELSE excluded.confirmed_at END",
@@ -456,6 +544,7 @@ async fn subscribe(
     .bind(site_id)
     .bind(&recipient.email)
     .bind(lang.as_str())
+    .bind(kind.as_str())
     .execute(&mut *tx)
     .await
     .map_err(anyhow::Error::from)?;
@@ -466,6 +555,7 @@ async fn subscribe(
 }
 
 async fn unsubscribe(
+    kind: Kind,
     State(api): State<Arc<DashApi>>,
     Path(site): Path<String>,
     headers: HeaderMap,
@@ -474,12 +564,15 @@ async fn unsubscribe(
     let site_id = site_id(&api, &site).await?;
     let user_id = ctx.s.user_id;
     let (mut tx, _) = begin(&api, user_id, site_id).await?;
-    sqlx::query("DELETE FROM weekly_report_subscriptions WHERE user_id = $1 AND site_id = $2")
-        .bind(user_id)
-        .bind(site_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(anyhow::Error::from)?;
+    sqlx::query(
+        "DELETE FROM weekly_report_subscriptions WHERE user_id = $1 AND site_id = $2 AND kind = $3",
+    )
+    .bind(user_id)
+    .bind(site_id)
+    .bind(kind.as_str())
+    .execute(&mut *tx)
+    .await
+    .map_err(anyhow::Error::from)?;
     tx.commit().await.map_err(anyhow::Error::from)?;
     let mut response = StatusCode::NO_CONTENT.into_response();
     no_store(&mut response);
@@ -585,22 +678,44 @@ fn unsubscribe_response(page: &'static str) -> Response {
     response
 }
 
-async fn unsubscribe_page(Path(token): Path<String>) -> Res<Response> {
-    if !session::is_well_formed(&token) {
-        return Err(DashError::NotFound);
-    }
-    Ok(unsubscribe_response(
-        r#"<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Unsubscribe · Rivu</title>
+/// The bilingual pages behind an unsubscribe link: (confirmation page, done, already off).
+fn unsubscribe_pages(kind: Kind) -> [&'static str; 3] {
+    match kind {
+        Kind::Weekly => [
+            r#"<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Unsubscribe · Rivu</title>
         <h1>Unsubscribe from Rivu weekly reports</h1>
         <p lang="zh">退订 Rivu 周报</p>
         <form method="post"><button>Unsubscribe · <span lang="zh">退订</span></button></form></html>"#,
-    ))
+            r#"<!doctype html><html lang="en"><meta charset="utf-8"><title>Rivu weekly reports</title>
+        <p>You have unsubscribed from Rivu weekly reports for this site.</p><p lang="zh">你已退订此站点的 Rivu 周报。</p></html>"#,
+            r#"<!doctype html><html lang="en"><meta charset="utf-8"><title>Rivu weekly reports</title>
+            <p>This link has expired or the subscription is already off.</p><p lang="zh">退订链接已过期，或订阅已关闭。</p></html>"#,
+        ],
+        Kind::Monthly => [
+            r#"<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Unsubscribe · Rivu</title>
+        <h1>Unsubscribe from Rivu monthly reports</h1>
+        <p lang="zh">退订 Rivu 月报</p>
+        <form method="post"><button>Unsubscribe · <span lang="zh">退订</span></button></form></html>"#,
+            r#"<!doctype html><html lang="en"><meta charset="utf-8"><title>Rivu monthly reports</title>
+        <p>You have unsubscribed from Rivu monthly reports for this site.</p><p lang="zh">你已退订此站点的 Rivu 月报。</p></html>"#,
+            r#"<!doctype html><html lang="en"><meta charset="utf-8"><title>Rivu monthly reports</title>
+            <p>This link has expired or the subscription is already off.</p><p lang="zh">退订链接已过期，或订阅已关闭。</p></html>"#,
+        ],
+    }
 }
 
-/// Switches off only the site the report was about; the mailbox stays confirmed. The request
-/// body is ignored, so this is also the RFC 8058 one-click target: mailbox providers POST
-/// `List-Unsubscribe=One-Click` here without cookies.
+async fn unsubscribe_page(kind: Kind, Path(token): Path<String>) -> Res<Response> {
+    if !session::is_well_formed(&token) {
+        return Err(DashError::NotFound);
+    }
+    Ok(unsubscribe_response(unsubscribe_pages(kind)[0]))
+}
+
+/// Switches off only the report and the site the email was about; the mailbox stays confirmed.
+/// The request body is ignored, so this is also the RFC 8058 one-click target: mailbox providers
+/// POST `List-Unsubscribe=One-Click` here without cookies.
 async fn unsubscribe_by_token(
+    kind: Kind,
     State(api): State<Arc<DashApi>>,
     Path(token): Path<String>,
 ) -> Res<Response> {
@@ -610,24 +725,22 @@ async fn unsubscribe_by_token(
     let deleted = sqlx::query(
         "DELETE FROM weekly_report_subscriptions w
          USING weekly_report_claims c
-         WHERE c.unsubscribe_hash = $1 AND w.user_id = c.user_id AND w.site_id = c.site_id
+         WHERE c.unsubscribe_hash = $1 AND c.kind = $2
+           AND w.user_id = c.user_id AND w.site_id = c.site_id AND w.kind = c.kind
            AND w.confirmed_at = c.confirmed_at",
     )
     .bind(session::hash_token(&token).as_slice())
+    .bind(kind.as_str())
     .execute(&api.pg)
     .await
     .map_err(anyhow::Error::from)?
     .rows_affected();
-    if deleted == 0 {
-        return Ok(unsubscribe_response(
-            r#"<!doctype html><html lang="en"><meta charset="utf-8"><title>Rivu weekly reports</title>
-            <p>This link has expired or the subscription is already off.</p><p lang="zh">退订链接已过期，或订阅已关闭。</p></html>"#,
-        ));
-    }
-    Ok(unsubscribe_response(
-        r#"<!doctype html><html lang="en"><meta charset="utf-8"><title>Rivu weekly reports</title>
-        <p>You have unsubscribed from Rivu weekly reports for this site.</p><p lang="zh">你已退订此站点的 Rivu 周报。</p></html>"#,
-    ))
+    let [_, done, already_off] = unsubscribe_pages(kind);
+    Ok(unsubscribe_response(if deleted == 0 {
+        already_off
+    } else {
+        done
+    }))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -638,6 +751,24 @@ struct Period {
     end: Timestamp,
 }
 
+impl Period {
+    /// `[from, first)` as local dates and their local midnights.
+    fn new(from: Date, first: Date, tz: &TimeZone) -> anyhow::Result<Self> {
+        Ok(Period {
+            from,
+            to: first.yesterday()?,
+            start: from.to_zoned(tz.clone())?.timestamp(),
+            end: first.to_zoned(tz.clone())?.timestamp(),
+        })
+    }
+}
+
+/// Reports go out from 09:00 local time on the first day after the period.
+fn sendable(now: Timestamp, first: Date, tz: &TimeZone) -> anyhow::Result<bool> {
+    Ok(now >= first.at(9, 0, 0, 0).to_zoned(tz.clone())?.timestamp())
+}
+
+/// The latest complete local week, once it may be sent.
 fn due_period(
     now: Timestamp,
     tz: &TimeZone,
@@ -647,16 +778,23 @@ fn due_period(
     let offset = (today.weekday().to_sunday_zero_offset() - week_start.to_sunday_zero_offset())
         .rem_euclid(7);
     let end_day = today.checked_sub(offset.days())?;
-    if now < end_day.at(9, 0, 0, 0).to_zoned(tz.clone())?.timestamp() {
+    if !sendable(now, end_day, tz)? {
         return Ok(None);
     }
-    let from = end_day.checked_sub(7.days())?;
-    Ok(Some(Period {
-        from,
-        to: end_day.yesterday()?,
-        start: from.to_zoned(tz.clone())?.timestamp(),
-        end: end_day.to_zoned(tz.clone())?.timestamp(),
-    }))
+    Ok(Some(Period::new(
+        end_day.checked_sub(7.days())?,
+        end_day,
+        tz,
+    )?))
+}
+
+/// The previous local calendar month, once it may be sent (09:00 on the 1st).
+fn due_month(now: Timestamp, tz: &TimeZone) -> anyhow::Result<Option<Period>> {
+    let first = now.to_zoned(tz.clone()).date().first_of_month();
+    if !sendable(now, first, tz)? {
+        return Ok(None);
+    }
+    Ok(Some(Period::new(first.checked_sub(1.month())?, first, tz)?))
 }
 
 struct Site {
@@ -668,39 +806,53 @@ struct Site {
 }
 
 impl Site {
-    fn due(&self, now: Timestamp) -> anyhow::Result<Option<Period>> {
+    fn due(&self, kind: Kind, now: Timestamp) -> anyhow::Result<Option<Period>> {
         let tz = TimeZone::get(&self.timezone)?;
-        let week_start = Weekday::from_sunday_zero_offset(i8::try_from(self.week_starts_on)?)?;
-        due_period(now, &tz, week_start)
+        match kind {
+            Kind::Weekly => {
+                let week_start =
+                    Weekday::from_sunday_zero_offset(i8::try_from(self.week_starts_on)?)?;
+                due_period(now, &tz, week_start)
+            }
+            Kind::Monthly => due_month(now, &tz),
+        }
     }
 }
 
-async fn candidates(pg: &PgPool, site_id: i64, period: Period) -> anyhow::Result<Vec<i64>> {
+async fn candidates(
+    pg: &PgPool,
+    kind: Kind,
+    site_id: i64,
+    period: Period,
+) -> anyhow::Result<Vec<i64>> {
     Ok(sqlx::query_scalar(
         "SELECT w.user_id FROM weekly_report_subscriptions w
          JOIN users u ON u.id = w.user_id AND u.disabled_at IS NULL AND u.deleted_at IS NULL
          JOIN sites s ON s.id = w.site_id
          JOIN weekly_report_emails e ON e.user_id = w.user_id AND e.email = w.email
                                      AND e.confirmed_at IS NOT NULL
-         WHERE w.site_id = $1 AND w.email = u.email::text
+         WHERE w.site_id = $1 AND w.kind = $4 AND w.email = u.email::text
            AND w.confirmed_at < to_timestamp($2)
            AND (EXISTS (SELECT FROM memberships m WHERE m.organization_id = s.organization_id
                         AND m.user_id = w.user_id AND m.deleted_at IS NULL)
                 OR EXISTS (SELECT FROM site_memberships m WHERE m.site_id = w.site_id
                            AND m.user_id = w.user_id AND m.deleted_at IS NULL))
            AND NOT EXISTS (SELECT FROM weekly_report_claims c WHERE c.user_id = w.user_id
-                           AND c.site_id = w.site_id AND c.period_end > to_timestamp($3))
+                           AND c.site_id = w.site_id AND c.kind = w.kind
+                           AND c.period_end > to_timestamp($3))
          ORDER BY w.user_id",
     )
     .bind(site_id)
     .bind(period.end.as_second() as f64)
     .bind(period.start.as_second() as f64)
+    .bind(kind.as_str())
     .fetch_all(pg)
     .await?)
 }
 
 async fn claim(
     api: &DashApi,
+    kind: Kind,
     site: &Site,
     user_id: i64,
     period: Period,
@@ -710,9 +862,10 @@ async fn claim(
     let Some(recipient) = lock_recipient(&mut tx, user_id, site.id).await? else {
         return Ok(None);
     };
+    // The week start only shapes weekly periods.
     if recipient.timezone != site.timezone
-        || recipient.week_starts_on != site.week_starts_on
-        || site.due((api.clock)())? != Some(period)
+        || (kind == Kind::Weekly && recipient.week_starts_on != site.week_starts_on)
+        || site.due(kind, (api.clock)())? != Some(period)
     {
         return Ok(None);
     }
@@ -720,15 +873,17 @@ async fn claim(
     let lang = sqlx::query_scalar(
         "WITH eligible AS (
              SELECT lang, confirmed_at FROM weekly_report_subscriptions
-             WHERE user_id = $1 AND site_id = $2 AND email = $3
+             WHERE user_id = $1 AND site_id = $2 AND kind = $7 AND email = $3
                AND confirmed_at < to_timestamp($4)
                AND EXISTS (SELECT FROM weekly_report_emails
                    WHERE user_id = $1 AND email = $3 AND confirmed_at IS NOT NULL)
                AND NOT EXISTS (SELECT FROM weekly_report_claims
-                   WHERE user_id = $1 AND site_id = $2 AND period_end > to_timestamp($5))
+                   WHERE user_id = $1 AND site_id = $2 AND kind = $7
+                     AND period_end > to_timestamp($5))
          ), claimed AS (
-             INSERT INTO weekly_report_claims (user_id, site_id, period_end, confirmed_at, unsubscribe_hash)
-             SELECT $1, $2, to_timestamp($4), confirmed_at, $6 FROM eligible
+             INSERT INTO weekly_report_claims
+                 (user_id, site_id, kind, period_end, confirmed_at, unsubscribe_hash)
+             SELECT $1, $2, $7, to_timestamp($4), confirmed_at, $6 FROM eligible
              ON CONFLICT DO NOTHING RETURNING user_id
          )
          SELECT lang FROM eligible CROSS JOIN claimed",
@@ -739,6 +894,7 @@ async fn claim(
     .bind(period.end.as_second() as f64)
     .bind(period.start.as_second() as f64)
     .bind(unsubscribe_hash.as_slice())
+    .bind(kind.as_str())
     .fetch_optional(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -748,7 +904,7 @@ async fn claim(
 fn totals(result: &QueryResult) -> anyhow::Result<(u64, u64, u64)> {
     anyhow::ensure!(
         result.meta.warnings.is_empty(),
-        "weekly query warnings: {:?}",
+        "report query warnings: {:?}",
         result.meta.warnings
     );
     match result.results.as_slice() {
@@ -758,22 +914,23 @@ fn totals(result: &QueryResult) -> anyhow::Result<(u64, u64, u64)> {
                 MetricValue::Int(visits),
                 MetricValue::Int(pageviews),
             ] => Ok((*visitors, *visits, *pageviews)),
-            _ => anyhow::bail!("weekly query did not return three integer totals"),
+            _ => anyhow::bail!("report query did not return three integer totals"),
         },
-        _ => anyhow::bail!("weekly query did not return a totals row"),
+        _ => anyhow::bail!("report query did not return a totals row"),
     }
 }
 
 async fn deliver(
     api: &DashApi,
     mailer: &rivu_mail::Mailer,
+    kind: Kind,
     site: &Site,
     now: Timestamp,
 ) -> anyhow::Result<()> {
-    let Some(period) = site.due(now)? else {
+    let Some(period) = site.due(kind, now)? else {
         return Ok(());
     };
-    let candidates = candidates(&api.pg, site.id, period).await?;
+    let candidates = candidates(&api.pg, kind, site.id, period).await?;
     if candidates.is_empty() {
         return Ok(());
     }
@@ -787,7 +944,8 @@ async fn deliver(
     .await
     .map_err(|_| anyhow::anyhow!("could not load site query settings"))?;
     if context.timezone != TimeZone::get(&site.timezone)?
-        || i16::from(context.week_starts_on.to_sunday_zero_offset()) != site.week_starts_on
+        || (kind == Kind::Weekly
+            && i16::from(context.week_starts_on.to_sunday_zero_offset()) != site.week_starts_on)
     {
         return Ok(());
     }
@@ -797,29 +955,35 @@ async fn deliver(
     }))?;
     let mut options = ExecOptions::new(api.dashboard_timeout_secs)
         .with_now(now)
-        .with_route("weekly_report");
+        .with_route(kind.route());
     options.rollup_min_rows = api.rollup_min_rows;
-    let result =
-        execute_cached(&api.reader, None, &context, spec, options, "weekly_report").await?;
+    let result = execute_cached(&api.reader, None, &context, spec, options, kind.route()).await?;
     let (visitors, visits, pageviews) = totals(&result)?;
     let base = api.base_url.trim_end_matches('/');
     for user_id in candidates {
         let token = session::generate();
-        let (email, lang) = match claim(api, site, user_id, period, &token.hash()).await {
+        let (email, lang) = match claim(api, kind, site, user_id, period, &token.hash()).await {
             Ok(Some(recipient)) => recipient,
             Ok(None) => continue,
             Err(error) => {
-                tracing::warn!(site_id = site.id, user_id, %error, "weekly report claim failed");
+                tracing::warn!(
+                    site_id = site.id,
+                    user_id,
+                    kind = kind.as_str(),
+                    %error,
+                    "report claim failed"
+                );
                 continue;
             }
         };
-        let unsubscribe_url = format!("{base}{UNSUBSCRIBE_PATH}/{}", token.plaintext());
+        let unsubscribe_url = format!("{base}{}/{}", kind.unsubscribe_path(), token.plaintext());
         let mail = report(&Report {
             lang: if lang == "zh" {
                 rivu_mail::Lang::Zh
             } else {
                 rivu_mail::Lang::En
             },
+            cadence: kind.cadence(),
             to: &email,
             base_url: base,
             site_id: site.id,
@@ -836,39 +1000,43 @@ async fn deliver(
             tracing::warn!(
                 site_id = site.id,
                 user_id,
-                "weekly report SMTP attempt failed"
+                kind = kind.as_str(),
+                "report SMTP attempt failed"
             );
         }
     }
     Ok(())
 }
 
-/// Evaluate only the latest completed local week, grouped by site.
+/// Evaluate only the latest completed local week and month, grouped by report and site.
 pub async fn run_once(api: &DashApi) -> anyhow::Result<()> {
     let Some(mailer) = &api.mailer else {
         return Ok(());
     };
     let now = (api.clock)();
-    let sites = sqlx::query_as::<_, (i64, String, String, String, i16)>(
-        "SELECT s.id, s.site_key, s.name, s.timezone, COALESCE(ss.week_starts_on, 1)::smallint
-         FROM sites s JOIN organizations o ON o.id = s.organization_id AND o.deleted_at IS NULL
-         LEFT JOIN site_settings ss ON ss.site_id = s.id
-         WHERE s.deleted_at IS NULL AND EXISTS (
-             SELECT FROM weekly_report_subscriptions w WHERE w.site_id = s.id)
-         ORDER BY s.id",
-    )
-    .fetch_all(&api.pg)
-    .await?;
-    for (id, key, name, timezone, week_starts_on) in sites {
-        let site = Site {
-            id,
-            key,
-            name,
-            timezone,
-            week_starts_on,
-        };
-        if let Err(error) = deliver(api, mailer, &site, now).await {
-            tracing::warn!(site_id = id, %error, "weekly report skipped");
+    for kind in Kind::ALL {
+        let sites = sqlx::query_as::<_, (i64, String, String, String, i16)>(
+            "SELECT s.id, s.site_key, s.name, s.timezone, COALESCE(ss.week_starts_on, 1)::smallint
+             FROM sites s JOIN organizations o ON o.id = s.organization_id AND o.deleted_at IS NULL
+             LEFT JOIN site_settings ss ON ss.site_id = s.id
+             WHERE s.deleted_at IS NULL AND EXISTS (
+                 SELECT FROM weekly_report_subscriptions w WHERE w.site_id = s.id AND w.kind = $1)
+             ORDER BY s.id",
+        )
+        .bind(kind.as_str())
+        .fetch_all(&api.pg)
+        .await?;
+        for (id, key, name, timezone, week_starts_on) in sites {
+            let site = Site {
+                id,
+                key,
+                name,
+                timezone,
+                week_starts_on,
+            };
+            if let Err(error) = deliver(api, mailer, kind, &site, now).await {
+                tracing::warn!(site_id = id, kind = kind.as_str(), %error, "report skipped");
+            }
         }
     }
     Ok(())
@@ -888,7 +1056,7 @@ pub(crate) fn spawn(
                 _ = async {
                     ticks.tick().await;
                     if let Err(error) = run_once(&api).await {
-                        tracing::warn!(%error, "weekly report tick failed");
+                        tracing::warn!(%error, "report tick failed");
                     }
                 } => {}
             }
@@ -939,5 +1107,63 @@ mod tests {
                 hours * 3600
             );
         }
+    }
+    #[test]
+    fn a_month_is_due_from_nine_on_the_first_in_the_site_timezone() {
+        let tz = TimeZone::get("Asia/Taipei").unwrap();
+        let due = |at: &str| due_month(at.parse().unwrap(), &tz).unwrap();
+        let october = due("2026-11-30T15:59:59Z").unwrap();
+        assert_eq!(october.from.to_string(), "2026-10-01");
+        assert_eq!(october.to.to_string(), "2026-10-31");
+        // Local midnight on the 1st starts the new month, but nothing is due until 09:00.
+        assert_eq!(due("2026-11-30T16:00:00Z"), None);
+        assert_eq!(due("2026-12-01T00:59:59Z"), None);
+        let november = due("2026-12-01T01:00:00Z").unwrap();
+        assert_eq!(november.from.to_string(), "2026-11-01");
+        assert_eq!(november.to.to_string(), "2026-11-30");
+        assert_eq!(
+            november.start,
+            "2026-10-31T16:00:00Z".parse::<Timestamp>().unwrap()
+        );
+        assert_eq!(
+            november.end,
+            "2026-11-30T16:00:00Z".parse::<Timestamp>().unwrap()
+        );
+        assert_eq!(due("2026-12-31T15:59:59Z"), Some(november));
+    }
+
+    #[test]
+    fn december_is_due_on_new_years_day_west_of_utc() {
+        let tz = TimeZone::get("America/New_York").unwrap();
+        let due = |at: &str| due_month(at.parse().unwrap(), &tz).unwrap();
+        // Already 2027 in UTC, still 31 December in New York: November is the latest month.
+        let november = due("2027-01-01T04:59:59Z").unwrap();
+        assert_eq!(november.to.to_string(), "2026-11-30");
+        assert_eq!(due("2027-01-01T05:00:00Z"), None);
+        assert_eq!(due("2027-01-01T13:59:59Z"), None);
+        let december = due("2027-01-01T14:00:00Z").unwrap();
+        assert_eq!(december.from.to_string(), "2026-12-01");
+        assert_eq!(december.to.to_string(), "2026-12-31");
+        assert_eq!(
+            december.start,
+            "2026-12-01T05:00:00Z".parse::<Timestamp>().unwrap()
+        );
+        assert_eq!(
+            december.end,
+            "2027-01-01T05:00:00Z".parse::<Timestamp>().unwrap()
+        );
+        // A month across a DST change is still bounded by local midnights.
+        let march = due("2026-04-01T13:00:00Z").unwrap();
+        assert_eq!(
+            march.start,
+            "2026-03-01T05:00:00Z".parse::<Timestamp>().unwrap()
+        );
+        assert_eq!(
+            march.end,
+            "2026-04-01T04:00:00Z".parse::<Timestamp>().unwrap()
+        );
+        // February in a leap year ends on the 29th.
+        let february = due("2028-03-01T14:00:00Z").unwrap();
+        assert_eq!(february.to.to_string(), "2028-02-29");
     }
 }

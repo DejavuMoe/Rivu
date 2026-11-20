@@ -412,7 +412,7 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 | `ingest_counters` 过期 | 表级 TTL | 无 | 由 ClickHouse TTL 处理（默认 90 天，见 `system-design.md` §5.4），不需要单独任务 |
 | `tombstone_purge` | cron | 每日 | 硬删除 30 天前的软删除行（`sites` 除外） |
 | `jobs_reaper`、`jobs_prune` | cron | 每分钟 / 每日 | 租约回收；清理历史 |
-| `weekly_report` | 已配置 SMTP 时启动 | 启动即检查，之后每分钟检查 | 按站点时区和每周起始日处理最近一个完整周，从下一周首日当地 09:00 起发送。用 reader 账号查询访客、访问和浏览量。有查询错误或覆盖警告时，跳过该次发送 |
+| `weekly_report` | 已配置 SMTP 时启动 | 启动即检查，之后每分钟检查 | 同一个任务发周报和月报（`bin/rivu/src/weekly_report.rs`）。周报按站点时区和每周起始日处理最近一个完整周，从下一周首日当地 09:00 起发送；月报按站点时区处理上一个自然月，从每月 1 日当地 09:00 起发送。用 reader 账号查询访客、访问和浏览量。有查询错误或覆盖警告时，跳过该次发送 |
 | `spike_notify`（第 4 阶段） | cron | 每 15 分钟 | 以站点最近发送时间去重（04§3.2 `TrafficChangeNotifier`，用途为推断） |
 
 `retention_purge` 通过 PG 站点行锁固定设置并协调显式擦除，ClickHouse writer 可继续写入。每个站点从 `rollup_site FINAL` 里第一个已过结算期的当前时区原生完成标记开始，逐日验证直到首个缺标记或未结算的本地日。设 `A`、`B` 分别为首个已验证日、首个未覆盖日的本地午夜，分别换算成 UTC。只有 `origin = 'native'`、`import_id = 0` 的站点标记能提供证明，空日的标记也有效。存在旧时区标记、站点被软删除、擦除任务未完成、缺少站点元数据或未取得行锁时，跳过该站点的自动清理。显式擦除按自身意图与恢复期限执行。
@@ -434,14 +434,15 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 
 ### 周报订阅接口
 
-收不收周报是个人偏好：邮箱在账号上确认一次，之后每个能看的站点各有一个开关。收件人始终是登录账号当前的邮箱。
+收不收周报、月报是个人偏好：邮箱在账号上确认一次，之后每个能看的站点各有一个周报开关和一个月报开关，两个开关互不影响。收件人始终是登录账号当前的邮箱。月报和周报共用邮箱确认、表和发送任务，表名沿用 `weekly_report_*`，用 `kind` 列区分（迁移 `20261120125000_monthly_reports`，已有的行都是 `weekly`）。下文说「周报」的规则，除单独写明的以外，对月报同样适用。
 
-**两张表**
+**三张表**
 
 | 表 | 一行代表 | 说明 |
 |---|---|---|
-| `weekly_report_emails` | 一个账号的邮箱确认 | 记录确认的是哪个邮箱、确认时间、待用的链接令牌（只存 SHA-256 摘要）及其过期时间、上次请求时间（限流用）、确认邮件的语言 |
-| `weekly_report_subscriptions` | 一个账号订阅了一个站点 | 有这一行就是开着，关掉即删除。`email` 是这份订阅投递的邮箱（订阅时的账号邮箱，确认新邮箱后改为新邮箱），`confirmed_at` 是订阅时间，`lang` 是周报语言 |
+| `weekly_report_emails` | 一个账号的邮箱确认 | 记录确认的是哪个邮箱、确认时间、待用的链接令牌（只存 SHA-256 摘要）及其过期时间、上次请求时间（限流用）、确认邮件的语言。周报和月报共用 |
+| `weekly_report_subscriptions` | 一个账号订阅了一个站点的一种报告 | 主键 `(user_id, site_id, kind)`，`kind` 是 `weekly` 或 `monthly`。有这一行就是开着，关掉即删除。`email` 是这份订阅投递的邮箱（订阅时的账号邮箱，确认新邮箱后改为新邮箱），`confirmed_at` 是订阅时间，`lang` 是报告语言 |
+| `weekly_report_claims` | 一次已领取的发送 | 主键 `(user_id, site_id, kind, period_end)`。`period_end` 是这一期结束的本地午夜（UTC），`confirmed_at` 是领取时订阅的订阅时间，`unsubscribe_hash` 是这封邮件退订令牌的摘要 |
 
 邮箱状态按账号当前的邮箱判断：
 
@@ -453,11 +454,13 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 
 | 请求 | 用途 |
 |---|---|
-| `GET /api/internal/account/weekly-report` | 返回 `available`（实例是否配置了 SMTP）、`email`、`email_status`、`sites`。`sites` 是这个账号有统计读权限的全部站点（组织成员或站点访客，不含已删除的站点和组织），每项有 `id`（数字站点 ID）、`name`、`timezone`、`week_starts_on`（`0` 为周日）、`subscribed`（有订阅行即为 `true`），按名称排序（不区分大小写），同名按 ID |
+| `GET /api/internal/account/weekly-report` | 返回 `available`（实例是否配置了 SMTP）、`email`、`email_status`、`sites`。`sites` 是这个账号有统计读权限的全部站点（组织成员或站点访客，不含已删除的站点和组织），每项有 `id`（数字站点 ID）、`name`、`timezone`、`week_starts_on`（`0` 为周日）、`subscribed`（周报开关：有 `weekly` 订阅行即为 `true`）、`monthly_subscribed`（月报开关：有 `monthly` 订阅行即为 `true`），按名称排序（不区分大小写），同名按 ID |
 | `POST /api/internal/account/weekly-report/confirmation` + `{"lang":"zh"}` 或 `{"lang":"en"}` | 给账号邮箱发确认邮件，邮件里是一个确认链接。每个账号每分钟最多一次，超出返回 `429` 和 `Retry-After`。已确认时只更新语言，不发邮件。成功返回与 `GET` 相同的对象 |
 | `DELETE /api/internal/account/weekly-report/confirmation` | 取消待确认（作废还没用的链接），返回 `204`。不影响已经确认的邮箱 |
 | `PUT /api/internal/sites/{site}/weekly-report` + `{"lang":"zh"}` 或 `{"lang":"en"}` | 订阅这个站点，返回 `204`。`{site}` 接受站点 ID 或 `site_key`；没有统计读权限或站点不存在都是 `404`。邮箱未确认返回 `409 email_unconfirmed`。已用当前邮箱订阅时只更新语言，订阅时间不变 |
 | `DELETE /api/internal/sites/{site}/weekly-report` | 取消订阅这个站点，返回 `204`，可重复调用。没有统计读权限或站点不存在是 `404` |
+| `PUT /api/internal/sites/{site}/monthly-report` + `{"lang":"zh"}` 或 `{"lang":"en"}` | 打开这个站点的月报，规则与周报的 `PUT` 相同，不影响周报开关 |
+| `DELETE /api/internal/sites/{site}/monthly-report` | 关掉这个站点的月报，规则与周报的 `DELETE` 相同，不影响周报开关 |
 
 各路径的其他方法返回 `405` 和 `Allow`。旧版按站点的 `GET`、`POST`（申请确认码）和 `POST …/confirm` 已删除。
 
@@ -484,9 +487,11 @@ SMTP 未配置时，`GET` 返回 `available: false`，`POST …/confirmation` �
 
 **发送**
 
-周报查询沿用站点隔离、导入与汇总层口径。有查询错误或警告时不领取发送记录，后续检查可重算。成功查询后再次核对邮箱、权限和订阅：订阅的 `email` 和邮箱确认记录都必须等于账号当前邮箱，且邮箱已确认。PostgreSQL 在调用 SMTP 前提交领取记录，重复或重叠周期会被跳过。每个已领取的收件人、站点和周期新增一行，记录跨退订、重订和服务重启保留。若领取后进程退出或 SMTP 未返回明确结果，不会自动重发。
+周报处理最近一个完整周，从下一周首日当地 09:00 起发送。月报处理上一个自然月（站点时区的 1 日 00:00 到下月 1 日 00:00），从每月 1 日当地 09:00 起发送；1 日 00:00 到 09:00 之间不发任何月份。两者都只处理最近的一期，停机恢复后不补发更早的期。订阅时间必须早于这一期结束，所以月中打开的月报从下个月 1 日发出的那一期（即打开当月）开始。
 
-周报正文与 `List-Unsubscribe` 邮件头提供免登录退订链接。打开链接会显示确认页，提交确认后取消这个站点的订阅，不影响邮箱确认和其他站点。成员或访客失去站点访问权限时清理其订阅，历史发送记录仍用于去重。
+周报查询沿用站点隔离、导入与汇总层口径。有查询错误或警告时不领取发送记录，后续检查可重算。成功查询后再次核对邮箱、权限和订阅：订阅的 `email` 和邮箱确认记录都必须等于账号当前邮箱，且邮箱已确认。PostgreSQL 在调用 SMTP 前提交领取记录，同一种报告里重复或重叠的周期会被跳过（周报和月报各自去重）。每个已领取的收件人、站点、报告种类和周期新增一行，记录跨退订、重订和服务重启保留。若领取后进程退出或 SMTP 未返回明确结果，不会自动重发。
+
+周报正文与 `List-Unsubscribe` 邮件头提供免登录退订链接。打开链接会显示确认页，提交确认后取消这个站点的订阅，不影响邮箱确认和其他站点。周报的退订链接是 `/api/weekly-report/unsubscribe/{token}`，月报的是 `/api/monthly-report/unsubscribe/{token}`，各自只关掉自己那种报告：月报的令牌拿到周报的地址上只会得到「已过期或已关闭」页。成员或访客失去站点访问权限时清理其全部报告订阅，历史发送记录仍用于去重。
 
 周报还带 `List-Unsubscribe-Post: List-Unsubscribe=One-Click`，也就是 RFC 8058 的「一键退订」：邮箱服务商在自己的界面上显示一个退订按钮，用户点了，服务商替用户向退订地址发一个 POST（表单内容 `List-Unsubscribe=One-Click`，不带 cookie）。这个 POST 和用户在确认页点按钮效果相同，只关掉这一个站点。GET 仍然只显示确认页，邮件客户端预取链接不会退订任何人。
 
@@ -498,9 +503,11 @@ SMTP 未配置时，`GET` 返回 `available: false`，`POST …/confirmation` �
 - 插进 HTML 的值（站点名、时区、收件地址、链接）都经过转义，站点名里有 `<`、引号之类的字符也只会显示成文字。
 - 链接都由 `RIVU_BASE_URL`（去掉末尾的 `/`）加固定路径拼成：看板 `{base}/s/{site_id}`，管理周报 `{base}/account`，退订 `{base}/api/weekly-report/unsubscribe/{token}`，确认 `{base}/weekly-report/confirm/{token}`。
 - 周报主题带站点名和日期，例如「studio.example.com 周报：11 月 16 日至 22 日」、「studio.example.com weekly report: Nov 16 – 22」；跨年的一周写出两个年份。正文是站点名、日期范围和站点时区、三个数字（按千位分隔，如 `12,840,310`）、「打开看板」按钮，页脚写明为什么收到这封邮件和收件地址，再是「管理周报」和「退订周报」两个链接。一周三个数字都是 0 时多一行「这一周没有记录到访问。」。
-- 周报只用发送时已经查到的数据，不做与上一周的对比。
+- 月报用同一个模板，结构与周报相同。主题带站点名和月份，例如「studio.example.com 月报：2026 年 10 月」、「studio.example.com monthly report: October 2026」；12 月的月报在次年 1 月 1 日发出，主题仍写所在年份「2026 年 12 月」。正文的日期范围写整月（「2026 年 10 月 1 日至 31 日」、「Oct 1 – 31, 2026」），页脚是「管理月报」和「退订月报」（英文 `Manage monthly report`、`Unsubscribe`），退订链接是 `{base}/api/monthly-report/unsubscribe/{token}`。一个月三个数字都是 0 时多一行「这个月没有记录到访问。」。
+- 周报和月报只用发送时已经查到的数据，不做与上一期的对比。
+- 确认邮件只有一种，文案仍是「确认接收 Rivu 周报」，月报不另发确认邮件。
 
-模板在 `crates/mail/src/weekly_report.rs`，排版和文案来自原型 `designs/weekly-report/email.html`。
+模板在 `crates/mail/src/weekly_report.rs`（周报和月报共用，按 `Cadence` 换文案），排版和文案来自原型 `designs/weekly-report/email.html`。
 
 **从旧流程升级**：旧版本按站点用确认码确认。升级时（迁移 `20261119120000_weekly_report_account_email`），已有生效订阅（已确认且邮箱等于账号当前邮箱）的账号视为邮箱已确认，这些订阅保留，订阅时间不变，已发出的退订链接继续有效；还没确认完的申请、已关闭的订阅和邮箱已变更的旧订阅删除。
 

@@ -1,5 +1,6 @@
-//! 周报的两封邮件：确认邮箱的链接邮件和周报本身。
+//! 报告邮件：确认邮箱的链接邮件，以及周报和月报本身。
 //!
+//! 周报和月报用同一个模板（[`report`]），只有文案和日期写法按 [`Cadence`] 不同。
 //! 每封都有纯文本和 HTML 两个部分，内容相同、链接相同。排版和文案来自
 //! `designs/weekly-report/email.html`（2026-11-19 确认）：表格布局、行内样式，没有脚本、图片和
 //! 远程资源，深色由 `prefers-color-scheme: dark` 切换。插进 HTML 的每个值都经过转义；
@@ -9,10 +10,20 @@ use jiff::civil::Date;
 
 use crate::{Lang, Mail};
 
-/// 一封周报用到的数据：`deliver` 已有的那些，不多查。
+/// 报告覆盖的周期。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cadence {
+    /// 上一整周（站点的每周起始日起 7 天）。
+    Weekly,
+    /// 上一个自然月。
+    Monthly,
+}
+
+/// 一封周报或月报用到的数据：`deliver` 已有的那些，不多查。
 #[derive(Clone, Copy, Debug)]
 pub struct Report<'a> {
     pub lang: Lang,
+    pub cadence: Cadence,
     /// 收件地址，也写在页脚里。
     pub to: &'a str,
     /// `RIVU_BASE_URL`，末尾不带 `/`。
@@ -20,7 +31,7 @@ pub struct Report<'a> {
     pub site_id: i64,
     pub site_name: &'a str,
     pub timezone: &'a str,
-    /// 这一周的第一天和最后一天（站点时区的日期，含两端）。
+    /// 这一期的第一天和最后一天（站点时区的日期，含两端）。月报是一个月的 1 日和最后一天。
     pub from: Date,
     pub until: Date,
     pub visitors: u64,
@@ -30,7 +41,7 @@ pub struct Report<'a> {
     pub unsubscribe_url: &'a str,
 }
 
-/// 周报邮件。
+/// 周报或月报邮件。
 pub fn report(r: &Report<'_>) -> Mail {
     // 站点名称是用户填的，没有长度和字符限制：换行会让主题和纯文本正文多出伪造的行。
     let site_name = single_line(r.site_name);
@@ -40,22 +51,27 @@ pub fn report(r: &Report<'_>) -> Mail {
         timezone: &timezone,
         ..*r
     };
-    let s = Words::of(r.lang);
+    let s = Words::of(r.lang, r.cadence);
     let (long, short) = period(r.from, r.until, r.lang);
-    let subject = match r.lang {
-        Lang::Zh => format!("{} 周报：{short}", r.site_name),
-        Lang::En => format!("{} weekly report: {short}", r.site_name),
+    // 周报写日期范围，月报只写月份：「… 周报：11 月 16 日至 22 日」「… 月报：2026 年 10 月」。
+    let when = match r.cadence {
+        Cadence::Weekly => short,
+        Cadence::Monthly => month(r.from, r.lang),
     };
+    let subject = format!("{} {}{}{when}", r.site_name, s.report, s.colon);
     let numbers = [r.visitors, r.visits, r.pageviews].map(grouped);
     let [visitors, visits, pageviews] = &numbers;
     let quiet = r.visitors == 0 && r.visits == 0 && r.pageviews == 0;
     let dashboard = format!("{}/s/{}", r.base_url, r.site_id);
     let manage = format!("{}/account", r.base_url);
     let reason = match r.lang {
-        Lang::Zh => format!("你订阅了 {} 的周报，收件地址 {}。", r.site_name, r.to),
+        Lang::Zh => format!(
+            "你订阅了 {} 的{}，收件地址 {}。",
+            r.site_name, s.report, r.to
+        ),
         Lang::En => format!(
-            "You subscribed to the weekly report for {} at {}.",
-            r.site_name, r.to
+            "You subscribed to the {} for {} at {}.",
+            s.report, r.site_name, r.to
         ),
     };
     let (open_zone, close_zone) = match r.lang {
@@ -150,7 +166,7 @@ pub fn report(r: &Report<'_>) -> Mail {
 /// 确认邮箱的邮件。`link` 是 `{base}/weekly-report/confirm/{token}`。没有退订链接，也不带
 /// `List-Unsubscribe`：确认属于账号，不属于某个站点。
 pub fn confirmation(lang: Lang, to: &str, link: &str) -> Mail {
-    let s = Words::of(lang);
+    let s = Words::of(lang, Cadence::Weekly);
     let (subject, title, lead, action, terms, ignore) = match lang {
         Lang::Zh => (
             "确认接收 Rivu 周报",
@@ -192,8 +208,10 @@ pub fn confirmation(lang: Lang, to: &str, link: &str) -> Mail {
     }
 }
 
-/// 两种语言的固定文案。
+/// 两种语言、两种周期的固定文案。
 struct Words {
+    /// 正文里对这类报告的称呼：「周报」/「weekly report」。
+    report: &'static str,
     visitors: &'static str,
     visits: &'static str,
     pageviews: &'static str,
@@ -205,25 +223,52 @@ struct Words {
 }
 
 impl Words {
-    fn of(lang: Lang) -> Self {
+    fn of(lang: Lang, cadence: Cadence) -> Self {
+        let monthly = cadence == Cadence::Monthly;
         match lang {
             Lang::Zh => Words {
+                report: if monthly { "月报" } else { "周报" },
                 visitors: "访客",
                 visits: "访问",
                 pageviews: "浏览量",
-                no_visits: "这一周没有记录到访问。",
+                no_visits: if monthly {
+                    "这个月没有记录到访问。"
+                } else {
+                    "这一周没有记录到访问。"
+                },
                 open: "打开看板",
-                manage: "管理周报",
-                unsubscribe: "退订周报",
+                manage: if monthly {
+                    "管理月报"
+                } else {
+                    "管理周报"
+                },
+                unsubscribe: if monthly {
+                    "退订月报"
+                } else {
+                    "退订周报"
+                },
                 colon: "：",
             },
             Lang::En => Words {
+                report: if monthly {
+                    "monthly report"
+                } else {
+                    "weekly report"
+                },
                 visitors: "Visitors",
                 visits: "Visits",
                 pageviews: "Pageviews",
-                no_visits: "No visits were recorded this week.",
+                no_visits: if monthly {
+                    "No visits were recorded this month."
+                } else {
+                    "No visits were recorded this week."
+                },
                 open: "Open dashboard",
-                manage: "Manage weekly report",
+                manage: if monthly {
+                    "Manage monthly report"
+                } else {
+                    "Manage weekly report"
+                },
                 unsubscribe: "Unsubscribe",
                 colon: ": ",
             },
@@ -375,6 +420,29 @@ fn grouped(value: u64) -> String {
 const MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
+const LONG_MONTHS: [&str; 12] = [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+];
+
+/// 月报主题里的月份：「2026 年 10 月」/「October 2026」。
+fn month(day: Date, lang: Lang) -> String {
+    let (y, m) = (day.year(), day.month());
+    match lang {
+        Lang::Zh => format!("{y} 年 {m} 月"),
+        Lang::En => format!("{} {y}", LONG_MONTHS[usize::try_from(m - 1).unwrap_or(0)]),
+    }
+}
 /// 英文日期范围的分隔：空格、短横线（en dash）、空格，与 Chromium 156 的 `Intl.DateTimeFormat` 一致
 /// （较早的 ICU 在短横线两边用细空格）。
 const EN_DASH: &str = " \u{2013} ";
@@ -452,6 +520,7 @@ mod tests {
         };
         Report {
             lang,
+            cadence: Cadence::Weekly,
             to: "viewer@example.com",
             base_url: BASE,
             site_id,
@@ -718,10 +787,158 @@ mod tests {
                 assert_eq!(text_links(&mail.body), want);
                 assert_eq!(hrefs(mail.html.as_deref().unwrap()), want);
             }
+            let mail = report(&monthly(lang, "2026-10-01", "2026-10-31"));
+            let want = [
+                format!("{BASE}/s/1"),
+                format!("{BASE}/account"),
+                UNSUBSCRIBE.to_owned(),
+            ];
+            assert_eq!(text_links(&mail.body), want);
+            assert_eq!(hrefs(mail.html.as_deref().unwrap()), want);
             let mail = confirmation(lang, "viewer@example.com", CONFIRM);
             assert_eq!(text_links(&mail.body), [CONFIRM]);
             assert_eq!(hrefs(mail.html.as_deref().unwrap()), [CONFIRM]);
         }
+    }
+
+    fn monthly(lang: Lang, from: &str, until: &str) -> Report<'static> {
+        let mut r = fixture(lang, "studio");
+        r.cadence = Cadence::Monthly;
+        r.from = from.parse().unwrap();
+        r.until = until.parse().unwrap();
+        r
+    }
+
+    #[test]
+    fn a_month_in_both_languages() {
+        let zh = report(&monthly(Lang::Zh, "2026-10-01", "2026-10-31"));
+        assert_eq!(zh.subject, "studio.example.com 月报：2026 年 10 月");
+        assert_eq!(
+            zh.body,
+            format!(
+                "studio.example.com\n2026 年 10 月 1 日至 31 日（Asia/Taipei）\n\n\
+                 访客：1,284\n访问：1,702\n浏览量：4,315\n\n\
+                 打开看板：{BASE}/s/1\n\n\
+                 你订阅了 studio.example.com 的月报，收件地址 viewer@example.com。\n\
+                 管理月报：{BASE}/account\n退订月报：{UNSUBSCRIBE}\n"
+            )
+        );
+        assert_eq!(zh.unsubscribe_url.as_deref(), Some(UNSUBSCRIBE));
+        let html = zh.html.unwrap();
+        self_contained(&html);
+        assert!(html.contains("<title>studio.example.com 月报：2026 年 10 月</title>"));
+        assert!(html.contains(">2026 年 10 月 1 日至 31 日（Asia/Taipei）</span>"));
+        assert!(html.contains(">管理月报</a>") && html.contains(">退订月报</a>"));
+        assert!(!html.contains("周报") && !zh.body.contains("周报"));
+
+        let en = report(&monthly(Lang::En, "2026-10-01", "2026-10-31"));
+        assert_eq!(
+            en.subject,
+            "studio.example.com monthly report: October 2026"
+        );
+        assert_eq!(
+            en.body,
+            format!(
+                "studio.example.com\nOct 1 \u{2013} 31, 2026 (Asia/Taipei)\n\n\
+                 Visitors: 1,284\nVisits: 1,702\nPageviews: 4,315\n\n\
+                 Open dashboard: {BASE}/s/1\n\n\
+                 You subscribed to the monthly report for studio.example.com at viewer@example.com.\n\
+                 Manage monthly report: {BASE}/account\nUnsubscribe: {UNSUBSCRIBE}\n"
+            )
+        );
+        let html = en.html.unwrap();
+        self_contained(&html);
+        assert!(html.contains("<title>studio.example.com monthly report: October 2026</title>"));
+        assert!(html.contains(">Manage monthly report</a>"));
+        // The fixture's unsubscribe link is a weekly one; nothing else may say weekly.
+        assert!(!html.replace(UNSUBSCRIBE, "").contains("weekly"));
+        assert!(!en.body.replace(UNSUBSCRIBE, "").contains("weekly"));
+    }
+
+    #[test]
+    fn december_and_january_name_their_own_year() {
+        for (from, until, zh_month, zh_range, en_month, en_range) in [
+            (
+                "2026-12-01",
+                "2026-12-31",
+                "2026 年 12 月",
+                "2026 年 12 月 1 日至 31 日",
+                "December 2026",
+                "Dec 1 \u{2013} 31, 2026",
+            ),
+            (
+                "2027-01-01",
+                "2027-01-31",
+                "2027 年 1 月",
+                "2027 年 1 月 1 日至 31 日",
+                "January 2027",
+                "Jan 1 \u{2013} 31, 2027",
+            ),
+            (
+                "2028-02-01",
+                "2028-02-29",
+                "2028 年 2 月",
+                "2028 年 2 月 1 日至 29 日",
+                "February 2028",
+                "Feb 1 \u{2013} 29, 2028",
+            ),
+        ] {
+            let zh = report(&monthly(Lang::Zh, from, until));
+            assert_eq!(zh.subject, format!("studio.example.com 月报：{zh_month}"));
+            assert!(
+                zh.body.contains(&format!("\n{zh_range}（Asia/Taipei）\n")),
+                "{}",
+                zh.body
+            );
+            let en = report(&monthly(Lang::En, from, until));
+            assert_eq!(
+                en.subject,
+                format!("studio.example.com monthly report: {en_month}")
+            );
+            assert!(
+                en.body.contains(&format!("\n{en_range} (Asia/Taipei)\n")),
+                "{}",
+                en.body
+            );
+        }
+    }
+
+    #[test]
+    fn a_month_without_visits_says_so() {
+        for (lang, line) in [
+            (Lang::Zh, "这个月没有记录到访问。"),
+            (Lang::En, "No visits were recorded this month."),
+        ] {
+            let mut r = monthly(lang, "2026-10-01", "2026-10-31");
+            (r.visitors, r.visits, r.pageviews) = (0, 0, 0);
+            let mail = report(&r);
+            assert!(
+                mail.body.contains(&format!("0\n{line}\n\n")),
+                "{}",
+                mail.body
+            );
+            assert!(mail.html.unwrap().contains(&format!("{line}</p>")));
+        }
+    }
+
+    #[test]
+    fn a_hostile_site_name_in_a_monthly_report() {
+        let mut r = monthly(Lang::En, "2026-10-01", "2026-10-31");
+        r.site_name = "<b>Acme</b>\r\nBcc: thief@example.test";
+        let mail = report(&r);
+        assert_eq!(
+            mail.subject,
+            "<b>Acme</b> Bcc: thief@example.test monthly report: October 2026"
+        );
+        assert_eq!(
+            mail.body.lines().next().unwrap(),
+            "<b>Acme</b> Bcc: thief@example.test"
+        );
+        let html = mail.html.unwrap();
+        self_contained(&html);
+        assert!(html.contains(">&lt;b&gt;Acme&lt;/b&gt; Bcc: thief@example.test</h1>"));
+        assert!(!html.contains("<b>"));
+        assert_eq!(hrefs(&html).len(), 3);
     }
 
     #[test]
