@@ -4,9 +4,9 @@
 
 2026-11-19 确认、正在实现的部分：「账号 → 邮件周报」（`src/routes/account/WeeklyReportsCard.svelte`）和邮件里的确认链接页（`src/routes/auth/WeeklyConfirmPage.svelte`，路径 `#/weekly-report/confirm/t0k3n`）。
 
-「昼夜之水」重新设计（待确认，分支 `design/redesign-flow`）：令牌 `src/styles/tokens.css`（新的颜色分工、字号、圆角、动效）、展示字体 `src/lib/fonts/`（Bricolage Grotesque，OFL，随包）、地球 `src/lib/charts/globe.ts` 与 `Globe.svelte`、看板的「此刻」窗口 `src/routes/dashboard/NowPanel.svelte`、登录页外壳 `src/routes/auth/AuthShell.svelte`。说明见 [`docs/ui/redesign-2026-11.md`](../../docs/ui/redesign-2026-11.md)。这个分支上共享文件与 `apps/dashboard` 不一致，检查脚本的同步一项不通过，确认后一起补齐。
+「昼夜之水」重新设计（2026-11-20 确认，`apps/dashboard` 还没实现）：令牌 `src/styles/tokens.css`（新的颜色分工、字号、圆角、动效）、展示字体 `src/lib/fonts/`（Bricolage Grotesque，OFL，随包）、地球 `src/lib/charts/globe.ts` 与 `Globe.svelte`、看板的「此刻」窗口 `src/routes/dashboard/NowPanel.svelte`、登录页外壳 `src/routes/auth/AuthShell.svelte`。说明见 [`docs/ui/redesign-2026-11.md`](../../docs/ui/redesign-2026-11.md)。看板实现之前，共享文件与 `apps/dashboard` 不一致，检查脚本的同步一项暂停着（`SYNC_SUSPENDED`）。
 
-v0.2.0 的部分，2026-11-20 确认按原型实现（修改登录邮箱和世界地图按意见改过，等再看一眼）：
+v0.2.0 的部分，2026-11-20 确认按原型实现（都还没在看板里做）：
 
 - 修改登录邮箱（#37）：`src/routes/account/LoginEmail.svelte`（账号页个人资料的「邮箱」一行和对话框）与确认链接页 `src/routes/auth/EmailChangeConfirmPage.svelte`（`#/email-change/confirm/t0k3n`）。只要新邮箱和当前密码，开了两步验证也不要验证码。
 - 月报（#38）：`src/routes/account/WeeklyReportsCard.svelte` 改成「邮件订阅」卡片，站点 × 周报 / 月报的开关表（文件名沿用）。
@@ -17,7 +17,7 @@ v0.2.0 的部分，2026-11-20 确认按原型实现（修改登录邮箱和世�
 - 自定义日期范围、「昨天」「上个月」、上一周期 / 下一周期（#32）：`src/routes/dashboard/period.ts`、`RangeDialog.svelte`、`FilterBar.svelte`。范围按钮菜单最后一项「自定义范围…」；箭头按范围自己的长度前后平移，按月的范围按自然月平移；实时和全部时间没有箭头。合并看板 `#/sites/combined` 也用这个控件（`RangeControl.svelte`），自定义日期每个站点按自己的时区算。
 - 页面报表的平均滚动深度、平均停留时间（#34）：只在「页面」卡片的明细表（「查看全部」）里，窄屏收进页面名下面的一行小字；口径写在表格下方。卡片本身不变。
 - 位置报表的城市（#35）：评审面板新增「地理库」（按站点 / 城市级 / 国家级）。城市级：国家、地区、城市三个标签页，城市行是城市名加国家，筛选里有地区和城市；国家级（默认的 DB-IP Lite）：只有国家，卡片底部「为什么只有国家」弹出一句原因和配置说明的链接（共享链接和公开看板不显示）。站点设置里地理精度选「国家」时也只有国家，不另作说明。
-- 位置报表的世界地图（#43）：共享图表 `src/lib/charts/WorldMap.svelte`，形状数据 `src/lib/charts/world/countries-110m.ts`（Natural Earth 1:110m，公有领域，来源见同目录 `PROVENANCE.md`，用 `scripts/gen-world-map.mjs` 生成），已逐字节复制到 `apps/dashboard/src/lib/charts`（那边暂未使用）。位置卡片保持半宽，地图是最后一个标签页「地图」（`BreakdownCard` 的 `visualTab`），数据同国家。看板按需动态加载地图，不进首屏；单文件原型会把它内联，所以原型的 `dist/index.html` 变大不代表看板首屏变大。
+- 位置报表的世界地图（#43）：共享图表 `src/lib/charts/WorldMap.svelte`，形状数据 `src/lib/charts/world/countries-110m.ts`（Natural Earth 1:110m，公有领域，来源见同目录 `PROVENANCE.md`，用 `scripts/gen-world-map.mjs` 生成），已逐字节复制到 `apps/dashboard/src/lib/charts`（那边暂未使用）。位置卡片保持半宽，地图是最后一个标签页「地图」（`BreakdownCard` 的 `visualTab`），数据同国家；重新设计后这个标签页画的是地球（`Globe.svelte`），平面地图组件暂时留着没用。看板按需动态加载地图，不进首屏；单文件原型会把它内联，所以原型的 `dist/index.html` 变大不代表看板首屏变大。
 
 ## 运行
 
@@ -50,6 +50,6 @@ src/lib/data/fixtures.ts  模拟数据
 src/routes/               各页面
 ```
 
-改完在仓库根目录运行 `node tools/design-lint/check.mjs`：它检查界面规则，并要求 `src/styles/tokens.css`、`radix.css`、`src/lib/ui`、`src/lib/charts` 与 `apps/dashboard` 里的对应文件逐字节相同。
+改完在仓库根目录运行 `node tools/design-lint/check.mjs`：它检查界面规则，并要求 `src/styles/tokens.css`、`radix.css`、`src/lib/ui`、`src/lib/charts` 与 `apps/dashboard` 里的对应文件逐字节相同（重新设计在看板里实现之前，这一项暂停，只打印有几个文件不同）。
 
 `apps/dashboard` 用的是同一套令牌与组件，`routes/*/query.ts` 这类模拟层在那里换成了真实的 `/api/internal/*` 调用。改界面时先改原型，审批后再同步到 `apps/dashboard`。
