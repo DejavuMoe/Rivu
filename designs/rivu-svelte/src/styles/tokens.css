@@ -1,28 +1,45 @@
 /*
- * Rivu 设计令牌。颜色全部来自 Radix Colors（radix.css 由 scripts/gen-radix.mjs 生成），
- * 并按 Radix 的分级用法映射成语义令牌：
+ * Rivu 设计令牌（「昼夜之水」方案，待确认）。
+ *
+ * 颜色的基础仍然是 Radix Colors（radix.css 由 scripts/gen-radix.mjs 生成），按 Radix 的分级用法映射成语义令牌：
  *   1 应用背景 · 2 次级背景 · 3/4/5 控件底（常态/悬停/按下或选中）
  *   6 不可交互的分隔线 · 7 控件边框 · 8 悬停边框与焦点
  *   9 实色背景 · 10 实色悬停 · 11 次要文字 · 12 主要文字
- * 深浅色由 radix.css 切换，这里只定义一次。组件只用这里的语义令牌，不直接写色阶，更不写裸色值。
+ * 少数 Radix 给不了的值（水面底色、地球、渐变、阴影）只在这个文件里写裸值。
+ * 组件只用这里的语义令牌，不直接写色阶，更不写裸色值和渐变。
+ *
+ * 颜色的分工：
+ *   墨（slate）      界面本身：文字、按钮、边框。界面是单色的。
+ *   水流（indigo → cyan）  已经发生的数据：趋势线、条形、地球上有访客的地方。越靠近现在越亮。
+ *   灯光（orange / amber） 此刻：在线人数、地球上的光点、趋势线末端。
+ *   绿 / 红          只表示涨跌与成功失败。
  */
 
 :root {
   color-scheme: light;
 
-  /* ---------- 字体：只有四个字号 ---------- */
+  /* ---------- 字体 ---------- */
+  /* 展示字体只有拉丁字符，中文落到后面的正文字体与系统中文字体 */
+  --font-display: "Bricolage Grotesque Variable", "IBM Plex Sans", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI",
+    "Microsoft YaHei", "Noto Sans CJK SC", "Source Han Sans SC", system-ui, sans-serif;
   --font-sans: "IBM Plex Sans", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei",
     "Noto Sans CJK SC", "Source Han Sans SC", system-ui, sans-serif;
   --font-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", "Cascadia Mono", Menlo, Consolas, monospace;
   --fs-sm: 12px; /* 辅助信息、表头、坐标轴 */
   --fs-md: 14px; /* 正文、控件、表格 */
-  --fs-lg: 16px; /* 页面与对话框标题 */
-  --fs-xl: 24px; /* 指标数值 */
+  --fs-lg: 16px; /* 对话框标题、卡片里的强调 */
+  --fs-xl: 20px; /* 页面标题（展示字体） */
+  --fs-2xl: 28px; /* 指标数值（展示字体） */
+  --fs-3xl: 44px; /* 一页里最大的那个数：此刻在线、登录页标题 */
   --lh: 1.5;
   --lh-tight: 1.25;
+  --lh-display: 1.05;
   --fw-regular: 400;
   --fw-medium: 500;
   --fw-semibold: 600;
+  /* 展示字体的字距：字号越大收得越紧 */
+  --track-display: -0.02em;
+  --track-display-lg: -0.035em;
 
   /* ---------- 间距（4px 网格） ---------- */
   --sp-1: 4px;
@@ -38,48 +55,76 @@
   /* ---------- 尺寸 ---------- */
   --control-sm: 28px;
   --control-md: 32px;
-  --control-lg: 36px;
-  --sidebar-w: 240px;
-  --content-max: 1200px;
+  --control-lg: 38px;
+  --sidebar-w: 248px;
+  --content-max: 1240px;
 
   /* ---------- 线与圆角 ---------- */
   --hairline: 0.5px;
-  /* 圆角按嵌套关系取值：外层 = 内层 + 间距（浮层 8 = 菜单项 4 + 内边距 4；分段控件 6 = 选项 4 + 2） */
-  --r-xs: 4px; /* 浮层与分段控件内的选项、徽标 */
-  --r-sm: 6px; /* 按钮、输入框、分段控件 */
-  --r-md: 8px; /* 卡片、浮层 */
-  --r-lg: 12px; /* 对话框 */
+  /* 圆角分级：越大的容器越圆；嵌套时内层不大于外层减间距（分段控件 8 = 选项 6 + 2） */
+  --r-xs: 6px; /* 浮层与分段控件内的选项、徽标、条形 */
+  --r-sm: 8px; /* 按钮、输入框、分段控件 */
+  --r-md: 14px; /* 卡片、浮层 */
+  --r-lg: 18px; /* 对话框、看板最上面的主区块 */
   --r-full: 999px;
 
-  /* ---------- 动效：以 transform 与 opacity 为主（条形图的宽度例外），出现用 ease-out，位移用 ease-in-out ---------- */
+  /* ---------- 动效 ---------- */
   --ease: cubic-bezier(0, 0, 0.2, 1); /* ease-out：出现、展开 */
   --ease-move: cubic-bezier(0.4, 0, 0.2, 1); /* ease-in-out：指示条、抽屉这类从一处移到另一处 */
+  --ease-settle: cubic-bezier(0.22, 1, 0.36, 1); /* 到达：先快后很慢地落定 */
   --dur-fast: 120ms; /* 悬停的颜色变化 */
   --dur-pop: 160ms; /* 浮层、提示出现 */
   --dur: 250ms; /* 对话框、抽屉、指示条 */
+  --dur-arrive: 700ms; /* 数据到达：条形长出、数字落定 */
+  --dur-draw: 1200ms; /* 趋势线画出 */
+  --dur-pulse: 2400ms; /* 在线光点的一次扩散 */
 
-  /* ---------- 中性色（gray） ---------- */
-  --bg-app: var(--gray-1);
-  --bg-subtle: var(--gray-2);
-  --bg-element: var(--gray-3);
-  --bg-hover: var(--gray-4);
-  --bg-active: var(--gray-5);
-  --border-subtle: var(--gray-6);
-  --border: var(--gray-7);
-  --border-hover: var(--gray-8);
-  --text-placeholder: var(--gray-9);
-  --text-muted: var(--gray-11);
-  --text: var(--gray-12);
+  /* 夜空：「此刻」窗口和登录页的底色，不随主题变 */
+  --night: #060915;
+  --night-scrim: radial-gradient(120% 100% at 0% 100%, #060915 30%, rgb(6 9 21 / 0) 72%);
 
-  /* ---------- 强调色（blue）：主操作、链接、焦点、选中，以及图表主序列 ---------- */
-  --accent-bg: var(--blue-3);
-  --accent-bg-hover: var(--blue-4);
-  --accent-bg-active: var(--blue-5);
-  --accent-border: var(--blue-7);
-  --accent-focus: var(--blue-8);
-  --accent-solid: var(--blue-9);
-  --accent-solid-hover: var(--blue-10);
-  --accent-text: var(--blue-11);
+  /* SVG 蒙版里表示「显示」的颜色（蒙版按亮度取值） */
+  --mask-on: #ffffff;
+
+}
+
+/*
+ * 颜色令牌。除了根元素，也在带 data-theme 的元素上重新声明一遍：
+ * 这样页面里的一小块可以单独用深色（看板的「此刻」窗口、登录页的夜空），里面的令牌按那一块的色阶重新取值。
+ */
+:root,
+[data-theme] {
+  /* ---------- 纸面：水面（页面）→ 纸（卡片、控件、浮层）→ 凹处（纸上的次级底） ---------- */
+  --bg-canvas: #f3f5f9;
+  --bg-app: #ffffff;
+  --bg-subtle: var(--slate-2);
+  --bg-element: var(--slate-3);
+  --bg-hover: var(--slate-4);
+  --bg-active: var(--slate-5);
+  /* 直接放在水面上的控件（侧栏的行、页头的标签）悬停与选中时的底 */
+  --bg-canvas-hover: var(--slate-a3);
+  --bg-canvas-active: #ffffff;
+  --border-subtle: var(--slate-5);
+  --border: var(--slate-6);
+  --border-hover: var(--slate-8);
+  --text-placeholder: var(--slate-9);
+  --text-muted: var(--slate-11);
+  --text: var(--slate-12);
+
+  /* ---------- 墨：主操作。按钮是墨色的，与标志一致 ---------- */
+  --ink: var(--slate-12);
+  --ink-hover: #30363d;
+  --ink-contrast: #ffffff;
+
+  /* ---------- 强调色（indigo）：链接、焦点、选中、开关 ---------- */
+  --accent-bg: var(--indigo-3);
+  --accent-bg-hover: var(--indigo-4);
+  --accent-bg-active: var(--indigo-5);
+  --accent-border: var(--indigo-7);
+  --accent-focus: var(--indigo-8);
+  --accent-solid: var(--indigo-9);
+  --accent-solid-hover: var(--indigo-10);
+  --accent-text: var(--indigo-11);
   --accent-contrast: #fff;
 
   /* ---------- 状态色：只表达状态，永远配文字 ---------- */
@@ -92,35 +137,142 @@
   --bad-solid: var(--red-9);
   --bad-solid-hover: var(--red-10);
   --bad-text: var(--red-11);
-  --live: var(--grass-9);
+
+  /* ---------- 灯光：此刻 ---------- */
+  --live: var(--orange-9);
+  --live-halo: var(--orange-a5);
+  --live-text: var(--orange-11);
 
   /* 焦点环：无障碍要求，不受 0.5px 线宽规则约束 */
-  --focus-ring: 0 0 0 2px var(--accent-focus);
+  --focus-ring: 0 0 0 2px var(--bg-app), 0 0 0 4px var(--accent-focus);
+
+  /* ---------- 水流：数据的颜色，从深（早）到亮（近） ---------- */
+  --flow-from: var(--indigo-9);
+  --flow-to: var(--cyan-9);
+  --flow-line: linear-gradient(90deg, var(--flow-from), var(--flow-to));
+  --flow-area-top: 0.32; /* 趋势线下方填充：最上面、七成深处的不透明度，再向下淡到 0 */
+  --flow-area-mid: 0.1;
+  --flow-glow: none; /* 深色模式下趋势线带一点光 */
 
   /* ---------- 图表 ---------- */
-  --series-1: var(--blue-9);
+  --series-1: var(--flow-from);
   --series-2: var(--tomato-9);
   --series-3: var(--violet-9);
-  --series-compare: var(--gray-8);
-  --chart-area: var(--blue-a2);
-  --chart-bar: var(--gray-a4);
-  --chart-bar-hover: var(--gray-a5);
-  --chart-grid: var(--gray-a4);
-  --chart-axis: var(--gray-a6);
+  --series-compare: var(--slate-8);
+  --chart-area: var(--indigo-a3);
+  --chart-bar: linear-gradient(90deg, var(--indigo-a4), var(--cyan-a3));
+  --chart-bar-hover: linear-gradient(90deg, var(--indigo-a5), var(--cyan-a4));
+  --chart-bar-flat: var(--indigo-a3);
+  --chart-grid: var(--slate-a3);
+  --chart-axis: var(--slate-a6);
 
-  /* ---------- 浮层 ---------- */
-  --shadow-pop: 0 8px 24px -12px rgb(0 0 0 / 0.18);
-  --overlay: var(--gray-a8);
+  /* ---------- 地球 ---------- */
+  --globe-sea-lit: #ffffff; /* 向着太阳的海面 */
+  --globe-sea: #e9eef8; /* 海面 */
+  --globe-sea-shade: #cfd8ea; /* 背着太阳的一侧与边缘 */
+  --globe-air: #5b7cf0; /* 大气的光晕 */
+  --globe-air-alpha: 0.22;
+  --globe-land: #8e99b3; /* 没有访客的陆地 */
+  --globe-land-alpha: 0.55;
+  --globe-night-alpha: 0.7; /* 夜半球的陆地点相对白天的不透明度 */
+  /* 有访客的陆地按多少分五档：浅色主题里越多越深，深色主题里越多越亮 */
+  --globe-data: var(--cyan-9);
+  --globe-data-bright: var(--indigo-9);
+  --globe-grid: var(--indigo-a3);
+
+  /* ---------- 浮层与纸面的影子 ---------- */
+  --shadow-card: 0 1px 2px rgb(22 32 64 / 0.04);
+  --shadow-control: 0 1px 1px rgb(22 32 64 / 0.05);
+  --shadow-pop: 0 16px 40px -16px rgb(22 32 64 / 0.28), 0 2px 8px rgb(22 32 64 / 0.06);
+  --overlay: var(--slate-a8);
 }
 
 @media (prefers-color-scheme: dark) {
   :root:where(:not([data-theme="light"])) {
     color-scheme: dark;
-    --shadow-pop: 0 8px 24px -8px rgb(0 0 0 / 0.6);
+    --bg-canvas: #0a0b0e;
+    --bg-app: #131418;
+    --bg-subtle: #191b20;
+    --bg-element: var(--slate-3);
+    --bg-hover: var(--slate-4);
+    --bg-active: var(--slate-5);
+    --bg-canvas-hover: var(--slate-a3);
+    --bg-canvas-active: #1a1c21;
+    --border-subtle: var(--slate-4);
+    --border: var(--slate-6);
+    --border-hover: var(--slate-8);
+    --ink: var(--slate-12);
+    --ink-hover: #ffffff;
+    --ink-contrast: #111113;
+    --live: var(--amber-9);
+    --live-halo: var(--amber-a5);
+    --live-text: var(--amber-11);
+    --flow-from: var(--indigo-10);
+    --flow-to: var(--cyan-11);
+    --flow-area-top: 0.42;
+    --flow-area-mid: 0.14;
+    --flow-glow: drop-shadow(0 0 6px rgb(84 114 228 / 0.55));
+    --chart-area: var(--indigo-a4);
+    --chart-bar: linear-gradient(90deg, var(--indigo-a5), var(--cyan-a3));
+    --chart-bar-hover: linear-gradient(90deg, var(--indigo-a6), var(--cyan-a4));
+    --chart-bar-flat: var(--indigo-a4);
+    --globe-sea-lit: #1d2a55;
+    --globe-sea: #10162b;
+    --globe-sea-shade: #07090f;
+    --globe-air: #4f72ff;
+    --globe-air-alpha: 0.4;
+    --globe-land: #7d8cb8;
+    --globe-land-alpha: 0.6;
+    --globe-night-alpha: 0.62;
+    --globe-data: var(--indigo-11);
+    --globe-data-bright: var(--cyan-11);
+    --globe-grid: var(--indigo-a4);
+    --shadow-card: none;
+    --shadow-control: none;
+    --shadow-pop: 0 16px 40px -12px rgb(0 0 0 / 0.7), 0 0 0 var(--hairline) var(--slate-6);
   }
 }
 
-:root[data-theme="dark"] {
+[data-theme="dark"] {
   color-scheme: dark;
-  --shadow-pop: 0 8px 24px -8px rgb(0 0 0 / 0.6);
+  --bg-canvas: #0a0b0e;
+  --bg-app: #131418;
+  --bg-subtle: #191b20;
+  --bg-element: var(--slate-3);
+  --bg-hover: var(--slate-4);
+  --bg-active: var(--slate-5);
+  --bg-canvas-hover: var(--slate-a3);
+  --bg-canvas-active: #1a1c21;
+  --border-subtle: var(--slate-4);
+  --border: var(--slate-6);
+  --border-hover: var(--slate-8);
+  --ink: var(--slate-12);
+  --ink-hover: #ffffff;
+  --ink-contrast: #111113;
+  --live: var(--amber-9);
+  --live-halo: var(--amber-a5);
+  --live-text: var(--amber-11);
+  --flow-from: var(--indigo-10);
+  --flow-to: var(--cyan-11);
+  --flow-area-top: 0.42;
+  --flow-area-mid: 0.14;
+  --flow-glow: drop-shadow(0 0 6px rgb(84 114 228 / 0.55));
+  --chart-area: var(--indigo-a4);
+  --chart-bar: linear-gradient(90deg, var(--indigo-a5), var(--cyan-a3));
+  --chart-bar-hover: linear-gradient(90deg, var(--indigo-a6), var(--cyan-a4));
+  --chart-bar-flat: var(--indigo-a4);
+  --globe-sea-lit: #1d2a55;
+  --globe-sea: #10162b;
+  --globe-sea-shade: #07090f;
+  --globe-air: #4f72ff;
+  --globe-air-alpha: 0.4;
+  --globe-land: #7d8cb8;
+  --globe-land-alpha: 0.6;
+  --globe-night-alpha: 0.62;
+  --globe-data: var(--indigo-11);
+  --globe-data-bright: var(--cyan-11);
+  --globe-grid: var(--indigo-a4);
+  --shadow-card: none;
+  --shadow-control: none;
+  --shadow-pop: 0 16px 40px -12px rgb(0 0 0 / 0.7), 0 0 0 var(--hairline) var(--slate-6);
 }

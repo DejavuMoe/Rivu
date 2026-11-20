@@ -4,6 +4,8 @@
 
 2026-11-19 确认、正在实现的部分：「账号 → 邮件周报」（`src/routes/account/WeeklyReportsCard.svelte`）和邮件里的确认链接页（`src/routes/auth/WeeklyConfirmPage.svelte`，路径 `#/weekly-report/confirm/t0k3n`）。
 
+「昼夜之水」重新设计（待确认，分支 `design/redesign-flow`）：令牌 `src/styles/tokens.css`（新的颜色分工、字号、圆角、动效）、展示字体 `src/lib/fonts/`（Bricolage Grotesque，OFL，随包）、地球 `src/lib/charts/globe.ts` 与 `Globe.svelte`、看板的「此刻」窗口 `src/routes/dashboard/NowPanel.svelte`、登录页外壳 `src/routes/auth/AuthShell.svelte`。说明见 [`docs/ui/redesign-2026-11.md`](../../docs/ui/redesign-2026-11.md)。这个分支上共享文件与 `apps/dashboard` 不一致，检查脚本的同步一项不通过，确认后一起补齐。
+
 v0.2.0 的部分，2026-11-20 确认按原型实现（修改登录邮箱和世界地图按意见改过，等再看一眼）：
 
 - 修改登录邮箱（#37）：`src/routes/account/LoginEmail.svelte`（账号页个人资料的「邮箱」一行和对话框）与确认链接页 `src/routes/auth/EmailChangeConfirmPage.svelte`（`#/email-change/confirm/t0k3n`）。只要新邮箱和当前密码，开了两步验证也不要验证码。

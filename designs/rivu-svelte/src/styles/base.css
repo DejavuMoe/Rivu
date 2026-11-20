@@ -16,13 +16,19 @@ html {
 body {
   margin: 0;
   min-height: 100vh;
-  background: var(--bg-app);
+  background: var(--bg-canvas);
   color: var(--text);
   font-family: var(--font-sans);
   font-size: var(--fs-md);
   line-height: var(--lh);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+}
+
+/* 独立页（登录等）整页是夜空：给滚动条预留的那一条也跟着暗下来 */
+html.night,
+html.night body {
+  background: var(--night);
 }
 
 h1,

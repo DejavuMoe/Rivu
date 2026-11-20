@@ -180,7 +180,8 @@
     left: 0;
     z-index: -1;
     border-radius: var(--r-sm);
-    background: var(--bg-hover);
+    background: var(--bg-canvas-active);
+    box-shadow: var(--shadow-control), 0 0 0 var(--hairline) var(--border-subtle);
     transition:
       transform var(--dur) var(--ease-move),
       width var(--dur) var(--ease-move);
@@ -199,7 +200,7 @@
     flex: none;
   }
   .item:hover:not([aria-current]) {
-    background: var(--bg-element);
+    background: var(--bg-canvas-hover);
     color: var(--text);
   }
   .item[aria-current="page"] {

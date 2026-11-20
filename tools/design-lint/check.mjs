@@ -109,7 +109,7 @@ function checkCss(file, fullText, css, offset) {
     }
     if (new RegExp(`var\\(--(${RADIX_SCALES})-a?\\d+\\)`).test(value)) fail("raw-color", "use a semantic token, not a Radix scale step");
 
-    if (prop === "font-size" && !/^(var\(--fs-(sm|md|lg|xl)\)|inherit)$/.test(value)) fail("font-size", "use var(--fs-sm|md|lg|xl)");
+    if (prop === "font-size" && !/^(var\(--fs-(sm|md|lg|xl|2xl|3xl)\)|inherit)$/.test(value)) fail("font-size", "use var(--fs-sm|md|lg|xl|2xl|3xl)");
     if (prop === "font-weight" && !/^(var\(--fw-(regular|medium|semibold)\)|inherit)$/.test(value)) fail("font-weight", "use var(--fw-regular|medium|semibold)");
     if (prop === "font" && !/^inherit$/.test(value)) fail("font-size", "set font-size and font-weight with tokens instead of the font shorthand");
 
@@ -121,14 +121,14 @@ function checkCss(file, fullText, css, offset) {
       if (bad.length) fail("radius", "use var(--r-xs|sm|md|lg|full)");
     }
     if (prop === "box-shadow") {
-      const ok = value.split(/,(?![^(]*\))/).every((part) => /^(none|var\(--(shadow-pop|focus-ring)\)|(inset )?0 0 0 (var\(--hairline\)|1px|2px) var\(--[a-z-]+\))$/.test(part.trim()));
-      if (!ok) fail("shadow", "only var(--shadow-pop) on overlays, var(--focus-ring), or a hairline ring");
+      const ok = value.split(/,(?![^(]*\))/).every((part) => /^(none|var\(--(shadow-pop|shadow-card|shadow-control|focus-ring)\)|(inset )?0 0 0 (var\(--hairline\)|1px|2px) var\(--[a-z-]+\))$/.test(part.trim()));
+      if (!ok) fail("shadow", "only the shadow tokens (--shadow-pop, --shadow-card, --shadow-control), var(--focus-ring), or a hairline ring");
     }
     if (/gradient\(/.test(value) || prop === "backdrop-filter" || (prop === "filter" && /blur\(/.test(value))) {
       fail("effect", "no gradients, glass or blur");
     }
     if (/^(transition|animation)(-duration)?$/.test(prop) && /(?<![\w.-])\d*\.?\d+m?s\b/.test(value.replace(/var\([^)]*\)/g, ""))) {
-      fail("motion", "use var(--dur-fast|dur-pop|dur)");
+      fail("motion", "use a duration token (--dur-fast, --dur-pop, --dur, --dur-arrive, --dur-draw, --dur-pulse)");
     }
   }
 }

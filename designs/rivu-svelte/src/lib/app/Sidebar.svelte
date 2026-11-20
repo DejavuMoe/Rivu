@@ -164,9 +164,9 @@
     gap: var(--sp-3);
     width: var(--sidebar-w);
     height: 100vh;
-    padding: var(--sp-3) var(--sp-2);
-    border-right: var(--hairline) solid var(--border-subtle);
-    background: var(--bg-subtle);
+    padding: var(--sp-3) var(--sp-3);
+    /* 侧栏与页面同在水面上，不另起一块底色，也没有分隔线；选中的那一行是水面上的一张纸 */
+    background: var(--bg-canvas);
   }
   .top {
     display: flex;
@@ -227,11 +227,12 @@
   .item:hover,
   .org:hover,
   .org[aria-expanded="true"] {
-    background: var(--bg-element);
+    background: var(--bg-canvas-hover);
     color: var(--text);
   }
   .item[aria-current="page"] {
-    background: var(--bg-hover);
+    background: var(--bg-canvas-active);
+    box-shadow: var(--shadow-control), 0 0 0 var(--hairline) var(--border-subtle);
     color: var(--text);
     font-weight: var(--fw-medium);
   }
@@ -245,7 +246,9 @@
 
   .org {
     color: var(--text);
+    font-family: var(--font-display);
     font-weight: var(--fw-semibold);
+    letter-spacing: var(--track-display);
   }
   .org-name {
     flex: 1;

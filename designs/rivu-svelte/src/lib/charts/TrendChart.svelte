@@ -3,14 +3,20 @@
 
   规则（DESIGN.md「数据可视化」）：
   - 只有一个纵轴；不同量纲的指标分开画。
-  - 主序列 2px 品牌色 + 约 15% 的渐隐面积；对比期是 1.5px 中性灰线，永远不占分类色。
-  - 进行中的最后一个时间桶用虚线（「数据未完整」的约定含义），其余一律实线。
+  - 主序列是 2px 的「水流」：颜色沿时间从深（早）到亮（近），下方的面积向下淡出；对比期是 1.5px 中性灰线，永远不占分类色。
+    第一次出现时线从左画到右，之后换范围、筛选只改形状，不重画。
+  - 进行中的最后一个时间桶用虚线（「数据未完整」的约定含义），其余一律实线；它的端点是「此刻」，用灯光色并带一圈扩散的光。
   - 悬停 / 键盘左右键：竖向十字线 + 每个序列一个带 2px 表面色描边的圆点 + 浮动提示。
   - 网格是 1px 实线发丝线；刻度 0 起，取整。
   - marks（可选，如图表批注）：横轴文字上方多留一行放标记，挨得太近的标记合成一个；标记是按钮，
     悬停、聚焦时与悬停到那个点一样显示提示框（多出标记的文字），点击或 Enter 交给 onmark。
     不传 marks 时图表和以前完全一样。
 -->
+<script module lang="ts">
+  /** 每个图一组渐变，id 不能撞 */
+  let seq = 0;
+</script>
+
 <script lang="ts">
   import { MessageSquareText } from "@lucide/svelte";
   import { monotonePath, niceTicks } from "./scale";
@@ -62,6 +68,7 @@
   const MARK_ROW = 20;
   const pad = $derived({ top: 12, right: 12, bottom: marks ? 28 + MARK_ROW : 28, left: 48 });
 
+  const uid = ++seq;
   let width = $state(640);
   let hover: number | null = $state(null);
 
@@ -79,10 +86,12 @@
 
   const colored = $derived.by(() => {
     let slot = 0;
-    return series.map((s) => ({
-      ...s,
-      stroke: s.compare ? "var(--series-compare)" : (s.color ?? `var(--series-${++slot})`),
-    }));
+    return series.map((s) => {
+      const color = s.compare ? "var(--series-compare)" : (s.color ?? `var(--series-${++slot})`);
+      // 第一条主序列画成水流（沿时间的渐变）；圆点、图例这些地方仍用单色
+      const flow = !s.compare && !s.color && slot === 1;
+      return { ...s, color, flow, stroke: flow ? `url(#flow-${uid})` : color };
+    });
   });
 
   function paths(values: (number | null)[]) {
@@ -154,6 +163,13 @@
   });
   const hoverMarks = $derived(hover === null ? [] : (marks ?? []).filter((m) => m.index === hover));
 
+  /** 进行中的那个时间桶的端点：「此刻」 */
+  const nowPoint = $derived.by(() => {
+    if (!partialLast || !primary || n < 1) return null;
+    const v = primary.values[n - 1];
+    return v === null || v === undefined ? null : { x: xs[n - 1], y: y(v) };
+  });
+
   const tipLeft = $derived(hover === null ? 0 : xs[hover]);
   const tipFlip = $derived(tipLeft > width * 0.62);
 </script>
@@ -174,6 +190,21 @@
     onclick={() => hover !== null && onselect?.(hover)}
     class:selectable={!!onselect}
   >
+    <defs>
+      <linearGradient id="flow-{uid}" gradientUnits="userSpaceOnUse" x1={pad.left} x2={pad.left + plotW} y1="0" y2="0">
+        <stop offset="0" class="flow-from" />
+        <stop offset="1" class="flow-to" />
+      </linearGradient>
+      <linearGradient id="veil-{uid}" gradientUnits="userSpaceOnUse" x1="0" x2="0" y1={pad.top} y2={pad.top + plotH}>
+        <stop offset="0" class="fade-top" />
+        <stop offset="0.7" class="fade-mid" />
+        <stop offset="1" class="fade-bottom" />
+      </linearGradient>
+      <mask id="mask-{uid}" maskUnits="userSpaceOnUse" x={pad.left} y={pad.top} width={plotW} height={plotH}>
+        <rect x={pad.left} y={pad.top} width={plotW} height={plotH} fill="url(#veil-{uid})" />
+      </mask>
+    </defs>
+
     <!-- 网格与纵轴刻度 -->
     {#each ticks as tk, i (tk)}
       <line
@@ -196,21 +227,26 @@
       >
     {/each}
 
-    {#if areaPath}<path d={areaPath} class="area" />{/if}
+    {#if areaPath}<path d={areaPath} class="area" class:flow={primary?.flow} fill={primary?.flow ? `url(#flow-${uid})` : undefined} mask={primary?.flow ? `url(#mask-${uid})` : undefined} />{/if}
 
     <!-- 对比期先画，主序列压在上面 -->
     {#each [...colored].sort((a, b) => Number(b.compare ?? false) - Number(a.compare ?? false)) as s (s.key)}
       {@const p = paths(s.values)}
-      <path d={p.solid} class="line" class:compare={s.compare} stroke={s.stroke} />
-      {#if p.dashed}<path d={p.dashed} class="line partial" class:compare={s.compare} stroke={s.stroke} />{/if}
+      <path d={p.solid} class="line" class:compare={s.compare} class:flow={s.flow} stroke={s.stroke} pathLength={s.flow ? 1 : undefined} />
+      {#if p.dashed}<path d={p.dashed} class="line partial" class:compare={s.compare} stroke={s.flow ? "var(--flow-to)" : s.stroke} />{/if}
     {/each}
+
+    {#if nowPoint}
+      <circle cx={nowPoint.x} cy={nowPoint.y} r="4" class="now-halo" />
+      <circle cx={nowPoint.x} cy={nowPoint.y} r="3.5" class="now" />
+    {/if}
 
     {#if hover !== null}
       <line x1={xs[hover]} x2={xs[hover]} y1={pad.top} y2={pad.top + plotH} class="cross" />
       {#each colored as s (s.key)}
         {@const v = s.values[hover]}
         {#if v !== null && v !== undefined}
-          <circle cx={xs[hover]} cy={y(v)} r={s.compare ? 3.5 : 4.5} fill={s.stroke} class="dot" />
+          <circle cx={xs[hover]} cy={y(v)} r={s.compare ? 3.5 : 4.5} fill={s.color} class="dot" />
         {/if}
       {/each}
     {/if}
@@ -244,7 +280,7 @@
       {#each colored as s (s.key)}
         {@const v = s.values[hover]}
         <div class="tip-row">
-          <span class="key" class:compare={s.compare} style:--c={s.stroke}></span>
+          <span class="key" class:compare={s.compare} class:flow={s.flow} style:--c={s.color}></span>
           <span class="tip-label">{s.labels?.[hover] ?? s.label}</span>
           <span class="tip-val">{v === null || v === undefined ? "—" : format(v)}</span>
         </div>
@@ -314,10 +350,73 @@
   }
   .line.partial {
     stroke-dasharray: 3 4;
+    animation: fade-in var(--dur-arrive) var(--ease) var(--dur-draw) backwards;
+  }
+  .line.compare {
+    animation: fade-in var(--dur-arrive) var(--ease) backwards;
+  }
+  /* 水流：第一次出现时从左画到右（pathLength=1，虚线偏移从 1 到 0），深色模式带一点光 */
+  .line.flow {
+    stroke-width: 2.25;
+    stroke-dasharray: 1 1;
+    filter: var(--flow-glow);
+    animation: draw var(--dur-draw) var(--ease-settle) backwards;
+  }
+  @keyframes draw {
+    from {
+      stroke-dashoffset: 1;
+    }
+  }
+  .flow-from {
+    stop-color: var(--flow-from);
+  }
+  .flow-to {
+    stop-color: var(--flow-to);
+  }
+  .fade-top {
+    stop-color: var(--mask-on);
+    stop-opacity: var(--flow-area-top);
+  }
+  .fade-mid {
+    stop-color: var(--mask-on);
+    stop-opacity: var(--flow-area-mid);
+  }
+  .fade-bottom {
+    stop-color: var(--mask-on);
+    stop-opacity: 0;
   }
   .area {
-    fill: var(--chart-area);
     pointer-events: none;
+  }
+  /* 水流的填充颜色来自渐变（写在属性上）；其余序列用平涂 */
+  .area:not(.flow) {
+    fill: var(--chart-area);
+  }
+  .area.flow {
+    animation: fade-in var(--dur-draw) var(--ease) backwards;
+  }
+  /* 此刻：进行中的时间桶的端点，灯光色，一圈扩散的光 */
+  .now {
+    fill: var(--live);
+    stroke: var(--bg-app);
+    stroke-width: 1.5;
+    animation: fade-in var(--dur-arrive) var(--ease) var(--dur-draw) backwards;
+  }
+  .now-halo {
+    fill: var(--live);
+    transform-box: fill-box;
+    transform-origin: center;
+    animation: now-pulse var(--dur-pulse) var(--ease) var(--dur-draw) infinite backwards;
+  }
+  @keyframes now-pulse {
+    from {
+      opacity: 0.5;
+      transform: scale(1);
+    }
+    to {
+      opacity: 0;
+      transform: scale(4);
+    }
   }
   .cross {
     stroke: var(--border);
@@ -368,6 +467,9 @@
     border-radius: 1px;
     background: var(--c);
     flex: none;
+  }
+  .key.flow {
+    background: var(--flow-line);
   }
   .tip-label {
     flex: 1;

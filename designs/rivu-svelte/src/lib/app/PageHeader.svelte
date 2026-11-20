@@ -84,7 +84,9 @@
   }
   h1 {
     overflow: hidden;
-    font-size: var(--fs-lg);
+    font-family: var(--font-display);
+    font-size: var(--fs-xl);
+    letter-spacing: var(--track-display);
     text-overflow: ellipsis;
     white-space: nowrap;
   }
@@ -132,7 +134,7 @@
     inset: 4px 0 6px;
     z-index: -1;
     border-radius: var(--r-sm);
-    background: var(--bg-element);
+    background: var(--bg-canvas-hover);
     opacity: 0;
     transition: opacity var(--dur-fast) var(--ease);
   }
@@ -157,7 +159,7 @@
     z-index: 1;
     height: 2px;
     border-radius: 1px;
-    background: var(--accent-solid);
+    background: var(--ink);
     transition:
       transform var(--dur) var(--ease-move),
       width var(--dur) var(--ease-move);

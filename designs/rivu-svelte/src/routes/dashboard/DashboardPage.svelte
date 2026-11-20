@@ -44,6 +44,7 @@
     geoLevels,
     pageEngagement,
     grans,
+    liveByCountry,
     readState,
     runQuery,
     suggestValues,
@@ -54,7 +55,8 @@
   import { fmtAxis, fmtMetric, lowerIsBetter } from "./metrics";
   import type { Details } from "./BreakdownCard.svelte";
   import type { BarRow } from "../../lib/charts/types";
-  import type WorldMapType from "../../lib/charts/WorldMap.svelte";
+  import type GlobeType from "../../lib/charts/Globe.svelte";
+  import NowPanel from "./NowPanel.svelte";
   import { NOW } from "../../lib/data/fixtures";
   import { periodText, rangeQuery, ymd, type RangeParam } from "./period";
   import { rangeUi } from "./range";
@@ -87,7 +89,11 @@
   /** 站点从来没有收到过数据（决定空状态的文案与动作）；带筛选的查询不做这个判断 */
   const neverReceived = $derived(site.scale === 0 && !query.filters.length);
   /** 页头的在线人数：加载中、出错时还没取到，不显示；范围里没有数据时是 0；其余取站点的模拟值 */
-  const live = $derived(!settled ? null : noData ? 0 : undefined);
+  // 有数据时在线人数在「此刻」窗口里，页头不重复；没有数据（空状态，没有那个窗口）时页头显示 0
+  const live = $derived(!settled ? null : noData && !realtime ? 0 : null);
+
+  /** 「此刻」窗口：有地理数据的看板都有；加载中也占着位置，页面不跳 */
+  const showNow = $derived(!failed);
 
   const res = $derived(runQuery(site, query, app.lang, noData && realtime));
   const metric = $derived(dash.metric);
@@ -181,17 +187,20 @@
     missing: t("dash.engagementMissing"),
   });
 
-  // 世界地图：组件和形状数据（约 11 KB gzip）按需动态加载，不进首屏；数据到齐、有国家数据时才去取。
-  // 加载失败只是没有图，列表照常
-  let WorldMap = $state<typeof WorldMapType | null>(null);
+  // 地球：组件和国家形状按需动态加载，不进首屏；数据到齐、有数据时才去取。
+  // 加载失败只是没有图，数字和列表照常
+  let Globe = $state<typeof GlobeType | null>(null);
   let mapFailed = $state(false);
   $effect(() => {
-    if (WorldMap || mapFailed || !settled || empty) return;
-    import("../../lib/charts/WorldMap.svelte").then(
-      (m) => (WorldMap = m.default),
+    if (Globe || mapFailed || !settled || empty) return;
+    import("../../lib/charts/Globe.svelte").then(
+      (m) => (Globe = m.default),
       () => (mapFailed = true),
     );
   });
+  /** 「此刻」窗口：在线人数与在线访客所在的国家（加载中、出错时还没有） */
+  const online = $derived(!settled ? null : noData ? 0 : site.live);
+  const liveRows = $derived(online ? liveByCountry(site, online) : []);
   function mapSummary(bars: BarRow[]): string {
     const top = bars.slice(0, 3).map((b) => `${b.label} ${percent(res.totalVisitors ? b.value / res.totalVisitors : 0, 0)}`);
     return t("dash.map.summary", { list: top.join(t("dash.map.sep")) });
@@ -230,20 +239,22 @@
 </script>
 
 {#snippet worldMap(bars: BarRow[])}
-  {#if WorldMap}
-    <WorldMap
-      rows={bars.filter((b) => /^[A-Z]{2}$/.test(b.key)).map((b) => ({ code: b.key, label: b.label, value: b.value }))}
-      format={(n) => compact(n, app.lang)}
-      total={res.totalVisitors}
-      percent={(r) => percent(r, 0)}
-      summary={mapSummary(bars)}
-      lessText={t("dash.map.less")}
-      moreText={t("dash.map.more")}
-      onpick={(code) => addFilter("country", code)}
-    />
-  {:else if !mapFailed}
-    <Skeleton height={240} radius={4} />
-  {/if}
+  <div class="map">
+    {#if Globe}
+      <Globe
+        rows={bars.filter((b) => /^[A-Z]{2}$/.test(b.key)).map((b) => ({ code: b.key, label: b.label, value: b.value }))}
+        format={(n: number) => compact(n, app.lang)}
+        total={res.totalVisitors}
+        percent={(r: number) => percent(r, 0)}
+        summary={mapSummary(bars)}
+        lessText={t("dash.map.less")}
+        moreText={t("dash.map.more")}
+        onpick={(code: string) => addFilter("country", code)}
+      />
+    {:else if !mapFailed}
+      <Skeleton height={280} radius={140} />
+    {/if}
+  </div>
 {/snippet}
 
 {#snippet attribution()}
@@ -341,6 +352,8 @@
         onselect={(k: MetricKey) => setQuery({ metric: k === "visitors" ? null : k })}
         loading={pending}
       />
+      <div class="stage" class:solo={!showNow}>
+      <div class="trend-col">
       <div class="chart-head">
         <div class="lead">
           <div class="legend">
@@ -436,6 +449,11 @@
           </div>
         {/if}
       </div>
+      </div>
+      {#if showNow}
+        <NowPanel {online} rows={liveRows} globe={Globe} realtime={!shared && !realtime ? href(`/s/${site.id}?range=realtime`) : undefined} attribution={settled && liveRows.length ? attribution : undefined} />
+      {/if}
+      </div>
     </section>
 
     <div class="grid">
@@ -509,12 +527,30 @@
     z-index: 20;
     margin: 0 calc(-1 * var(--sp-8));
     padding: var(--sp-2) var(--sp-8);
-    background: var(--bg-app);
+    background: var(--bg-canvas);
   }
+  /* 主区块：指标条在上，下面左边是趋势图（这段时间），右边是「此刻」的窗 */
   .main {
     border: var(--hairline) solid var(--border-subtle);
-    border-radius: var(--r-md);
+    border-radius: var(--r-lg);
+    background: var(--bg-app);
+    box-shadow: var(--shadow-card);
     overflow: hidden;
+  }
+  .stage {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 340px;
+  }
+  .stage.solo {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .trend-col {
+    min-width: 0;
+    padding-bottom: var(--sp-2);
+  }
+  .map {
+    width: min(100%, 312px);
+    margin: 0 auto;
   }
   .chart-head {
     display: flex;
@@ -611,6 +647,9 @@
     gap: var(--sp-4);
   }
   @media (max-width: 960px) {
+    .stage {
+      grid-template-columns: minmax(0, 1fr);
+    }
     .grid {
       grid-template-columns: 1fr;
     }

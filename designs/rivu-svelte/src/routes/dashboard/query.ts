@@ -222,6 +222,26 @@ export interface DashResult {
   importedExcluded: boolean;
 }
 
+/**
+ * 此刻各国的在线人数：把站点的在线人数按国家的份额分开（最大余数法），份额小的国家可能分不到。
+ * 生产里是一次实时范围、按国家分组的查询。
+ */
+export function liveByCountry(site: Site, online: number): Row[] {
+  if (online <= 0) return [];
+  const rows = rowsFor(site, "country", 10000);
+  const sum = rows.reduce((a, r) => a + r.visitors, 0) || 1;
+  const parts = rows.map((r) => {
+    const exact = (r.visitors / sum) * online;
+    return { label: r.label, n: Math.floor(exact), rest: exact - Math.floor(exact) };
+  });
+  let left = online - parts.reduce((a, p) => a + p.n, 0);
+  for (const p of [...parts].sort((a, b) => b.rest - a.rest)) {
+    if (left-- <= 0) break;
+    p.n++;
+  }
+  return parts.filter((p) => p.n > 0).map((p) => ({ label: p.label, visitors: p.n }));
+}
+
 // ---------- 分解的原始取值 ----------
 
 /** 夹具里没有的维度：按份额生成。 */
