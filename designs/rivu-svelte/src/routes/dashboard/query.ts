@@ -77,9 +77,12 @@ export const DIMS = [
 /** 只有国家级地理库时没有意义的维度。 */
 export const CITY_LEVEL_DIMS = new Set(["region", "city"]);
 
-/** 维度允许的筛选条件：目标只能按名字等于 / 不等于。 */
+/** 只能按等于 / 不等于筛选的维度：目标按名字，城市按 GeoNames id。 */
+const EXACT_ONLY_DIMS = new Set(["goal", "city"]);
+
+/** 维度允许的筛选条件。 */
 export function opsFor(dim: string): Op[] {
-  return dim === "goal" ? ["is", "is_not"] : ["is", "is_not", "contains"];
+  return EXACT_ONLY_DIMS.has(dim) ? ["is", "is_not"] : ["is", "is_not", "contains", "contains_not"];
 }
 
 /** 每个范围允许的粒度，第一个是默认值。 */
@@ -121,7 +124,7 @@ export function decodeFilters(s: string | null): Filter[] {
       continue;
     }
     if (!dim || !(DIMS.includes(dim) || isPropDim(dim)) || !OPS.has(op as Op)) continue;
-    if (dim === "goal" && op !== "is" && op !== "is_not") continue;
+    if (!opsFor(dim).includes(op as Op)) continue;
     const values = (v ?? "")
       .split("|")
       .filter(Boolean)
@@ -255,7 +258,7 @@ export function suggestValues(site: Site, dim: string): string[] {
   return site.scale === 0 ? [] : rowsFor(site, dim, 10000).map((r) => r.label);
 }
 
-/** 这个维度自己的筛选作用在排行上：等于只留所选值，不等于去掉所选值，包含按子串匹配。 */
+/** 这个维度自己的筛选作用在排行上：等于只留所选值，不等于去掉所选值，包含 / 不包含按子串匹配。 */
 function applyOwn(rows: Row[], own: Filter | undefined): Row[] {
   if (!own) return rows;
   const hit = (label: string) =>
@@ -266,7 +269,7 @@ function applyOwn(rows: Row[], own: Filter | undefined): Row[] {
   return rows.filter((r) => hit(r.label) === keep);
 }
 
-/** 筛选把流量按份额缩小：is 取所选值的份额之和，is_not 取剩余，contains 估 30%。 */
+/** 筛选把流量按份额缩小：is 取所选值的份额之和，is_not 取剩余，contains 估 30%，contains_not 估 70%。 */
 function filterFactor(site: Site, filters: Filter[]): number {
   let f = 1;
   for (const flt of filters) {

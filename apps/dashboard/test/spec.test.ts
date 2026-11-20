@@ -173,10 +173,33 @@ test("目标卡片的 QuerySpec、目标筛选与结果", () => {
   ]);
   assert.deepEqual(goalsSpec(q("range=realtime"), now).date_range, realtimeRange(now));
   assert.deepEqual(opsFor("goal"), ["is", "is_not"]);
-  assert.deepEqual(opsFor("page"), ["is", "is_not", "contains"]);
+  assert.deepEqual(opsFor("page"), ["is", "is_not", "contains", "contains_not"]);
   assert.deepEqual(readGoals(result({ results: [{ dimensions: ["Signup"], metrics: [3, 5, 0.25] }] })), [
     { label: "Signup", visitors: 3, events: 5, cr: 0.25 },
   ]);
+});
+
+test("不包含：除目标与城市外的维度都能选，URL 往返后保留", () => {
+  for (const dim of ["page", "entry_page", "source", "utm_campaign", "country", "browser", "prop:plan"]) {
+    assert.ok(opsFor(dim).includes("contains_not"), dim);
+  }
+  // 目标按名字、城市按 GeoNames id，服务端只支持等于 / 不等于
+  assert.deepEqual(opsFor("goal"), ["is", "is_not"]);
+  assert.deepEqual(opsFor("city"), ["is", "is_not"]);
+  const fs = [
+    { dim: "page", op: "contains_not" as const, values: ["/admin", "a~b|c"] },
+    { dim: "prop:plan", op: "contains_not" as const, values: ["trial"] },
+  ];
+  const enc = encodeFilters(fs);
+  assert.deepEqual(decodeFilters(enc), fs);
+  const s = q(`range=7d&f=${encodeURIComponent(enc)}`);
+  assert.deepEqual(totalsSpec(s, now).filters, [
+    ["contains_not", "event:page", ["/admin", "a~b|c"]],
+    ["contains_not", "event:props:plan", ["trial"]],
+  ]);
+  // 目标与城市上的包含 / 不包含在解码时丢弃
+  assert.deepEqual(decodeFilters("goal~contains_not~Sign;city~contains_not~26;city~contains~26"), []);
+  assert.deepEqual(decodeFilters("city~is_not~2694762"), [{ dim: "city", op: "is_not", values: ["2694762"] }]);
 });
 
 test("分解行", () => {
@@ -191,7 +214,7 @@ test("属性：维度换算、URL 往返（键里有分隔符）、键列表的 
   assert.deepEqual(decodeFilters(enc), fs);
   // 空键、未知维度丢弃
   assert.deepEqual(decodeFilters("prop:~is~x;bogus~is~x"), []);
-  assert.deepEqual(opsFor("prop:plan"), ["is", "is_not", "contains"]);
+  assert.deepEqual(opsFor("prop:plan"), ["is", "is_not", "contains", "contains_not"]);
   const s = q(`range=7d&f=${encodeURIComponent(enc)}`);
   const b = breakdownSpec(s, "prop:plan", 8, now);
   assert.deepEqual(b.dimensions, ["event:props:plan"]);

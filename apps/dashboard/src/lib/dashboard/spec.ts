@@ -96,9 +96,12 @@ export function grans(range: RangeKey): Gran[] {
 
 const OPS = new Set<Op>(["is", "is_not", "contains", "contains_not"]);
 
-/** 维度允许的筛选条件：目标只能按名字等于 / 不等于（服务端只支持 is、is_not）。 */
+/** 只能按等于 / 不等于筛选的维度：目标按名字，城市按 GeoNames id（服务端只支持 is、is_not）。 */
+const EXACT_ONLY_DIMS = new Set(["goal", "city"]);
+
+/** 维度允许的筛选条件。 */
 export function opsFor(dim: string): Op[] {
-  return dim === "goal" ? ["is", "is_not"] : ["is", "is_not", "contains"];
+  return EXACT_ONLY_DIMS.has(dim) ? ["is", "is_not"] : ["is", "is_not", "contains", "contains_not"];
 }
 
 export function decodeFilters(s: string | null): Filter[] {
@@ -113,7 +116,7 @@ export function decodeFilters(s: string | null): Filter[] {
       continue;
     }
     if (!dim || !(dim in DIMS || isPropDim(dim)) || !OPS.has(op as Op)) continue;
-    if (dim === "goal" && op !== "is" && op !== "is_not") continue;
+    if (!opsFor(dim).includes(op as Op)) continue;
     const values = (v ?? "")
       .split("|")
       .filter(Boolean)
