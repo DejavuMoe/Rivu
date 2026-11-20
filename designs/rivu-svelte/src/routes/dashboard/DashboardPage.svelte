@@ -19,7 +19,7 @@
   import TrendChart from "../../lib/charts/TrendChart.svelte";
   import { t } from "../../lib/i18n";
   import { app, canEdit, siteAccess, toast } from "../../lib/state.svelte";
-  import { delta, duration, percent } from "../../lib/format";
+  import { compact, delta, duration, percent } from "../../lib/format";
   import { href, route, setQuery } from "../../lib/router.svelte";
   import { propertyKeys, type Site } from "../../lib/data/fixtures";
   import FilterBar from "./FilterBar.svelte";
@@ -53,6 +53,8 @@
   } from "./query";
   import { fmtAxis, fmtMetric, lowerIsBetter } from "./metrics";
   import type { Details } from "./BreakdownCard.svelte";
+  import type { BarRow } from "../../lib/charts/types";
+  import type WorldMapType from "../../lib/charts/WorldMap.svelte";
   import { NOW } from "../../lib/data/fixtures";
   import { periodText, rangeQuery, ymd, type RangeParam } from "./period";
   import { rangeUi } from "./range";
@@ -179,6 +181,22 @@
     missing: t("dash.engagementMissing"),
   });
 
+  // 世界地图：组件和形状数据（约 11 KB gzip）按需动态加载，不进首屏；数据到齐、有国家数据时才去取。
+  // 加载失败只是没有图，列表照常
+  let WorldMap = $state<typeof WorldMapType | null>(null);
+  let mapFailed = $state(false);
+  $effect(() => {
+    if (WorldMap || mapFailed || !settled || empty) return;
+    import("../../lib/charts/WorldMap.svelte").then(
+      (m) => (WorldMap = m.default),
+      () => (mapFailed = true),
+    );
+  });
+  function mapSummary(bars: BarRow[]): string {
+    const top = bars.slice(0, 3).map((b) => `${b.label} ${percent(res.totalVisitors ? b.value / res.totalVisitors : 0, 0)}`);
+    return t("dash.map.summary", { list: top.join(t("dash.map.sep")) });
+  }
+
   function addFilter(dim: string, value: string) {
     const rest = dash.filters.filter((f) => f.dim !== dim);
     setQuery({ f: encodeFilters([...rest, { dim, op: "is", values: [value] }]) });
@@ -210,6 +228,23 @@
     }, 900);
   }
 </script>
+
+{#snippet worldMap(bars: BarRow[])}
+  {#if WorldMap}
+    <WorldMap
+      rows={bars.filter((b) => /^[A-Z]{2}$/.test(b.key)).map((b) => ({ code: b.key, label: b.label, value: b.value }))}
+      format={(n) => compact(n, app.lang)}
+      total={res.totalVisitors}
+      percent={(r) => percent(r, 0)}
+      summary={mapSummary(bars)}
+      lessText={t("dash.map.less")}
+      moreText={t("dash.map.more")}
+      onpick={(code) => addFilter("country", code)}
+    />
+  {:else if !mapFailed}
+    <Skeleton height={240} radius={4} />
+  {/if}
+{/snippet}
 
 {#snippet attribution()}
   <a href={attr.url} target="_blank" rel="noreferrer">{attr.text}</a>
@@ -423,16 +458,24 @@
         {loading}
         {failed}
       />
-      <BreakdownCard
-        title={t("dash.card.locations")}
-        dims={geoDims}
-        rowsOf={res.breakdown}
-        total={res.totalVisitors}
-        onpick={addFilter}
-        {loading}
-        {failed}
-        footer={settled ? attribution : undefined}
-      />
+      <!-- 位置卡片占整行：国家标签页里世界地图在左、列表在右（窄屏地图在上） -->
+      <div class="wide">
+        <BreakdownCard
+          title={t("dash.card.locations")}
+          dims={geoDims}
+          visual={worldMap}
+          visualDims={["country"]}
+          rowsOf={res.breakdown}
+          total={res.totalVisitors}
+          onpick={addFilter}
+          {loading}
+          {failed}
+          footer={settled ? attribution : undefined}
+        />
+      </div>
+    </div>
+
+    <div class="grid">
       <BreakdownCard
         title={t("dash.card.devices")}
         dims={["device", "browser", "os"]}
@@ -442,9 +485,6 @@
         {loading}
         {failed}
       />
-    </div>
-
-    <div class="grid">
       <GoalsCard rows={res.goals} onpick={addFilter} {loading} {failed} />
       <PropsCard keys={propertyKeys(site)} rowsOf={res.breakdown} total={res.totalVisitors} onpick={addFilter} {loading} {failed} />
     </div>
@@ -565,6 +605,13 @@
     gap: var(--sp-2);
     padding: var(--sp-2) var(--sp-3);
     font-size: var(--fs-sm);
+  }
+  /* 位置卡片（有地图）占整行 */
+  .wide {
+    grid-column: 1 / -1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
   }
   .grid {
     display: grid;

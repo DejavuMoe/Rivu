@@ -3,6 +3,7 @@
   点击行即按该值筛选；国家行前面是两字母代码徽标（不用 emoji 国旗：Windows 上不显示）。
   取值是服务端的原始取值，显示名在这里翻译（values.ts）。
   details：某些维度在「查看全部」的明细表里多几列（页面的滚动深度、停留时间），卡片本身保持一列访客数。
+  visual：某些维度在列表旁边多一个图（国家的世界地图）；卡片窄于 720px 时图在列表上面。
 -->
 <script module lang="ts">
   /** 明细表的附加列 */
@@ -47,10 +48,13 @@
     failed?: boolean;
     footer?: Snippet;
     details?: Details;
+    /** 列表旁边的图（拿到这个维度的全部行）与它出现的维度 */
+    visual?: Snippet<[BarRow[]]>;
+    visualDims?: string[];
     /** 补空行到这个行数，让并排的卡片等高；单独一行的卡片传 0 */
     minRows?: number;
   }
-  let { title, dims, rowsOf, total, onpick, loading = false, failed = false, footer, details, minRows = 8 }: Props = $props();
+  let { title, dims, rowsOf, total, onpick, loading = false, failed = false, footer, details, visual, visualDims = [], minRows = 8 }: Props = $props();
 
   let dim = $state("");
   $effect.pre(() => {
@@ -107,7 +111,19 @@
     <EmptyState compact icon={CircleAlert} tone="bad" title={t("dash.error.title")} />
   {:else if !rows.length}
     <EmptyState compact icon={Inbox} title={t("dash.noRows")} />
+  {:else if visual && visualDims.includes(dim)}
+    <div class="wrap">
+      <div class="split">
+        <div class="vis">{@render visual(bars)}</div>
+        <div class="lst">{@render list()}</div>
+      </div>
+    </div>
   {:else}
+    {@render list()}
+  {/if}
+</Card>
+
+{#snippet list()}
     <BarList
       rows={bars.slice(0, 8)}
       {minRows}
@@ -123,8 +139,7 @@
         {#if r.code}<span class="code">{r.code}</span>{/if}
       {/snippet}
     </BarList>
-  {/if}
-</Card>
+{/snippet}
 
 {#if full}
   <BreakdownDialog
@@ -155,6 +170,28 @@
   .title {
     padding-left: 10px;
     font-weight: var(--fw-semibold);
+  }
+  /* 图和列表：宽卡片里左右排（图占 7 份），窄了上下排 */
+  .wrap {
+    container-type: inline-size;
+  }
+  .split {
+    display: grid;
+    grid-template-columns: minmax(0, 7fr) minmax(0, 5fr);
+    align-items: start;
+    gap: var(--sp-6);
+  }
+  .vis {
+    padding-top: var(--sp-6);
+  }
+  @container (max-width: 720px) {
+    .split {
+      grid-template-columns: 1fr;
+      gap: var(--sp-4);
+    }
+    .vis {
+      padding-top: var(--sp-4);
+    }
   }
   .sk {
     display: flex;

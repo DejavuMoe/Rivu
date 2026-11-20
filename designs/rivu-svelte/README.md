@@ -15,6 +15,7 @@
 - 自定义日期范围、「昨天」「上个月」、上一周期 / 下一周期（#32）：`src/routes/dashboard/period.ts`、`RangeDialog.svelte`、`FilterBar.svelte`。范围按钮菜单最后一项「自定义范围…」；箭头按范围自己的长度前后平移，按月的范围按自然月平移；实时和全部时间没有箭头。合并看板 `#/sites/combined` 也用这个控件（`RangeControl.svelte`），自定义日期每个站点按自己的时区算。
 - 页面报表的平均滚动深度、平均停留时间（#34）：只在「页面」卡片的明细表（「查看全部」）里，窄屏收进页面名下面的一行小字；口径写在表格下方。卡片本身不变。
 - 位置报表的城市（#35）：评审面板新增「地理库」（按站点 / 城市级 / 国家级）。城市级：国家、地区、城市三个标签页，城市行是城市名加国家，筛选里有地区和城市；国家级（默认的 DB-IP Lite）：只有国家，卡片底部「为什么只有国家」弹出一句原因和配置说明的链接（共享链接和公开看板不显示）。站点设置里地理精度选「国家」时也只有国家，不另作说明。
+- 位置报表的世界地图（#43）：共享图表 `src/lib/charts/WorldMap.svelte`，形状数据 `src/lib/charts/world/countries-110m.ts`（Natural Earth 1:110m，公有领域，来源见同目录 `PROVENANCE.md`，用 `scripts/gen-world-map.mjs` 生成），已逐字节复制到 `apps/dashboard/src/lib/charts`（那边暂未使用）。看板按需动态加载地图，不进首屏；单文件原型会把它内联，所以原型的 `dist/index.html` 变大不代表看板首屏变大。
 
 ## 运行
 
