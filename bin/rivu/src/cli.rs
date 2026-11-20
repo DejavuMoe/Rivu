@@ -124,6 +124,18 @@ pub enum UserAction {
     List,
     /// 关闭用户的两步验证（用户丢了验证器又没有恢复码时）；用户下次登录只要密码
     Reset2fa(UserEmailArgs),
+    /// 改用户的登录邮箱（不发确认邮件）；他的全部登录会话立即失效
+    SetEmail(UserSetEmailArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct UserSetEmailArgs {
+    /// 用户现在的邮箱
+    #[arg(long)]
+    pub email: String,
+    /// 新邮箱
+    #[arg(long)]
+    pub new_email: String,
 }
 
 #[derive(Debug, Args)]
@@ -864,6 +876,26 @@ mod tests {
         assert!(p(&["user", "disable", "--email", "u@b.co"]).is_ok());
         assert!(p(&["user", "enable", "--email", "u@b.co"]).is_ok());
         assert!(p(&["user", "list"]).is_ok());
+        let cli = p(&[
+            "user",
+            "set-email",
+            "--email",
+            "u@b.co",
+            "--new-email",
+            "v@b.co",
+        ])
+        .unwrap();
+        let Command::User(UserArgs {
+            action: UserAction::SetEmail(a),
+        }) = cli.command
+        else {
+            panic!("不是 user set-email");
+        };
+        assert_eq!(
+            (a.email.as_str(), a.new_email.as_str()),
+            ("u@b.co", "v@b.co")
+        );
+        assert!(p(&["user", "set-email", "--email", "u@b.co"]).is_err());
         assert!(p(&["user", "add", "--email", "u@b.co", "--password", "x"]).is_err());
 
         // org

@@ -1,4 +1,4 @@
-//! `rivu setup`、`rivu user add | disable | enable | list`、`rivu org create`、`rivu org member add`、
+//! `rivu setup`、`rivu user add | disable | enable | list | reset-2fa | set-email`、`rivu org create`、`rivu org member add`、
 //! `rivu share create | list | revoke`：首次初始化、用户、组织与共享链接的命令行管理（支撑测试与运维）。
 //!
 //! 直接连 PostgreSQL（`RIVU_DATABASE_URL`，应用账号），不经过 HTTP，所以不受 `RIVU_SETUP_TOKEN` 约束
@@ -144,6 +144,7 @@ pub async fn user(config: &Config, args: UserArgs) -> Result<ExitCode> {
                 println!("{email} 没有开启两步验证");
             }
         }
+        UserAction::SetEmail(a) => set_email(&pool, &a.email, &a.new_email).await?,
         UserAction::List => {
             let rows = rivu_storage_pg::users::list_users(&pool).await?;
             if rows.is_empty() {
@@ -172,6 +173,31 @@ pub async fn user(config: &Config, args: UserArgs) -> Result<ExitCode> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `rivu user set-email`：运维直接改邮箱，不发确认邮件（同没有 SMTP 时的账户页），撤销该用户的全部会话。
+/// 周报的邮箱确认不跟过去：用户要在账户页重新确认新邮箱，之后已开的站点改投新邮箱。
+pub async fn set_email(pool: &PgPool, email: &str, new_email: &str) -> Result<()> {
+    use rivu_storage_pg::email_changes::{Outcome, change_now};
+    let email = normalize_email(email).map_err(anyhow::Error::msg)?;
+    let new_email = normalize_email(new_email).map_err(anyhow::Error::msg)?;
+    let Some(user) = rivu_storage_pg::users::find_by_email(pool, &email).await? else {
+        bail!("找不到用户 `{email}`（或已删除）");
+    };
+    if new_email == user.email.to_lowercase() {
+        bail!("新邮箱与现在的邮箱相同");
+    }
+    match change_now(pool, user.id, &new_email, None).await? {
+        Outcome::Changed(c) => {
+            println!(
+                "已把 {email} 的登录邮箱改为 {new_email}，撤销了 {} 个登录会话",
+                c.revoked_sessions
+            );
+            Ok(())
+        }
+        Outcome::Taken => bail!("邮箱 `{new_email}` 已被别的账号使用"),
+        Outcome::NotFound => bail!("用户 `{email}` 已停用或已删除"),
+    }
 }
 
 async fn set_disabled(pool: &PgPool, email: &str, disabled: bool) -> Result<()> {

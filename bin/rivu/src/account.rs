@@ -12,8 +12,14 @@
 //! | `POST /api/internal/me/totp/enable` | 会话 | `{"code"}` 确认后启用 → `{"recovery_codes"}`（只出现这一次） |
 //! | `POST /api/internal/me/totp/recovery-codes` | 会话 + 当前密码 | 换一组恢复码 |
 //! | `POST /api/internal/me/totp/disable` | 会话 + 当前密码 | 关闭 |
+//! | `GET /api/internal/me/email` | 会话 | `{"email","confirm_by_email","pending"}` |
+//! | `POST /api/internal/me/email` | 会话 + 当前密码 | `{"new_email","current_password","lang"?}`：有 SMTP 时 202 并给新邮箱发确认链接（24 小时）；没有时 200 立即生效 |
+//! | `DELETE /api/internal/me/email` | 会话 | 取消待确认的更换 → 204 |
+//! | `GET /api/email-change/{token}` | 链接令牌 | 有效 `{"email": 新邮箱}`，否则统一 404；不改任何状态 |
+//! | `POST /api/email-change/{token}` | 链接令牌 | 确认更换 → `{"email","signed_in"}`；带着本人会话时保留它，其余会话全部撤销 |
 //!
 //! 找回密码与 challenge 的限流：请求按 IP 与邮箱各一桶；验证码每个 challenge 最多试 5 次，另外计入登录的 IP 桶。
+//! 更换邮箱：当前密码计入改密码的 `(用户, IP)` 桶，发确认邮件再计入找回密码的邮箱桶（按新邮箱），链接按 IP 限流。
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -22,13 +28,14 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::extract::{ConnectInfo, Path, Request, State};
-use axum::http::{HeaderMap, StatusCode, header};
-use axum::response::Response;
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use rivu_auth::identity::normalize_email;
 use rivu_auth::password::{MAX_PASSWORD_CHARS, validate_password};
 use rivu_auth::{session, totp};
 use rivu_mail::Lang;
+use rivu_storage_pg::email_changes::{self, Outcome};
 use rivu_storage_pg::{auth_tokens, totp as totp_store, users};
 use serde::Deserialize;
 use serde_json::json;
@@ -481,6 +488,255 @@ async fn totp_disable(
     Ok(api.finish(json_response(StatusCode::OK, json!({})), &ctx))
 }
 
+// ------------------------------------------------------------------------------------------
+// 更换登录邮箱
+// ------------------------------------------------------------------------------------------
+
+/// 确认链接的有效期。
+const EMAIL_CHANGE_TTL_SECS: i64 = 24 * 3600;
+/// 确认邮件里链接指向的看板页面；页面调用 `/api/email-change/{token}`。
+const CONFIRM_EMAIL_PAGE: &str = "/email-change/confirm";
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum BodyLang {
+    Zh,
+    En,
+}
+
+#[derive(Deserialize)]
+struct EmailChangeBody {
+    new_email: String,
+    current_password: String,
+    /// 邮件的语言；不给就按 `Accept-Language`。
+    #[serde(default)]
+    lang: Option<BodyLang>,
+}
+
+fn email_taken() -> DashError {
+    DashError::Conflict(
+        "email_taken",
+        "an account with this email address already exists".into(),
+    )
+}
+
+fn lang_str(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Zh => "zh",
+        Lang::En => "en",
+    }
+}
+
+async fn email_status(State(api): State<Arc<DashApi>>, req: Request) -> Res<Response> {
+    let ctx = api.require_session(req.headers()).await?;
+    let pending = email_changes::pending(&api.pg, ctx.s.user_id).await?;
+    let body = json!({
+        "email": ctx.s.email,
+        "confirm_by_email": api.mailer.is_some(),
+        "pending": pending.map(|p| json!({"new_email": p.new_email, "expires_at": p.expires_at})),
+    });
+    Ok(api.finish(json_response(StatusCode::OK, body), &ctx))
+}
+
+/// 更换登录邮箱（`platform-and-ops.md` §5）：校验新邮箱 → 当前密码（限流同改密码）→ 新邮箱没被别的账号用。
+/// 有 SMTP 时记下待确认的更换并给新邮箱发链接（202）；没有 SMTP 时立即生效（200），保留当前会话、撤销其余会话。
+async fn request_email_change(
+    State(api): State<Arc<DashApi>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: Request,
+) -> Res<Response> {
+    let headers = req.headers().clone();
+    let ctx = api.require_session(&headers).await?;
+    let user_id = ctx.s.user_id;
+    let body: EmailChangeBody = read_json(req, AUTH_BODY_MAX).await?;
+    let new_email =
+        normalize_email(&body.new_email).map_err(|m| DashError::BadRequest("invalid_email", m))?;
+    if new_email == ctx.s.email.to_lowercase() {
+        return Err(DashError::BadRequest(
+            "same_email",
+            "the new email address is the same as the current one",
+        ));
+    }
+    confirm_password(&api, peer, &headers, user_id, body.current_password).await?;
+    if email_changes::email_taken(&api.pg, user_id, &new_email).await? {
+        return Err(email_taken());
+    }
+    let lang = match body.lang {
+        Some(BodyLang::Zh) => Lang::Zh,
+        Some(BodyLang::En) => Lang::En,
+        None => lang(&headers),
+    };
+
+    let Some(mailer) = api.mailer.clone() else {
+        // 没有 SMTP：没法验证新邮箱，凭当前密码直接改
+        return match email_changes::change_now(&api.pg, user_id, &new_email, Some(ctx.s.id)).await?
+        {
+            Outcome::Changed(c) => {
+                tracing::info!(
+                    user_id,
+                    revoked = c.revoked_sessions,
+                    "更换登录邮箱（未配置 SMTP，立即生效），其他会话已撤销"
+                );
+                let user = user_json(
+                    user_id,
+                    &c.new_email,
+                    ctx.s.name.as_deref(),
+                    ctx.s.is_instance_admin,
+                );
+                Ok(api.finish(
+                    json_response(StatusCode::OK, json!({"status": "changed", "user": user})),
+                    &ctx,
+                ))
+            }
+            Outcome::Taken => Err(email_taken()),
+            Outcome::NotFound => Err(DashError::Unauthorized),
+        };
+    };
+
+    // 发信有成本，也不能拿来轰炸别人的邮箱：按新邮箱计入找回密码的邮箱桶
+    api.limiters
+        .reset_email
+        .check(&new_email)
+        .map_err(|w| rate_limited("email_change", w))?;
+    let token = session::generate();
+    let hash = token.hash();
+    let expires_at = email_changes::create(
+        &api.pg,
+        user_id,
+        &ctx.s.email,
+        &new_email,
+        lang_str(lang),
+        &hash,
+        EMAIL_CHANGE_TTL_SECS,
+    )
+    .await?
+    .ok_or(DashError::Unauthorized)?;
+    let link = format!(
+        "{}{CONFIRM_EMAIL_PAGE}/{}",
+        api.base_url.trim_end_matches('/'),
+        token.plaintext()
+    );
+    let mail = rivu_mail::email_change::confirmation(
+        lang,
+        &new_email,
+        &link,
+        (EMAIL_CHANGE_TTL_SECS / 3600) as u32,
+    );
+    if let Err(e) = mailer.send(mail).await {
+        tracing::warn!(user_id, error = %format!("{e:#}"), "发送更换邮箱的确认邮件失败");
+        // 没人收到这条链接：撤回它（之前的那条已被替换，不恢复）
+        email_changes::cancel(&api.pg, user_id, Some(&hash)).await?;
+        return Ok(api.finish(
+            json_response(
+                StatusCode::BAD_GATEWAY,
+                json!({"error": "mail_failed", "message": "the confirmation email could not be delivered"}),
+            ),
+            &ctx,
+        ));
+    }
+    tracing::info!(user_id, "已发送更换登录邮箱的确认邮件");
+    let body = json!({
+        "status": "pending",
+        "pending": {"new_email": new_email, "expires_at": expires_at},
+    });
+    Ok(api.finish(json_response(StatusCode::ACCEPTED, body), &ctx))
+}
+
+async fn cancel_email_change(State(api): State<Arc<DashApi>>, req: Request) -> Res<Response> {
+    let ctx = api.require_session(req.headers()).await?;
+    email_changes::cancel(&api.pg, ctx.s.user_id, None).await?;
+    Ok(api.finish(
+        crate::dash_api::ns(StatusCode::NO_CONTENT.into_response()),
+        &ctx,
+    ))
+}
+
+/// 链接端点不把链接经 `Referer` 带给别的站点。
+fn no_referrer(mut response: Response) -> Response {
+    response
+        .headers_mut()
+        .insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    response
+}
+
+/// 打开确认页时检查链接：不改任何状态，邮件客户端预取链接不会替用户确认。各种失败都是同一个 404。
+async fn check_email_change(
+    State(api): State<Arc<DashApi>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path(token): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let result = async {
+        let hash = reset_token(&api, peer, &headers, &token)?;
+        let email = email_changes::lookup(&api.pg, &hash)
+            .await?
+            .ok_or(DashError::NotFound)?;
+        Ok::<_, DashError>(json_response(StatusCode::OK, json!({"email": email})))
+    }
+    .await;
+    no_referrer(result.unwrap_or_else(IntoResponse::into_response))
+}
+
+/// 凭链接确认更换。不需要登录（链接本身证明能收新邮箱的信）；请求带着本人的有效会话时保留它，其余会话全部撤销。
+async fn confirm_email_change(
+    State(api): State<Arc<DashApi>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path(token): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let result = async {
+        let hash = reset_token(&api, peer, &headers, &token)?;
+        let presented = api.session(&headers).await?;
+        let outcome = email_changes::confirm(
+            &api.pg,
+            &hash,
+            presented.as_ref().map(|c| (c.s.user_id, c.s.id)),
+        )
+        .await?;
+        let c = match outcome {
+            Outcome::Changed(c) => c,
+            Outcome::NotFound => return Err(DashError::NotFound),
+            Outcome::Taken => return Err(email_taken()),
+        };
+        let signed_in = presented
+            .as_ref()
+            .is_some_and(|p| p.s.user_id == c.user_id);
+        tracing::info!(
+            user_id = c.user_id,
+            revoked = c.revoked_sessions,
+            kept_current = signed_in,
+            "凭链接更换登录邮箱，其他会话已撤销"
+        );
+        if let Some(mailer) = api.mailer.clone() {
+            let lang = match c.lang.as_deref() {
+                Some("zh") => Lang::Zh,
+                _ => Lang::En,
+            };
+            let mail = rivu_mail::email_change::changed_notice(
+                lang,
+                &c.old_email,
+                &rivu_mail::email_change::mask_email(&c.new_email),
+            );
+            let user_id = c.user_id;
+            tokio::spawn(async move {
+                if let Err(e) = mailer.send(mail).await {
+                    tracing::warn!(user_id, error = %format!("{e:#}"), "发送登录邮箱已更改的通知失败");
+                }
+            });
+        }
+        let response = json_response(
+            StatusCode::OK,
+            json!({"email": c.new_email, "signed_in": signed_in}),
+        );
+        Ok(match presented.filter(|_| signed_in) {
+            Some(ctx) => api.finish(response, &ctx),
+            None => response,
+        })
+    }
+    .await;
+    no_referrer(result.unwrap_or_else(IntoResponse::into_response))
+}
+
 /// 发邀请邮件（配置了 SMTP 时）；返回是否已交给发信。`target` 是组织名或站点名。
 pub(crate) fn send_invitation(
     api: &DashApi,
@@ -553,6 +809,26 @@ pub(crate) fn routes(api: &Arc<DashApi>) -> Router {
             "internal.totp_recovery",
             "/api/internal/me/totp/recovery-codes",
             only(post(totp_recovery_codes), "POST"),
+        ))
+        .merge(endpoint(
+            a,
+            "internal.me_email",
+            "/api/internal/me/email",
+            only(
+                get(email_status)
+                    .post(request_email_change)
+                    .delete(cancel_email_change),
+                "GET, HEAD, POST, DELETE",
+            ),
+        ))
+        .merge(endpoint(
+            a,
+            "internal.email_change_token",
+            "/api/email-change/{token}",
+            only(
+                get(check_email_change).post(confirm_email_change),
+                "GET, HEAD, POST",
+            ),
         ))
         .merge(endpoint(
             a,

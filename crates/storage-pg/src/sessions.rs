@@ -188,5 +188,10 @@ pub async fn cleanup(pool: &PgPool) -> Result<(u64, u64)> {
         .execute(pool)
         .await
         .context("清理 auth_tokens 失败")?;
+    // 过期的邮箱更换（确认或取消时已经删掉）
+    sqlx::query("DELETE FROM email_changes WHERE expires_at < now()")
+        .execute(pool)
+        .await
+        .context("清理 email_changes 失败")?;
     Ok((sessions, grants))
 }

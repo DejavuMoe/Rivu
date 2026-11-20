@@ -102,6 +102,7 @@ Rivu 只支持单实例：会话分配依赖单写者，同一时间只能有一
 | `api_keys` | API 密钥 | `organization_id`、`user_id`、`name`、`key_prefix`、`key_hash`、`scopes text[]`、`last_used_at`、`expires_at` | `UNIQUE(key_hash)`；`INDEX(user_id)` |
 | `auth_sessions` | 后台登录会话 | `user_id`、`token_hash`、`device_label`、`last_used_at`、`expires_at` | `UNIQUE(token_hash)`；`INDEX(expires_at)` |
 | `auth_tokens` | 一次性令牌，目前只有找回密码（1 小时，只有最新一封有效） | `user_id`、`kind`、`token_hash`、`expires_at`、`used_at` | `UNIQUE(token_hash)`；`auth_sessions_cleanup` 删除过期与用过的行 |
+| `email_changes` | 待确认的登录邮箱更换（§5「更换登录邮箱」），每个用户至多一条，新请求替换旧的 | `user_id` PK、`old_email`（发起时的邮箱）、`new_email`、`lang`、`token_hash`、`expires_at`（24 小时） | `UNIQUE(token_hash)`；确认、取消、改密码、重设密码时删除；`auth_sessions_cleanup` 删除过期的行 |
 | `user_totp` | 两步验证 | `user_id` PK、`secret_enc`（nonce + AES-256-GCM 密文，48 字节）、`enabled_at`（空 = 设置中）、`last_step`、`recovery_hashes bytea[]` | 密钥加密，恢复码只存摘要（04§2.4）；时间步与恢复码在一条 UPDATE 里检查加修改，防重放 |
 | `salts` | 访客 ID 盐 | `day` PK、`salt bytea(16)` | 见 3.3 |
 | `jobs` | 后台任务队列 | `kind`、`payload`、`state`、`run_at`、`attempts`、`locked_until`、`unique_key` | 见 3.3 |
@@ -325,7 +326,7 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 | 密码 | argon2id；长度 12–128，无字符类强制；哈希在 `spawn_blocking` 中执行并用信号量限并发。Plausible 用 bcrypt（04§1.2），Rivu 与 shared link 统一 argon2id |
 | 登录会话 | 32 字节 CSPRNG token，仅存 SHA-256（Plausible 的 `user_sessions.token` 存原值，04§1.2）。`expires_at = last_used_at + 14d`（04§2.4 同为 14 天），距上次续期超 10 分钟才写库 |
 | Cookie | `__Host-rivu_session`：`HttpOnly; Secure; SameSite=Lax; Path=/`，Max-Age 14 天随续期刷新；`http://localhost` 属安全上下文，开发无需额外开关（Plausible 按 `BASE_URL` 推断 Secure，04§4.2） |
-| 会话轮换 | 登录签发新会话并撤销请求携带的旧会话，其他设备继续登录。改密撤销全部旧会话并签发新会话。登出撤销当前会话，也可选择「退出所有设备」 |
+| 会话轮换 | 登录签发新会话并撤销请求携带的旧会话，其他设备继续登录。改密撤销全部旧会话并签发新会话。更换登录邮箱只保留发起（或确认）的那一个会话，见下文。登出撤销当前会话，也可选择「退出所有设备」 |
 | CSRF | 变更请求只接受 `Content-Type: application/json`（上传导出的 zip 用 `application/zip`）并校验 `Origin` 的 host 等于 `RIVU_BASE_URL`；无表单提交；同源部署不开 CORS |
 | 登录防护 | 限流见 4.4（按 `(账号, IP)` 与 IP 阻断，不按单纯账号阻断，避免被用来锁号）；用户不存在与密码错误的响应和耗时一致；失败日志只记账号 id 与结果，不记 IP（`RIVU_LOG_FAILED_LOGINS`，默认 off，对应 04§4.2）。**失败告警（只告警不阻断）**：只计失败（被限流拒绝的不算），同一账号 1 小时内失败达 50 次、全实例每分钟失败达 300 次时各打一条 `warn`（只记存在时的用户 id，不记邮箱与 IP）并累加 `rivu_auth_login_alerts_total{kind=account\|global}`，同一窗口同一对象只告警一次；账号计数表有上限（10 万），内存有界 |
 | 修改密码 | `POST /api/internal/me/password`（会话 + CSRF），请求体 `{"current","new"}`：先按 `(用户, IP)` 限流（同登录的 `(账号, IP)` 桶，5 次 / 60 秒，429），再校验新密码长度（400 `invalid_new_password`），然后**总是**对当前密码做一次 argon2id 校验（不对 400 `wrong_password`；与登录同样的哈希耗时），与当前相同 400 `same_password`；通过后在同一事务内更新 `password_hash` 并撤销该用户的全部会话（含发起请求的这一个），再签发新会话（`Set-Cookie`），响应 `{}` |
@@ -333,6 +334,62 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 | 清理 | `auth_sessions_cleanup` 每小时清理过期与撤销行（Plausible 每 2 小时，04§3.2）；读取路径始终校验 `expires_at`，清理滞后不影响安全 |
 | TOTP | 密钥用 `RIVU_SECRET_KEY` 经 HKDF 派生的 AES-256-GCM 加密；轮换期用 `RIVU_SECRET_KEY_FALLBACK` 解旧数据；恢复码 10 个只存摘要、用后移除；`last_step` 防重放（04§2.4、04§4.2 `TOTP_VAULT_KEY_FALLBACK`）。登录：密码正确后只返回 challenge（内存里 5 分钟、最多试 5 次），凭验证码或恢复码换会话；设置、换恢复码、关闭都要再输当前密码。丢了验证器又没有恢复码时由管理员 `rivu user reset-2fa`。实现在 `crates/auth/src/totp.rs`、`bin/rivu/src/account.rs` |
 | 找回密码 | 需要 SMTP（`RIVU_SMTP_URL`）。请求总是 202，查账号与发信在后台，响应与账号是否存在无关；按 IP 与邮箱限流。令牌 1 小时、一次性，用掉时同一个事务里改密码并撤销全部会话；不自动登录，开了两步验证仍要验证码 |
+| 更换登录邮箱 | 当前密码 + 新邮箱确认链接（有 SMTP 时）或立即生效（没有 SMTP 时），见下文 |
+
+### 更换登录邮箱
+
+用户在账号页输入新邮箱和当前密码。配置了 SMTP 时，新邮箱收到一封确认邮件，点开链接确认后才真正更换；没配置 SMTP 时没法验证新邮箱，校验当前密码后立即更换。实现在 `bin/rivu/src/account.rs`、`crates/storage-pg/src/email_changes.rs`。
+
+**为什么不要求两步验证码**：设置、关闭两步验证和换恢复码都只要求当前密码，能关掉两步验证的人本来就能绕过这里的验证码，所以更换邮箱与它们一致，只要当前密码。开了两步验证的账号换邮箱后，登录仍然要验证码。
+
+**发起**（会话 + CSRF）
+
+| 请求 | 用途 |
+|---|---|
+| `GET /api/internal/me/email` | `{"email": 当前邮箱, "confirm_by_email": 是否配置了 SMTP, "pending": null 或 {"new_email", "expires_at"}}`。`pending` 只列没过期、且发起后账号邮箱没变过的那一条 |
+| `POST /api/internal/me/email` + `{"new_email", "current_password", "lang"?}` | `lang` 为 `"zh"` 或 `"en"`，决定两封邮件的语言，不给时按 `Accept-Language` |
+| `DELETE /api/internal/me/email` | 取消待确认的更换（作废链接），`204`，可重复调用 |
+
+`POST` 按顺序检查，第一个不通过的返回：
+
+| 情况 | 响应 |
+|---|---|
+| 没有会话 | `401 unauthorized` |
+| 请求体不是这个形状（含 `lang` 不是 `zh`/`en`） | `400 invalid_request` |
+| 新邮箱格式不对（规则同初始化和接受邀请：去首尾空白、转小写、3 到 320 个字符） | `400 invalid_email` |
+| 新邮箱就是当前邮箱（不区分大小写） | `400 same_email` |
+| 超出限流（与改密码同一个 `(用户, IP)` 桶，5 次 / 60 秒） | `429 rate_limited` + `Retry-After` |
+| 当前密码不对（总是做一次 argon2id 校验） | `400 wrong_password` |
+| 新邮箱已被别的账号使用（在密码校验之后，不能凭会话探测别人的邮箱；与接受邀请时一样只说「已有账号」） | `409 email_taken`，`message` 为 `an account with this email address already exists` |
+| 配置了 SMTP，同一个新邮箱发信太频繁（与找回密码共用按邮箱的桶） | `429 rate_limited` |
+| 确认邮件发送失败 | `502 mail_failed`，刚写的待确认更换撤回（之前的那条已被替换，不恢复） |
+
+成功时：
+
+- **配置了 SMTP**：`202 {"status": "pending", "pending": {"new_email", "expires_at"}}`。写一条 `email_changes`（替换之前的那条，旧链接随即失效），给新邮箱发确认邮件。邮箱这时还没变，会话都还在。
+- **没配置 SMTP**：`200 {"status": "changed", "user": {"id", "email", "name", "is_instance_admin"}}`。同一个事务里改 `users.email`，保留发起请求的会话、撤销其余会话，作废发到旧邮箱的找回密码链接和周报确认链接。周报的邮箱确认不跟到新邮箱（新邮箱没有验证过；没有 SMTP 也发不了周报），之后配置了 SMTP，要在账号页重新确认一次。
+
+**确认链接**
+
+链接是 `{RIVU_BASE_URL}/email-change/confirm/{token}`，打开的是看板里一个不需要登录的页面（同周报的确认页）：打开时只显示要换成的邮箱，用户点按钮才确认。页面调用：
+
+| 请求 | 用途 |
+|---|---|
+| `GET /api/email-change/{token}` | 检查链接，返回 `{"email": 新邮箱}`，不改变任何状态（邮件客户端预取链接不会替用户确认） |
+| `POST /api/email-change/{token}` + `{}` | 确认更换，返回 `{"email": 新邮箱, "signed_in": bool}`。走看板的 CSRF 校验（JSON + 同源 `Origin`） |
+
+- 令牌是 32 字节随机数的 base64url（43 个字符），数据库只存 SHA-256，24 小时内有效，只能用一次。令牌绑定用户和发起时的邮箱：这期间账号邮箱变过（另一次更换、运维改过），链接失效。
+- 格式不对、不存在、已过期、已用过、已被新请求替换或取消、账号邮箱已变、账号已停用或删除，两个接口都返回同一个 `404 {"error":"not_found","message":"not found"}`。按 IP 限流（同邀请页），超出 `429`。响应都带 `Cache-Control: no-store` 和 `Referrer-Policy: no-referrer`。
+- 确认时新邮箱已被别人注册：`409 email_taken`，这条更换随之删除。
+- 确认不需要登录，链接本身证明了新邮箱能收信。确认请求带着**同一个账号**的有效会话时，只保留这一个会话（`signed_in: true`），其余全部撤销；没登录或登录的是别的账号时，这个账号的全部会话都撤销（`signed_in: false`，页面提示用新邮箱登录）。
+- 同一个事务里：改 `users.email`（`email_verified_at` 记为确认时间）、删除 `email_changes`、作废找回密码的令牌、撤销会话。周报：旧邮箱已确认收周报时，确认记录跟到新邮箱，已开的站点改投新邮箱（订阅时间重记，发到旧邮箱的退订链接失效，规则同「周报订阅接口」里的确认新邮箱）；周报邮箱还在待确认时，那条链接作废，回到未确认；从没确认过的不新建记录。
+- 确认后给**旧邮箱**发一封通知：「登录邮箱已改为 n***@example.com」（新邮箱的本地部分只留第一个字符），没有链接。语言用发起时的语言。发信失败只记日志。
+
+改密码和凭邮件重设密码会删除待确认的更换：拿回账号的人不用担心别人发起的更换。
+
+**两封邮件**：确认邮件和旧邮箱通知都是 `multipart/alternative`（纯文本在前、HTML 在后），版式同周报的确认邮件（`designs/weekly-report/email.html`），模板在 `crates/mail/src/email_change.rs`。确认邮件只有一句说明、「确认更换」按钮、有效期与「确认后其他设备需要重新登录」，以及「不是本人操作可忽略」；通知邮件没有按钮，只有一句说明和「不是本人操作请联系管理员」。
+
+**运维**：`rivu user set-email --email <现在的邮箱> --new-email <新邮箱>` 直接改，不发任何邮件，撤销这个用户的全部会话，作废待确认的更换、找回密码链接和周报确认链接；周报的邮箱确认同样不跟过去。新邮箱已被别的账号使用时报错退出。
 
 ## 6. 后台任务
 调度模型：
@@ -343,7 +400,7 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 | 任务 `kind` | 触发 | 频率 | 幂等性 |
 |---|---|---|---|
 | `salts_rotate` | 进程启动补跑 + 定时 | 启动时一次，之后每小时一次（进程内定时器，不经任务队列；盐只需「提前一天存在」，不必卡在固定时刻） | 确保存在 `today-1`、`today`、`today+1` 的盐（`ON CONFLICT DO NOTHING`；UTC 以西站点的本地日期可能还是 `today-1`），删除 `day < today-2`。依据：站点本地日期相对 UTC 日期在 −1 到 +1 天内，多留 1 天覆盖迟到事件 |
-| `auth_sessions_cleanup` | cron | 每小时 | 删除过期/撤销行，可重复 |
+| `auth_sessions_cleanup` | cron | 每小时 | 删除过期/撤销行（含过期的 `email_changes`），可重复 |
 | `invitations_expire` | cron | 每日 | 删除过期邀请（04§3.2 `CleanInvitations`） |
 | `ch_delete_batch` | 进程启动 + 定时；日期范围删除请求写入后立即唤醒 | 每 `RIVU_STATS_DELETE_INTERVAL_SECS`（默认 5 分钟） | 进程内定时器（`crates/jobs/src/stats_delete.rs`），不经任务队列。领取 `pending_stats_deletions`（`status IN ('pending','running') AND not_before <= now()`，`FOR UPDATE SKIP LOCKED`），置 `running`、`attempts+1`，并把 `not_before` 推后 1 小时作为租约（每完成一个分区续租），多进程不会同时处理同一条，崩溃后租约到期由任意进程续跑。用 `rivu_maintainer` 账号对 `events`、`sessions`、`ingest_counters` 逐分区执行 `DELETE FROM t IN PARTITION p WHERE site_id = … [AND 时间条件]`：`scope='site'` 删除该站点全部分区（分区按 `site_id` 现查）；`scope='date_range'` 的日期是站点本地日期，按入队时在站点锁内保存的 UTC 半开区间（与查询引擎的整日区间同一套换算），`events` 按 `ts`、`ingest_counters` 按 `minute`，`sessions` 删除**开始时间**落在区间内的会话（跨边界的会话按开始时间归属）；`rollup_*` 按站点（与本地日）一并删除。完成的分区在维护事务中记入 `partitions_done`（`表:YYYYMM`），续跑时跳过已提交的进度；进程退出时未提交的进度会重放。全部完成置 `done` + `completed_at`；失败记 `last_error`，保持 `running` 并退避（5 分钟起翻倍、上限 6 小时），第 8 次失败置 `failed`。指标 `rivu_stats_deletions_total{scope,result}`、`rivu_stats_delete_partitions_total{table}`。Plausible 为每周批处理（04§3.2 `ClickhouseCleanSites`），Rivu 缩短周期以满足删除请求时效 |
 | `retention_purge` | 进程启动 + 定时 | 每小时 | 每个站点的目标截止时刻是站点时区里「今天 − (N − 1)」的 00:00（N = 站点 `retention_days` 或 `RIVU_RETENTION_DAYS`，取小）。按逐日验证的原生汇总覆盖，轻量删除站点内符合保留策略的原始行。指标 `rivu_retention_partitions_total{table,action="delete"}` 和 `rivu_retention_blocked_rows{table}`。详见下文。 |
@@ -406,7 +463,9 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 
 SMTP 未配置时，`GET` 返回 `available: false`，`POST …/confirmation` 一律返回 `503 mail_unavailable`（包括已确认的账号），其余接口照常可用（已确认的账号仍然可以开关站点，只是周报不会发出）。
 
-账号换了邮箱后，邮箱状态回到未确认，已开的站点保持开着（`subscribed` 仍为 `true`），但在新邮箱确认前不发周报，也不能再开新的站点。新邮箱确认后，已开的站点改投新邮箱并重新记订阅时间，从下一个完整周开始发送，发到旧邮箱的退订链接随之失效。确认记录每个账号只有一条：给新邮箱发确认邮件时，旧邮箱的确认随即作废，即使之后又把账号邮箱改回去，也要重新确认一次。
+通过邮件链接确认更换登录邮箱时（§5「更换登录邮箱」），已确认的周报邮箱直接跟到新邮箱，已开的站点改投新邮箱，效果同下面的「新邮箱确认后」；待确认的链接作废，回到未确认。没有 SMTP 时直接生效的更换和 `rivu user set-email` 不验证新邮箱，按下面的规则处理。
+
+其他情况下账号换了邮箱后，邮箱状态回到未确认，已开的站点保持开着（`subscribed` 仍为 `true`），但在新邮箱确认前不发周报，也不能再开新的站点。新邮箱确认后，已开的站点改投新邮箱并重新记订阅时间，从下一个完整周开始发送，发到旧邮箱的退订链接随之失效。确认记录每个账号只有一条：给新邮箱发确认邮件时，旧邮箱的确认随即作废，即使之后又把账号邮箱改回去，也要重新确认一次。
 
 确认邮件发送失败返回 `502 mail_failed`，邮箱状态与请求之前相同：此前仍然有效的链接继续有效，没有就仍是未确认。这次请求仍计入每分钟一次的限制。恢复是尽力而为的：进程在写入新链接之后、发信结束之前中断，或者发信服务器慢到一次请求超过一分钟、紧接着的下一次也失败，都可能留下一个没人收到的待确认链接。这时账号页显示待确认，重新发送或取消即可。
 
@@ -494,7 +553,7 @@ SMTP 未配置时，`GET` 返回 `available: false`，`POST …/confirmation` �
 | `RIVU_LOG_FORMAT`、`RIVU_LOG_LEVEL` | `json`、`info` | 格式为 `json` 或 `pretty`。开发排障可提高到 `debug` 或 `trace`，见[排障](../install.md#排障) |
 | `RIVU_METRICS` | `on` | 内部口 `/metrics` 开关（Plausible 默认关，04§0#6） |
 | `RIVU_OTLP_ENDPOINT`、`RIVU_ERROR_REPORT_DSN` | 空（关闭） | OTLP 导出（同 04§4.2 `OTLP_ENDPOINT` 思路）；可选错误上报，脱敏见第 10 节 |
-| `RIVU_SMTP_URL`、`RIVU_SMTP_FROM` | 两项须一起设置 | 邀请、密码重置、周报。支持 `smtps://` 或 `smtp://…?tls=required`，见[安装说明](../install.md#安装) |
+| `RIVU_SMTP_URL`、`RIVU_SMTP_FROM` | 两项须一起设置 | 邀请、密码重置、周报、更换登录邮箱的确认（不设置时更换登录邮箱立即生效）。支持 `smtps://` 或 `smtp://…?tls=required`，见[安装说明](../install.md#安装) |
 | `RIVU_S3_ENDPOINT`、`_REGION`、`_BUCKET`、`_ACCESS_KEY_ID`、`_SECRET_ACCESS_KEY` | 空 | 导出对象存储，未配置则落本地；启用后缺一即报错（04§4.2 S3 段） |
 
 ## 8. 数据库账号与权限
