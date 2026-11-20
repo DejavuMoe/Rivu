@@ -3,6 +3,7 @@
 
 import { NOW, type Site } from "../../lib/data/fixtures";
 import { DELETED_SITES, SITES } from "../../lib/data/sites.svelte";
+import { app } from "../../lib/state.svelte";
 
 /** 实例对外地址，只用于拼接分享链接的展示。 */
 export const INSTANCE = "https://rivu.northwind.dev";
@@ -20,9 +21,13 @@ export const MAX_GOALS = 100;
 export type RuleType = "ip" | "cidr" | "country" | "hostname" | "page";
 export type GoalKind = "event" | "page" | "scroll";
 
-/** 地理库能力：国家级库只能选国家，城市级库可选国家、地区、城市，没有库不记录位置。真实里是实例级，原型按站点放几种以便评审。 */
+/**
+ * 地理库能力：国家级库只能选国家，城市级库可选国家、地区、城市，没有库不记录位置。真实里是实例级，
+ * 原型默认按站点放几种以便评审；评审面板的「地理库」可以把所有站点切成城市级或国家级。
+ */
 export function geoCapability(site: Site): "country" | "city" | null {
   if (site.id === 3) return null;
+  if (app.review.geoDb !== "site") return app.review.geoDb;
   if (site.id === 5) return "country";
   return "city";
 }
@@ -275,7 +280,8 @@ function make(site: Site): Cfg {
     script: { outbound: false, downloads: false, forms: false, hash: false, tagged: true, engagement: true },
     rateLimit: "",
     eventProps: site.id === 1 ? ["plan", "type", "variant"] : [],
-    geo: geoCapability(site) === "country" ? "country" : "city",
+    // 站点的地理精度（geo_level）；地理库只有国家级时实际只到国家
+    geo: "city",
     retention: "",
     spikeThreshold: SPIKES[site.id] ?? "",
     rules: rules(site),

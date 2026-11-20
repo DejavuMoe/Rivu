@@ -1,4 +1,8 @@
-<!-- 分解明细：完整表格（至多 1000 行）+ 搜索 + 导出 CSV。点行同样是按该值筛选。 -->
+<!--
+  分解明细：完整表格（至多 1000 行）+ 搜索 + 导出 CSV。点行同样是按该值筛选。
+  extras：访客之后的附加列（页面的滚动深度、停留时间），值在 BarRow.extra；notes 是表格下面的口径说明。
+  窄屏放不下几列数字，附加列收进名称下面的一行小字。
+-->
 <script lang="ts">
   import { CircleAlert, Download, Search } from "@lucide/svelte";
   import Dialog from "../../lib/ui/Dialog.svelte";
@@ -20,8 +24,10 @@
     load: (signal: AbortSignal) => Promise<BarRow[]>;
     total: number;
     onpick: (v: string) => void;
+    extras?: string[];
+    notes?: string[];
   }
-  let { open = $bindable(), title, dimLabel, load, total, onpick }: Props = $props();
+  let { open = $bindable(), title, dimLabel, load, total, onpick, extras = [], notes = [] }: Props = $props();
 
   let rows: BarRow[] = $state([]);
   let status = $state<"loading" | "ready" | "failed">("loading");
@@ -66,15 +72,24 @@
         onrowclick={(r) => onpick(r.key)}
         columns={[
           { key: "label", label: dimLabel },
-          { key: "visitors", label: t("metric.visitors"), align: "right", width: "120px" },
+          { key: "visitors", label: t("metric.visitors"), align: "right", width: extras.length ? "96px" : "120px" },
+          ...extras.map((h, i) => ({ key: `x${i}`, label: h, align: "right" as const, width: "112px", optional: true })),
           { key: "share", label: t("metric.percentage"), align: "right", width: "96px", optional: true },
         ]}
       >
         {#snippet cell(r, c)}
           {#if c.key === "label"}
-            <button class="lbl" type="button">{r.label}</button>
+            <button class="lbl" type="button">{r.label}{#if r.sub}<span class="sub">{r.sub}</span>{/if}</button>
+            {#if extras.length}
+              <span class="mini">
+                {#each extras as h, i (i)}<span>{h} <span class="num">{r.extra?.[i] ?? "—"}</span></span>{/each}
+              </span>
+            {/if}
           {:else if c.key === "visitors"}
             {full(r.value, app.lang)}
+          {:else if c.key.startsWith("x")}
+            {@const v = r.extra?.[Number(c.key.slice(1))] ?? "—"}
+            <span class:muted={v === "—"}>{v}</span>
           {:else}
             <span class="muted">{percent(total ? r.value / total : NaN)}</span>
           {/if}
@@ -82,6 +97,11 @@
       </Table>
     {/if}
   </div>
+  {#if notes.length && status === "ready"}
+    <div class="notes">
+      {#each notes as n, i (i)}<p>{n}</p>{/each}
+    </div>
+  {/if}
 </Dialog>
 
 <style>
@@ -99,12 +119,41 @@
   }
   .tools :global(.input) {
     flex: 1;
+    min-width: 0;
+  }
+  .sub {
+    margin-left: var(--sp-2);
+    color: var(--text-muted);
+  }
+  .mini {
+    display: none;
+  }
+  @media (max-width: 720px) {
+    .mini {
+      display: flex;
+      flex-wrap: wrap;
+      column-gap: var(--sp-3);
+      padding-bottom: var(--sp-2);
+      color: var(--text-muted);
+      font-size: var(--fs-sm);
+    }
+    .lbl {
+      padding-top: var(--sp-2);
+    }
   }
   .table {
     max-height: 56vh;
     overflow: auto;
     border: var(--hairline) solid var(--border-subtle);
     border-radius: var(--r-sm);
+  }
+  .notes {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-1);
+    margin-top: var(--sp-3);
+    color: var(--text-muted);
+    font-size: var(--fs-sm);
   }
   .sk {
     display: flex;

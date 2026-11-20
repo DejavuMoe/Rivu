@@ -1,24 +1,31 @@
 <!--
   看板筛选栏：一行，作用于下面所有图表（不在单个卡片里放筛选）。
-  日期范围、对比、分群（segment 片段，登录后的看板才有）、已加的筛选条件（可点开修改、可移除）、添加筛选。
+  日期范围（前后两个箭头切到上一周期 / 下一周期，菜单最后是自定义范围）、对比、分群（segment 片段，登录后的看板才有）、
+  已加的筛选条件（可点开修改、可移除）、添加筛选。
 -->
 <script lang="ts">
   import type { Snippet } from "svelte";
-  import { CalendarRange, GitCompareArrows, ListFilter, Plus, X } from "@lucide/svelte";
-  import Popover from "../../lib/ui/Popover.svelte";
-  import MenuItem from "../../lib/ui/MenuItem.svelte";
-  import MenuLabel from "../../lib/ui/MenuLabel.svelte";
+  import { GitCompareArrows, ListFilter, Plus, X } from "@lucide/svelte";
   import Select from "../../lib/ui/Select.svelte";
   import Button from "../../lib/ui/Button.svelte";
   import { t } from "../../lib/i18n";
   import { app } from "../../lib/state.svelte";
   import { displayValue } from "./values";
-  import { PROP_PREFIX, RANGES, isPropDim, type CompareKey, type DashState, type Filter, type RangeKey } from "./query";
+  import { PROP_PREFIX, RANGES, isPropDim, type CompareKey, type DashState, type Filter } from "./query";
+  import type { RangeParam } from "./period";
   import FilterDialog from "./FilterDialog.svelte";
+  import RangeControl from "./RangeControl.svelte";
 
   interface Props {
     dash: DashState;
-    onrange: (r: RangeKey) => void;
+    onrange: (r: RangeParam) => void;
+    /** 范围按钮上的文字：预设名，自定义范围是日期 */
+    rangeText: string;
+    /** 上一周期 / 下一周期；undefined 表示这个范围没有前后（实时、全部时间），null 表示这一边不能再走（还没开始） */
+    prev: RangeParam | null | undefined;
+    next: RangeParam | null | undefined;
+    /** 自定义对话框的初始值（当前范围的起止日）、上限（站点本地的今天）、站点时区 */
+    custom: { from: string; to: string; today: string; timezone: string };
     oncompare: (c: CompareKey) => void;
     onfilters: (fs: Filter[]) => void;
     /** 可以筛选的维度 */
@@ -28,7 +35,7 @@
     /** 分群按钮（共享链接与公开看板不传） */
     segment?: Snippet;
   }
-  let { dash, onrange, oncompare, onfilters, dims, suggest, segment }: Props = $props();
+  let { dash, onrange, rangeText, prev, next, custom, oncompare, onfilters, dims, suggest, segment }: Props = $props();
 
   let dialogOpen = $state(false);
   let editing: number | null = $state(null);
@@ -57,28 +64,7 @@
 </script>
 
 <div class="bar">
-  <Popover width={200} label={t("range.label")}>
-    {#snippet trigger({ toggle, props })}
-      <button type="button" class="ctl" onclick={toggle} {...props}>
-        <CalendarRange size={16} strokeWidth={1.75} />
-        <span>{t(`range.${dash.range}`)}</span>
-      </button>
-    {/snippet}
-    {#snippet children({ close })}
-      {#each RANGES as group, gi (gi)}
-        {#if gi > 0}<MenuLabel separator />{/if}
-        {#each group as r (r)}
-          <MenuItem
-            checked={dash.range === r}
-            onclick={() => {
-              onrange(r);
-              close();
-            }}>{t(`range.${r}`)}</MenuItem
-          >
-        {/each}
-      {/each}
-    {/snippet}
-  </Popover>
+  <RangeControl range={dash.range} groups={RANGES} {rangeText} {prev} {next} {custom} {onrange} />
 
   {#if dash.range !== "realtime"}
     <Select
@@ -136,25 +122,6 @@
     align-items: center;
     flex-wrap: wrap;
     gap: var(--sp-2);
-  }
-  .ctl {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    height: var(--control-md);
-    padding: 0 12px 0 10px;
-    border: var(--hairline) solid var(--border);
-    border-radius: var(--r-sm);
-    background: var(--bg-app);
-    font-weight: var(--fw-medium);
-  }
-  .ctl :global(svg) {
-    color: var(--text-muted);
-  }
-  .ctl:hover,
-  .ctl[aria-expanded="true"] {
-    background: var(--bg-element);
-    border-color: var(--border-hover);
   }
   .chip {
     display: inline-flex;

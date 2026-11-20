@@ -1,18 +1,15 @@
 <!--
   合并看板（/sites/combined）：把当前组织里你能读的所有站点加在一起看。只在能读的站点有两个及以上时出现（否则 404），
-  共享链接与公开看板没有它。没有筛选、没有对比、没有实时：时间范围 → 指标条与趋势（图 / 表）→ 各站点的明细与访客占比。
+  共享链接与公开看板没有它。没有筛选、没有对比、没有实时：时间范围（与站点看板同一个控件，含前后周期和自定义范围）→ 指标条与趋势（图 / 表）→ 各站点的明细与访客占比。
   访客是各站点访客数之和（Rivu 不跨站点识别访客），指标名和说明里都这样写。
   状态由评审面板的数据状态驱动：加载、出错 / 排队 / 超时、无数据（所选范围内所有站点都没有数据）。
 -->
 <script lang="ts">
-  import { CalendarRange, ChartSpline, CircleAlert, Clock, Hourglass, Inbox, Table2 } from "@lucide/svelte";
+  import { ChartSpline, CircleAlert, Clock, Hourglass, Inbox, Table2 } from "@lucide/svelte";
   import Avatar from "../../lib/ui/Avatar.svelte";
   import Button from "../../lib/ui/Button.svelte";
   import Card from "../../lib/ui/Card.svelte";
   import EmptyState from "../../lib/ui/EmptyState.svelte";
-  import MenuItem from "../../lib/ui/MenuItem.svelte";
-  import MenuLabel from "../../lib/ui/MenuLabel.svelte";
-  import Popover from "../../lib/ui/Popover.svelte";
   import Segmented from "../../lib/ui/Segmented.svelte";
   import Skeleton from "../../lib/ui/Skeleton.svelte";
   import Table from "../../lib/ui/Table.svelte";
@@ -25,7 +22,10 @@
   import { grans, type Gran, type MetricKey } from "../dashboard/query";
   import { fmtAxis, fmtMetric } from "../dashboard/metrics";
   import SitesHeader from "./SitesHeader.svelte";
-  import { COMBINED_RANGES, readCombined, readableSites, runCombined } from "./combined";
+  import RangeControl from "../dashboard/RangeControl.svelte";
+  import { rangeQuery, type RangeParam } from "../dashboard/period";
+  import { rangeUi } from "../dashboard/range";
+  import { COMBINED_RANGES, combinedFirstDay, readCombined, readableSites, runCombined } from "./combined";
   import "./strings";
 
   let { orgId }: { orgId: string } = $props();
@@ -46,8 +46,20 @@
   const labelOf = (k: MetricKey) => (k === "visitors" ? t("cv.visitorsSum") : t(`metric.${k}`));
   const defOf = (k: MetricKey) => (k === "visitors" ? t("cv.visitors.def") : t(`metric.${k}.def`));
 
+  // 时间范围：与站点看板同一个控件（前后周期、自定义范围）；自定义日期每个站点按自己的时区算
+  const ru = $derived(rangeUi(st, res.period, combinedFirstDay(sites), "", app.lang));
+  function setRange(r: RangeParam) {
+    setQuery({ ...rangeQuery(r), gran: null });
+  }
+
   /** 带上当前范围去单个站点的看板 */
-  const siteHref = (id: number) => href(`/s/${id}${st.range === "30d" ? "" : `?range=${st.range}`}`);
+  const rangeQs = $derived.by(() => {
+    const q = new URLSearchParams();
+    for (const [k, v] of Object.entries(rangeQuery(st))) if (v) q.set(k, v);
+    const s = q.toString();
+    return s ? `?${s}` : "";
+  });
+  const siteHref = (id: number) => href(`/s/${id}${rangeQs}`);
 
   const failure = $derived(
     {
@@ -62,28 +74,7 @@
   <SitesHeader {orgId} tabbed />
 
   <div class="toolbar">
-    <Popover width={200} label={t("range.label")}>
-      {#snippet trigger({ toggle, props })}
-        <button type="button" class="ctl" onclick={toggle} {...props}>
-          <CalendarRange size={16} strokeWidth={1.75} />
-          <span>{t(`range.${st.range}`)}</span>
-        </button>
-      {/snippet}
-      {#snippet children({ close })}
-        {#each COMBINED_RANGES as group, gi (gi)}
-          {#if gi > 0}<MenuLabel separator />{/if}
-          {#each group as r (r)}
-            <MenuItem
-              checked={st.range === r}
-              onclick={() => {
-                setQuery({ range: r === "30d" ? null : r, gran: null });
-                close();
-              }}>{t(`range.${r}`)}</MenuItem
-            >
-          {/each}
-        {/each}
-      {/snippet}
-    </Popover>
+    <RangeControl range={st.range} groups={COMBINED_RANGES} {...ru} onrange={setRange} />
   </div>
 
   {#if empty}
@@ -91,7 +82,7 @@
       <EmptyState icon={Inbox} title={t("dash.empty.title")}>
         {#snippet actions()}
           {#if st.range !== "all" && ds !== "empty"}
-            <Button onclick={() => setQuery({ range: "all", gran: null })}>{t("dash.viewAll")}</Button>
+            <Button onclick={() => setRange({ range: "all" })}>{t("dash.viewAll")}</Button>
           {/if}
         {/snippet}
       </EmptyState>
@@ -115,13 +106,13 @@
           <p class="def">{defOf(metric)}</p>
         </div>
         <div class="tools">
-          {#if grans(st.range).length > 1}
+          {#if grans(st).length > 1}
             <Segmented
               size="sm"
               label={t("gran.label")}
               value={st.gran}
-              onchange={(g: Gran) => setQuery({ gran: g === grans(st.range)[0] ? null : g })}
-              options={grans(st.range).map((g) => ({ value: g, label: t(`gran.${g}`) }))}
+              onchange={(g: Gran) => setQuery({ gran: g === grans(st)[0] ? null : g })}
+              options={grans(st).map((g) => ({ value: g, label: t(`gran.${g}`) }))}
             />
           {/if}
           <Segmented
@@ -192,7 +183,7 @@
           caption={t("cv.bySite")}
           rows={res.rows}
           rowKey={(r) => r.site.id}
-          onrowclick={(r) => navigate(`/s/${r.site.id}${st.range === "30d" ? "" : `?range=${st.range}`}`)}
+          onrowclick={(r) => navigate(`/s/${r.site.id}${rangeQs}`)}
           columns={[
             { key: "site", label: t("cv.col.site") },
             { key: "visitors", label: t("metric.visitors"), align: "right", width: "96px" },
@@ -240,25 +231,6 @@
     display: flex;
     align-items: center;
     gap: var(--sp-2);
-  }
-  .ctl {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    height: var(--control-md);
-    padding: 0 12px 0 10px;
-    border: var(--hairline) solid var(--border);
-    border-radius: var(--r-sm);
-    background: var(--bg-app);
-    font-weight: var(--fw-medium);
-  }
-  .ctl :global(svg) {
-    color: var(--text-muted);
-  }
-  .ctl:hover,
-  .ctl[aria-expanded="true"] {
-    background: var(--bg-element);
-    border-color: var(--border-hover);
   }
   .main {
     border: var(--hairline) solid var(--border-subtle);

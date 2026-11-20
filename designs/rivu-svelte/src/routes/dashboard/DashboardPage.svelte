@@ -6,7 +6,8 @@
   分群：URL 的 seg=<id> 引用站点的一个分群，它的条件和 f= 里的临时筛选同时生效；分群已被删除时提示一句，按没有分群查询。
 -->
 <script lang="ts">
-  import { ChartSpline, CircleAlert, Clock, Download, Hourglass, Inbox, MessageSquarePlus, Share2, Table2 } from "@lucide/svelte";
+  import { ChartSpline, CircleAlert, Clock, Download, Hourglass, Inbox, Info, MessageSquarePlus, Share2, Table2 } from "@lucide/svelte";
+  import Popover from "../../lib/ui/Popover.svelte";
   import SiteHeader from "../../lib/app/SiteHeader.svelte";
   import Callout from "../../lib/ui/Callout.svelte";
   import Card from "../../lib/ui/Card.svelte";
@@ -18,7 +19,7 @@
   import TrendChart from "../../lib/charts/TrendChart.svelte";
   import { t } from "../../lib/i18n";
   import { app, canEdit, siteAccess, toast } from "../../lib/state.svelte";
-  import { delta } from "../../lib/format";
+  import { compact, delta, duration, percent } from "../../lib/format";
   import { href, route, setQuery } from "../../lib/router.svelte";
   import { propertyKeys, type Site } from "../../lib/data/fixtures";
   import FilterBar from "./FilterBar.svelte";
@@ -35,11 +36,13 @@
   import type { ChartMark } from "../../lib/charts/types";
   import "./note-strings";
   import {
-    CITY_LEVEL_DIMS,
     DIMS,
-    GEO_ATTRIBUTION,
     encodeFilters,
-    geoHasRegions,
+    firstDay,
+    geoAttribution,
+    geoCountryOnly,
+    geoLevels,
+    pageEngagement,
     grans,
     readState,
     runQuery,
@@ -49,9 +52,17 @@
     type MetricKey,
   } from "./query";
   import { fmtAxis, fmtMetric, lowerIsBetter } from "./metrics";
+  import type { Details } from "./BreakdownCard.svelte";
+  import type { BarRow } from "../../lib/charts/types";
+  import type WorldMapType from "../../lib/charts/WorldMap.svelte";
+  import { NOW } from "../../lib/data/fixtures";
+  import { periodText, rangeQuery, ymd, type RangeParam } from "./period";
+  import { rangeUi } from "./range";
 
   let { site, mode = "app" }: { site: Site; mode?: "app" | "shared" } = $props();
   const shared = $derived(mode === "shared");
+  /** 安装文档里地理库一节（链接，不加载任何资源） */
+  const GEO_DOCS = "https://github.com/DejavuMoe/Rivu/blob/master/docs/install.md#geoip-%E5%9C%B0%E7%90%86%E5%BA%93";
 
   const dash = $derived(readState(route.current.query));
   /** URL 里的分群 id；分群只在登录后的看板里生效 */
@@ -130,13 +141,61 @@
     notesOpen = true;
   }
 
+  // 范围：按钮文字、上一周期 / 下一周期、自定义对话框的初始值。图例里写出主区间和对比期的具体日期，
+  // 让人知道「过去 30 天」「对比上一周期」到底是哪几天；导出的文件名用同样的日期
+  const first = $derived(firstDay(site));
+  const periodLabel = $derived(realtime ? "" : periodText(res.period, app.lang, NOW));
+  const compareLabel = $derived(res.comparePeriod ? periodText(res.comparePeriod, app.lang, NOW) : "");
+  const ru = $derived(rangeUi(dash, res.period, first, site.timezone, app.lang));
+  function setRange(r: RangeParam) {
+    // 换范围时粒度回到默认（不同范围允许的粒度不同）
+    setQuery({ ...rangeQuery(r), gran: null });
+  }
+
   /** 导出：有效角色 editor 起（含站点访客 editor）；分享：组织成员里的 editor 起，站点访客不行 */
   const mayExport = $derived(canEdit(site));
   const mayShare = $derived(canEdit(site) && siteAccess(site).access === "member");
 
-  /** 地理库到地区级时，位置卡片有「地区」标签页；筛选里没有城市（见 query.ts） */
-  const regions = $derived(geoHasRegions(site));
-  const filterDims = $derived(DIMS.filter((d) => d !== "city" && (regions || !CITY_LEVEL_DIMS.has(d))));
+  /**
+   * 位置卡片的级别：城市级地理库下有国家、地区、城市三个标签页，筛选里也有地区和城市；
+   * 只有国家级地理库（默认的 DB-IP Lite）时只有国家，卡片底部一个「为什么只有国家」说明原因和要配置什么。
+   */
+  const geoDims = $derived(geoLevels(site));
+  const countryOnly = $derived(geoCountryOnly(site));
+  const attr = $derived(geoAttribution(site));
+  const filterDims = $derived(DIMS.filter((d) => (d !== "region" && d !== "city") || geoDims.includes(d as "region" | "city")));
+
+  // 页面报表的明细表多两列：平均滚动深度、平均停留时间（只有「页面」，入口页和退出页没有）。
+  // 卡片太窄放不下三列数字，所以只在「查看全部」里出现
+  const pageDetails = $derived<Details>({
+    dims: ["page"],
+    headers: [t("metric.scroll_depth"), t("metric.time_on_page")],
+    values: (page) => {
+      const e = pageEngagement(site, page);
+      return e ? [percent(e.scroll_depth / 100, 0), duration(e.time_on_page, app.lang)] : null;
+    },
+    notes: [
+      t("dash.defLine", { m: t("metric.scroll_depth"), d: t("metric.scroll_depth.def") }),
+      t("dash.defLine", { m: t("metric.time_on_page"), d: t("metric.time_on_page.def") }),
+    ],
+    missing: t("dash.engagementMissing"),
+  });
+
+  // 世界地图：组件和形状数据（约 11 KB gzip）按需动态加载，不进首屏；数据到齐、有国家数据时才去取。
+  // 加载失败只是没有图，列表照常
+  let WorldMap = $state<typeof WorldMapType | null>(null);
+  let mapFailed = $state(false);
+  $effect(() => {
+    if (WorldMap || mapFailed || !settled || empty) return;
+    import("../../lib/charts/WorldMap.svelte").then(
+      (m) => (WorldMap = m.default),
+      () => (mapFailed = true),
+    );
+  });
+  function mapSummary(bars: BarRow[]): string {
+    const top = bars.slice(0, 3).map((b) => `${b.label} ${percent(res.totalVisitors ? b.value / res.totalVisitors : 0, 0)}`);
+    return t("dash.map.summary", { list: top.join(t("dash.map.sep")) });
+  }
 
   function addFilter(dim: string, value: string) {
     const rest = dash.filters.filter((f) => f.dim !== dim);
@@ -163,15 +222,45 @@
         toast(t("dash.exportFailed"), "bad");
         return;
       }
-      const day = (d: Date | undefined) => (d ? d.toISOString().slice(0, 10) : "");
-      const span = `${day(res.points[0]?.t)}-${day(res.points.at(-1)?.t)}`;
+      // 文件名带区间的起止日（站点本地日，终点封顶到今天），和看板上的范围一致
+      const span = `${ymd(res.period.from)}-${ymd(res.period.kind === "instant" ? new Date(res.period.to.getTime() - 1) : res.period.to)}`;
       toast(t("dash.exportedFile", { f: `rivu-${site.domain}-${span}.zip` }), "good");
     }, 900);
   }
 </script>
 
+{#snippet worldMap(bars: BarRow[])}
+  {#if WorldMap}
+    <WorldMap
+      rows={bars.filter((b) => /^[A-Z]{2}$/.test(b.key)).map((b) => ({ code: b.key, label: b.label, value: b.value }))}
+      format={(n) => compact(n, app.lang)}
+      total={res.totalVisitors}
+      percent={(r) => percent(r, 0)}
+      summary={mapSummary(bars)}
+      lessText={t("dash.map.less")}
+      moreText={t("dash.map.more")}
+      onpick={(code) => addFilter("country", code)}
+    />
+  {:else if !mapFailed}
+    <Skeleton height={240} radius={4} />
+  {/if}
+{/snippet}
+
 {#snippet attribution()}
-  <a href={GEO_ATTRIBUTION.url} target="_blank" rel="noreferrer">{GEO_ATTRIBUTION.text}</a>
+  <a href={attr.url} target="_blank" rel="noreferrer">{attr.text}</a>
+  {#if countryOnly && !shared}
+    <Popover width={300} role="dialog" align="end" side="top" label={t("dash.geo.why")}>
+      {#snippet trigger({ toggle, props })}
+        <button type="button" class="why" onclick={toggle} {...props}><Info size={14} strokeWidth={1.75} />{t("dash.geo.why")}</button>
+      {/snippet}
+      {#snippet children()}
+        <div class="why-pop">
+          <p>{t("dash.geo.whyBody")}</p>
+          <a href={GEO_DOCS} target="_blank" rel="noreferrer">{t("dash.geo.whyLink")}</a>
+        </div>
+      {/snippet}
+    </Popover>
+  {/if}
 {/snippet}
 
 <div class="page">
@@ -191,7 +280,11 @@
       {dash}
       dims={filterDims}
       suggest={(dim) => suggestValues(site, dim)}
-      onrange={(r) => setQuery({ range: r === "30d" ? null : r, gran: null })}
+      rangeText={ru.rangeText}
+      prev={ru.prev}
+      next={ru.next}
+      custom={ru.custom}
+      onrange={setRange}
       oncompare={(c) => setQuery({ cmp: c === "previous_period" ? null : c })}
       onfilters={(fs: Filter[]) => setQuery({ f: fs.length ? encodeFilters(fs) : null })}
     >
@@ -235,7 +328,7 @@
             <Button variant="primary" href={href(`/s/${site.id}/install`)}>{t("dash.installGuide")}</Button>
           {:else if !neverReceived && dash.range !== "all"}
             <!-- 所选范围没有数据，但站点以前收到过 -->
-            <Button onclick={() => setQuery({ range: "all", gran: null })}>{t("dash.viewAll")}</Button>
+            <Button onclick={() => setRange({ range: "all" })}>{t("dash.viewAll")}</Button>
           {/if}
         {/snippet}
       </EmptyState>
@@ -251,24 +344,30 @@
       <div class="chart-head">
         <div class="lead">
           <div class="legend">
-            <span class="key" aria-hidden="true"></span>
-            <span>{t(`metric.${metric}`)}</span>
+            <span class="item">
+              <span class="key" aria-hidden="true"></span>
+              <span>{t(`metric.${metric}`)}</span>
+              {#if periodLabel}<span class="muted num">{periodLabel}</span>{/if}
+            </span>
             {#if prevValues}
-              <span class="key compare" aria-hidden="true"></span>
-              <span class="muted">{compareText}</span>
+              <span class="item">
+                <span class="key compare" aria-hidden="true"></span>
+                <span class="muted">{compareText}</span>
+                <span class="muted num">{compareLabel}</span>
+              </span>
             {/if}
           </div>
           <!-- 访客、访问、浏览量容易混：选中哪个指标，就在图上方用一句话说明它怎么算 -->
           <p class="def">{t(`metric.${metric}.def`)}</p>
         </div>
         <div class="tools">
-          {#if grans(dash.range).length > 1}
+          {#if grans(dash).length > 1}
             <Segmented
               size="sm"
               label={t("gran.label")}
               value={dash.gran}
-              onchange={(g: Gran) => setQuery({ gran: g === grans(dash.range)[0] ? null : g })}
-              options={grans(dash.range).map((g) => ({ value: g, label: t(`gran.${g}`) }))}
+              onchange={(g: Gran) => setQuery({ gran: g === grans(dash)[0] ? null : g })}
+              options={grans(dash).map((g) => ({ value: g, label: t(`gran.${g}`) }))}
             />
           {/if}
           {#if mayNote}
@@ -352,22 +451,31 @@
       <BreakdownCard
         title={t("dash.card.pages")}
         dims={["page", "entry_page", "exit_page"]}
+        details={pageDetails}
         rowsOf={res.breakdown}
         total={res.totalVisitors}
         onpick={addFilter}
         {loading}
         {failed}
       />
-      <BreakdownCard
-        title={t("dash.card.locations")}
-        dims={regions ? ["country", "region"] : ["country"]}
-        rowsOf={res.breakdown}
-        total={res.totalVisitors}
-        onpick={addFilter}
-        {loading}
-        {failed}
-        footer={settled ? attribution : undefined}
-      />
+      <!-- 位置卡片占整行：国家标签页里世界地图在左、列表在右（窄屏地图在上） -->
+      <div class="wide">
+        <BreakdownCard
+          title={t("dash.card.locations")}
+          dims={geoDims}
+          visual={worldMap}
+          visualDims={["country"]}
+          rowsOf={res.breakdown}
+          total={res.totalVisitors}
+          onpick={addFilter}
+          {loading}
+          {failed}
+          footer={settled ? attribution : undefined}
+        />
+      </div>
+    </div>
+
+    <div class="grid">
       <BreakdownCard
         title={t("dash.card.devices")}
         dims={["device", "browser", "os"]}
@@ -377,9 +485,6 @@
         {loading}
         {failed}
       />
-    </div>
-
-    <div class="grid">
       <GoalsCard rows={res.goals} onpick={addFilter} {loading} {failed} />
       <PropsCard keys={propertyKeys(site)} rowsOf={res.breakdown} total={res.totalVisitors} onpick={addFilter} {loading} {failed} />
     </div>
@@ -431,7 +536,9 @@
   .legend {
     display: flex;
     align-items: center;
-    gap: var(--sp-2);
+    flex-wrap: wrap;
+    column-gap: var(--sp-4);
+    row-gap: var(--sp-1);
     /* 与右侧工具（28px 高）同一行居中 */
     min-height: var(--control-sm);
     font-weight: var(--fw-medium);
@@ -439,6 +546,11 @@
   .def {
     color: var(--text-muted);
     font-size: var(--fs-sm);
+  }
+  .legend .item {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--sp-2);
   }
   .legend .muted {
     font-weight: var(--fw-regular);
@@ -450,7 +562,6 @@
     background: var(--series-1);
   }
   .key.compare {
-    margin-left: var(--sp-2);
     background: var(--series-compare);
   }
   .tools {
@@ -472,6 +583,35 @@
   .note-cell {
     color: var(--text-muted);
     white-space: normal;
+  }
+  .why {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--sp-1);
+    flex: none;
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--text-muted);
+    font-size: var(--fs-sm);
+  }
+  .why:hover,
+  .why[aria-expanded="true"] {
+    color: var(--text);
+  }
+  .why-pop {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-2);
+    padding: var(--sp-2) var(--sp-3);
+    font-size: var(--fs-sm);
+  }
+  /* 位置卡片（有地图）占整行 */
+  .wide {
+    grid-column: 1 / -1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
   }
   .grid {
     display: grid;
