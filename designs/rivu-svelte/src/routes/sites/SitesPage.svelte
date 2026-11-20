@@ -1,7 +1,7 @@
 <!--
   站点列表：当前组织的站点网格。卡片整体可点进看板；24 小时内没有数据的站点链到安装页。
   每张卡片显示按小时的访客走势，以及 24 小时去重访客总数（分小时的访客数不能相加）。
-  站点多于 6 个时才出现搜索框。所有者和管理员在页头和空状态里有「添加站点」入口，列表下方是恢复期内的已删除站点。
+  站点多于 6 个时才出现搜索框。能读的站点有两个及以上时，页头下有「列表 / 合并看板」标签（SitesHeader）。所有者和管理员在页头和空状态里有「添加站点」入口，列表下方是恢复期内的已删除站点。
   只以站点访客身份看到的组织：没有「添加站点」，站点带「访客权限」标记，也没有安装指引的链接。
 
   状态由评审面板的数据状态驱动：
@@ -12,7 +12,7 @@
 -->
 <script lang="ts">
   import { Inbox, Plus, Search, X } from "@lucide/svelte";
-  import PageHeader from "../../lib/app/PageHeader.svelte";
+  import SitesHeader from "./SitesHeader.svelte";
   import Sparkline from "../../lib/charts/Sparkline.svelte";
   import Avatar from "../../lib/ui/Avatar.svelte";
   import Badge from "../../lib/ui/Badge.svelte";
@@ -79,13 +79,7 @@
 </script>
 
 <div class="page">
-  <PageHeader title={t("sites.title")}>
-    {#snippet actions()}
-      {#if canAdd}
-        <Button variant="primary" icon={Plus} href={href("/sites/new")}>{t("nav.addSite")}</Button>
-      {/if}
-    {/snippet}
-  </PageHeader>
+  <SitesHeader {orgId} tabbed={all.length >= 2} />
 
   {#if all.length > 6}
     <div class="search">

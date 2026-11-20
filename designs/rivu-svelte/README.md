@@ -11,6 +11,7 @@
 - 流量突增通知（#39）：站点设置的「通知」分区 `src/routes/settings/AlertsSection.svelte`（`#/s/1/settings/alerts`，所有者 / 管理员，且「邮件」为已配置），以及「邮件订阅」表里的「流量突增」一列。
 - 分群（#40）：`src/routes/dashboard/SegmentMenu.svelte`，`#/s/1` 筛选栏的「分群」；评审面板「看板分群」切换有 / 无，「角色」切到查看者只剩套用。
 - 图表批注（#41）：`src/routes/dashboard/NotesDialog.svelte` 与 `lib/charts/TrendChart.svelte` 的 `marks`；`#/s/1` 趋势图下方的标记、图表右上角「添加批注」；评审面板「图表批注」切换有 / 无 / 已满。
+- 合并看板（#42）：`src/routes/sites/CombinedPage.svelte`，`#/sites/combined`，站点列表页头的「合并看板」标签与命令面板；Northwind Labs 与 Fabrikam Studio 有，只有一个站点的「开源文档社区」没有（直接打开是 404）；评审面板「数据状态」演示加载、无数据、出错。
 
 ## 运行
 

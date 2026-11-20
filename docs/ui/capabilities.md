@@ -385,6 +385,7 @@ Approved marketing copy: none.
 | site | 站点 | Site | PG1:65; used throughout docs |
 | segment | 分群 | Segment | SD:635 "分群" |
 | chart annotation | 批注 | Note | `proposed`（#41） |
+| consolidated view | 合并看板 | Combined view | `proposed`（#42） |
 | goal | 目标 | Goal | SD:726 |
 | funnel | 漏斗 | Funnel | SD:796 |
 | shared link | 共享链接 | Shared link | PO:118 "分享链接", SD:622 "共享链接": variants, choose one |

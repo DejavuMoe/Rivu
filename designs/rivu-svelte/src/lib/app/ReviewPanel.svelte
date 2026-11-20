@@ -22,6 +22,7 @@
     ["/invite/t0k3n", "接受邀请"],
     ["/sites", "站点"],
     ["/sites/new", "添加站点"],
+    ["/sites/combined", "合并看板"],
     ["/s/4/install", "安装"],
     ["/s/1", "看板"],
     ["/s/1/diagnostics", "诊断"],

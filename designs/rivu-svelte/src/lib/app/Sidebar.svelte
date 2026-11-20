@@ -78,7 +78,7 @@
   </div>
 
   <nav class="nav" aria-label={t("nav.sites")}>
-    <a class="item" href={href("/sites")} aria-current={seg[0] === "sites" && !seg[1] ? "page" : undefined}>
+    <a class="item" href={href("/sites")} aria-current={seg[0] === "sites" && (!seg[1] || seg[1] === "combined") ? "page" : undefined}>
       <LayoutGrid size={16} strokeWidth={1.75} />
       <span class="grow">{t("nav.allSites")}</span>
     </a>

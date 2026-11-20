@@ -10,6 +10,7 @@
     /email-change/confirm/:token                                               确认新的登录邮箱（邮件里的链接，独立页）
     /share/:slug  /public/:key                                                 共享链接、公开看板（独立页）
     /sites  /sites/new                                    站点列表、添加站点
+    /sites/combined                                       合并看板（组织里能读的站点两个及以上，否则 404）
     /s/:id  /s/:id/install  /s/:id/diagnostics           看板、安装、接入诊断
     /s/:id/settings/:section                               站点设置
     /org/members  /org/api-keys  /account                组织与账号
@@ -38,6 +39,8 @@
   import EmailChangeConfirmPage from "./routes/auth/EmailChangeConfirmPage.svelte";
   import SitesPage from "./routes/sites/SitesPage.svelte";
   import AddSitePage from "./routes/sites/AddSitePage.svelte";
+  import CombinedPage from "./routes/sites/CombinedPage.svelte";
+  import { combinedAvailable } from "./routes/sites/combined";
   import InstallPage from "./routes/sites/InstallPage.svelte";
   import DiagnosticsPage from "./routes/diagnostics/DiagnosticsPage.svelte";
   import SettingsPage from "./routes/settings/SettingsPage.svelte";
@@ -132,6 +135,8 @@
           {/if}
         {:else if seg[0] === "sites" && seg[1] === "new"}
           <AddSitePage />
+        {:else if seg[0] === "sites" && seg[1] === "combined"}
+          {#if combinedAvailable(app.orgId)}<CombinedPage orgId={app.orgId} />{:else}<NotFound />{/if}
         {:else if seg[0] === "sites" || seg.length === 0}
           <SitesPage orgId={app.orgId} />
         {:else if seg[0] === "org" && seg[1] === "members"}

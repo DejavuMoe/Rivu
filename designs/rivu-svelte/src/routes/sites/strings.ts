@@ -20,6 +20,18 @@ extend({
   "sl.deleted.expired": ["恢复期已过，无法恢复", "The restore period has ended"],
   "sl.deleted.failed": ["恢复失败，请稍后重试", "Couldn't restore the site. Try again shortly."],
 
+  // ---- 合并看板（词表：consolidated view → 合并看板 / Combined view） ----
+  "sl.tab.list": ["列表", "List"],
+  "cv.tab": ["合并看板", "Combined view"],
+  "cv.visitorsSum": ["访客之和", "Visitors, summed"],
+  "cv.visitors.def": [
+    "把每个站点的访客数相加。同一个人访问了两个站点，会被算两次。",
+    "Each site's visitors added up. Someone who visits two sites counts twice.",
+  ],
+  "cv.bySite": ["各站点", "By site"],
+  "cv.col.site": ["站点", "Site"],
+  "cv.col.share": ["访客占比", "Share of visitors"],
+
   // ---- 添加站点 ----
   "as.title": ["添加站点", "Add site"],
   "as.domain": ["域名", "Domain"],
