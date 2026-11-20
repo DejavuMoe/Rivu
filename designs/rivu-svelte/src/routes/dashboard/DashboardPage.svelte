@@ -458,24 +458,19 @@
         {loading}
         {failed}
       />
-      <!-- 位置卡片占整行：国家标签页里世界地图在左、列表在右（窄屏地图在上） -->
-      <div class="wide">
-        <BreakdownCard
-          title={t("dash.card.locations")}
-          dims={geoDims}
-          visual={worldMap}
-          visualDims={["country"]}
-          rowsOf={res.breakdown}
-          total={res.totalVisitors}
-          onpick={addFilter}
-          {loading}
-          {failed}
-          footer={settled ? attribution : undefined}
-        />
-      </div>
-    </div>
-
-    <div class="grid">
+      <!-- 位置卡片与其他卡片一样半宽；世界地图是最后一个标签页「地图」，数据同国家 -->
+      <BreakdownCard
+        title={t("dash.card.locations")}
+        dims={geoDims}
+        visual={worldMap}
+        visualTab={{ key: "map", of: "country" }}
+        rowsOf={res.breakdown}
+        total={res.totalVisitors}
+        onpick={addFilter}
+        {loading}
+        {failed}
+        footer={settled ? attribution : undefined}
+      />
       <BreakdownCard
         title={t("dash.card.devices")}
         dims={["device", "browser", "os"]}
@@ -485,6 +480,9 @@
         {loading}
         {failed}
       />
+    </div>
+
+    <div class="grid">
       <GoalsCard rows={res.goals} onpick={addFilter} {loading} {failed} />
       <PropsCard keys={propertyKeys(site)} rowsOf={res.breakdown} total={res.totalVisitors} onpick={addFilter} {loading} {failed} />
     </div>
@@ -607,12 +605,6 @@
     font-size: var(--fs-sm);
   }
   /* 位置卡片（有地图）占整行 */
-  .wide {
-    grid-column: 1 / -1;
-    min-width: 0;
-    display: flex;
-    flex-direction: column;
-  }
   .grid {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));

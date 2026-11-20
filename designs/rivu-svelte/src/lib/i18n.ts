@@ -106,6 +106,7 @@ const dict = {
   "dim.country": ["国家", "Countries"],
   "dim.region": ["地区", "Regions"],
   "dim.city": ["城市", "Cities"],
+  "dim.map": ["地图", "Map"],
   "dim.device": ["设备类型", "Devices"],
   "dim.browser": ["浏览器", "Browsers"],
   "dim.os": ["操作系统", "Operating systems"],
