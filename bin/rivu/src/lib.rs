@@ -21,6 +21,7 @@ pub mod public;
 pub mod query_api;
 pub mod run;
 pub mod script;
+pub mod segments_admin;
 pub mod session_warm;
 pub mod shield_cmd;
 pub mod site_admin;

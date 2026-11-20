@@ -299,6 +299,7 @@ pub async fn issue_link(
             expires_at_unix: expires_at,
             created_by: None,
             name: None,
+            segment_id: None,
         },
     )
     .await?;

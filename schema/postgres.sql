@@ -255,6 +255,7 @@ TABLE segments
   CONSTRAINT segments_pkey PRIMARY KEY (id)
   CONSTRAINT segments_site_id_fkey FOREIGN KEY (site_id) REFERENCES sites(id)
   CREATE INDEX segments_site ON public.segments USING btree (site_id)
+  CREATE UNIQUE INDEX segments_site_name ON public.segments USING btree (site_id, lower(name)) WHERE ((deleted_at IS NULL) AND (owner_user_id IS NULL))
   CREATE TRIGGER segments_set_updated_at BEFORE UPDATE ON public.segments FOR EACH ROW EXECUTE FUNCTION set_updated_at()
 
 TABLE shared_link_grants
@@ -288,6 +289,7 @@ TABLE shared_links
   CONSTRAINT shared_links_segment_id_fkey FOREIGN KEY (segment_id) REFERENCES segments(id)
   CONSTRAINT shared_links_site_id_fkey FOREIGN KEY (site_id) REFERENCES sites(id)
   CONSTRAINT shared_links_slug_check CHECK ((char_length(slug) >= 24))
+  CREATE INDEX shared_links_segment ON public.shared_links USING btree (segment_id) WHERE ((segment_id IS NOT NULL) AND (deleted_at IS NULL))
   CREATE INDEX shared_links_site ON public.shared_links USING btree (site_id) WHERE (deleted_at IS NULL)
   CREATE UNIQUE INDEX shared_links_slug ON public.shared_links USING btree (slug)
   CREATE INDEX shared_links_updated ON public.shared_links USING btree (updated_at)

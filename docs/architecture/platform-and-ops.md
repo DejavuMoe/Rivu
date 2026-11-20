@@ -97,8 +97,8 @@ Rivu 只支持单实例：会话分配依赖单写者，同一时间只能有一
 | `goals` | 转化目标 | `site_id`、`kind` ∈ event/page/scroll、`event_name`、`page_path`、`scroll_threshold`（滚动深度目标的阈值，1–100）、`display_name` | `UNIQUE(site,kind,COALESCE(event_name,page_path),COALESCE(scroll_threshold,0))` 部分唯一 |
 | `annotations` | 图表注释：钉在趋势图某一天上的一句话（如「发布 v2.0」），按站点共享，不是个人的 | `site_id`、`date`（站点本地日期）、`text`（trim 后 1–255 个字符，无控制字符）、`created_by` NULL（`ON DELETE SET NULL`）、`deleted_at` | `INDEX(site_id, date)` 部分索引；每站最多 500 条未删除的注释，添加时事务内先锁站点行再计数（同屏蔽规则），超出 409 `limit_reached`。站点软删除不动注释（随站点一起不可见，恢复站点后原样回来）；按日期范围删除统计数据不删注释（注释是站点内容，不是统计数据）。不进站点快照，每次请求现读 |
 | `funnels`、`funnel_steps` | 漏斗（第 4 阶段） | `site_id`、`name`；`funnel_id`、`goal_id`、`step_order` | `UNIQUE(funnel_id,step_order)` |
-| `segments` | 保存的筛选段 | `site_id`、`owner_user_id` NULL=站点级、`name`、`filter jsonb`（结构见 `system-design.md`） | `INDEX(site_id)` |
-| `shared_links` | 分享链接 | `site_id`、`name` NULL（1–100 字符，看板里区分链接用）、`slug`（≥24 字符随机）、`password_hash` NULL（argon2id）、`segment_id` NULL、`expires_at` | `UNIQUE(slug)` |
+| `segments` | 分群：一组带名字的筛选条件（如「来自搜索的手机访客」），按站点共享 | `site_id`、`owner_user_id` NULL=站点级（个人分群暂不支持，接口只读写站点级分群）、`name`（trim 后 1–100 个字符，无控制字符）、`filter jsonb`（QuerySpec 的 `filters` 数组，规范化后存，`system-design.md` §6.2）、`deleted_at` | `INDEX(site_id)`；`UNIQUE(site_id, lower(name))` 部分唯一（未删除的站点级分群）。每站最多 100 个未删除的分群，添加、改名时事务内先锁站点行再计数、查重名（超出 409 `limit_reached`，重名 409 `conflict`）。有未吊销的共享链接绑定时不能删。站点软删除不动分群。不进站点快照，查询引用到时现读 |
+| `shared_links` | 分享链接 | `site_id`、`name` NULL（1–100 字符，看板里区分链接用）、`slug`（≥24 字符随机）、`password_hash` NULL（argon2id）、`segment_id` NULL（同一站点的分群，通过链接看到的数据都叠加它）、`expires_at` | `UNIQUE(slug)`；`INDEX(segment_id)` 部分索引（未吊销且绑定了分群的链接，删分群前查） |
 | `shield_rules` | 屏蔽规则，单表（Plausible 为 4 张，04§1.2） | `site_id`、`type`、`action`、`value` | `UNIQUE(site,type,value)` 部分唯一；每站上限见 3.3 |
 | `api_keys` | API 密钥 | `organization_id`、`user_id`、`name`、`key_prefix`、`key_hash`、`scopes text[]`、`last_used_at`、`expires_at` | `UNIQUE(key_hash)`；`INDEX(user_id)` |
 | `auth_sessions` | 后台登录会话 | `user_id`、`token_hash`、`device_label`、`last_used_at`、`expires_at` | `UNIQUE(token_hash)`；`INDEX(expires_at)` |
@@ -300,6 +300,19 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 
 一条注释：`{"id","date","text","author","mine","created_at","updated_at"}`。`date` 是 `YYYY-MM-DD`（年份 2000–2099），`text` trim 后 1–255 个字符（按字符数，不按字节），不含控制字符（包括换行）；请求体有未知字段、取值不合法 400 `invalid_request`。`mine` 表示是不是调用者自己加的。`author` 是 `{"name","email"}` 或 `null`，只按成员页会给调用者看的样子给：组织成员能在成员页看到成员和站点访客，所以作者现在仍是该组织的成员或访客时给组织成员看；站点访客调不到成员页，只看得到自己加的注释的作者；作者已离开组织或账号已删除时为 `null`，注释保留。id 不是整数、不存在、已删除或属于别的站点 404。
 
+**分群端点**（`bin/rivu/src/segments_admin.rs`，`/api/internal/sites/{site}/segments`，会话鉴权 + CSRF，同目标端点）：分群是一组保存下来的筛选条件，按站点共享（`owner_user_id` 为空）：列表要 `stats.read`（能在登录后的看板里看这个站点统计的人，含站点访客 viewer，他们也能应用分群），添加、改名、改条件、删除要 `site.content.write`（按有效角色：owner、admin、editor、站点访客 editor；viewer 与站点访客 viewer 403），谁都能改、删别人建的分群。没有会话 401，站点不可见 404。应用分群不需要专门的端点：查询的 `filters` 里加 `["is","segment",[id]]`（`system-design.md` §6.2）。
+
+| 请求 | 说明 |
+|---|---|
+| `GET …/segments` | 返回 `{"segments":[…],"max_segments":100}`，按名称（不区分大小写）、id 升序 |
+| `POST …/segments` + `{"name","filters"}` | 201 `{"segment":{…}}`；重名（trim 后不区分大小写）409 `conflict`；已有 100 个 409 `limit_reached` |
+| `PATCH …/segments/{id}` + `{"name"?,"filters"?}` | 至少给一项，200 `{"segment":{…}}`；改名只和别的分群比重名（只改大小写可以） |
+| `DELETE …/segments/{id}` | 软删除，204；还有未吊销的共享链接绑定它（含已过期的：设置页仍列出它们）时 409 `{"error":"segment_in_use","message","links":[{"id","name"}]}`，`links` 按 id 升序，`name` 没起名为 `null`，先吊销这些链接再删 |
+
+一个分群：`{"id","name","filters","created_at","updated_at"}`。`name` trim 后 1–100 个字符（按字符数），不含控制字符，不合法 400 `invalid_request`；`filters` 与 QuerySpec 的 `filters` 同一个语法（数组，顶层隐式 AND，至少一项），保存前用查询的解析器和规则校验（取值个数与长度、正则、`event:goal` 只能 `is`/`is_not` 等），不能用时间维度，也不能再引用分群；不合法 400，响应与查询的 400 同形（`{"error":"invalid_query","message","errors":[{"path","message"}]}`，`path` 以 `filters` 开头，如 `filters[0][1]`）。存的是规范化后的写法（取值一律是字符串，`case_sensitive` 只在给了时出现），响应也是。请求体有未知字段 400。id 不是整数、不存在、已删除或属于别的站点 404。
+
+共享链接（`POST /api/internal/sites/{site}/shared-links`）的请求体可以带 `segment_id`：必须是这个站点未删除的分群，否则 400 `invalid_request`；建链接与删分群互斥（建链接时给分群行加共享锁，删分群时先锁分群行再查链接），不会建出绑定已删除分群的链接。链接列表与创建响应的每一项多一个 `segment`：`{"id","name"}` 或 `null`（分群若被绕过接口删掉，`name` 为 `null`，链接本身 404）。
+
 **看板成员与 API key 端点**（`bin/rivu/src/org_admin.rs`，`/api/internal/orgs/{org_id}/members`、`invitations`、`guests`、`api-keys`，以及公开的 `/api/internal/invitations/{token}` 与 `.../accept`；会话鉴权 + CSRF，API key 永远调不到）：`Action` 另有 `MemberManage`（邀请、移除、改角色：owner、admin）、`SiteMembershipManage`（站点访客的邀请与移除：owner、admin）、`ApiKeyManageOwn`（所有 org 角色，只管自己的 key）；「谁能给谁什么角色、谁能改谁」走纯函数 `can_assign`、`can_modify`，并在锁住 org 行的事务里按最新角色再判一次。org 不存在或调用者不是（未删除的）成员 404，是成员但角色不够 403 `forbidden`；任何人都不能通过这些端点改自己的角色或移除自己（403）；降级或移除 owner 时先 `SELECT ... FOR UPDATE` 锁 org 行再数 owner，最后一名 owner 409 `conflict`；移除成员的同一事务里软删除他在该 org 的 API key（否则重新加回他会让旧 key 复活）。邀请不发邮件：创建返回一次性链接 `<RIVU_BASE_URL>/invite/<token>`（令牌 32 字节随机数的 base64url，库里只存 SHA-256，7 天有效，只在创建响应里出现一次），owner 不可被邀请，已是成员 409，同范围已有未过期的待处理邀请 409（已过期的先在同一事务里软删除，所以过期后可以重新邀请）。邀请页的查询与接受不需要登录，按客户端 IP 限流（参数同共享链接与公开看板，在查库之前），令牌无效、过期、已接受、已撤销、org 或站点已删除一律同一个 404；接受时锁邀请行：邮箱已有账号则必须是该账号的会话（无会话 401，别的账号 403 `email_mismatch`，被禁用的账号 404），没有账号则必须给密码（12 到 128 个字符）并在同一事务里创建账号、写成员或访客关系，再像登录一样签发会话 cookie（不撤销请求里带的其它会话）。API key 的创建返回明文一次（`rivu_` 加 43 个字符，格式、哈希与 `rivu apikey create` 相同），可限定 `stats:read:<site_key>` 的站点（须是本 org 未删除的站点，否则 400）与 30、90、365 天的有效期；列表只含调用者自己未吊销的 key（过期的仍列出），吊销别人的 key 是 404。
 
 **状态规则**（服务层事务内校验；04§2.1 同样把此类规则留在 service）：org 至少保留一名 owner（降级、移除、自行退出都先 `SELECT ... FOR UPDATE` 锁 org 行再数 owner）；同时有 org 角色与站点访客角色时取较高者；邀请不能授予超出邀请人可分配范围的角色，过期或已接受的邀请不可复用；站点已软删除时除恢复外的写动作返回 404。
@@ -311,7 +324,7 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 |---|---|---|
 | 1 | 用 `site_key` 查缓存；不存在或已软删除 → 404 | — |
 | 2 | 识别主体：登录用户 / API key / shared link / 匿名 | — |
-| 3 | shared link：slug 属于该站点、未过期、密码通过；仅放行 `stats.read`，并强制叠加绑定 segment 的过滤 | — |
+| 3 | shared link：slug 属于该站点、未过期、密码通过；仅放行 `stats.read`，并强制叠加绑定的分群（在过滤末尾加 `["is","segment",[id]]`，与看板里应用分群同一条展开路径，`system-design.md` §6.3；分群读不到时链接 404） | — |
 | 4 | 登录用户：`有效角色 = max(org 角色, 站点访客角色)`，查矩阵 | 对应第 4 步 |
 | 5 | API key：key 的 org 必须等于站点所属 org；`scopes` 覆盖动作与站点；且所属用户当前有效角色允许该动作（取交集） | 对应 04§2.3 |
 | 6 | 无授权但 `is_public` 且动作为 `stats.read` → 放行 | 对应 `sites.public` |

@@ -625,6 +625,7 @@ async fn direct_with(
         retention_days: None,
         imported: None,
         completed_import_ids: Vec::new(),
+        segments: Vec::new(),
     };
     let result = execute(
         &server.reader,

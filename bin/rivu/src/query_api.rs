@@ -80,7 +80,8 @@ use rivu_auth::{
 };
 use rivu_geo::{GeoDb, NameLang};
 use rivu_query::{
-    ExecOptions, GoalDef, QueryCache, QueryError, QueryResult, QuerySpec, SiteContext, TenantScope,
+    ExecOptions, GoalDef, QueryCache, QueryError, QueryResult, QuerySpec, SegmentDef, SiteContext,
+    TenantScope, spec::Filter,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -258,6 +259,8 @@ pub(crate) async fn load_site_context(
         geo_attribution: geo.and_then(|g| g.attribution()),
         geo_capability: geo.and_then(|g| g.capability()),
         goals,
+        // 分群按查询加载（[`attach_segments`]）
+        segments: Vec::new(),
         // 站点设置只能比全局短（PATCH 时校验；全局调小后也以全局为准）
         retention_days: Some(
             settings
@@ -267,6 +270,40 @@ pub(crate) async fn load_site_context(
         ),
     })
 }
+/// 加载查询引用到的分群（§6.3 build 阶段「展开分群」）：只在过滤里有 `["is", "segment", [id]]` 时查 PG，每次现读，
+/// 没有缓存，改了分群立即生效。只认这个站点未删除的站点级分群：别的站点的、已删除的 id 不加载，build 阶段按
+/// 「未知分群」返回 400。库里的过滤读不懂按内部错误处理（宁可失败，也不能少过滤）。
+pub(crate) async fn attach_segments(
+    pg: &PgPool,
+    site: &mut SiteContext,
+    filters: &[Filter],
+) -> Result<(), ApiError> {
+    let ids: Vec<i64> = rivu_query::segment_ids(filters).into_iter().collect();
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let site_id = site.site_id;
+    let rows = rivu_storage_pg::segments::load_filters(pg, site_id, &ids)
+        .await
+        .map_err(|e| {
+            tracing::error!(site_id, error = %format!("{e:#}"), "读取分群失败");
+            ApiError::Internal
+        })?;
+    site.segments = rows
+        .iter()
+        .map(|(id, text)| {
+            serde_json::from_str::<Value>(text)
+                .map_err(|e| e.to_string())
+                .and_then(|v| SegmentDef::from_json(*id, &v).map_err(|e| e.to_string()))
+                .map_err(|e| {
+                    tracing::error!(site_id, segment_id = id, error = %e, "分群的过滤无法解析");
+                    ApiError::Internal
+                })
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(())
+}
+
 // ------------------------------------------------------------------------------------------
 // 错误
 // ------------------------------------------------------------------------------------------
@@ -530,7 +567,9 @@ async fn run_query<S: AuthStore>(
         .guard
         .authorize_site(ctx, &site_key, Resource::Stats, ScopeAction::Read)
         .await?;
-    let site = api.site_context(owner.id, &owner.site_key).await?;
+    let mut site = api.site_context(owner.id, &owner.site_key).await?;
+    // 分群只认这个站点的：别的站点的分群 id 与不存在的一样，400
+    attach_segments(&api.pg, &mut site, &spec.filters).await?;
 
     let mut opts = ExecOptions::new(api.timeout_secs)
         .with_now((api.clock)())

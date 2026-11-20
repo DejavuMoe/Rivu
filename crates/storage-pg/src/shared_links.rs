@@ -17,9 +17,10 @@ pub struct LinkInfo {
     pub timezone: String,
     /// `None` = 没有密码。
     pub password_hash: Option<String>,
-    /// 绑定的 segment 的过滤（JSON 文本）。链接绑定了 segment 却读不到它（已删除）时，[`find_active`] 不返回该链接
+    /// 绑定的分群。查询时把 `["is", "segment", [id]]` 叠加到过滤上，与看板里应用分群走同一条展开路径。
+    /// 链接绑定了分群却读不到它（已删除）时，[`find_active`] 不返回该链接
     /// （fail-closed：宁可 404，也不能把未过滤的数据放出去）。
-    pub segment_filter: Option<String>,
+    pub segment_id: Option<i64>,
 }
 
 impl std::fmt::Debug for LinkInfo {
@@ -43,11 +44,12 @@ pub fn is_slug_shaped(s: &str) -> bool {
 pub async fn find_active(pool: &PgPool, slug: &str) -> Result<Option<LinkInfo>> {
     let row = sqlx::query(
         "SELECT l.id, l.site_id, s.site_key, s.name AS site_name, s.timezone, l.password_hash,
-                l.segment_id, seg.filter::text AS segment_filter
+                l.segment_id, seg.id AS live_segment_id
          FROM shared_links l
          JOIN sites s ON s.id = l.site_id AND s.deleted_at IS NULL
          JOIN organizations o ON o.id = s.organization_id AND o.deleted_at IS NULL
-         LEFT JOIN segments seg ON seg.id = l.segment_id AND seg.deleted_at IS NULL
+         LEFT JOIN segments seg ON seg.id = l.segment_id AND seg.site_id = l.site_id
+                               AND seg.deleted_at IS NULL AND seg.owner_user_id IS NULL
          WHERE l.slug = $1 AND l.deleted_at IS NULL AND (l.expires_at IS NULL OR l.expires_at > now())",
     )
     .bind(slug)
@@ -58,8 +60,8 @@ pub async fn find_active(pool: &PgPool, slug: &str) -> Result<Option<LinkInfo>> 
         return Ok(None);
     };
     let segment_id: Option<i64> = r.try_get("segment_id")?;
-    let segment_filter: Option<String> = r.try_get("segment_filter")?;
-    if segment_id.is_some() && segment_filter.is_none() {
+    let live_segment_id: Option<i64> = r.try_get("live_segment_id")?;
+    if segment_id.is_some() && live_segment_id.is_none() {
         return Ok(None);
     }
     let site_id: i64 = r.try_get("site_id")?;
@@ -70,7 +72,7 @@ pub async fn find_active(pool: &PgPool, slug: &str) -> Result<Option<LinkInfo>> 
         site_name: r.try_get("site_name")?,
         timezone: r.try_get("timezone")?,
         password_hash: r.try_get("password_hash")?,
-        segment_filter,
+        segment_id,
     }))
 }
 
@@ -85,13 +87,45 @@ pub struct NewLink<'a> {
     pub created_by: Option<i64>,
     /// 名称（调用方已校验：1 到 100 个字符）；`None` = 没有名称。
     pub name: Option<&'a str>,
+    /// 绑定的分群（必须是同一站点未删除的站点级分群，否则 [`create`] 返回 [`SegmentNotFound`]）。
+    pub segment_id: Option<i64>,
 }
 
-/// 建链接，返回 `shared_links.id`。站点不存在或已删除报错。
+/// [`create`] 的错误：要绑定的分群不存在、已删除或属于别的站点（调用方用 `anyhow::Error::is` 判断，按 400 处理）。
+#[derive(Debug)]
+pub struct SegmentNotFound;
+
+impl std::fmt::Display for SegmentNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("要绑定的分群不存在、已删除或属于别的站点")
+    }
+}
+
+impl std::error::Error for SegmentNotFound {}
+
+/// 建链接，返回 `shared_links.id`。站点不存在或已删除报错。绑定分群时在同一事务里给分群行加共享锁，
+/// 与「删除分群」（先锁分群行再查绑定它的链接）串行：不会建出绑定已删除分群的链接。
 pub async fn create(pool: &PgPool, new: &NewLink<'_>) -> Result<i64> {
+    let mut tx = pool.begin().await.context("开启事务失败")?;
+    if let Some(segment_id) = new.segment_id {
+        let found: Option<i64> = sqlx::query_scalar(
+            "SELECT seg.id FROM segments seg JOIN sites s ON s.id = seg.site_id
+              WHERE seg.id = $1 AND s.site_key = $2 AND s.deleted_at IS NULL
+                AND seg.deleted_at IS NULL AND seg.owner_user_id IS NULL
+              FOR SHARE OF seg",
+        )
+        .bind(segment_id)
+        .bind(new.site_key)
+        .fetch_optional(&mut *tx)
+        .await
+        .context("查询分群失败")?;
+        if found.is_none() {
+            return Err(SegmentNotFound.into());
+        }
+    }
     let id: Option<i64> = sqlx::query_scalar(
-        "INSERT INTO shared_links (site_id, slug, password_hash, expires_at, created_by, name)
-         SELECT s.id, $2, $3, to_timestamp($4::bigint::double precision), $5, $6
+        "INSERT INTO shared_links (site_id, slug, password_hash, expires_at, created_by, name, segment_id)
+         SELECT s.id, $2, $3, to_timestamp($4::bigint::double precision), $5, $6, $7
          FROM sites s WHERE s.site_key = $1 AND s.deleted_at IS NULL
          RETURNING id",
     )
@@ -101,11 +135,15 @@ pub async fn create(pool: &PgPool, new: &NewLink<'_>) -> Result<i64> {
     .bind(new.expires_at_unix)
     .bind(new.created_by)
     .bind(new.name)
-    .fetch_optional(pool)
+    .bind(new.segment_id)
+    .fetch_optional(&mut *tx)
     .await
     .context("写入 shared_links 失败")?;
     match id {
-        Some(id) => Ok(id),
+        Some(id) => {
+            tx.commit().await.context("提交事务失败")?;
+            Ok(id)
+        }
         None => bail!("找不到站点 `{}`（或已删除）", new.site_key),
     }
 }
@@ -163,6 +201,15 @@ pub struct LinkAdminRow {
     pub created_at: String,
     /// 创建者（用户已删除、或命令行建的链接为 `None`）。
     pub created_by: Option<LinkCreator>,
+    /// 绑定的分群（没有绑定为 `None`）。
+    pub segment: Option<LinkSegment>,
+}
+
+/// 链接绑定的分群。分群已删除（只可能是绕过接口改了库：有链接绑定时接口不让删）时 `name` 为 `None`，链接本身打不开。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkSegment {
+    pub id: i64,
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,8 +226,11 @@ macro_rules! admin_select {
     ts_utc!("l.expires_at"),
     " AS expires_at, ",
     ts_utc!("l.created_at"),
-    " AS created_at, u.id AS creator_id, u.name AS creator_name, u.email::text AS creator_email
+    " AS created_at, u.id AS creator_id, u.name AS creator_name, u.email::text AS creator_email,
+     l.segment_id, seg.name AS segment_name
      FROM shared_links l LEFT JOIN users u ON u.id = l.created_by AND u.deleted_at IS NULL
+     LEFT JOIN segments seg ON seg.id = l.segment_id AND seg.site_id = l.site_id
+                           AND seg.deleted_at IS NULL AND seg.owner_user_id IS NULL
      WHERE l.site_id = $1 AND l.deleted_at IS NULL"
         )
     };
@@ -204,6 +254,15 @@ fn admin_row(r: &sqlx::postgres::PgRow) -> Result<LinkAdminRow> {
         expires_at: r.try_get("expires_at")?,
         created_at: r.try_get("created_at")?,
         created_by,
+        segment: r
+            .try_get::<Option<i64>, _>("segment_id")?
+            .map(|id| -> Result<LinkSegment> {
+                Ok(LinkSegment {
+                    id,
+                    name: r.try_get("segment_name")?,
+                })
+            })
+            .transpose()?,
     })
 }
 

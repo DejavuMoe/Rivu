@@ -31,6 +31,7 @@ pub mod goals;
 pub mod imports;
 pub mod members;
 pub mod salts;
+pub mod segments;
 pub mod sessions;
 pub mod shared_links;
 pub mod shield;

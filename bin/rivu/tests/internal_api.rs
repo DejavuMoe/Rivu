@@ -2535,6 +2535,7 @@ async fn direct(server: &Server, site: &Site, spec: &Value) -> String {
         retention_days: None,
         imported: None,
         completed_import_ids: Vec::new(),
+        segments: Vec::new(),
     };
     let result = execute(
         &server.reader,
@@ -4765,7 +4766,8 @@ async fn shared_links_passwords_expiry_revocation_scope_and_segments() {
         .await
         .unwrap();
 
-    // 绑定 segment：强制叠加它的过滤（瑞典的访客），与「请求自己带同样的过滤」逐字节相同，且与不带过滤的结果不同
+    // 绑定 segment：强制叠加它的过滤（瑞典的访客），与「请求自己带同样的过滤」结果相同（回显里是分群引用
+    // `["is","segment",[id]]`，其余逐字节相同），且与不带过滤的结果不同
     let seg_id: i64 = sqlx::query_scalar("INSERT INTO segments (site_id, name, filter) VALUES ($1, 'sweden', $2::text::jsonb) RETURNING id")
         .bind(site.id as i64)
         .bind(r#"["is","visit:country",["SE"]]"#)
@@ -4786,17 +4788,19 @@ async fn shared_links_passwords_expiry_revocation_scope_and_segments() {
     filtered["filters"] = json!([["is", "visit:country", ["SE"]]]);
     let want_filtered = direct(&server, &site, &filtered).await;
     assert_ne!(want_filtered, want, "测试数据里瑞典访客只是一部分");
+    // 回显里的过滤换成分群引用，其余不变
+    let want_filtered: Value = {
+        let mut v: Value = serde_json::from_str(&want_filtered).unwrap();
+        v["query"]["filters"] = json!([["is", "segment", [seg_id.to_string()]]]);
+        v
+    };
     let r = http
         .post(&query_path(site.id), spec)
         .share(&seg_slug)
         .send()
         .await;
-    assert_eq!(
-        (r.status, r.body.as_str()),
-        (200, want_filtered.as_str()),
-        "{}",
-        r.body
-    );
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.json(), want_filtered, "{}", r.body);
     // 请求自己的过滤也在，segment 的过滤叠加在后面（隐式 AND）：请求要英国，叠加瑞典，结果为空
     let mut contradictory = spec.clone();
     contradictory["filters"] = json!([["is", "visit:country", ["GB"]]]);
@@ -4825,7 +4829,8 @@ async fn shared_links_passwords_expiry_revocation_scope_and_segments() {
         .send()
         .await;
     assert_eq!(
-        r.body, want_filtered,
+        r.json(),
+        want_filtered,
         "带链接头的请求按链接判定，即使同时登录了"
     );
     // 带无效链接头的成员：404，不退回去用会话（否则同一个链接 URL 会因调用者是否登录而得到不同的响应）

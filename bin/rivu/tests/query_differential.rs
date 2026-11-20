@@ -1297,6 +1297,7 @@ impl Harness {
             retention_days: None,
             imported: None,
             completed_import_ids: Vec::new(),
+            segments: Vec::new(),
         };
         let got = execute(
             &self.reader,
