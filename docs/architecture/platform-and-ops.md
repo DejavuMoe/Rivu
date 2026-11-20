@@ -95,6 +95,7 @@ Rivu 只支持单实例：会话分配依赖单写者，同一时间只能有一
 | `site_hostnames` | 来源主机名白名单 | `site_id`、`pattern`（小写 punycode，支持 `*.example.com`） | `UNIQUE(site,pattern)` 部分唯一 |
 | `site_settings` | 采集、隐私、保留期（1:1） | `site_id` PK、`collect_enabled`、`ingest_rate_limit_per_min`、`retention_days`、`geo_level`、`strip_query_params`、`allowed_event_props`、`tracker jsonb`、`spike_threshold` | `spike_threshold` 是流量激增提醒的阈值（当前在线访客数，≥ 1，`NULL` = 关闭，见§6「流量激增提醒」）；`retention_days` 在 30 到 `RIVU_RETENTION_DAYS` 之间（应用层校验；全局调小后以全局为准）；`geo_level` 选 region / city 需要库提供子区划码与城市 id，默认 DB-IP Lite 没有，看板据 `meta.geo_capability` 提示（`system-design.md` §10 Q24、§6.10）；`tracker` 取代 `tracker_script_configuration` 表（04§1.2） |
 | `goals` | 转化目标 | `site_id`、`kind` ∈ event/page、`event_name`、`page_path`、`display_name` | `UNIQUE(site,kind,COALESCE(event_name,page_path))` 部分唯一 |
+| `annotations` | 图表注释：钉在趋势图某一天上的一句话（如「发布 v2.0」），按站点共享，不是个人的 | `site_id`、`date`（站点本地日期）、`text`（trim 后 1–255 个字符，无控制字符）、`created_by` NULL（`ON DELETE SET NULL`）、`deleted_at` | `INDEX(site_id, date)` 部分索引；每站最多 500 条未删除的注释，添加时事务内先锁站点行再计数（同屏蔽规则），超出 409 `limit_reached`。站点软删除不动注释（随站点一起不可见，恢复站点后原样回来）；按日期范围删除统计数据不删注释（注释是站点内容，不是统计数据）。不进站点快照，每次请求现读 |
 | `funnels`、`funnel_steps` | 漏斗（第 4 阶段） | `site_id`、`name`；`funnel_id`、`goal_id`、`step_order` | `UNIQUE(funnel_id,step_order)` |
 | `segments` | 保存的筛选段 | `site_id`、`owner_user_id` NULL=站点级、`name`、`filter jsonb`（结构见 `system-design.md`） | `INDEX(site_id)` |
 | `shared_links` | 分享链接 | `site_id`、`name` NULL（1–100 字符，看板里区分链接用）、`slug`（≥24 字符随机）、`password_hash` NULL（argon2id）、`segment_id` NULL、`expires_at` | `UNIQUE(slug)` |
@@ -217,7 +218,7 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 ```
 
 设计说明：
-- **站点删除是多阶段流程**（借鉴 04§9.9 的「提醒、撤销窗口、执行前复核」与 04§3.2 `ClickhouseCleanSites` 的分批清理）：`sites.deleted_at` 置位后缓存立即摘除，此后 collector 按 `unknown_site` 丢弃（`system-design.md` §10 Q13）；删除的同一事务里插入 `scope='site'` 意图，`not_before = 删除时刻 + RIVU_SITE_RESTORE_DAYS`（默认 7 天），这段时间内可恢复（意图置 `cancelled`、清掉 `deleted_at`，站点快照下一轮重载即恢复采集）；到期后由 `ch_delete_batch` 按分区执行。日期范围删除立即插入 `scope='date_range'` 意图（`not_before = now()`），执行时连同这些本地日的汇总行一起删除。
+- **站点删除是多阶段流程**（借鉴 04§9.9 的「提醒、撤销窗口、执行前复核」与 04§3.2 `ClickhouseCleanSites` 的分批清理）：`sites.deleted_at` 置位后缓存立即摘除，此后 collector 按 `unknown_site` 丢弃（`system-design.md` §10 Q13）；删除的同一事务里插入 `scope='site'` 意图，`not_before = 删除时刻 + RIVU_SITE_RESTORE_DAYS`（默认 7 天），这段时间内可恢复（意图置 `cancelled`、清掉 `deleted_at`，站点快照下一轮重载即恢复采集）；到期后由 `ch_delete_batch` 按分区执行。日期范围删除立即插入 `scope='date_range'` 意图（`not_before = now()`），执行时连同这些本地日的汇总行一起删除。站点内容（目标、共享链接、图表注释等 PG 里的行）不受这两种删除影响：站点删除时随站点一起不可见、恢复后原样回来，日期范围删除只删统计数据。
 - **屏蔽规则 `shield_rules`**（采集侧编译与匹配见 `system-design.md` §4.2，实现在 `rivu-ingest::shield`）：
 
   | 项 | 规则 |
@@ -245,7 +246,7 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 |---|---|---|---|---|---|---|
 | `stats.read` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `sites.read`（读站点信息；API key 的 `sites:read`） | ✓ | ✓ | ✓ | ✓ | — | — |
-| `export.create`、`site.content.write`（goals、funnels、segments） | ✓ | ✓ | ✓ | ✗ | ✓ | ✗ |
+| `export.create`、`site.content.write`（goals、funnels、segments、annotations 的写） | ✓ | ✓ | ✓ | ✗ | ✓ | ✗ |
 | `exports.read`（读导出；API key 的 `exports:read`，与 `export.create` 同级） | ✓ | ✓ | ✓ | ✗ | — | — |
 | `shared_link.manage` | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ |
 | `site.settings.write`（hostnames、采集、隐私、shield、保留期）、`site.public.toggle` | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ |
@@ -288,6 +289,16 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 ```
 
 `trend` 是各站点时间桶标签的并集（升序，没有数据的桶为 0）；`sites` 按站点名排序，`range` 是该站点解析后的时间范围（本地时间）；`warnings` 是各站点查询的警告，带站点 id。给了 `compare` 时，顶层多一个 `comparison_totals`，`sites` 的每一项多一个 `comparison_totals`。比率是 0 到 1，时长是秒，与查询 API 相同。
+**图表注释端点**（`bin/rivu/src/annotations_admin.rs`，`/api/internal/sites/{site}/annotations`，会话鉴权 + CSRF，同目标端点）：注释按站点共享，列表要 `stats.read`（能在登录后的看板里看这个站点统计的人，含站点访客 viewer），添加、修改、删除要 `site.content.write`（按有效角色：owner、admin、editor、站点访客 editor；viewer 与站点访客 viewer 403），谁都能改、删别人加的注释。公开看板、共享链接和公开查询 API 都不返回注释：没有会话 401（带了共享链接头也一样），站点不可见 404。
+
+| 请求 | 说明 |
+|---|---|
+| `GET …/annotations?from=YYYY-MM-DD&to=YYYY-MM-DD` | `from`、`to` 可选，含两端，站点本地日期；`from` 晚于 `to` 400。返回 `{"annotations":[…],"max_annotations":500}`，按日期、id 升序 |
+| `POST …/annotations` + `{"date","text"}` | 201 `{"annotation":{…}}`；已有 500 条 409 `limit_reached` |
+| `PATCH …/annotations/{id}` + `{"date"?,"text"?}` | 至少给一项，200 `{"annotation":{…}}` |
+| `DELETE …/annotations/{id}` | 软删除，204 |
+
+一条注释：`{"id","date","text","author","mine","created_at","updated_at"}`。`date` 是 `YYYY-MM-DD`（年份 2000–2099），`text` trim 后 1–255 个字符（按字符数，不按字节），不含控制字符（包括换行）；请求体有未知字段、取值不合法 400 `invalid_request`。`mine` 表示是不是调用者自己加的。`author` 是 `{"name","email"}` 或 `null`，只按成员页会给调用者看的样子给：组织成员能在成员页看到成员和站点访客，所以作者现在仍是该组织的成员或访客时给组织成员看；站点访客调不到成员页，只看得到自己加的注释的作者；作者已离开组织或账号已删除时为 `null`，注释保留。id 不是整数、不存在、已删除或属于别的站点 404。
 
 **看板成员与 API key 端点**（`bin/rivu/src/org_admin.rs`，`/api/internal/orgs/{org_id}/members`、`invitations`、`guests`、`api-keys`，以及公开的 `/api/internal/invitations/{token}` 与 `.../accept`；会话鉴权 + CSRF，API key 永远调不到）：`Action` 另有 `MemberManage`（邀请、移除、改角色：owner、admin）、`SiteMembershipManage`（站点访客的邀请与移除：owner、admin）、`ApiKeyManageOwn`（所有 org 角色，只管自己的 key）；「谁能给谁什么角色、谁能改谁」走纯函数 `can_assign`、`can_modify`，并在锁住 org 行的事务里按最新角色再判一次。org 不存在或调用者不是（未删除的）成员 404，是成员但角色不够 403 `forbidden`；任何人都不能通过这些端点改自己的角色或移除自己（403）；降级或移除 owner 时先 `SELECT ... FOR UPDATE` 锁 org 行再数 owner，最后一名 owner 409 `conflict`；移除成员的同一事务里软删除他在该 org 的 API key（否则重新加回他会让旧 key 复活）。邀请不发邮件：创建返回一次性链接 `<RIVU_BASE_URL>/invite/<token>`（令牌 32 字节随机数的 base64url，库里只存 SHA-256，7 天有效，只在创建响应里出现一次），owner 不可被邀请，已是成员 409，同范围已有未过期的待处理邀请 409（已过期的先在同一事务里软删除，所以过期后可以重新邀请）。邀请页的查询与接受不需要登录，按客户端 IP 限流（参数同共享链接与公开看板，在查库之前），令牌无效、过期、已接受、已撤销、org 或站点已删除一律同一个 404；接受时锁邀请行：邮箱已有账号则必须是该账号的会话（无会话 401，别的账号 403 `email_mismatch`，被禁用的账号 404），没有账号则必须给密码（12 到 128 个字符）并在同一事务里创建账号、写成员或访客关系，再像登录一样签发会话 cookie（不撤销请求里带的其它会话）。API key 的创建返回明文一次（`rivu_` 加 43 个字符，格式、哈希与 `rivu apikey create` 相同），可限定 `stats:read:<site_key>` 的站点（须是本 org 未删除的站点，否则 400）与 30、90、365 天的有效期；列表只含调用者自己未吊销的 key（过期的仍列出），吊销别人的 key 是 404。
 

@@ -31,6 +31,7 @@
 //! | `GET /api/internal/sites/{site}/shield`（editor+）、`POST`（admin+）、`DELETE …/shield/{id}`（admin+） | 会话 | 屏蔽规则 |
 //! | `GET /api/internal/sites/{site}/shared-links`、`POST`、`DELETE …/shared-links/{id}` | 会话，组织 editor+ | 共享链接的列表、创建、吊销 |
 //! | `GET /api/internal/sites/{site}/goals`、`POST`、`DELETE …/goals/{id}` | 会话，有效角色 editor+（含站点访客 editor，`site.content.write`） | 目标的列表、添加（`{"kind":"event","event_name"}` 或 `{"kind":"page","page_path"}`，可带 `display_name`；同类同值或同名 409 `conflict`，每站 100 个 409 `limit_reached`）、删除；实现在 [`crate::goals_admin`] |
+//! | `GET /api/internal/sites/{site}/annotations?from=&to=`、`POST`、`PATCH …/annotations/{id}`、`DELETE …/annotations/{id}` | 会话；列表 `stats.read`（含站点访客 viewer），写 `site.content.write`（有效角色 editor+，含站点访客 editor） | 图表注释：列表（`{"annotations":[{id,date,text,author,mine,created_at,updated_at}],"max_annotations":500}`，可按站点本地日期 `from`、`to` 筛选）、添加（`{"date","text"}`，文本 trim 后 1–255 个字符、无控制字符；每站 500 条 409 `limit_reached`）、修改（`{"date"?,"text"?}`）、删除；公开看板与共享链接不返回；实现在 [`crate::annotations_admin`] |
 //! | `GET /api/internal/sites/{site}/imports`、`POST …/imports?file_name=`、`DELETE …/imports/{id}` | 会话，组织 admin+ | Plausible 导出的导入：列表（带 `native_from`，站点自己的数据开始的那天）、上传 zip（请求体是原样字节，最大 128 MiB；202，后台导入；进行中时 409 `import_running`）、删除（进行中 409）；实现在 [`crate::imports_admin`] |
 //! | `/api/internal/auth-options`、`/password-reset`、`/login/totp`、`/me/totp/*` | 见 [`crate::account`] | 找回密码、登录的第二步、账户的两步验证 |
 //! | `GET /api/internal/orgs/{org_id}/consolidated?range=\|from=&to=&interval=&compare=` | 会话；组织里至少一个能读统计的站点（成员或站点访客），否则 404 | 多站点汇总：调用者能读的全部站点的访客（各站之和）、访问、浏览量、跳出率与访问时长（按访问加权）、趋势与每个站点的数字，最多 100 个站点；实现在 [`crate::consolidated`] |
@@ -1946,6 +1947,7 @@ pub fn router(api: Arc<DashApi>) -> Router {
         .merge(crate::site_admin::routes(a))
         .merge(crate::goals_admin::routes(a))
         .merge(crate::consolidated::routes(a))
+        .merge(crate::annotations_admin::routes(a))
         .merge(crate::diagnostics::routes(a))
         .merge(crate::org_admin::routes(a))
         .merge(crate::imports_admin::routes(a))

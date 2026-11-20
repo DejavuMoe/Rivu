@@ -53,6 +53,8 @@ pub(crate) struct Caller {
     pub(crate) site: SiteOwner,
     /// 有效角色：max(组织角色, 站点访客角色)。
     role: OrgRole,
+    /// 调用者是站点所属组织的成员（不只是站点访客）。
+    pub(crate) is_member: bool,
 }
 
 impl DashApi {
@@ -77,6 +79,7 @@ impl DashApi {
             session,
             site,
             role,
+            is_member: roles.org_role.is_some(),
         })
     }
 }

@@ -23,6 +23,7 @@ macro_rules! ts_sec {
 }
 
 pub mod access;
+pub mod annotations;
 pub mod api_keys;
 pub mod auth_tokens;
 pub mod email_changes;

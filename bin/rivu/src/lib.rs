@@ -2,6 +2,7 @@
 
 pub mod account;
 pub mod admin;
+pub mod annotations_admin;
 pub mod api_auth;
 pub mod apikey_cmd;
 pub mod cli;
