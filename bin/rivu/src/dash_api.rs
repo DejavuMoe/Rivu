@@ -122,7 +122,7 @@ use rivu_auth::session::{
 use rivu_common::config::{
     Cidr, Config, DEFAULT_PUBLIC_VIEW_BURST, DEFAULT_PUBLIC_VIEW_RATE_PER_MIN,
 };
-use rivu_geo::GeoDb;
+use rivu_geo::{GeoDb, NameLang};
 use rivu_query::spec::Filter;
 use rivu_query::{
     ExecOptions, QueryCache, QueryError, QueryResult, QuerySpec, SiteContext, TenantScope,
@@ -1377,6 +1377,15 @@ fn overlay_segment(spec: &mut QuerySpec, filter_json: &str) -> Result<(), ()> {
     Ok(())
 }
 
+/// 城市名的语言：看板在请求头 `Accept-Language` 里带界面语言（第一个标签以 `zh` 开头为中文，其余英文）。
+fn name_lang(headers: &HeaderMap) -> NameLang {
+    NameLang::from_accept_language(
+        headers
+            .get(header::ACCEPT_LANGUAGE)
+            .and_then(|v| v.to_str().ok()),
+    )
+}
+
 fn route_name(surface: &str, op: &str) -> &'static str {
     match (surface, op) {
         ("internal", "query") => "internal.query",
@@ -1515,7 +1524,8 @@ async fn site_query(
     let headers = req.headers().clone();
     let auth = api.authorize(peer, &headers, &site_seg).await?;
     let spec = read_spec(&api, &auth, req).await?;
-    let result = api.execute(&auth, spec, "query").await?;
+    let mut result = api.execute(&auth, spec, "query").await?;
+    query_api::attach_city_names(&mut result, api.geo.as_deref(), name_lang(&headers));
     let resp = ns(Json(result).into_response());
     Ok(match &auth.principal {
         Principal::Session(ctx) => api.finish(resp, ctx),
@@ -1569,8 +1579,14 @@ async fn site_export(
     .map(|k| k.key)
     .collect();
     let (reader, cache, site_ref) = (&api.reader, api.cache.as_deref(), &site);
+    let (geo, lang) = (api.geo.as_deref(), name_lang(&headers));
     let export = crate::export::build(&request, &keys, move |spec| {
-        query_api::execute_cached(reader, cache, site_ref, spec, opts.clone(), ROUTE)
+        let run = query_api::execute_cached(reader, cache, site_ref, spec, opts.clone(), ROUTE);
+        async move {
+            let mut result = run.await?;
+            query_api::attach_city_names(&mut result, geo, lang);
+            Ok::<_, QueryError>(result)
+        }
     })
     .await
     .map_err(invalid)?;

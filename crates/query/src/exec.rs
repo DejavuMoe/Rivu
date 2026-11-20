@@ -959,6 +959,7 @@ pub async fn execute(
         } else {
             None
         },
+        city_names: None,
         total_rows,
     };
     let query = EchoedQuery {

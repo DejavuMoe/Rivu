@@ -266,7 +266,7 @@ tracker ─► 反向代理 ─► rivu serve
   - PG `LISTEN/NOTIFY`：这四张表的 `AFTER INSERT OR UPDATE` 触发器向频道 `rivu_site_changed` 发 `site_id`，collector 收到后合并 200 ms 内的通知、立即做一次增量刷新，新站点约 1 秒内可用（Plausible 有约 30 秒的未知站点窗口，R01 §11.2 #11）。通知只是加速，断线期间丢失的由定时增量刷新兜底。
 - 热路径不回源。查不到 `site_key` 就按 `unknown_site` 丢弃，这样随机 key 洪水打不到 PG。
 - UA 解析结果缓存用 moka（10 万条，TTL 1 小时）。键是截断到 512 字节后的 UA，空 UA 不进缓存；键占用的内存上界约 50 MB（10 万 × 512 B）。
-- GeoIP 把 mmdb **读入内存**（City 约 121 MiB，Country 约 8 MiB），不用内存映射：`maxminddb` 的 mmap 入口是 `unsafe fn`，而工作区禁止 `unsafe`（§10 Q25）。更新后用 `ArcSwap` 原子替换并热加载（§4.4），每个加载库的进程各占一份。
+- GeoIP 把 mmdb **读入内存**（City 约 121 MiB，Country 约 8 MiB），不用内存映射：`maxminddb` 的 mmap 入口是 `unsafe fn`，而工作区禁止 `unsafe`（§10 Q25）。更新后用 `ArcSwap` 原子替换并热加载（§4.4），每个加载库的进程各占一份。City 级的库加载后，`rivu serve` 另在后台建一张城市名索引（约 6–10 MiB，§4.4「城市名」）。
 
 ### 4.4 富化数据源与许可
 
@@ -275,7 +275,7 @@ tracker ─► 反向代理 ─► rivu serve
 | UA 解析 | `ua-parser` 0.2（uap-core 官方 Rust 实现）+ 固定 commit 的 `regexes.yaml`，随仓库嵌入（`crates/ua/data/uap-core/`），运行期不读文件、不联网。固定 commit 与升级流程见该目录的 `PROVENANCE.md`；uap-core 自带测试集 100% 通过（`test_ua` 1601、`test_os` 483、`test_device` 16129，见 `docs/research/enrich-ua.md` §6.1） | Apache-2.0。Plausible 用的 Matomo device-detector 数据是 LGPL-3.0，不用。上游在固定 commit 没有 `NOTICE`，仓库里的 `NOTICE` 是我们写的署名说明 |
 | 机器人 | uap-core 的 device=Spider，加自维护的 Headless、自动化框架、脚本 HTTP 客户端、爬虫名与自报家门规则（全是子串或前缀比较，没有正则）；空 UA 算机器人（§10 Q21）。在 crawler-user-agents 的 2120 个样例 UA 上检测率 84.58%（uap-core 单独 62.36%）；这是对一份名单的数字，不代表线上流量（§6.10） | 规则库同上；自维护名字表每条要有证据。crawler-user-agents 是 MIT，只当测试输入，不嵌入其正则 |
 | GeoIP | 默认 DB-IP Lite；可选 MaxMind GeoLite2；可选自定义 mmdb 直链（§10 Q5，详见下） | DB-IP Lite 为 CC BY 4.0，必须署名；GeoLite2 需要 Account ID 加 license key 并遵守其 EULA，也要求署名；自定义库的许可由运维者负责 |
-| 地名 | GeoNames（查询时经 CH 字典转换，与 Plausible 的 `location_data_dict` 做法相同） | CC BY 4.0。默认来源 DB-IP Lite 没有城市的 GeoNames id、也没有子区划代码（§10 Q24），字典只在 MaxMind 或同结构的自定义库下有数据可转换 |
+| 城市名 | 取自当前加载的 City 库自带的 `city.names`（GeoNames 的名字），库加载后在进程内建 `geoname_id → 名字` 索引，查询时随结果返回（下文「城市名」，§10 Q30）。不另外下载 GeoNames，也不用 CH 字典 | 名字的许可随库：MaxMind GeoLite2 City 遵守其 EULA（名字来自 GeoNames，CC BY 4.0，署名见下）；自定义库由运维者负责。默认来源 DB-IP Lite 没有城市的 GeoNames id（§10 Q24），不提供城市 |
 | 来源 | Matomo `searchengine-and-social-list`（`SearchEngines.yml`、`Socials.yml`、`AIAssistants.yml`，固定 commit，`crates/source/data/matomo/`）加自维护补充表（`supplement.yml`，每条写明依据）。构建时核对数据文件的 SHA-256，编译成排序静态表，运行期无解析、无初始化 | Matomo 数据为 CC0-1.0，无署名义务。Snowplow `referers.yml` 的 README 写明数据按 **GPL-3.0** 提供，**不用**。Google GA4 来源清单无许可声明，只作对照不入库（`docs/research/enrich-source.md` §4.1） |
 | 垃圾引荐 | Matomo `referrer-spam-list`（固定 commit `eaaa5ea`，2352 条，`crates/source/data/spam/`，随仓库嵌入，运行期不联网）。referrer 的 host 做**后缀匹配**：host 等于条目或以 `.<条目>` 结尾才命中（Matomo 自己是子串匹配，这里更严格，`semalt.com` 命中 `a.semalt.com`，不命中 `notsemalt.com`）。构建时核对 `spammers.txt` 的 SHA-256。名单与来源库已复核，只有 2 处重叠：`search.fbdownloader.com`、`search.iminent.com`（浏览器劫持类「搜索引擎」，名单列了它们的根域）；垃圾引荐判定先于来源分类，所以这两个来源的流量被丢弃，新增重叠会让测试失败，须人工复核 | 公有领域 / CC0 1.0（上游 `README.md` 与 `composer.json` 各有一处声明，一致），无署名义务，来源与许可证据见 `crates/source/data/spam/PROVENANCE.md`。名单按现状提供，可能不完整、含过期条目。Plausible 的 `referrer-blocklist` 在 AGPL-3.0 仓库里，不拷贝 |
 
@@ -299,6 +299,23 @@ tracker ─► 反向代理 ─► rivu serve
 | 自定义 mmdb | 取决于库；需要 `country.iso_code`，区域与城市要同 MaxMind 的结构 | 同左 | 同左 |
 
 `rivu-geo` 不猜测：没有代码就返回空，不拿英文名拼凑。所以默认配置下 `geo_level` 设为 region 或 city 实际等同于 country，要用地区与城市报表须配置 MaxMind 或同结构的自定义库（§10 Q24；看板的提示要求见 §6.10）。
+
+#### 城市名（Q30）
+
+`visit:city` 的取值与过滤都是 GeoNames id（字符串形式），看板显示城市要名字。名字取自**当前加载的 City 库本身**：
+
+| 项 | 做法 |
+|---|---|
+| 需要的库 | City 级的库（`meta.geo_capability = city`）：MaxMind GeoLite2 City，或同结构的自定义 mmdb。默认来源 DB-IP Lite 不用于城市（没有 GeoNames id，§10 Q24）；不自己做「名字 → id」映射 |
+| 建索引 | 库加载后（含每次热加载），`rivu serve` 在一个后台线程（`rivu-geo-cities`）遍历库里的全部网段，按记录在数据区的偏移去重，每条记录只解码 `city.geoname_id`、`city.names.en`、`city.names.zh-CN`、`country.iso_code`，建 `geoname_id → {英文名, 中文名, 国家}` 的表。不阻塞启动、`/readyz` 与采集；建好前名字缺席。建好后记一条 `info` 日志（城市数、字节数、耗时） |
+| 语言 | 只留看板支持的两种：`en` 与 `zh-CN`。要中文而库里没有中文名时回退英文名；没有英文名时用中文名；两种都没有的城市不收（看板显示 id）|
+| 热加载 | 新库是 City 级：旧索引在新索引建好前继续提供名字（城市 id 跨版本不变），建好后替换，任何时刻最多一份旧索引加一份正在建的。新库不是 City 级：索引立即丢弃。建到一半又加载了新库：旧的建索引线程放弃，同一时刻只有一个在建。建索引失败：丢弃索引，记 `warn`，城市只显示 id |
+| 代价 | 在 DB-IP City Lite 2026-11（121 MiB，1429 万个网段，56 万条记录）上实测（WSL2，8 核，release）：遍历加解码 0.66–0.77 s；按（国家，英文名）去重得 17.99 万个城市，表 6.42 MiB；建索引期间进程峰值比建之前多约 30 MiB（偏移去重集合与临时哈希表），建完后常驻多约 11 MiB。GeoLite2 City 拿不到免凭据的完整库，没有实测；它的网段比 DB-IP 少、每条记录的字段更多、城市数同一量级，又多存中文名（只有部分城市有），估计耗时 1–2 秒、表 7–10 MiB，以日志里的实际数字为准。测量用的测试是 `rivu-geo` 里被忽略的 `measure_build_cost_on_a_real_database` |
+| 命令行 | `rivu query`（结果含 `visit:city` 时）与 `rivu export` 同步建一次索引再查，名字用英文 |
+
+返回方式见 §6.3「地理元数据」的 `meta.city_names`。导出的 `cities.csv` 在 `city`（id）列后加 `city_name`（导出请求的界面语言）与 `country` 两列，id 列保留（过滤只认 id）。
+
+署名：名字来自库，所以库的署名（`meta.geo_attribution`）照常显示；GeoLite2 的城市名源自 GeoNames（CC BY 4.0），看板在同一位置显示 GeoNames 署名（见下「署名要求」）。
 
 **文件与元数据**：所有来源都落在同一个文件 `RIVU_GEOIP_DB_PATH`。旁边的 `<文件名>.meta.json` 记录来源标识、ETag、Last-Modified、SHA-256、下载时间、`build_epoch` 和署名。meta 里的来源标识与当前配置不一致（例如从 DB-IP 改成自定义 URL）时，视为没有本地副本；meta 的 `build_epoch` 与库文件不一致（文件被手工换过）时，meta 作废，署名退回手工署名。SHA-256 记的是**解压后的 mmdb 内容**，所以传输压缩方式变化不会触发替换。
 
@@ -747,7 +764,7 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 - 分群是查询前的宏展开，执行器不知道分群的存在（R03 §6.5）。
 - 对比查询沿用 Plausible 的做法：先执行主查询，再用主查询结果中的维度值约束对比期，保证两边的行集一致（R03 §7.5）。时间维度不参与约束。
 - 一次请求可能发多条查询（`all` 的最早事件、`percentage` 的分母、主查询、对比期），共用同一个截止时间（调用方档位的 `max_execution_time`，§6.8）。
-- **地理元数据**：`meta.geo_capability`（`country` 或 `city`）只在维度或过滤涉及位置（`visit:country` `visit:region` `visit:city`）时给出；`meta.geo_attribution` 只在**维度**含位置时给出（§4.4 署名要求）。站点的地理库能力是 `country`，而维度或过滤用到 `visit:region` 或 `visit:city` 时，`meta.warnings` 带 `geo_capability_country_only`（地理库只提供国家级数据，地区与城市为空，§6.10）。
+- **地理元数据**：`meta.geo_capability`（`country` 或 `city`）只在维度或过滤涉及位置（`visit:country` `visit:region` `visit:city`）时给出；`meta.geo_attribution` 只在**维度**含位置时给出（§4.4 署名要求）。站点的地理库能力是 `country`，而维度或过滤用到 `visit:region` 或 `visit:city` 时，`meta.warnings` 带 `geo_capability_country_only`（地理库只提供国家级数据，地区与城市为空，§6.10）。维度含 `visit:city` 时另有 `meta.city_names`：`{"<GeoNames id>": {"name": "Berlin", "country": "DE"}}`，只含主结果与对比结果里出现的 id，`country` 没有时为 `null`；库里查不到的 id 不出现（看板显示 id 本身）。名字的语言：看板的内部端点（含共享链接、公开看板、导出）按请求头 `Accept-Language` 的第一个标签，以 `zh` 开头给中文，其余英文，看板发送自己的界面语言；公开 API 没有语言参数，一律英文。城市名索引还没建好、或库不是 City 级时省略这个字段（§4.4「城市名」）。它由 API 层在结果缓存之后补上，执行器与结果缓存都不含它；城市过滤照旧只认 id。
 - **加载目标**：调用方（`query_api::load_site_context`）每次查询从 PG 读站点未删除的目标放进 `SiteContext.goals`，没有缓存，增删立即生效；build 阶段把 `event:goal` 过滤的取值解析成目标的完成条件，`event:goal` 维度用全部目标。分群（`segment`）的展开目前未实现：build 阶段直接返回 `not supported yet`（§6.2）。
 
 ### 6.4 规划器：选表与选层
@@ -912,7 +929,7 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 | `visit:os_version` | 低 | Windows 10 与 11 不可区分（UA 恒为 `NT 10.0`），记 `10`，含义是 Windows 10 / 11；只有 Client Hints 的 `platformVersion` 能区分，tracker 目前不发送。macOS `10.15`（Chrome 90 起冻结）、`Android 10; K)`（Android 精简形状）、ChromeOS 的版本不可得，一律报空串。iOS Safari 26+ 的 UA 里 iOS 版本冻结在 18_6，改取 `Version/` 里的版本（§10 Q22） | 看板在 Windows 版本旁注明「10 代表 10 和 11」；空串显示为「未知」，不补值 |
 | `visit:device` | desktop、mobile 中；tablet 偏低 | iPadOS 13+ Safari 默认发桌面 UA，与 Mac Safari 不可区分：iPad 被计为 macOS + desktop，`tablet` 被低估、`desktop` 被高估，服务端不处理（§10 Q23）。Android 只看 `Mobile` 记号；无该记号的手机 WebView、Chrome「桌面版网站」会与 Plausible 有差异；电视、游戏机、车机、未知归 desktop。规则是启发式，没有外部 ground truth，只有 18 条手工断言，真实流量上的准确率要等访问日志对账（UA 研究 §5、§11） | 文档与看板说明 tablet 偏低；与 Plausible 并行回放时，device 的差异先归因到这几类 |
 | `visit:country` | 中高 | DB-IP Lite 是完整库的子集（“reduced coverage and accuracy”），按月更新。与五个 RIR 的公开分配记录对照，国家一致率 **90.99%**（6369/7000）：IPv4 按块 90.16%，按地址数加权 93.84%；IPv6 93.05%；RIPE NCC 最低（83.06%），LACNIC 最高（99.20%）。RIR 记录的是**注册国**，不是使用地，跨国使用的块（云、托管）本来就会不同，所以这是一致率，不是准确率（Geo 研究 §5.2） | 显示署名（§4.4）；不把这个数字说成准确率 |
-| `visit:region`，`visit:city` | 默认配置下无数据 | DB-IP Lite 没有 ISO 3166-2 代码和 GeoNames id（§10 Q24）：`region_code` 恒空，`city_geoname_id` 恒为 0（7000 个地址实测 0 个非空）。MaxMind 库下这两个字段有值，但本项目没有对它的定位准确度做外部对照，官方测试库只证明字段解码正确（Geo 研究 §4、§5.3） | 见下「地理精度提示」 |
+| `visit:region`，`visit:city` | 默认配置下无数据 | DB-IP Lite 没有 ISO 3166-2 代码和 GeoNames id（§10 Q24）：`region_code` 恒空，`city_geoname_id` 恒为 0（7000 个地址实测 0 个非空）。MaxMind 库下这两个字段有值，但本项目没有对它的定位准确度做外部对照，官方测试库只证明字段解码正确（Geo 研究 §4、§5.3）。城市名来自同一个库（§4.4「城市名」） | 见下「地理精度提示」；城市显示 `meta.city_names` 里的名字，名字缺席时显示 id |
 | 机器人过滤（`dropped_bot`） | 中 | 检测率 84.58%（1793/2120）是对 crawler-user-agents 名单的数字，不代表线上流量；名字表有一部分是看过名单的漏检项后补的，不是盲测（补之前 69.6%）。未命中的 327 个多是几乎不执行 JS 的小众爬虫，对 tracker 影响小；要紧的是会执行 JS 的机器人（无头浏览器、合成监控），靠已知答案探针和访问日志核对，目前只有单元测试，没有端到端验证。非 Spider 语料里浏览器形态 UA 10389 条只有 9 条判为机器人，全是真机器人，但语料偏旧，不代表 2026 年的真实流量。 | 不把 `dropped_bot` 的比例读作「机器人占比」 |
 | 访问数本身（拦截插件） | 偏低，维度不失真 | 拦截插件让整条事件缺失，服务端无法识别，也不进 `ingest_counters`；只能靠边缘日志与 `ingest_counters` 对账（`brief-p1.md` 验收）。站点可配置第一方 `endpoint` 反代（`tracker-and-protocol.md` §1.2） | 不修正，不估算 |
 
@@ -932,7 +949,7 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 |---|---|---|
 | 写入 | 5000 事件/s 约等于每秒 1 次 INSERT、每次 5000 行；RowBinary 约 2 MB/s | §4.7 |
 | collector CPU | 每个事件 ≤50 µs（JSON 解析约 5 µs，UA 缓存命中约 1 µs、未命中 50–200 µs，地理查询约 2 µs，SipHash ×3 可忽略），5000 事件/s 约 0.25 核。UA 的实测（Windows，release，单线程，690 条 uap-core 样本）：缓存命中均值约 150 ns，未命中均值约 22 µs（p99 约 130–180 µs），都在预算内；来源与渠道 `classify` 约 143 ns/次；`UaParser::embedded()`（解析 222 KB YAML、编译全部正则）约 130 ms，只在启动时一次 | 需压测（并发与 Linux 数字未测；`docs/research/enrich-ua.md` §9、`enrich-source.md` §7.4） |
-| GeoIP 内存 | 库读入内存，每个加载库的进程各占一份：City 约 121 MiB，Country 约 8 MiB；热加载期间新旧并存，刷新校验时再临时读一份。UA 缓存键上界约 50 MB（§4.3）。内存紧张的部署选 DB-IP country | §4.3、§10 Q25 |
+| GeoIP 内存 | 库读入内存，每个加载库的进程各占一份：City 约 121 MiB，Country 约 8 MiB；热加载期间新旧并存，刷新校验时再临时读一份。City 级的库另有城市名索引：约 6–10 MiB，建索引时临时再多约 30 MiB（§4.4「城市名」）。UA 缓存键上界约 50 MB（§4.3）。内存紧张的部署选 DB-IP country | §4.3、§10 Q25 |
 | 事件可见 | p95 < 2 s | §4.7 |
 | 会话内存 | 条数上限默认 200 万，每个分片还限制字符串载荷为 16 MiB（32 个分片合计 512 MiB）。两项限制均按 LRU 淘汰整个会话。分片索引、分配器及快照另占内存 | §4.6 |
 | 磁盘 | 每事件估算 60–150 B（压缩后，需实测），`sessions` 约再加 30–50%，保留 731 天。日均 1000 万事件：7.31 十亿事件，事件表约 0.44–1.1 TB，加 `sessions` 后约 0.6–1.6 TB，超出参考配置（§7.1）的 500 GB：这个规模应把 `RIVU_RETENTION_DAYS` 调低到 180 天（约 0.14–0.4 TB）或扩容磁盘。日均 100 万事件：约 60–165 GB。过期数据每小时删除（§5.6） | §7.1 |
@@ -1025,6 +1042,7 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 | Q27 | MaxMind 下载接口与认证 | 只实现现行接口：`https://download.maxmind.com/geoip/databases/<edition>/download?suffix=tar.gz`，HTTP Basic（Account ID + license key），返回 `tar.gz`，要解 tar 取 `.mmdb`。旧的 `/app/geoip_download?license_key=` 接口仍在，但只认 key、官方文档已不提，不实现。`RIVU_MAXMIND_ACCOUNT_ID` 在设置 license key 时必填，配置校验报错但不回显 key。Basic 认证只发给 API 域名，跨源重定向不带 `Authorization`。带凭据的真实下载、重定向目标对条件请求的反应**没有验证**（没有账号）：实现不依赖这些，有校验头就带，服务器忽略就整文件下载，再按解压后 mmdb 的 SHA-256 与 meta 比较，相同不替换。拿到账号后验证一次；若条件 GET 不被支持或占用每日 30 次额度，改为先 `HEAD` 比较 `Last-Modified`（`HEAD` 不计额度） | §4.4 优先级表第 2 行；`platform-and-ops.md` §7 `RIVU_MAXMIND_*`；`docs/research/enrich-geo.md` §3、§7 第 3、9 条 |
 | Q28 | 没有 meta 的库文件要不要刷新 | 看配置：默认来源（DB-IP Lite）时直接使用、**不自动刷新**，否则 24 小时后会被 DB-IP 的库覆盖；配置了 `RIVU_GEOIP_DB_URL` 或 `RIVU_MAXMIND_LICENSE_KEY` 时视为没有本地副本，立即下载，新库校验通过前旧文件继续用。meta 的 `build_epoch` 与库不一致时 meta 作废，署名退回手工署名。有本地副本时，第一次条件 GET 安排在 meta 最近检查时间加一个（带抖动的）刷新周期，已过期则立即 | §4.4「文件与元数据」「生命周期」；`platform-and-ops.md` §6 `geoip_refresh`；`docs/research/enrich-geo.md` §6、§7 第 4、5 条 |
 | Q29 | 看板与登录限流口径 | （1）公开看板与共享链接默认 300 次/分钟、突发 60（`RIVU_PUBLIC_VIEW_RATE_PER_MIN`、`RIVU_PUBLIC_VIEW_BURST`，可配置）：一个看板页加载就并发约 10 个查询（概览、时间序列、各维度分解），再加实时轮询，30 次/分钟、突发 10 这一级的限额第一次打开就会 429。（2）登录没有单纯按账号的阻断桶：那样任何人不停用受害者的邮箱登录就能让真用户一直 429（锁号）。限流是每 IP 20 次/60 秒（防喷洒）加每 `(账号, IP)` 5 次/60 秒（防同一来源爆破），再加**只告警不阻断**的失败统计：同一账号 1 小时内失败达 50 次、全实例每分钟失败达 300 次时 `warn` 并累加 `rivu_auth_login_alerts_total{kind}`，同一窗口只告警一次。代价：分布式爆破（很多 IP 各试几次）不再被挡住，由 Argon2 成本、告警与后续的 TOTP 兜底 | `platform-and-ops.md` §4.4 限流表、§5 登录防护、§7 配置表、§10 指标；`bin/rivu/src/dash_api.rs` |
+| Q30 | 城市名从哪来 | **从当前加载的 City 库本身取**：MaxMind GeoLite2 City 或同结构的自定义库带 `city.names`，库加载（和每次热加载）后在后台线程遍历全库，建 `geoname_id → {en, zh-CN, 国家}` 索引，查询结果含 `visit:city` 时在 `meta.city_names` 返回（看板按界面语言，公开 API 英文）。默认来源 DB-IP Lite 不用于城市：它没有 GeoNames id（Q24 不变）；也不自己做「名字 → id」映射。不另外下载 GeoNames、不建 CH 字典：名字和 id 来自同一个库，版本天然一致，也不多一个要更新的数据源。代价（DB-IP City Lite 实测，GeoLite2 City 外推）：1–2 秒、6–10 MiB 常驻，建索引时临时多约 30 MiB；建好前名字缺席，不阻塞启动、`/readyz` 与采集。城市过滤仍只认 id | §4.4「城市名」、地名行；§6.3「地理元数据」；§6.10；§7 GeoIP 内存行；`docs/install.md`「GeoIP 地理库」 |
 
 ---
 

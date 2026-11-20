@@ -14,7 +14,7 @@
 
 use std::collections::BTreeMap;
 
-use rivu_geo::Attribution;
+use rivu_geo::{Attribution, CityName};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -83,6 +83,10 @@ pub struct Meta {
     /// 维度或过滤涉及位置时给出：`country` 或 `city`（§6.10）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub geo_capability: Option<&'static str>,
+    /// 维度含 `visit:city` 时，结果里出现的 GeoNames id 的城市名：`{"<id>": {"name", "country"}}`（§4.4「城市名」）。
+    /// 执行器不填，由 API 层按请求语言补上（结果缓存里不含它）；城市名索引还没建好、库不是 City 级时省略。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub city_names: Option<BTreeMap<String, CityName>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_rows: Option<u64>,
 }

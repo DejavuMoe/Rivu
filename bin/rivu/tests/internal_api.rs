@@ -2964,6 +2964,62 @@ async fn session_queries_equal_direct_execution_and_site_access_is_uniform() {
         "{}",
         r.body
     );
+    assert!(
+        r.json()["meta"].get("city_names").is_none(),
+        "没有城市维度就没有城市名：{}",
+        r.body
+    );
+
+    // 城市名（§4.4「城市名」）：索引建好前省略；建好后按 Accept-Language 给出结果里出现的 id
+    let city_spec = json!({"metrics": ["visitors"], "dimensions": ["visit:city"],
+                           "date_range": ["2026-03-09", "2026-03-11"]});
+    let city_query = |lang: &'static str| {
+        http.post(&query_path(site_a.id), &city_spec)
+            .cookie(&c_owner)
+            .header("Accept-Language", lang)
+    };
+    let r = city_query("zh-CN,zh;q=0.9").send().await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert!(r.json()["meta"].get("city_names").is_none(), "{}", r.body);
+    assert!(server.geo.build_city_index().expect("建城市名索引"));
+    let r = city_query("zh-CN,zh;q=0.9").send().await.json();
+    let ids: Vec<&str> = r["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|row| row["dimensions"][0].as_str())
+        .collect();
+    assert!(ids.contains(&"2038180") && ids.contains(&"2643743"), "{r}");
+    assert_eq!(
+        r["meta"]["city_names"]["2038180"],
+        json!({"name": "长春", "country": "CN"}),
+        "{r}"
+    );
+    // 没有中文名：回退英文
+    assert_eq!(
+        r["meta"]["city_names"]["2643743"],
+        json!({"name": "London", "country": "GB"}),
+        "{r}"
+    );
+    // 只含结果里出现的 id
+    let names = r["meta"]["city_names"].as_object().unwrap();
+    assert!(names.keys().all(|k| ids.contains(&k.as_str())), "{r}");
+    let r = city_query("en-US,en;q=0.9").send().await.json();
+    assert_eq!(
+        r["meta"]["city_names"]["2038180"]["name"], "Changchun",
+        "{r}"
+    );
+    // 过滤仍然只认 id
+    let mut filtered = city_spec.clone();
+    filtered["filters"] = json!([["is", "visit:city", ["2038180"]]]);
+    let r = http
+        .post(&query_path(site_a.id), &filtered)
+        .cookie(&c_owner)
+        .send()
+        .await
+        .json();
+    assert_eq!(r["results"].as_array().map(Vec::len), Some(1), "{r}");
+    assert_eq!(r["results"][0]["dimensions"][0], "2038180", "{r}");
 
     // 属性键列表使用与查询相同的鉴权；别的组织的站点返回 404。
     let keys_path = format!("/api/internal/sites/{}/property-keys", site_a.id);
@@ -3013,6 +3069,7 @@ async fn session_queries_equal_direct_execution_and_site_access_is_uniform() {
     let r = http
         .post(&export_path, &export_body)
         .cookie(&c_owner)
+        .header("Accept-Language", "zh-CN")
         .send()
         .await;
     assert_eq!(r.status, 200, "{}", r.body);
@@ -3074,6 +3131,22 @@ async fn session_queries_equal_direct_execution_and_site_access_is_uniform() {
     ] {
         assert!(!read(f).is_empty(), "{f}");
     }
+    // 城市：id 列后面是界面语言的城市名与国家
+    let cities = read("cities.csv");
+    assert!(
+        cities.starts_with(
+            "\u{feff}city,city_name,country,visitors,visits,pageviews,bounce_rate,visit_duration\n"
+        ),
+        "{cities}"
+    );
+    assert!(
+        cities.lines().any(|l| l.starts_with("2038180,长春,CN,")),
+        "{cities}"
+    );
+    assert!(
+        cities.lines().any(|l| l.starts_with("2643743,London,GB,")),
+        "{cities}"
+    );
     let props = read("custom_props.csv");
     assert!(props.starts_with("\u{feff}property,value,visitors,events\n"));
     let expected = format!("{},fixture,1,1", "x".repeat(250));

@@ -13,6 +13,9 @@
 //! | `conversions.csv` | `event:goal` | visitors events conversion_rate |
 //! | `custom_props.csv` | 每个属性键一组 `event:props:<k>` | property value visitors events |
 //!
+//! `cities.csv` 的 `city` 列是 GeoNames id（与看板的城市过滤一致），后面是 `city_name`（导出请求的界面语言，
+//! 没有中文名的城市用英文名）与 `country` 两列；城市名索引没建好（刚加载 City 库的几秒内）或库不是 City 级时这两列为空。
+//!
 //! 比率是 0 到 1（4 位小数），时长是整数秒，滚动深度是 0 到 100 的整数。每个文件最多 [`MAX_LIMIT`] 行（按 visitors 降序）。
 
 use std::future::Future;
@@ -43,6 +46,9 @@ struct Part {
     metrics: &'static [&'static str],
     fallback: Option<&'static [&'static str]>,
 }
+
+/// `cities.csv` 的维度：`city` 列是 GeoNames id，后面另加 `city_name`、`country` 两列。
+const CITY_DIMS: &[(&str, &str)] = &[("city", "visit:city")];
 
 const PARTS: &[Part] = &[
     Part {
@@ -125,7 +131,7 @@ const PARTS: &[Part] = &[
     },
     Part {
         file: "cities.csv",
-        dims: &[("city", "visit:city")],
+        dims: CITY_DIMS,
         metrics: SESSION,
         fallback: None,
     },
@@ -374,11 +380,28 @@ where
             Err(e) => return Err(e),
         };
         let mut header: Vec<&str> = part.dims.iter().map(|(c, _)| *c).collect();
+        // 城市：id 列后面加名字和国家（`meta.city_names`，名字索引没建好时为空）；id 留着，过滤只认 id
+        let city_names = part.dims == CITY_DIMS;
+        if city_names {
+            header.extend(["city_name", "country"]);
+        }
         header.extend(used);
+        let names = res.meta.city_names.as_ref();
         let rows = res.results.iter().map(|r| {
+            let named = city_names.then(|| {
+                let n = r
+                    .dimensions
+                    .first()
+                    .and_then(|id| names.and_then(|m| m.get(id)));
+                [
+                    n.map(|n| n.name.clone()).unwrap_or_default(),
+                    n.and_then(|n| n.country.clone()).unwrap_or_default(),
+                ]
+            });
             r.dimensions
                 .iter()
                 .cloned()
+                .chain(named.into_iter().flatten())
                 .map(text)
                 .chain(r.metrics.iter().zip(used).map(|(v, m)| cell(m, v)))
                 .collect()

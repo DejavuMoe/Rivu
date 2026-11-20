@@ -376,11 +376,12 @@ pub async fn run(config: Config) -> Result<ExitCode> {
         bg_stop_rx.clone(),
     ));
 
-    // GeoIP：持有库并热加载；管线用它查位置，查询 API 用它回显署名与精度。`geoip_refresh` 刷新成功后直接热加载同一个库。
+    // GeoIP：持有库并热加载；管线用它查位置，查询 API 用它回显署名、精度与城市名。`geoip_refresh` 刷新成功后直接热加载同一个库。
     for w in config.geo.warnings() {
         tracing::warn!("{w}");
     }
-    let geo_db = Arc::new(GeoDb::from_config(&config.geo));
+    // City 库加载（含每次热加载）后在后台线程建城市名索引（`meta.city_names`，§4.4「城市名」），不阻塞启动与采集
+    let geo_db = Arc::new(GeoDb::from_config(&config.geo).with_city_names());
     background.push(geo_db.spawn_reloader(
         config.geo.db_path.clone(),
         GEO_RELOAD_CHECK_INTERVAL,
