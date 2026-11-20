@@ -8,14 +8,14 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, anyhow, bail};
 use jiff::tz::TimeZone;
 use rivu_common::config::Config;
-use rivu_geo::GeoDb;
+use rivu_geo::{GeoDb, NameLang};
 use rivu_query::{ExecOptions, QuerySpec, SiteContext, TenantScope};
 use rivu_storage_pg::sites::NewSite;
 use serde_json::{Value, json};
 
 use crate::cli::{ExportArgs, ImportAction, MailAction, QueryArgs, SiteAddArgs};
 use crate::export::ExportRequest;
-use crate::query_api::load_site_context;
+use crate::query_api::{attach_city_names, load_site_context};
 
 /// 规范化一条 hostname 白名单模式（实现与屏蔽规则的 hostname 类型共用，见 `rivu_ingest::hostname::validated_pattern`）。
 pub fn normalize_pattern(raw: &str) -> Result<String> {
@@ -65,23 +65,35 @@ pub async fn query(config: &Config, args: QueryArgs) -> Result<ExitCode> {
         bail!("QuerySpec 的 `site` 必填");
     };
 
-    let (reader, ctx) = query_context(config, &site_key).await?;
+    let (reader, ctx, geo) = query_context(config, &site_key).await?;
     // 等同看板查询，用看板档的超时（§10 Q14）。
     let opts = ExecOptions::new(config.query_timeouts.dashboard_secs)
         .with_route("cli.query")
         .with_rollup(config.rollup_min_rows);
-    let result = rivu_query::execute(&reader, &TenantScope::new(ctx.site_id), &ctx, spec, opts)
+    let mut result = rivu_query::execute(&reader, &TenantScope::new(ctx.site_id), &ctx, spec, opts)
         .await
         .map_err(|e| anyhow!("查询失败：{e}"))?;
+    // 有城市维度时就地建城市名索引（GeoLite2 City 约 1–2 秒），与 API 一样给出英文的 `meta.city_names`
+    if result.query.dimensions.iter().any(|d| d == "visit:city") {
+        build_city_names(&geo);
+        attach_city_names(&mut result, Some(&geo), NameLang::En);
+    }
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(ExitCode::SUCCESS)
 }
 
-/// 查询用的 `rivu_reader` 客户端与站点上下文（`rivu query`、`rivu export`）。
+/// 同步建城市名索引（命令行用）；失败只记日志，城市名缺席。
+fn build_city_names(geo: &GeoDb) {
+    if let Err(e) = geo.build_city_index() {
+        tracing::warn!(error = %format!("{e:#}"), "建城市名索引失败，城市只显示 id");
+    }
+}
+
+/// 查询用的 `rivu_reader` 客户端、站点上下文与地理库（`rivu query`、`rivu export`）。
 async fn query_context(
     config: &Config,
     site_key: &str,
-) -> Result<(clickhouse::Client, SiteContext)> {
+) -> Result<(clickhouse::Client, SiteContext, GeoDb)> {
     let pool = rivu_storage_pg::connect(config.database_url.expose(), 2).await?;
     let Some(site) = rivu_storage_pg::sites::find_site_by_key(&pool, site_key).await? else {
         bail!("找不到站点 `{site_key}`（或已删除）");
@@ -107,7 +119,7 @@ async fn query_context(
     )
     .await
     .map_err(|e| anyhow!("读取站点 `{site_key}` 的查询设置失败：{e:?}"))?;
-    Ok((reader, ctx))
+    Ok((reader, ctx, geo))
 }
 
 /// `rivu export`：看板「导出」的命令行版本（[`crate::export`]），写一个 zip。
@@ -122,7 +134,9 @@ pub async fn export(config: &Config, args: ExportArgs) -> Result<ExitCode> {
     };
     let body = json!({"date_range": date_range, "filters": filters, "interval": args.interval});
     let request = ExportRequest::parse(&body).map_err(|e| anyhow!("导出参数无效：{e}"))?;
-    let (reader, ctx) = query_context(config, &args.site).await?;
+    let (reader, ctx, geo) = query_context(config, &args.site).await?;
+    // `cities.csv` 带城市名（英文）
+    build_city_names(&geo);
     let scope = TenantScope::new(ctx.site_id);
     let opts = ExecOptions::new(config.query_timeouts.dashboard_secs)
         .with_route("cli.export")
@@ -137,9 +151,14 @@ pub async fn export(config: &Config, args: ExportArgs) -> Result<ExitCode> {
     .await
     .map_err(|e| anyhow!("读取属性键失败：{e}"))?;
     let keys: Vec<String> = keys.into_iter().map(|k| k.key).collect();
-    let (reader, ctx_ref, scope_ref) = (&reader, &ctx, &scope);
+    let (reader, ctx_ref, scope_ref, geo_ref) = (&reader, &ctx, &scope, &geo);
     let export = crate::export::build(&request, &keys, move |spec| {
-        rivu_query::execute(reader, scope_ref, ctx_ref, spec, opts.clone())
+        let run = rivu_query::execute(reader, scope_ref, ctx_ref, spec, opts.clone());
+        async move {
+            let mut result = run.await?;
+            attach_city_names(&mut result, Some(geo_ref), NameLang::En);
+            Ok::<_, rivu_query::QueryError>(result)
+        }
     })
     .await
     .map_err(|e| anyhow!("导出失败：{e}"))?;

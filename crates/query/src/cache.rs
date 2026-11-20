@@ -149,6 +149,7 @@ mod tests {
                 metric_semantics: Default::default(),
                 geo_attribution: None,
                 geo_capability: None,
+                city_names: None,
                 total_rows: None,
             },
             query: EchoedQuery {

@@ -9,12 +9,14 @@
 //! 我们自己的替换是「写临时文件再 `rename`」，旧映射本来也安全；风险只在运维者原地改写库文件，
 //! 这正是不用 mmap 想避开的。内存吃紧的部署可以选 DB-IP country 版。
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, ensure};
 use arc_swap::ArcSwapOption;
@@ -25,6 +27,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::attribution::{Attribution, SOURCE_CUSTOM, SOURCE_DBIP};
+use crate::cities::{CityIndex, CityName, NameLang};
 use crate::meta;
 
 /// 一次查询的地理信息；查不到时全为空值。
@@ -137,7 +140,7 @@ struct SubdivisionRec<'a> {
 
 /// 两个字母的国家码，大写。非字母（`A1`、`A2`、`T1` 等匿名代理、卫星、Tor 占位码）和
 /// 未知占位码 `ZZ`、`XX` 都算没有（与 Plausible 的 `geolocation.ex` 一致，R01 §5）。
-fn country_code(raw: &str) -> [u8; 2] {
+pub(crate) fn country_code(raw: &str) -> [u8; 2] {
     let b = raw.as_bytes();
     if b.len() != 2 || !b.iter().all(u8::is_ascii_alphabetic) {
         return [0, 0];
@@ -285,6 +288,19 @@ pub(crate) fn open_validated(path: &Path) -> Result<(Reader<Vec<u8>>, FileKey)> 
 struct Db {
     reader: Reader<Vec<u8>>,
     key: FileKey,
+    /// 第几次加载（从 1 起）：城市名索引据此判断自己属于哪个库、是否已被新库取代。
+    generation: u64,
+}
+
+/// 城市名索引的状态（`system-design.md` §4.4「城市名」）。单独放在 `Arc` 里，后台建索引的线程只持有它和
+/// 正在建索引的那个库。
+#[derive(Default)]
+struct Cities {
+    index: ArcSwapOption<CityIndex>,
+    /// 最近一次加载的库的代数。
+    generation: AtomicU64,
+    /// 同一时刻只建一份索引：新库加载时旧的建索引线程会放弃。
+    build: Mutex<()>,
 }
 
 /// 当前库的来源与署名。
@@ -316,6 +332,9 @@ pub struct GeoDb {
     origin: ArcSwapOption<Origin>,
     /// 手工放置的库（没有 meta）使用的署名，来自 `RIVU_GEOIP_ATTRIBUTION_*`。
     manual_attribution: Option<Attribution>,
+    cities: Arc<Cities>,
+    /// 加载 City 库后是否自动在后台建城市名索引（[`GeoDb::with_city_names`]）。
+    auto_city_names: bool,
 }
 
 impl std::fmt::Debug for GeoDb {
@@ -339,7 +358,17 @@ impl GeoDb {
             db: ArcSwapOption::empty(),
             origin: ArcSwapOption::empty(),
             manual_attribution: None,
+            cities: Arc::default(),
+            auto_city_names: false,
         }
+    }
+
+    /// 每次加载 City 库后在后台线程建城市名索引（`rivu serve` 用）。不开时只能用
+    /// [`GeoDb::build_city_index`] 同步建（命令行与测试用）。
+    #[must_use]
+    pub fn with_city_names(mut self) -> Self {
+        self.auto_city_names = true;
+        self
     }
 
     /// 同 [`GeoDb::new`]，并指定手工放置文件的署名。
@@ -392,6 +421,56 @@ impl GeoDb {
         self.db.load().is_some()
     }
 
+    /// 城市名索引是否可用：当前库是 City 级，且索引已经建好。
+    pub fn city_names_ready(&self) -> bool {
+        self.capability() == Some(GeoCapability::City) && self.cities.index.load().is_some()
+    }
+
+    /// 一批 GeoNames id 的城市名（`meta.city_names`），键是 id 的十进制字符串。索引没建好、库不是 City 级时
+    /// 返回 `None`（调用方省略该字段）；建好了但一个也查不到时返回空表。id 为 0（未知城市）不查。
+    pub fn city_names(
+        &self,
+        ids: impl IntoIterator<Item = u32>,
+        lang: NameLang,
+    ) -> Option<BTreeMap<String, CityName>> {
+        if self.capability() != Some(GeoCapability::City) {
+            return None;
+        }
+        let index = self.cities.index.load_full()?;
+        Some(index.names(ids.into_iter().filter(|id| *id != 0), lang))
+    }
+
+    /// 为当前库同步建城市名索引，建好返回 `true`。库没加载、不是 City 级、索引已是当前库的、或建到一半被
+    /// 新库取代时返回 `false`。耗时与库大小成正比（GeoLite2 City 约几秒），所以 `rivu serve` 在后台线程里
+    /// 调用（[`GeoDb::with_city_names`]），不阻塞启动、`/readyz` 与采集。
+    pub fn build_city_index(&self) -> Result<bool> {
+        let Some(db) = self.db.load_full() else {
+            return Ok(false);
+        };
+        if self.capability() != Some(GeoCapability::City) {
+            self.cities.index.store(None);
+            return Ok(false);
+        }
+        build_city_index_for(&self.cities, &db)
+    }
+
+    fn spawn_city_index_build(&self) {
+        let Some(db) = self.db.load_full() else {
+            return;
+        };
+        let cities = Arc::clone(&self.cities);
+        let spawned = std::thread::Builder::new()
+            .name("rivu-geo-cities".into())
+            .spawn(move || {
+                if let Err(e) = build_city_index_for(&cities, &db) {
+                    tracing::warn!(error = %format!("{e:#}"), "建城市名索引失败，城市只显示 id");
+                }
+            });
+        if let Err(e) = spawned {
+            tracing::warn!(error = %e, "无法启动建城市名索引的线程，城市只显示 id");
+        }
+    }
+
     pub fn status(&self) -> GeoStatus {
         match &*self.origin.load() {
             Some(o) if self.is_loaded() => GeoStatus {
@@ -436,8 +515,21 @@ impl GeoDb {
                 build_epoch,
                 database_type,
             ))));
-            self.db.store(Some(Arc::new(Db { reader, key })));
+            let generation = self.cities.generation.fetch_add(1, Ordering::SeqCst) + 1;
+            self.db.store(Some(Arc::new(Db {
+                reader,
+                key,
+                generation,
+            })));
             reloaded = true;
+            if self.capability() == Some(GeoCapability::City) {
+                // 旧索引在新索引建好前继续提供名字（城市的 id 跨版本不变），建好后替换
+                if self.auto_city_names {
+                    self.spawn_city_index_build();
+                }
+            } else {
+                self.cities.index.store(None);
+            }
         } else if let Some(cur) = self.origin.load_full() {
             let refreshed = self.origin_for(path, cur.build_epoch, cur.database_type.clone());
             if refreshed != *cur {
@@ -517,6 +609,51 @@ impl GeoDb {
             }
         })
     }
+}
+
+/// 为库 `db` 建索引并发布。同一时刻只有一个线程在建；`db` 已被新库取代时放弃。
+fn build_city_index_for(cities: &Cities, db: &Db) -> Result<bool> {
+    let _guard = cities
+        .build
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let superseded = || cities.generation.load(Ordering::SeqCst) != db.generation;
+    if superseded()
+        || cities
+            .index
+            .load()
+            .as_ref()
+            .is_some_and(|i| i.generation == db.generation)
+    {
+        return Ok(false);
+    }
+    let started = Instant::now();
+    let built = CityIndex::build(&db.reader, db.generation, superseded);
+    let (index, stats) = match built {
+        Ok(Some(b)) => b,
+        Ok(None) => return Ok(false),
+        Err(e) => {
+            // 不留旧库的索引冒充新库的
+            if !superseded() {
+                cities.index.store(None);
+            }
+            return Err(e);
+        }
+    };
+    if superseded() {
+        return Ok(false);
+    }
+    tracing::info!(
+        cities = index.len(),
+        bytes = index.heap_bytes(),
+        networks = stats.networks,
+        records = stats.records,
+        skipped = stats.skipped,
+        elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        "城市名索引已建好"
+    );
+    cities.index.store(Some(Arc::new(index)));
+    Ok(true)
 }
 
 fn now_epoch() -> u64 {
@@ -663,6 +800,96 @@ mod tests {
             assert!(db.reload_if_changed(&dir.join(file)).unwrap());
             assert_eq!(db.capability(), Some(want), "{file}");
         }
+    }
+
+    fn test_db_path(file: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data/test-data")
+            .join(file)
+    }
+
+    #[test]
+    fn city_names_come_from_the_loaded_city_database() {
+        let db = GeoDb::new();
+        // 没加载库：没有名字
+        assert_eq!(db.city_names([2_038_180], NameLang::En), None);
+        assert!(!db.build_city_index().unwrap());
+
+        assert!(
+            db.reload_if_changed(&test_db_path("GeoIP2-City-Test.mmdb"))
+                .unwrap()
+        );
+        // 没开后台建索引：索引建好之前名字缺席，不报错
+        assert!(!db.city_names_ready());
+        assert_eq!(db.city_names([2_038_180], NameLang::En), None);
+
+        assert!(db.build_city_index().unwrap());
+        // 已是当前库的索引：不重建
+        assert!(!db.build_city_index().unwrap());
+        assert!(db.city_names_ready());
+        let names = db
+            .city_names([2_038_180, 2_643_743, 0, 42], NameLang::ZhCn)
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&names).unwrap(),
+            serde_json::json!({
+                "2038180": {"name": "长春", "country": "CN"},
+                "2643743": {"name": "London", "country": "GB"},
+            })
+        );
+        // 建好了但一个也查不到：空表（与「还没建好」区分开）
+        assert_eq!(db.city_names([42], NameLang::En), Some(BTreeMap::new()));
+
+        // 换成 Country 库：索引随即丢弃
+        assert!(
+            db.reload_if_changed(&test_db_path("GeoIP2-Country-Test.mmdb"))
+                .unwrap()
+        );
+        assert!(!db.city_names_ready());
+        assert_eq!(db.city_names([2_038_180], NameLang::En), None);
+        assert!(!db.build_city_index().unwrap());
+        assert!(db.cities.index.load().is_none());
+    }
+
+    #[test]
+    fn city_names_are_built_in_the_background_after_each_load() {
+        let db = GeoDb::new().with_city_names();
+        assert!(
+            db.reload_if_changed(&test_db_path("GeoLite2-City-Test.mmdb"))
+                .unwrap()
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !db.city_names_ready() {
+            assert!(Instant::now() < deadline, "后台建索引超时");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let first = db.cities.index.load_full().unwrap();
+        assert_eq!(first.generation, 1);
+        assert_eq!(
+            db.city_names([2_694_762], NameLang::ZhCn).unwrap()["2694762"].name,
+            "林雪平"
+        );
+        // 热加载另一个 City 库：新索引建好前旧索引继续提供名字，之后换成新库的
+        assert!(
+            db.reload_if_changed(&test_db_path("GeoIP2-City-Test.mmdb"))
+                .unwrap()
+        );
+        while db
+            .cities
+            .index
+            .load()
+            .as_ref()
+            .is_none_or(|i| i.generation != 2)
+        {
+            assert!(db.city_names_ready(), "重建期间名字不应缺席");
+            assert!(Instant::now() < deadline, "后台重建索引超时");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // 只在 GeoIP2 测试库里的城市（新加坡）
+        assert_eq!(
+            db.city_names([1_880_252], NameLang::ZhCn).unwrap()["1880252"].name,
+            "新加坡"
+        );
     }
 
     #[test]

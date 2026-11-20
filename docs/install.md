@@ -79,6 +79,12 @@ RIVU_GEOIP_ATTRIBUTION_URL=https://www.maxmind.com
 
 也可以从 MaxMind 直接下载。在 `deploy/.env` 同时设置 `RIVU_MAXMIND_ACCOUNT_ID` 和 `RIVU_MAXMIND_LICENSE_KEY`。`RIVU_MAXMIND_EDITION` 默认为 `GeoLite2-City`，也可设为 `GeoLite2-Country`。授权密钥可通过 `RIVU_MAXMIND_LICENSE_KEY_FILE` 从挂载文件读取。两种来源都填时优先用直链，都留空时使用 DB-IP Lite。
 
+#### 想看到城市
+
+城市报表需要城市级的地理库：上面的 GeoLite2 City 直链、MaxMind 的 `GeoLite2-City`，或结构相同的自定义库都可以。都不配置时用的默认库（DB-IP Lite）只能给出国家，地区和城市都会是空的。
+
+城市名直接从这个库里读取，不用另外下载。Rivu 启动或换上新库后，会在后台花大约 1 到 2 秒把库里的城市名整理成一张表，这期间采集和看板照常工作，只是暂时拿不到城市名，城市先显示成编号。这张表大约占 6 到 10 MiB 内存，整理时临时再多用约 30 MiB。城市名有英文和简体中文两种，跟随看板的界面语言；没有中文名的城市显示英文名。导出的 `cities.csv` 里，`city` 列是城市编号（GeoNames 的城市 ID，筛选用的就是它），后面的 `city_name`、`country` 两列是城市名和所在国家。
+
 ### 站点周报
 
 配置 `RIVU_SMTP_URL` 和 `RIVU_SMTP_FROM` 后，用户可以给自己有权查看统计的站点订阅周报，内容是上一整周的访客数、访问次数和页面浏览量。默认不订阅。

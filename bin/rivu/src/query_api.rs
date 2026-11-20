@@ -78,7 +78,7 @@ use jiff::tz::TimeZone;
 use rivu_auth::{
     ApiError, ApiGuard, AuthContext, AuthStore, Required, Resource, ScopeAction, protect,
 };
-use rivu_geo::GeoDb;
+use rivu_geo::{GeoDb, NameLang};
 use rivu_query::{
     ExecOptions, GoalDef, QueryCache, QueryError, QueryResult, QuerySpec, SiteContext, TenantScope,
 };
@@ -479,6 +479,36 @@ pub(crate) async fn execute_cached(
     }
 }
 
+/// 结果维度含 `visit:city` 时补上 `meta.city_names`（§4.4「城市名」）：主结果与对比结果里出现的 GeoNames id
+/// 的名字，语言由调用方决定（看板跟随界面语言，公开 API 用英文）。索引没建好时不加这个字段。
+/// 在结果缓存之后调用，所以缓存里的结果不含名字，索引建好后的下一次查询就有。
+pub(crate) fn attach_city_names(result: &mut QueryResult, geo: Option<&GeoDb>, lang: NameLang) {
+    let Some(geo) = geo else {
+        return;
+    };
+    let Some(i) = result
+        .query
+        .dimensions
+        .iter()
+        .position(|d| d == "visit:city")
+    else {
+        return;
+    };
+    let main = result.results.iter().flat_map(|r| {
+        std::iter::once(&r.dimensions).chain(r.comparison.as_ref().map(|c| &c.dimensions))
+    });
+    let compared = result
+        .comparison_results
+        .iter()
+        .flatten()
+        .map(|r| &r.dimensions);
+    let ids: std::collections::BTreeSet<u32> = main
+        .chain(compared)
+        .filter_map(|dims| dims.get(i)?.parse().ok())
+        .collect();
+    result.meta.city_names = geo.city_names(ids, lang);
+}
+
 async fn run_query<S: AuthStore>(
     api: &QueryApi<S>,
     ctx: &AuthContext,
@@ -507,7 +537,7 @@ async fn run_query<S: AuthStore>(
         .with_comment("org", ctx.org_id)
         .with_comment("api_key_id", ctx.api_key_id);
     opts.rollup_min_rows = api.rollup_min_rows;
-    execute_cached(
+    let mut result = execute_cached(
         &api.reader,
         api.cache.as_deref(),
         &site,
@@ -516,7 +546,10 @@ async fn run_query<S: AuthStore>(
         ROUTE_QUERY,
     )
     .await
-    .map_err(Fail::Query)
+    .map_err(Fail::Query)?;
+    // 公开 API 没有语言参数：城市名一律英文
+    attach_city_names(&mut result, api.geo.as_deref(), NameLang::En);
+    Ok(result)
 }
 
 async fn query<S: AuthStore>(

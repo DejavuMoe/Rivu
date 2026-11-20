@@ -961,6 +961,76 @@ async fn http_results_equal_direct_execution() {
         Err(e) => println!("跳过 log_comment 校验：当前账号不能 FLUSH LOGS（{e}）"),
     }
 
+    // ---- 城市名与地理精度（放在指标计数之后，不影响上面的请求数）---------------------------------
+    let country_spec = json!({"site": site.key, "metrics": ["visitors"], "dimensions": ["visit:country"],
+                              "date_range": ["2026-03-09", "2026-03-11"]});
+    let r = server
+        .http
+        .query(Some(&key.key), &country_spec)
+        .await
+        .json();
+    assert!(r["meta"].get("city_names").is_none(), "{r}");
+    assert!(r["meta"]["warnings"].as_array().unwrap().is_empty(), "{r}");
+
+    // 城市名：索引建好前省略（上面逐字节对照的用例因此不受影响），建好后给英文名
+    let city_spec = json!({"site": site.key, "metrics": ["visitors"], "dimensions": ["visit:city"],
+                           "date_range": ["2026-03-09", "2026-03-11"]});
+    let r = server.http.query(Some(&key.key), &city_spec).await.json();
+    assert!(r["meta"].get("city_names").is_none(), "{r}");
+    assert!(server.geo.build_city_index().expect("建城市名索引"));
+    let r = server.http.query(Some(&key.key), &city_spec).await.json();
+    assert_eq!(
+        r["meta"]["city_names"],
+        json!({
+            "2038180": {"name": "Changchun", "country": "CN"},
+            "2643743": {"name": "London", "country": "GB"},
+            "2694762": {"name": "Linköping", "country": "SE"},
+        }),
+        "公开 API 没有语言参数，一律英文：{r}"
+    );
+    // 换成只有国家的库：维度或过滤用到城市、地区时带 `geo_capability_country_only`，城市名随索引一起消失
+    let mmdb = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../crates/geo/tests/data/test-data/GeoIP2-Country-Test.mmdb");
+    assert!(server.geo.reload_if_changed(&mmdb).expect("加载国家测试库"));
+    let r = server.http.query(Some(&key.key), &city_spec).await.json();
+    assert_eq!(r["meta"]["geo_capability"], "country", "{r}");
+    assert_eq!(
+        r["meta"]["warnings"][0]["code"], "geo_capability_country_only",
+        "{r}"
+    );
+    assert!(r["meta"].get("city_names").is_none(), "{r}");
+    let mut region_filter = country_spec.clone();
+    region_filter["filters"] = json!([["is", "visit:region", ["SE-E"]]]);
+    let r = server
+        .http
+        .query(Some(&key.key), &region_filter)
+        .await
+        .json();
+    assert_eq!(
+        r["meta"]["warnings"][0]["code"], "geo_capability_country_only",
+        "过滤用到地区也提示：{r}"
+    );
+    let r = server
+        .http
+        .query(Some(&key.key), &country_spec)
+        .await
+        .json();
+    assert_eq!(r["meta"]["geo_capability"], "country", "{r}");
+    assert!(
+        r["meta"]["warnings"].as_array().unwrap().is_empty(),
+        "只查国家不提示：{r}"
+    );
+    // 不涉及位置：不回显精度
+    let r = server
+        .http
+        .query(
+            Some(&key.key),
+            &json!({"site": site.key, "metrics": ["visitors"], "date_range": ["2026-03-09", "2026-03-11"]}),
+        )
+        .await
+        .json();
+    assert!(r["meta"].get("geo_capability").is_none(), "{r}");
+
     cleanup(&env, &[sites[0].id, sites[1].id]).await;
 }
 
