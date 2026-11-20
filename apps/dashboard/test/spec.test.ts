@@ -177,6 +177,10 @@ test("目标卡片的 QuerySpec、目标筛选与结果", () => {
   assert.deepEqual(readGoals(result({ results: [{ dimensions: ["Signup"], metrics: [3, 5, 0.25] }] })), [
     { label: "Signup", visitors: 3, events: 5, cr: 0.25 },
   ]);
+  // 滚动深度目标：服务端的完成次数是 0，卡片里不显示
+  assert.deepEqual(readGoals(result({ results: [{ dimensions: ["≥ 75%"], metrics: [2, 0, 0.5] }] })), [
+    { label: "≥ 75%", visitors: 2, events: null, cr: 0.5 },
+  ]);
 });
 
 test("不包含：除目标与城市外的维度都能选，URL 往返后保留", () => {

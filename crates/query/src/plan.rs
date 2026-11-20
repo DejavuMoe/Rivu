@@ -234,7 +234,7 @@ pub(crate) fn metric_semantics(q: &ResolvedQuery, p: &Plan) -> BTreeMap<String, 
             )
         {
             text.push_str(
-                " With an event:goal dimension each row counts the events that complete the goal (event goals: the event name; page goals: pageviews whose pathname matches the pattern); an event completing several goals counts in each.",
+                " With an event:goal dimension each row counts the events that complete the goal (event goals: the event name; page goals: pageviews whose pathname matches the pattern; scroll depth goals: engagement events on a matching pathname whose scroll depth is at least the threshold, which count towards visitors and visits only, so events and pageviews are 0 for those rows); an event completing several goals counts in each.",
             );
         }
         if event_filter {

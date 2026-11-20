@@ -233,6 +233,7 @@ pub(crate) async fn load_site_context(
                 &g.kind,
                 g.event_name.as_deref(),
                 g.page_path.as_deref(),
+                g.scroll_threshold,
                 g.display_name.as_deref(),
             )
         })

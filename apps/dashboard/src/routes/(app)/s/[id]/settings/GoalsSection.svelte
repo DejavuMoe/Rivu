@@ -1,5 +1,6 @@
 <!--
-  目标：事件（事件名）与页面（路径，* 是通配）。看板的目标卡片按目标的名字（显示名，否则目标值）列出转化。
+  目标：事件（事件名）、页面（路径，* 是通配）与滚动深度（阈值，可限定页面）。看板的目标卡片按目标的名字
+  （显示名，否则目标值）列出转化。
   添加对话框做初筛，服务端校验为准（400 的 message 显示在字段旁）；上限由服务端给出，用量显示在表头右侧。
   editor 起（含站点访客 editor）可写；没有写权限时不显示添加与删除入口。
 -->
@@ -12,9 +13,20 @@
   import Field from "#lib/ui/Field.svelte";
   import Input from "#lib/ui/Input.svelte";
   import Segmented from "#lib/ui/Segmented.svelte";
+  import Select from "#lib/ui/Select.svelte";
   import Skeleton from "#lib/ui/Skeleton.svelte";
   import Table from "#lib/ui/Table.svelte";
-  import { eventNameError, goalTarget, isDuplicateGoal, labelTaken, normalizePagePath, pagePathError } from "#lib/admin/goals.ts";
+  import {
+    eventNameError,
+    goalTarget,
+    isDuplicateGoal,
+    labelTaken,
+    normalizePagePath,
+    pagePathError,
+    SCROLL_ALL_PAGES,
+    SCROLL_DEPTHS,
+    scrollLabel,
+  } from "#lib/admin/goals.ts";
   import { api, ApiError, type Goal, type GoalKind, type Site } from "#lib/api.ts";
   import { t } from "#lib/i18n.ts";
   import { toast } from "#lib/state.svelte.ts";
@@ -50,22 +62,30 @@
   let kind = $state<GoalKind>("event");
   let eventName = $state("");
   let pagePath = $state("");
+  let depth = $state("75");
+  let depthPath = $state("");
   let display = $state("");
   let busy = $state(false);
   let serverErr = $state("");
 
-  const target = $derived(kind === "event" ? eventName.trim() : normalizePagePath(pagePath));
-  const label = $derived(display.trim() || target);
-  const targetErr = $derived(kind === "event" ? eventNameError(eventName) : pagePathError(pagePath));
-  const dup = $derived(!!goals && isDuplicateGoal(goals, kind, target));
+  /** 滚动深度目标的路径：不填是所有页面 */
+  const scrollPath = $derived(normalizePagePath(depthPath) || SCROLL_ALL_PAGES);
+  const target = $derived(kind === "event" ? eventName.trim() : kind === "page" ? normalizePagePath(pagePath) : scrollPath);
+  const label = $derived(display.trim() || (kind === "scroll" ? scrollLabel(Number(depth)) : target));
+  const targetErr = $derived(kind === "event" ? eventNameError(eventName) : pagePathError(kind === "page" ? pagePath : depthPath));
+  const dup = $derived(!!goals && isDuplicateGoal(goals, kind, target, kind === "scroll" ? Number(depth) : null));
   const nameTaken = $derived(!dup && !!goals && labelTaken(goals, label));
   const errKey = $derived(targetErr ?? (dup ? "set.goals.err.dup" : null));
   const targetMsg = $derived(serverErr || (target && errKey ? t(errKey) : ""));
+  /** 滚动深度：重复与服务端的错误显示在阈值旁，路径格式错误显示在路径旁 */
+  const depthMsg = $derived(serverErr || (dup ? t("set.goals.err.dup") : ""));
+  const depthPathMsg = $derived(targetErr ? t(targetErr) : "");
   const canAdd = $derived(!!target && !errKey && !nameTaken && !full && !busy);
 
   function openAdd() {
     kind = "event";
-    eventName = pagePath = display = "";
+    eventName = pagePath = depthPath = display = "";
+    depth = "75";
     serverErr = "";
     open = true;
   }
@@ -75,7 +95,12 @@
     busy = true;
     try {
       const display_name = display.trim() || undefined;
-      const body = kind === "event" ? { kind, event_name: target, display_name } : { kind, page_path: target, display_name };
+      const body =
+        kind === "event"
+          ? { kind, event_name: target, display_name }
+          : kind === "page"
+            ? { kind, page_path: target, display_name }
+            : { kind, page_path: target, scroll_threshold: Number(depth), display_name };
       const { goal } = await api.addGoal(site.id, body);
       goals.push(goal);
       open = false;
@@ -141,7 +166,10 @@
         {#if c.key === "kind"}
           {t(`set.goals.kind.${g.kind}`)}
         {:else if c.key === "target"}
-          <code class="tg">{goalTarget(g)}</code>
+          <div class="tg">
+            <code>{goalTarget(g)}</code>
+            {#if g.kind === "scroll" && g.page_path && g.page_path !== SCROLL_ALL_PAGES}<span class="muted">{g.page_path}</span>{/if}
+          </div>
         {:else if c.key === "display"}
           {#if g.display_name}{g.display_name}{:else}<span class="muted">—</span>{/if}
         {:else}
@@ -179,6 +207,7 @@
         options={[
           { value: "event", label: t("set.goals.kind.event") },
           { value: "page", label: t("set.goals.kind.page") },
+          { value: "scroll", label: t("set.goals.kind.scroll") },
         ]}
       />
     </Field>
@@ -196,7 +225,7 @@
           spellcheck={false}
         />
       </Field>
-    {:else}
+    {:else if kind === "page"}
       <Field label={t("set.goals.pagePath")} for="g-page" hint={t("set.goals.pageHint")} error={targetMsg || undefined}>
         <Input
           id="g-page"
@@ -205,6 +234,28 @@
           oninput={() => (serverErr = "")}
           placeholder="/pricing"
           invalid={!!targetMsg}
+          autocomplete="off"
+          spellcheck={false}
+        />
+      </Field>
+    {:else}
+      <Field label={t("set.goals.depth")} error={depthMsg || undefined}>
+        <Select
+          label={t("set.goals.depth")}
+          block
+          bind:value={depth}
+          onchange={() => (serverErr = "")}
+          options={SCROLL_DEPTHS.map((d) => ({ value: String(d), label: `${d}%` }))}
+        />
+      </Field>
+      <Field label={t("set.goals.depthPath")} for="g-dpath" optional hint={t("set.goals.pageHint")} error={depthPathMsg || undefined}>
+        <Input
+          id="g-dpath"
+          mono
+          bind:value={depthPath}
+          oninput={() => (serverErr = "")}
+          placeholder="/blog/*"
+          invalid={!!depthPathMsg}
           autocomplete="off"
           spellcheck={false}
         />
@@ -247,7 +298,18 @@
     padding: var(--sp-4) var(--sp-5);
   }
   .tg {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 6px 0;
+    min-width: 0;
+  }
+  .tg code {
     overflow-wrap: anywhere;
+  }
+  .tg .muted {
+    font-family: var(--font-mono);
+    font-size: var(--fs-sm);
   }
   .form {
     display: flex;

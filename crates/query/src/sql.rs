@@ -500,12 +500,17 @@ impl<'a> Builder<'a> {
                         needs.insert("s_entry_host");
                         return self.cond("s_entry_host", l);
                     }
-                    // 「会话在范围内有匹配的事件」：对非 engagement 事件求叶子条件（存在语义）
+                    // 「会话在范围内有匹配的事件」：对非 engagement 事件求叶子条件（存在语义）；
+                    // 目标叶子里的滚动深度目标由 engagement 事件完成，这些事件也参与
+                    let scroll: Vec<GoalKind> = match &l.test {
+                        Test::Goal { goals, .. } => {
+                            goals.iter().filter(|g| g.is_scroll()).cloned().collect()
+                        }
+                        _ => Vec::new(),
+                    };
+                    let base = self.event_base(&scroll);
                     let cond = self.cond(ev_expr(l.col), l);
-                    let scan = self.events_scan(
-                        "session_id",
-                        Some(&format!("name != 'engagement' AND {cond}")),
-                    );
+                    let scan = self.events_scan("session_id", Some(&format!("{base} AND {cond}")));
                     format!("session_id IN ({scan})")
                 }
                 col => {
@@ -562,7 +567,9 @@ impl<'a> Builder<'a> {
     }
 
     /// 事件满足任一目标的完成条件（在 `events` 的列上求值）：事件目标 `name = …`；
-    /// 页面目标 `name = 'pageview' AND pathname LIKE …`（通配转成 `LIKE`，区分大小写、整串匹配）。没有目标时恒假。
+    /// 页面目标 `name = 'pageview' AND pathname LIKE …`（通配转成 `LIKE`，区分大小写、整串匹配）；
+    /// 滚动深度目标 `name = 'engagement' AND scroll_depth >= 阈值 AND scroll_depth <= 100 AND pathname LIKE …`
+    /// （255 是「没有滚动深度」，永远不算）。没有目标时恒假。
     fn goal_cond(&mut self, goals: &[GoalKind]) -> String {
         if goals.is_empty() {
             return "0".to_owned();
@@ -578,9 +585,55 @@ impl<'a> Builder<'a> {
                     let ph = self.p(ParamValue::Str(wildcard_to_like(pattern)));
                     format!("(name = 'pageview' AND pathname LIKE {ph})")
                 }
+                GoalKind::Scroll { pattern, threshold } => {
+                    let t = self.p(ParamValue::U8(*threshold));
+                    let ph = self.p(ParamValue::Str(wildcard_to_like(pattern)));
+                    format!(
+                        "(name = 'engagement' AND scroll_depth >= {t} AND scroll_depth <= 100 AND pathname LIKE {ph})"
+                    )
+                }
             })
             .collect();
         format!("({})", parts.join(" OR "))
+    }
+
+    /// 查询用到的滚动深度目标：`event:goal` 过滤叶子里的，有 `event:goal` 维度时再加上站点的全部滚动深度目标。
+    fn scroll_goals(&self) -> Vec<GoalKind> {
+        fn walk(p: &Pred, out: &mut BTreeSet<GoalKind>) {
+            match p {
+                Pred::And(c) | Pred::Or(c) => c.iter().for_each(|x| walk(x, out)),
+                Pred::Not(x) => walk(x, out),
+                Pred::Leaf(l) => {
+                    if let Test::Goal { goals, .. } = &l.test {
+                        out.extend(goals.iter().filter(|g| g.is_scroll()).cloned());
+                    }
+                }
+            }
+        }
+        let mut out = BTreeSet::new();
+        if let Some(f) = &self.q.filter {
+            walk(f, &mut out);
+        }
+        if self.q.dims.contains(&RDim::Col(Col::EventGoal)) {
+            out.extend(
+                self.q
+                    .goals
+                    .iter()
+                    .map(|g| g.kind.clone())
+                    .filter(GoalKind::is_scroll),
+            );
+        }
+        out.into_iter().collect()
+    }
+
+    /// 事件组件的基础条件：非 engagement 事件；`scroll` 非空时再加上完成其中某个滚动深度目标的 engagement 事件
+    /// （它们只计入 `visitors` 与 `visits`，`events` `pageviews` 只数非 engagement 事件）。
+    fn event_base(&mut self, scroll: &[GoalKind]) -> String {
+        if scroll.is_empty() {
+            "name != 'engagement'".to_owned()
+        } else {
+            format!("(name != 'engagement' OR {})", self.goal_cond(scroll))
+        }
     }
 
     /// `event:goal` 维度在事件组件里的取值：事件匹配的目标标签（去重），`arrayJoin` 展开成一行一个；
@@ -777,8 +830,9 @@ impl<'a> Builder<'a> {
     /// 事件组件：`visitors`、`pageviews`、`events`，以及事件形式的 `visits`。
     fn comp_events(&mut self) -> String {
         let mut needs = Needs::new();
+        let scroll = self.scroll_goals();
+        let mut extra = self.event_base(&scroll);
         let tree = self.tree_events(&mut needs);
-        let mut extra = String::from("name != 'engagement'");
         if let Some(t) = tree {
             extra.push_str(" AND ");
             extra.push_str(&t);
@@ -789,7 +843,14 @@ impl<'a> Builder<'a> {
         let mut own: Vec<(Measure, &str)> = vec![
             (Measure::Visitors, "uniq(visitor_id)"),
             (Measure::Pageviews, "countIf(name = 'pageview')"),
-            (Measure::Events, "count()"),
+            (
+                Measure::Events,
+                if scroll.is_empty() {
+                    "count()"
+                } else {
+                    "countIf(name != 'engagement')"
+                },
+            ),
         ];
         if self.plan.visits_form == VisitsForm::Events {
             own.push((Measure::Visits, "uniq(session_id)"));

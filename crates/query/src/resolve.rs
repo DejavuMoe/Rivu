@@ -83,41 +83,55 @@ impl SiteContext {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GoalDef {
     pub id: i64,
-    /// 标签：显示名，否则事件名，否则页面通配。`event:goal` 维度的取值，也是过滤里认的名字。
+    /// 标签：显示名，否则事件名、页面通配，滚动深度目标是 `≥ N%`。`event:goal` 维度的取值，也是过滤里认的名字。
     pub label: String,
     pub kind: GoalKind,
 }
 
-/// 目标的完成条件（只看非 engagement 事件）。
+/// 目标的完成条件。
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum GoalKind {
-    /// 事件名完全相等（区分大小写）。
+    /// 非 engagement 事件的事件名完全相等（区分大小写）。
     Event(String),
     /// `pageview` 事件，且 pathname 整串匹配通配模式：只有 `*` 是通配（匹配任意串，含空串与 `/`），区分大小写，
     /// 与屏蔽规则的 `page` 模式同一语义。
     Page(String),
+    /// `engagement` 事件，pathname 整串匹配通配模式（同 [`GoalKind::Page`]），且 `scroll_depth` 有效（≤ 100）、
+    /// 不小于阈值（1–100，百分比）。`scroll_depth = 255`（没有滚动深度）永远不算。
+    Scroll { pattern: String, threshold: u8 },
+}
+
+impl GoalKind {
+    pub fn is_scroll(&self) -> bool {
+        matches!(self, GoalKind::Scroll { .. })
+    }
 }
 
 impl GoalDef {
-    /// 由 `goals` 表的字段构造：`kind` 是 `event` 或 `page`，否则返回 `None`。
+    /// 由 `goals` 表的字段构造：`kind` 是 `event`、`page` 或 `scroll`（阈值 1–100），否则返回 `None`。
     pub fn from_parts(
         id: i64,
         kind: &str,
         event_name: Option<&str>,
         page_path: Option<&str>,
+        scroll_threshold: Option<u8>,
         display_name: Option<&str>,
     ) -> Option<GoalDef> {
-        let kind = match (kind, event_name, page_path) {
-            ("event", Some(n), _) => GoalKind::Event(n.to_owned()),
-            ("page", _, Some(p)) => GoalKind::Page(p.to_owned()),
+        let (kind, default_label) = match (kind, event_name, page_path, scroll_threshold) {
+            ("event", Some(n), _, None) => (GoalKind::Event(n.to_owned()), n.to_owned()),
+            ("page", _, Some(p), None) => (GoalKind::Page(p.to_owned()), p.to_owned()),
+            ("scroll", _, Some(p), Some(t @ 1..=100)) => (
+                GoalKind::Scroll {
+                    pattern: p.to_owned(),
+                    threshold: t,
+                },
+                format!("≥ {t}%"),
+            ),
             _ => return None,
-        };
-        let value = match &kind {
-            GoalKind::Event(v) | GoalKind::Page(v) => v.clone(),
         };
         Some(GoalDef {
             id,
-            label: display_name.map(str::to_owned).unwrap_or(value),
+            label: display_name.map_or(default_label, str::to_owned),
             kind,
         })
     }

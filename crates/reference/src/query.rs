@@ -14,7 +14,11 @@
 //!   `bounce_rate` 再要求把 `event:page` / `event:hostname` 叶子换成入口页之后的树也成立。
 //! - `visits`：有 `event:*` 维度时是「含该维度值的事件所属的不同会话数」，否则是「区间内活跃的会话数」。
 //! - 所有区间的终点封顶到 `now + 1 ms`。
-//! - 目标：事件目标是事件名相等，页面目标是 `pageview` 且 pathname 整串匹配通配（手写 glob，区分大小写）。
+//! - 目标：事件目标是事件名相等，页面目标是 `pageview` 且 pathname 整串匹配通配（手写 glob，区分大小写），
+//!   滚动深度目标是 `engagement` 且 pathname 匹配通配、`scroll_depth ≤ 100` 且不小于阈值。
+//!   engagement 事件只在完成查询用到的滚动深度目标（目标过滤叶子里的，有 `event:goal` 维度时是全部）时
+//!   进入事件级的计数，且只算 `visitors` 与事件形式的 `visits`（不算 `events`、`pageviews`）；
+//!   会话上的目标叶子同理（叶子自己的滚动深度目标）。转化率的分母不含 engagement 事件。
 //!   `event:goal` 维度：一个事件落进它完成的每个目标（按标签去重）的组；过滤取值按标签或 id 对上目标，只有 `is` / `is_not`。
 //!   `conversion_rate` = 本组访客 ÷ 分母：过滤去掉目标叶子、同样的其余维度值的访客（`event:goal` 维度取每个目标标签）；
 //!   有维度时只保留有转化访客的组。
@@ -117,14 +121,56 @@ pub enum RefGoalKind {
     Event(String),
     /// `pageview`，且 pathname 整串匹配通配（只有 `*`，区分大小写）。
     Page(String),
+    /// `engagement`，pathname 整串匹配通配，`scroll_depth` 有效（≤ 100）且不小于阈值。
+    Scroll { pattern: String, threshold: u8 },
 }
 
 impl RefGoal {
-    /// 非 engagement 事件 `e` 是否完成了这个目标。
+    /// 事件 `e` 是否完成了这个目标。
     fn completed_by(&self, e: &RefEvent) -> bool {
         match &self.kind {
-            RefGoalKind::Event(n) => e.name == *n,
+            RefGoalKind::Event(n) => e.kind() != EventKind::Engagement && e.name == *n,
             RefGoalKind::Page(p) => e.name == "pageview" && glob_match(p, &e.pathname),
+            RefGoalKind::Scroll { pattern, threshold } => {
+                e.kind() == EventKind::Engagement
+                    && e.scroll_depth <= 100
+                    && e.scroll_depth >= *threshold
+                    && glob_match(pattern, &e.pathname)
+            }
+        }
+    }
+
+    fn is_scroll(&self) -> bool {
+        matches!(self.kind, RefGoalKind::Scroll { .. })
+    }
+}
+
+/// 目标叶子的取值对上目标 `g`（标签或 id）。
+fn goal_named(l: &Leaf, g: &RefGoal) -> bool {
+    l.values.iter().any(|v| {
+        let by_label = if l.case_sensitive {
+            *v == g.label
+        } else {
+            v.eq_ignore_ascii_case(&g.label)
+        };
+        by_label || *v == g.id.to_string()
+    })
+}
+
+/// 过滤树里目标叶子对上的滚动深度目标的 id。
+fn scroll_goals_in(n: &Node, goals: &[RefGoal], out: &mut HashSet<i64>) {
+    match n {
+        Node::And(c) | Node::Or(c) => c.iter().for_each(|x| scroll_goals_in(x, goals, out)),
+        Node::Not(x) => scroll_goals_in(x, goals, out),
+        Node::Leaf(l) => {
+            if l.dim == "event:goal" {
+                out.extend(
+                    goals
+                        .iter()
+                        .filter(|g| g.is_scroll() && goal_named(l, g))
+                        .map(|g| g.id),
+                );
+            }
         }
     }
 }
@@ -819,17 +865,10 @@ impl Model<'_> {
             return leaf_test(l, &self.event_value(&l.dim, i), 0);
         }
         let e = &self.ev[i];
-        let named = |g: &RefGoal| {
-            l.values.iter().any(|v| {
-                let by_label = if l.case_sensitive {
-                    *v == g.label
-                } else {
-                    v.eq_ignore_ascii_case(&g.label)
-                };
-                by_label || *v == g.id.to_string()
-            })
-        };
-        let hit = self.goals.iter().any(|g| named(g) && g.completed_by(e));
+        let hit = self
+            .goals
+            .iter()
+            .any(|g| goal_named(l, g) && g.completed_by(e));
         match l.op.as_str() {
             "is" => hit,
             "is_not" => !hit,
@@ -869,9 +908,17 @@ impl Model<'_> {
                     if entry && l.dim == "event:hostname" {
                         return leaf_test(l, self.entry(s).0, 0);
                     }
+                    // 目标叶子：完成叶子自己的滚动深度目标的 engagement 事件也算
+                    let scroll_ok = |e: &RefEvent| {
+                        l.dim == "event:goal"
+                            && self
+                                .goals
+                                .iter()
+                                .any(|g| g.is_scroll() && goal_named(l, g) && g.completed_by(e))
+                    };
                     self.sess[s].event_indices.iter().any(|&i| {
                         let e = &self.ev[i];
-                        e.kind() != EventKind::Engagement
+                        (e.kind() != EventKind::Engagement || scroll_ok(e))
                             && e.ts_ms >= iv.start
                             && e.ts_ms < iv.end
                             && self.event_leaf(l, i)
@@ -969,6 +1016,25 @@ impl Run<'_> {
         self.spec.metrics.iter().any(|m| m == metric)
     }
 
+    /// 事件 `i` 能否进入事件级的计数：非 engagement 事件都能；engagement 事件只在完成查询用到的滚动深度目标时
+    /// （过滤里目标叶子对上的；`with_dims` 且有 `event:goal` 维度时是站点的全部滚动深度目标）。
+    fn admitted(&self, i: usize, with_dims: bool) -> bool {
+        let m = self.m;
+        let e = &m.ev[i];
+        if e.kind() != EventKind::Engagement {
+            return true;
+        }
+        let mut ids = HashSet::new();
+        if let Some(f) = &self.spec.filter {
+            scroll_goals_in(f, m.goals, &mut ids);
+        }
+        let goal_dim = with_dims && self.spec.dims.iter().any(|d| d == "event:goal");
+        m.goals
+            .iter()
+            .filter(|g| g.is_scroll() && (goal_dim || ids.contains(&g.id)))
+            .any(|g| g.completed_by(e))
+    }
+
     /// 在区间 `iv` 上计算所有组件，按维度原始值分组。
     fn groups(&self, iv: &Iv) -> BTreeMap<Vec<String>, Acc> {
         let mut groups = self.groups_raw(iv);
@@ -999,7 +1065,7 @@ impl Run<'_> {
             || (self.needs("visits") && self.has_event_dim);
         if ev_needed {
             for (i, e) in m.ev.iter().enumerate() {
-                if m.owner[i].is_none() || e.kind() == EventKind::Engagement || !in_range(e.ts_ms) {
+                if m.owner[i].is_none() || !in_range(e.ts_ms) || !self.admitted(i, true) {
                     continue;
                 }
                 if filter.is_some_and(|f| !m.eval_event(f, i)) {
@@ -1008,7 +1074,9 @@ impl Run<'_> {
                 for key in m.event_keys(&spec.dims, i, self.gran, false) {
                     let a = groups.entry(key).or_default();
                     a.visitors.insert((m.clock.date(e.ts_ms), e.person));
-                    a.events += 1;
+                    if e.kind() != EventKind::Engagement {
+                        a.events += 1;
+                    }
                     if e.kind() == EventKind::Pageview {
                         a.pageviews += 1;
                     }
@@ -1110,9 +1178,9 @@ impl Run<'_> {
         let mut set: HashSet<(Date, u64)> = HashSet::new();
         for (i, e) in m.ev.iter().enumerate() {
             if m.owner[i].is_none()
-                || e.kind() == EventKind::Engagement
                 || e.ts_ms < iv.start
                 || e.ts_ms >= iv.end
+                || !self.admitted(i, false)
             {
                 continue;
             }

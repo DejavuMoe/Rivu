@@ -740,7 +740,7 @@ TTL minute + INTERVAL 90 DAY DELETE;
 | 指标 | `visitors` `visits` `pageviews` `events` `views_per_visit` `bounce_rate` `visit_duration` `engaged_duration` `percentage` `exit_rate` `time_on_page` `scroll_depth` `conversion_rate` | 分组转化率（`group_conversion_rate`） |
 | 维度 | `event:name` `event:page` `event:hostname` `event:goal` `visit:entry_page` `visit:exit_page` `visit:source` `visit:channel` `visit:referrer` `visit:utm_*` `visit:country` `visit:region` `visit:city` `visit:device` `visit:browser(_version)` `visit:os(_version)`、`time` `time:minute` `time:hour` `time:day` `time:week` `time:month`（`time:minute` 至多 1500 个桶，约 25 小时）；属性 `event:props:<k>`：取 `props[k]`，没有这个键的事件为 `(none)`，是事件级维度（不能配会话指标与 `time_on_page` `scroll_depth`），一次查询至多 8 个不同的键，键名只以参数出现，暂不走日汇总层 | — |
 | 过滤 | 上述维度（不含时间维度）上的 8 个叶子操作符，以及 `and` `or` `not`；`visit:city` 只支持 `is` `is_not`，取值是 GeoNames id；`event:goal` 只支持 `is` `is_not`，取值是目标的标签或 id；属性上的过滤是事件级叶子（会话指标上是「存在」语义） | `has_done` `has_not_done`、`["is","segment",[id]]` |
-| 目标 | 事件目标（事件名）与页面目标（pathname 通配），见 §6.6 | 滚动深度目标、目标的 props 条件（要改表结构） |
+| 目标 | 事件目标（事件名）、页面目标（pathname 通配）与滚动深度目标（pathname 通配 + 阈值 1–100），见 §6.6 | 目标的 props 条件（要改表结构） |
 | `date_range` | `day` `24h` `month` `year` `all` `realtime` `Nd` `Nmo` `[from, to]` | — |
 | `include` | `time_labels` `total_rows` `compare` | `imports`（未实现，直接是未知字段） |
 | 数据层 | 原始层（`events` 与 `sessions`）与日汇总层（§5.5、§6.4 选层） | — |
@@ -836,7 +836,7 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 | `time_on_page` | 按行计算，只看 engagement 事件：先对每个（维度值，会话）累加 `engagement_ms`，再 `sum(engagement_ms) / 1000 / 有 engagement 的会话数` |
 | `scroll_depth` | 按行计算：先对每个（维度值，会话）取 `max(scroll_depth ≤ 100)`，再对有有效 `scroll_depth` 的会话取平均，范围 0–100 |
 | `exit_rate` | 该页的退出次数 / 该页的 pageviews。退出次数是区间内活跃、最后一个 pageview 是该页的会话数，所以退出发生在区间之后时比值可以超过 1 |
-| `conversion_rate` | 完成目标的访客数 / 同范围、去掉目标过滤后的访客数（0–1）。要求 `event:goal` 维度或 `event:goal` 过滤，否则校验错误。**分子**是本行的 `visitors`（有目标过滤时只数完成目标的事件；有目标维度时只数完成本行目标的事件）。**分母**是另一个事件组件（转化分母组件）：同一区间、非 engagement 事件、过滤树去掉全部 `event:goal` 叶子（`and` / `or` 去掉这些子节点，子节点全被去掉的分支与 `not` 一并去掉，整棵树都是目标叶子时不过滤）、按本行**其余维度**（时间桶、来源等）分组的访客数；`event:goal` 维度在分母里展开成全部目标标签，所以同一组其余维度值下每个目标的分母相同。有维度时只返回有转化访客（分子 > 0）的行，没有转化的目标不出现。props 条件不在本期，没有可去掉的 props 过滤 |
+| `conversion_rate` | 完成目标的访客数 / 同范围、去掉目标过滤后的访客数（0–1；滚动深度目标见 §6.6 的近似）。要求 `event:goal` 维度或 `event:goal` 过滤，否则校验错误。**分子**是本行的 `visitors`（有目标过滤时只数完成目标的事件；有目标维度时只数完成本行目标的事件）。**分母**是另一个事件组件（转化分母组件）：同一区间、非 engagement 事件、过滤树去掉全部 `event:goal` 叶子（`and` / `or` 去掉这些子节点，子节点全被去掉的分支与 `not` 一并去掉，整棵树都是目标叶子时不过滤）、按本行**其余维度**（时间桶、来源等）分组的访客数；`event:goal` 维度在分母里展开成全部目标标签，所以同一组其余维度值下每个目标的分母相同。有维度时只返回有转化访客（分子 > 0）的行，没有转化的目标不出现。props 条件不在本期，没有可去掉的 props 过滤 |
 | `percentage` | 本行访客数 / 去掉维度后的访客总数（同一区间、同样的过滤，另一次查询）。要求至少一个维度，且不能带时间维度 |
 | `realtime` | `uniq(visitor_id)`，取最近 5 分钟、`name != 'engagement'` 的事件 |
 
@@ -850,17 +850,21 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 
 - 带 `event:page` 过滤时：`visitors` 和 `pageviews` 只统计**浏览过**该页的访客和浏览次数；`bounce_rate` 只统计**以该页为入口**的会话；其余会话指标统计**浏览过**该页的会话。这与 Plausible 相同（R03 §6.3）。保留这一语义是为了与 Plausible 导入的数据口径一致，同时必须明示。
 - **会话行上的事件级叶子是「存在」语义**：`event:name`、`event:page`、`event:hostname` 的叶子在会话指标上翻译成 `session_id IN (SELECT session_id FROM events WHERE name != 'engagement' AND <叶子条件>)`，意思是「会话在范围内有一个满足条件的事件」。所以在会话指标（`visits`、`views_per_visit`、`bounce_rate`、`visit_duration`、`engaged_duration`）上，`["is_not","event:page",["/a"]]`（有一个页面不是 `/a` 的事件）与 `["not",["is","event:page",["/a"]]]`（没有任何事件的页面是 `/a`）**不同**；在事件指标上两者相同，因为是逐事件判定。
-- **事件级的一切都不含 engagement**：`visitors`、`pageviews`、`events`、事件形式的 `visits`、上面的存在子查询都带 `name != 'engagement'`。反过来，`time_on_page` 与 `scroll_depth` 只看 engagement 事件，所以不能与 `event:name` 维度或过滤同用（它们算的是 engagement 事件，`event:name` 恒为 `engagement`）。`event:page` 等过滤对 engagement 事件的 `pathname` 照常生效。
+- **事件级的一切都不含 engagement**：`visitors`、`pageviews`、`events`、事件形式的 `visits`、上面的存在子查询都带 `name != 'engagement'`。唯一的例外是完成滚动深度目标的 engagement 事件（见下面的「目标」）。反过来，`time_on_page` 与 `scroll_depth` 只看 engagement 事件，所以不能与 `event:name` 维度或过滤同用（它们算的是 engagement 事件，`event:name` 恒为 `engagement`）。`event:page` 等过滤对 engagement 事件的 `pathname` 照常生效。
 - **组合限制**（不兼容的组合直接报错，不静默放行）：`percentage` 要求至少一个维度且不能带时间维度；`exit_rate` 要求维度恰好是 `[event:page]`，且不能带事件级过滤（`event:page` `event:hostname` `event:name`）；`event:name` 维度不能与会话指标（`bounce_rate` `visit_duration` `engaged_duration` `views_per_visit`）同用；时间维度至多一个、维度至多 4 个；`include.time_labels` 要求时间维度。
 - **时间维度上的会话**：会话级指标按会话在范围内**首次活跃**的桶计入，即 `max(started_at, 范围起点)` 所在的桶，所以各桶的 `visits` 之和等于整个范围的 `visits`。事件形式的 `visits`（有 `event:*` 维度）按事件时间分桶，同一会话的事件落在多个桶时各算一次，各桶之和可以大于总数。
 - **取值规则**：`is` 的取值若等于该维度的展示文案（`Direct / None`、`(not set)`、`(none)`），按空值匹配；`contains` 不匹配空串；`case_sensitive: false` 只做 ASCII 大小写折叠；`visit:city` 只支持 `is` `is_not`，取值是 GeoNames id。数量上限与正则限制见 §6.8。
 - `has_done` / `has_not_done` 通过 `session_id IN (…)` 实现（目前返回 `not supported yet`，§6.2）。
-- **目标（goal）**：Plausible 有三种（事件名、页面通配、滚动深度阈值），每个目标最多带 3 个 props 条件（R03 §6.4）。Rivu 本期只做前两种，不带 props 条件：
+- **目标（goal）**：Plausible 有三种（事件名、页面通配、滚动深度阈值），每个目标最多带 3 个 props 条件（R03 §6.4）。Rivu 三种都做，不带 props 条件：
   - **事件目标**：非 engagement 事件的 `name` 与目标的事件名完全相等（区分大小写）；
   - **页面目标**：`pageview` 事件，且规范化后的 pathname 整串匹配目标的通配模式：只有 `*` 是通配（匹配任意串，含空串与 `/`，连续的 `*` 合并），其余字符按字面、区分大小写，与屏蔽规则的 `page` 模式同一语义（SQL 里转成 `LIKE`，`%` `_` `\` 转义）；
-  - **标签**：显示名，否则事件名，否则页面通配；同一站点里标签唯一（添加时 409），是 `event:goal` 维度的取值；
+  - **滚动深度目标**：路径通配（同页面目标；添加时不给就是 `/*`，所有页面）加上阈值 N（1–100，百分比）。完成它的事件是 `engagement` 事件：pathname 整串匹配通配，且 `scroll_depth ≤ 100`、`scroll_depth ≥ N`。恰好 N% 算完成；`scroll_depth = 255`（采集脚本没有报告滚动位置）永远不算。访客在一次浏览里多次上报、或多次浏览都达到阈值，仍是一个访客；
+  - **engagement 事件只为滚动深度目标进入事件级的计数**：查询用到滚动深度目标时（`event:goal` 过滤叶子对上了它，或有 `event:goal` 维度，此时是站点的全部滚动深度目标），事件组件除了非 engagement 事件，还读完成这些目标的 engagement 事件，它们照常经过过滤树（`event:page`、来源等对 engagement 事件的字段照常生效），并计入 `visitors` 与事件形式的 `visits`。`events` 与 `pageviews` 只数非 engagement 事件，所以**滚动深度目标的行 `events`、`pageviews` 恒为 0**：滚动是在一次浏览中测量的，不是单独的事件，没有「完成次数」。事件 / 页面目标的行至少有一次完成，`events ≥ 1`，所以 `event:goal` 维度下 `events = 0` 的行只能是滚动深度目标（看板据此在目标卡片里把这一格留空）。不涉及滚动深度目标的查询，SQL 与没有滚动深度目标时完全相同；
+  - **标签**：显示名，否则事件名、页面通配，滚动深度目标是 `≥ N%`（与路径无关，所以同一阈值、不同路径的两个滚动深度目标要有一个带显示名）；同一站点里标签唯一（添加、编辑时 409），是 `event:goal` 维度的取值；同类同值唯一，滚动深度目标按（路径, 阈值）判定，同一路径不同阈值可以并存；
   - **`event:goal` 维度**：一个事件落进它完成的每个目标（按标签去重）的行，不完成任何目标的事件不出现，所以没有空值行；只能与 `visitors` `visits` `events` `pageviews` `conversion_rate` 同用（会话指标、`percentage`、`exit_rate`、`time_on_page`、`scroll_depth` 报错）；
-  - **`event:goal` 过滤**：`["is","event:goal",[…]]` 与 `is_not`，取值等于目标的标签（`case_sensitive: false` 时 ASCII 大小写折叠）或目标 id 的十进制文本；翻译成这些目标完成条件的 `OR`，不认识的取值对不上任何目标（`is` 恒假、`is_not` 恒真）。它是事件级叶子：在事件指标上逐事件判定，在会话指标上是「会话在范围内有完成目标的事件」（存在语义，同上）；不能与 `exit_rate`、`time_on_page`、`scroll_depth` 同用。
+  - **`event:goal` 过滤**：`["is","event:goal",[…]]` 与 `is_not`，取值等于目标的标签（`case_sensitive: false` 时 ASCII 大小写折叠）或目标 id 的十进制文本；翻译成这些目标完成条件的 `OR`，不认识的取值对不上任何目标（`is` 恒假、`is_not` 恒真）。它是事件级叶子：在事件指标上逐事件判定，在会话指标上是「会话在范围内有完成目标的事件」（存在语义，同上；滚动深度目标的存在子查询也读完成它的 engagement 事件，所以 `visits`、`bounce_rate` 等是完成了滚动深度目标的会话）；不能与 `exit_rate`、`time_on_page`、`scroll_depth` 同用。
+  - **滚动深度目标的转化率**：分子是完成它的访客，分母仍是同范围、去掉目标叶子后的非 engagement 事件的访客（与其他目标相同）。已知近似：访客的页面浏览在范围起点之前、只有 engagement 事件落在范围里时，算作完成却不在分母里，转化率可能略高（只发生在范围边界上的一次浏览）。
+  - **选层**：目标过滤是事件级过滤，`conversion_rate` 不走汇总层，`event:goal` 维度不在任何汇总族里，所以涉及目标的查询都在原始层，滚动深度目标也一样。
 - 未知的过滤组合直接报错，不静默放行。Plausible 的做法是返回 false 再记一条日志，只是不会泄露数据。
 
 ### 6.7 时间与时区

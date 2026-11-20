@@ -1,0 +1,54 @@
+---
+source: crates/query/src/sql_tests.rs
+expression: "render(&sql, &params)"
+---
+SELECT d0, sum(c_visitors) AS m0, sum(c_visits) AS m1, ifNotFinite(sum(c_b_bounces) / sum(c_b_n), 0) AS m2, ifNotFinite(sum(c_visitors) / sum(c_cr_base), 0) AS m3
+FROM (
+  SELECT toString(referrer_source) AS d0, uniq(visitor_id) AS c_visitors, toUInt64(0) AS c_visits, toUInt64(0) AS c_b_n, toUInt64(0) AS c_b_bounces, toUInt64(0) AS c_cr_base
+  FROM (
+    SELECT *
+    FROM events
+    WHERE site_id = {site:UInt64} AND toDate(ts) >= {from_date:Date} AND toDate(ts) <= {to_date:Date} AND ts >= fromUnixTimestamp64Milli({from_ms:Int64}, 'UTC') AND ts < fromUnixTimestamp64Milli({to_ms:Int64}, 'UTC') AND (name != 'engagement' OR ((name = 'engagement' AND scroll_depth >= {p0:UInt8} AND scroll_depth <= 100 AND pathname LIKE {p1:String}))) AND ((name = 'engagement' AND scroll_depth >= {p2:UInt8} AND scroll_depth <= 100 AND pathname LIKE {p3:String}))) AS e
+  GROUP BY d0
+  UNION ALL SELECT toString(a_source) AS d0, toUInt64(0) AS c_visitors, count() AS c_visits, count() AS c_b_n, countIf(s_pv <= 1 AND s_inter = 0) AS c_b_bounces, toUInt64(0) AS c_cr_base
+  FROM (
+    SELECT session_id, min(started_at) AS s_start, max(last_event_at) AS s_last, sum(pageviews) AS s_pv, sum(interactive_events) AS s_inter, sum(engagement_ms) AS s_eng, any(referrer_source) AS a_source
+    FROM sessions
+    WHERE site_id = {site:UInt64} AND start_date >= {s_from:Date} AND start_date <= {to_date:Date}
+    GROUP BY site_id, start_date, session_id
+    HAVING s_last >= fromUnixTimestamp64Milli({from_ms:Int64}, 'UTC') AND s_start < fromUnixTimestamp64Milli({to_ms:Int64}, 'UTC'))
+  WHERE session_id IN (
+    SELECT session_id
+    FROM events
+    WHERE site_id = {site:UInt64} AND toDate(ts) >= {from_date:Date} AND toDate(ts) <= {to_date:Date} AND ts >= fromUnixTimestamp64Milli({from_ms:Int64}, 'UTC') AND ts < fromUnixTimestamp64Milli({to_ms:Int64}, 'UTC') AND (name != 'engagement' OR ((name = 'engagement' AND scroll_depth >= {p4:UInt8} AND scroll_depth <= 100 AND pathname LIKE {p5:String}))) AND ((name = 'engagement' AND scroll_depth >= {p6:UInt8} AND scroll_depth <= 100 AND pathname LIKE {p7:String})))
+  GROUP BY d0
+  UNION ALL SELECT toString(referrer_source) AS d0, toUInt64(0) AS c_visitors, toUInt64(0) AS c_visits, toUInt64(0) AS c_b_n, toUInt64(0) AS c_b_bounces, uniq(visitor_id) AS c_cr_base
+  FROM (
+    SELECT *
+    FROM events
+    WHERE site_id = {site:UInt64} AND toDate(ts) >= {from_date:Date} AND toDate(ts) <= {to_date:Date} AND ts >= fromUnixTimestamp64Milli({from_ms:Int64}, 'UTC') AND ts < fromUnixTimestamp64Milli({to_ms:Int64}, 'UTC') AND name != 'engagement') AS e
+  GROUP BY d0)
+GROUP BY d0
+HAVING sum(c_visitors) > 0
+ORDER BY m0 DESC, d0 ASC
+LIMIT {p8:UInt64} OFFSET {p9:UInt64}
+
+-- params
+site: UInt64 = 4242
+from_ms: Int64 = 1792188000000
+to_ms: Int64 = 1792749600001
+from_date: Date = "2026-10-16"
+to_date: Date = "2026-10-23"
+s_from: Date = "2026-10-09"
+tz: String = "Europe/Berlin"
+wk: UInt8 = 7
+p0: UInt8 = 75
+p1: String = "/blog/%"
+p2: UInt8 = 75
+p3: String = "/blog/%"
+p4: UInt8 = 75
+p5: String = "/blog/%"
+p6: UInt8 = 75
+p7: String = "/blog/%"
+p8: UInt64 = 10000
+p9: UInt64 = 0

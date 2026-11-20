@@ -8204,7 +8204,7 @@ async fn goals_crud_permissions_and_goal_queries() {
         409,
         "conflict",
     );
-    // 400：类型、缺字段、多字段、事件名、页面通配、显示名、滚动深度与属性条件（不在本期）
+    // 400：类型、缺字段、多字段、事件名、页面通配、显示名、滚动深度缺阈值、属性条件（不在本期）
     for bad in [
         json!({"kind": "scroll", "page_path": "/a"}),
         json!({"kind": "event"}),
@@ -8365,6 +8365,286 @@ async fn goals_crud_permissions_and_goal_queries() {
         .await
         .unwrap();
     assert_eq!(n, 5, "软删除的行仍在");
+
+    cleanup(&env, &[site.id, other.id]).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scroll_goals_crud_validation_and_permissions() {
+    let Some(env) = test_env("scroll_goals") else {
+        return;
+    };
+    migrate_once(&env).await;
+    let pg = rivu_storage_pg::connect(&env.pg_url, 6).await.unwrap();
+    let server = start(&env, &pg, &config(&env, &[]), Some(loose())).await;
+    let http = &server.http;
+    let c = cast(&pg, http).await;
+    let site = make_site(&pg, &c.org, false).await;
+    let other = make_site(&pg, &c.org, false).await;
+    let ge = guest_of(&pg, &site, "editor").await;
+    let ge_cookie = login_cookie(http, &ge.email).await;
+    let gv = guest_of(&pg, &site, "viewer").await;
+    let gv_cookie = login_cookie(http, &gv.email).await;
+    let gp = site_path(site.id, "/goals");
+    let add = |cookie: &str, body: Value| {
+        let cookie = cookie.to_owned();
+        let gp = gp.clone();
+        async move { http.post(&gp, &body).cookie(&cookie).send().await }
+    };
+    let edit = |cookie: &str, id: String, body: Value| {
+        let cookie = cookie.to_owned();
+        let path = format!("{gp}/{id}");
+        async move { http.patch(&path, &body).cookie(&cookie).send().await }
+    };
+
+    // ---- 添加：路径通配规范化，默认标签是 `≥ N%`
+    let v = expect(
+        &add(
+            &ge_cookie,
+            json!({"kind": "scroll", "page_path": " /blog/** ", "scroll_threshold": 75}),
+        )
+        .await,
+        201,
+    );
+    let g = &v["goal"];
+    assert_eq!(g["kind"], "scroll");
+    assert_eq!(g["page_path"], "/blog/*");
+    assert_eq!(g["scroll_threshold"], 75);
+    assert_eq!(g["event_name"], Value::Null);
+    assert_eq!(g["label"], "≥ 75%");
+    let blog75 = g["id"].as_i64().unwrap();
+    // 同一路径、不同阈值可以并存（标签不同）
+    let v = expect(
+        &add(
+            &c.editor,
+            json!({"kind": "scroll", "page_path": "/blog/*", "scroll_threshold": 100, "display_name": "Read all"}),
+        )
+        .await,
+        201,
+    );
+    let blog100 = v["goal"]["id"].as_i64().unwrap();
+    assert_eq!(v["goal"]["label"], "Read all");
+    // 不给路径：所有页面
+    let v = expect(
+        &add(&c.owner, json!({"kind": "scroll", "scroll_threshold": 50})).await,
+        201,
+    );
+    assert_eq!(v["goal"]["page_path"], "/*");
+    assert_eq!(v["goal"]["label"], "≥ 50%");
+    // 页面目标照旧，列表里带 scroll_threshold（其余为 null）
+    expect(
+        &add(&c.owner, json!({"kind": "page", "page_path": "/blog/*"})).await,
+        201,
+    );
+    let list = expect(&http.get(&gp).cookie(&ge_cookie).send().await, 200);
+    let rows: Vec<(String, Value)> = list["goals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| {
+            (
+                g["label"].as_str().unwrap().to_owned(),
+                g["scroll_threshold"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            ("≥ 75%".to_owned(), json!(75)),
+            ("Read all".to_owned(), json!(100)),
+            ("≥ 50%".to_owned(), json!(50)),
+            ("/blog/*".to_owned(), Value::Null),
+        ]
+    );
+
+    // ---- 409：同路径同阈值；默认标签撞了（另一个路径的 75%）
+    expect_err(
+        &add(
+            &c.owner,
+            json!({"kind": "scroll", "page_path": "/blog/*", "scroll_threshold": 75, "display_name": "Other"}),
+        )
+        .await,
+        409,
+        "conflict",
+    );
+    expect_err(
+        &add(
+            &c.owner,
+            json!({"kind": "scroll", "page_path": "/docs/*", "scroll_threshold": 75}),
+        )
+        .await,
+        409,
+        "conflict",
+    );
+    expect(
+        &add(
+            &c.owner,
+            json!({"kind": "scroll", "page_path": "/docs/*", "scroll_threshold": 75, "display_name": "Docs read"}),
+        )
+        .await,
+        201,
+    );
+
+    // ---- 400：阈值缺失、越界、不是整数；滚动目标带事件名；其他类型带阈值
+    for bad in [
+        json!({"kind": "scroll", "page_path": "/a"}),
+        json!({"kind": "scroll", "page_path": "/a", "scroll_threshold": 0}),
+        json!({"kind": "scroll", "page_path": "/a", "scroll_threshold": 101}),
+        json!({"kind": "scroll", "page_path": "/a", "scroll_threshold": "50"}),
+        json!({"kind": "scroll", "page_path": "/a", "scroll_threshold": 50.5}),
+        json!({"kind": "scroll", "page_path": "no-slash", "scroll_threshold": 50}),
+        json!({"kind": "scroll", "event_name": "A", "scroll_threshold": 50}),
+        json!({"kind": "page", "page_path": "/a", "scroll_threshold": 50}),
+        json!({"kind": "event", "event_name": "A", "scroll_threshold": 50}),
+    ] {
+        let r = add(&c.owner, bad.clone()).await;
+        assert_eq!(r.status, 400, "{bad}: {}", r.body);
+    }
+
+    // ---- 编辑：整体替换，id 不变
+    let v = expect(
+        &edit(
+            &ge_cookie,
+            blog75.to_string(),
+            json!({"kind": "scroll", "page_path": "/blog/*", "scroll_threshold": 60}),
+        )
+        .await,
+        200,
+    );
+    assert_eq!(v["goal"]["id"], blog75);
+    assert_eq!(v["goal"]["scroll_threshold"], 60);
+    assert_eq!(v["goal"]["label"], "≥ 60%");
+    // 改成别的类型也可以
+    let v = expect(
+        &edit(
+            &c.editor,
+            blog75.to_string(),
+            json!({"kind": "page", "page_path": "/blog/x", "display_name": "Blog x"}),
+        )
+        .await,
+        200,
+    );
+    assert_eq!(v["goal"]["kind"], "page");
+    assert_eq!(v["goal"]["scroll_threshold"], Value::Null);
+    expect(
+        &edit(
+            &c.editor,
+            blog75.to_string(),
+            json!({"kind": "scroll", "page_path": "/blog/*", "scroll_threshold": 60}),
+        )
+        .await,
+        200,
+    );
+    // 和自己相同不算重复；撞到另一个目标的取值或标签 409
+    expect(
+        &edit(
+            &c.owner,
+            blog100.to_string(),
+            json!({"kind": "scroll", "page_path": "/blog/*", "scroll_threshold": 100, "display_name": "Read all"}),
+        )
+        .await,
+        200,
+    );
+    expect_err(
+        &edit(
+            &c.owner,
+            blog100.to_string(),
+            json!({"kind": "scroll", "page_path": "/blog/*", "scroll_threshold": 60}),
+        )
+        .await,
+        409,
+        "conflict",
+    );
+    expect_err(
+        &edit(
+            &c.owner,
+            blog100.to_string(),
+            json!({"kind": "scroll", "page_path": "/x", "scroll_threshold": 1, "display_name": "Docs read"}),
+        )
+        .await,
+        409,
+        "conflict",
+    );
+    let r = edit(
+        &c.owner,
+        blog100.to_string(),
+        json!({"kind": "scroll", "page_path": "/blog/*", "scroll_threshold": 0}),
+    )
+    .await;
+    assert_eq!(r.status, 400, "{}", r.body);
+    // 不存在、非整数 id、别的站点：404
+    let body = json!({"kind": "scroll", "page_path": "/z", "scroll_threshold": 10});
+    for id in ["999999999", "abc"] {
+        expect_err(
+            &edit(&c.owner, id.to_owned(), body.clone()).await,
+            404,
+            "not_found",
+        );
+    }
+    expect_err(
+        &http
+            .patch(&site_path(other.id, &format!("/goals/{blog100}")), &body)
+            .cookie(&c.owner)
+            .send()
+            .await,
+        404,
+        "not_found",
+    );
+
+    // ---- 权限：viewer、站点访客 viewer 不能写（403），外人 404，没有会话 401
+    for cookie in [&c.viewer, &gv_cookie] {
+        expect_err(
+            &add(cookie, json!({"kind": "scroll", "scroll_threshold": 10})).await,
+            403,
+            "forbidden",
+        );
+        expect_err(
+            &edit(cookie, blog100.to_string(), body.clone()).await,
+            403,
+            "forbidden",
+        );
+        expect_err(
+            &http
+                .delete(&format!("{gp}/{blog100}"))
+                .cookie(cookie)
+                .send()
+                .await,
+            403,
+            "forbidden",
+        );
+    }
+    expect_err(
+        &edit(&c.outsider, blog100.to_string(), body.clone()).await,
+        404,
+        "not_found",
+    );
+    let r = http.patch(&format!("{gp}/{blog100}"), &body).send().await;
+    assert_eq!(r.status, 401, "{}", r.body);
+
+    // ---- 删除
+    expect(
+        &http
+            .delete(&format!("{gp}/{blog100}"))
+            .cookie(&ge_cookie)
+            .send()
+            .await,
+        204,
+    );
+    expect_err(
+        &edit(&c.owner, blog100.to_string(), body.clone()).await,
+        404,
+        "not_found",
+    );
+    // 删除后同样的目标可以再加
+    expect(
+        &add(
+            &c.owner,
+            json!({"kind": "scroll", "page_path": "/blog/*", "scroll_threshold": 100}),
+        )
+        .await,
+        201,
+    );
 
     cleanup(&env, &[site.id, other.id]).await;
 }

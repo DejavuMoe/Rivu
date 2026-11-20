@@ -11,7 +11,9 @@
 //!    Asia/Kathmandu + 周日起始），若干 QuerySpec 的 HTTP 响应与直接调用 `rivu_query::execute` 的结果
 //!    **逐字节**相等（同一个「现在」、同一份站点上下文），并核对 `log_comment` 带 route / site / org / api_key_id；
 //! 2. `errors_follow_the_documented_chain`：400 / 401 / 403 / 404 与 schema.json；
-//! 3. `hourly_quota_exhaustion_is_429_with_headers`：组织小时配额用尽后 429 + `Retry-After` + `X-RateLimit-*`。
+//! 3. `hourly_quota_exhaustion_is_429_with_headers`：组织小时配额用尽后 429 + `Retry-After` + `X-RateLimit-*`；
+//! 4. `scroll_goals_count_at_the_threshold`：滚动深度目标（目标从 PG 现读）的阈值边界（恰好 N%、N − 1、
+//!    没有滚动深度即 255、路径不匹配），以及事件 / 页面目标的结果与站点没有滚动深度目标时相同。
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -28,7 +30,7 @@ use rivu::{api_auth, migrate, public};
 use rivu_common::config::{BufferConfig, ChAccount, Config, Env, Role, Secret};
 use rivu_geo::GeoDb;
 use rivu_ingest::pipeline::{Outcome, Pipeline, RequestCtx, SaltCache, SiteSnapshot};
-use rivu_query::{ExecOptions, QuerySpec, SiteContext, TenantScope, execute};
+use rivu_query::{ExecOptions, GoalDef, QuerySpec, SiteContext, TenantScope, execute};
 use rivu_storage_pg::sites::NewSite;
 use rivu_ua::UaParser;
 use rivu_writer::{BatchWriter, ChSink, WriterOptions};
@@ -512,7 +514,10 @@ fn body_for(site: &Site, e: &Ev) -> Value {
     let mut body = json!({"v": 1, "sv": 1, "s": site.key, "n": e.name, "u": url});
     if e.name == "engagement" {
         body["e"] = json!(e.e.unwrap());
-        body["sd"] = json!(e.sd.unwrap());
+        // 没有 sd：入库为 255（没有滚动深度）
+        if let Some(sd) = e.sd {
+            body["sd"] = json!(sd);
+        }
     } else if let Some(r) = e.referrer {
         body["r"] = json!(r);
     }
@@ -521,6 +526,17 @@ fn body_for(site: &Site, e: &Ev) -> Value {
 
 /// 把 `known_events` 经真实管线写进这些站点（固定的历史时间，所以先备好那几天的盐），返回每个站点被接受的事件数。
 async fn ingest(env: &TestEnv, pg: &PgPool, sites: &[Site], geo: &Arc<GeoDb>) -> Vec<usize> {
+    ingest_events(env, pg, sites, geo, &known_events()).await
+}
+
+/// 把给定的事件经真实管线写进这些站点。
+async fn ingest_events(
+    env: &TestEnv,
+    pg: &PgPool,
+    sites: &[Site],
+    geo: &Arc<GeoDb>,
+    events: &[Ev],
+) -> Vec<usize> {
     let mut days = Vec::new();
     let mut d = date(2026, 3, 6);
     while d <= date(2026, 3, 14) {
@@ -561,11 +577,10 @@ async fn ingest(env: &TestEnv, pg: &PgPool, sites: &[Site], geo: &Arc<GeoDb>) ->
         ua_parser(),
         Arc::clone(geo),
     );
-    let events = known_events();
     let mut accepted = Vec::new();
     for site in sites {
         let mut n = 0;
-        for e in &events {
+        for e in events {
             let out = pipeline.process(
                 body_for(site, e).to_string().as_bytes(),
                 RequestCtx {
@@ -589,6 +604,16 @@ async fn ingest(env: &TestEnv, pg: &PgPool, sites: &[Site], geo: &Arc<GeoDb>) ->
 
 /// 与处理函数相同的站点上下文与「现在」，直接调 `rivu_query::execute`；返回结果的 JSON 文本。
 async fn direct(server: &Server, site: &Site, spec: &Value) -> (String, Value) {
+    direct_with(server, site, spec, Vec::new()).await
+}
+
+/// 同 [`direct`]，站点上下文带给定的目标。
+async fn direct_with(
+    server: &Server,
+    site: &Site,
+    spec: &Value,
+    goals: Vec<GoalDef>,
+) -> (String, Value) {
     let ctx = SiteContext {
         site_id: site.id,
         site_key: Some(site.key.clone()),
@@ -596,7 +621,7 @@ async fn direct(server: &Server, site: &Site, spec: &Value) -> (String, Value) {
         week_starts_on: site.week_start,
         geo_attribution: server.geo.attribution(),
         geo_capability: server.geo.capability(),
-        goals: Vec::new(),
+        goals,
         retention_days: None,
         imported: None,
         completed_import_ids: Vec::new(),
@@ -1396,4 +1421,229 @@ async fn hourly_quota_exhaustion_is_429_with_headers() {
     assert_eq!(r.status, 200);
 
     cleanup(&env, &[site.id, other_site.id]).await;
+}
+
+// ------------------------------------------------------------------ 用例 4
+
+/// 2026-03-10，6 个人各一个会话：都先浏览一个页面，再按下表上报 engagement（`sd` 为 `None` 时入库是 255）。
+fn scroll_events() -> Vec<Ev> {
+    let d = date(2026, 3, 10);
+    let ev = |person: usize, min: i8, name: &'static str, path: &'static str, sd: Option<u8>| Ev {
+        ts_ms: at(d, 9 + person as i8, min, 0),
+        person,
+        name,
+        path,
+        referrer: None,
+        utm: None,
+        e: (name == "engagement").then_some(4000),
+        sd,
+    };
+    let mut out = vec![
+        // 59%：差 1 不算
+        ev(0, 0, "pageview", "/blog/a", None),
+        ev(0, 1, "engagement", "/blog/a", Some(59)),
+        // 恰好 60%：算；同一会话再滚到 70% 也只算一个访客
+        ev(1, 0, "pageview", "/blog/a", None),
+        ev(1, 1, "engagement", "/blog/a", Some(60)),
+        ev(1, 2, "engagement", "/blog/a", Some(70)),
+        // 没有滚动深度（255）：永远不算
+        ev(2, 0, "pageview", "/blog/a", None),
+        ev(2, 1, "engagement", "/blog/a", None),
+        // 100%：两个阈值都算
+        ev(3, 0, "pageview", "/blog/a", None),
+        ev(3, 1, "engagement", "/blog/a", Some(100)),
+        // 路径不匹配
+        ev(4, 0, "pageview", "/pricing", None),
+        ev(4, 1, "engagement", "/pricing", Some(80)),
+        // 只有页面浏览和自定义事件
+        ev(5, 0, "pageview", "/blog/b", None),
+        ev(5, 1, "Signup", "/blog/b", None),
+    ];
+    out.sort_by_key(|e| e.ts_ms);
+    out
+}
+
+fn goal_rows(v: &Value) -> Vec<(String, Vec<f64>)> {
+    v["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            (
+                r["dimensions"][0].as_str().unwrap().to_owned(),
+                r["metrics"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|m| m.as_f64().unwrap())
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+/// 目标的 `(kind, 事件名, 页面通配, 滚动阈值, 显示名)`。
+type GoalSpec = (
+    &'static str,
+    Option<&'static str>,
+    Option<&'static str>,
+    Option<u8>,
+    Option<&'static str>,
+);
+
+#[tokio::test]
+async fn scroll_goals_count_at_the_threshold() {
+    let Some(env) = test_env("scroll_goals_count_at_the_threshold") else {
+        return;
+    };
+    migrate_once(&env).await;
+    let pg = rivu_storage_pg::connect(&env.pg_url, 8)
+        .await
+        .expect("连接 PG");
+    let org = make_org(&pg).await;
+    let site = make_site(&pg, &org, "UTC", Weekday::Monday, false).await;
+    let key = new_key(&pg, &org, &["stats:read"]).await;
+    // 目标存进 PG：HTTP 端点每次查询现读
+    use rivu_storage_pg::goals::{AddGoalOutcome, NewGoal, add_goal};
+    let defs: [GoalSpec; 5] = [
+        ("event", Some("Signup"), None, None, None),
+        ("page", None, Some("/blog/*"), None, None),
+        ("scroll", None, Some("/blog/*"), Some(60), None),
+        ("scroll", None, Some("/blog/*"), Some(100), Some("Read all")),
+        ("scroll", None, Some("/*"), Some(1), Some("Any scroll")),
+    ];
+    let mut goals = Vec::new();
+    for (kind, e, p, t, d) in defs {
+        let out = add_goal(
+            &pg,
+            &NewGoal {
+                site_id: site.id,
+                kind,
+                event_name: e,
+                page_path: p,
+                scroll_threshold: t,
+                display_name: d,
+            },
+            100,
+        )
+        .await
+        .unwrap();
+        let AddGoalOutcome::Added(id) = out else {
+            panic!("{out:?}");
+        };
+        goals.push(GoalDef::from_parts(id, kind, e, p, t, d).unwrap());
+    }
+    let classic: Vec<GoalDef> = goals
+        .iter()
+        .filter(|g| !g.kind.is_scroll())
+        .cloned()
+        .collect();
+    let server = start_server(&env, &pg).await;
+    ingest_events(
+        &env,
+        &pg,
+        std::slice::from_ref(&site),
+        &server.geo,
+        &scroll_events(),
+    )
+    .await;
+
+    let range = json!(["2026-03-10", "2026-03-10"]);
+    let http_query = |spec: Value| {
+        let mut spec = spec;
+        spec["site"] = json!(site.key);
+        let key = key.key.clone();
+        let http = &server.http;
+        async move {
+            let r = http.query(Some(&key), &spec).await;
+            assert_eq!(r.status, 200, "{spec}: {}", r.body);
+            (spec, r.json())
+        }
+    };
+
+    // ---- 目标维度：滚动深度目标只有访客、会话与转化率有意义，events / pageviews 为 0
+    let (spec, v) = http_query(json!({
+        "metrics": ["visitors", "visits", "events", "pageviews", "conversion_rate"],
+        "date_range": range, "dimensions": ["event:goal"],
+        "order_by": [["event:goal", "asc"]]
+    }))
+    .await;
+    // HTTP（目标从 PG 读）与带同样目标的直接执行逐字段相等
+    assert_eq!(v, direct_with(&server, &site, &spec, goals.clone()).await.1);
+    let rows = goal_rows(&v);
+    let denom = 6.0;
+    assert_eq!(
+        rows,
+        [
+            ("/blog/*".to_owned(), vec![5.0, 5.0, 5.0, 5.0, 5.0 / denom]),
+            // 59%、60%、100%、/pricing 的 80%；255 不算
+            (
+                "Any scroll".to_owned(),
+                vec![4.0, 4.0, 0.0, 0.0, 4.0 / denom]
+            ),
+            ("Read all".to_owned(), vec![1.0, 1.0, 0.0, 0.0, 1.0 / denom]),
+            ("Signup".to_owned(), vec![1.0, 1.0, 1.0, 0.0, 1.0 / denom]),
+            // 恰好 60% 与 100%
+            ("≥ 60%".to_owned(), vec![2.0, 2.0, 0.0, 0.0, 2.0 / denom]),
+        ],
+        "{v}"
+    );
+    // 事件 / 页面目标的行与站点没有滚动深度目标时完全相同
+    let (_, without) = direct_with(&server, &site, &spec, classic.clone()).await;
+    let classic_rows: Vec<_> = rows
+        .iter()
+        .filter(|(l, _)| l == "/blog/*" || l == "Signup")
+        .cloned()
+        .collect();
+    assert_eq!(goal_rows(&without), classic_rows);
+
+    // ---- 目标过滤：访客与会话是完成的人，分母照旧
+    let (spec, v) = http_query(json!({
+        "metrics": ["visitors", "visits", "pageviews", "bounce_rate", "conversion_rate"],
+        "date_range": range,
+        "filters": [["is", "event:goal", ["≥ 60%"]]]
+    }))
+    .await;
+    assert_eq!(v, direct_with(&server, &site, &spec, goals.clone()).await.1);
+    let m: Vec<f64> = v["results"][0]["metrics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_f64().unwrap())
+        .collect();
+    assert_eq!(m[..3], [2.0, 2.0, 0.0], "{v}");
+    assert!((m[4] - 2.0 / denom).abs() < 1e-12, "{v}");
+    // is_not 与事件 / 页面目标的过滤：与站点没有滚动深度目标时相同
+    for filter in [
+        json!(["is_not", "event:goal", ["≥ 60%"]]),
+        json!(["is", "event:goal", ["Signup", "/blog/*"]]),
+        json!(["is_not", "event:goal", ["Signup"]]),
+    ] {
+        let spec = json!({
+            "site": site.key,
+            "metrics": ["visitors", "visits", "pageviews", "events", "bounce_rate"],
+            "date_range": range, "filters": [filter]
+        });
+        let with = direct_with(&server, &site, &spec, goals.clone()).await.1;
+        let without = direct_with(&server, &site, &spec, classic.clone()).await.1;
+        assert_eq!(with["results"], without["results"], "{spec}");
+    }
+    // 不涉及目标的查询不受影响：滚动深度目标不会把 engagement 事件带进访客数
+    let (_, v) = http_query(json!({
+        "metrics": ["visitors", "events"], "date_range": range,
+        "dimensions": ["event:page"], "order_by": [["event:page", "asc"]]
+    }))
+    .await;
+    let pages = goal_rows(&v);
+    assert_eq!(
+        pages,
+        [
+            ("/blog/a".to_owned(), vec![4.0, 4.0]),
+            ("/blog/b".to_owned(), vec![1.0, 2.0]),
+            ("/pricing".to_owned(), vec![1.0, 1.0]),
+        ],
+        "{v}"
+    );
+
+    cleanup(&env, &[site.id]).await;
 }
