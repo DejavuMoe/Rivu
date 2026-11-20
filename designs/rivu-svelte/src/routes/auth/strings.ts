@@ -89,9 +89,9 @@ extend({
   "inv.acc.mismatch": ["当前登录的账号与邀请的邮箱不一致。", "The signed-in account doesn't match the invited email."],
   "inv.acc.needSignIn": ["请先登录后再接受邀请。", "Sign in first to accept this invitation."],
 
-  // ---- 确认周报邮箱（邮件里的链接）----
-  "wconfirm.title": ["确认接收周报", "Confirm weekly reports"],
-  "wconfirm.body": ["确认后，{email} 可以接收 Rivu 的站点周报。", "After you confirm, {email} can receive Rivu weekly site reports."],
+  // ---- 确认邮件订阅的邮箱（邮件里的链接）----
+  "wconfirm.title": ["确认接收邮箱", "Confirm your email"],
+  "wconfirm.body": ["确认后，{email} 可以接收 Rivu 的站点周报和月报。", "After you confirm, {email} can receive Rivu weekly and monthly site reports."],
   "wconfirm.submit": ["确认邮箱", "Confirm email"],
   "wconfirm.failed": ["确认失败，请稍后重试。", "Couldn't confirm. Try again shortly."],
   "wconfirm.doneTitle": ["邮箱已确认", "Email confirmed"],
@@ -110,7 +110,7 @@ extend({
   "econfirm.doneTitle": ["登录邮箱已修改", "Sign-in email changed"],
   "econfirm.doneBody": ["现在用 {email} 登录。其他设备已退出登录。", "You now sign in with {email}. Other devices were signed out."],
   "econfirm.doneBodySignedOut": ["所有设备都已退出，用 {email} 重新登录。", "You've been signed out everywhere. Sign in again with {email}."],
-  "econfirm.reportsMoved": ["周报也改发到这个邮箱。", "Weekly reports now go to this email too."],
+  "econfirm.reportsMoved": ["邮件订阅也改发到这个邮箱。", "Your email subscriptions now go to this email too."],
   "econfirm.toAccount": ["回到账号页", "Back to account"],
   "econfirm.toLogin": ["去登录", "Sign in"],
   "econfirm.invalidTitle": ["链接已失效", "This link has expired"],
