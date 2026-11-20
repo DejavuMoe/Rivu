@@ -234,7 +234,9 @@
   }
   .main {
     border: var(--hairline) solid var(--border-subtle);
-    border-radius: var(--r-md);
+    border-radius: var(--r-lg);
+    background: var(--bg-app);
+    box-shadow: var(--shadow-card);
     overflow: hidden;
   }
   .chart-head {

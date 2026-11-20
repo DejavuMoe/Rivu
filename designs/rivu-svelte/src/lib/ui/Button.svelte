@@ -111,18 +111,20 @@
     width: 100%;
   }
 
+  /* 主操作是墨色的，与标志一致；颜色留给数据 */
   .primary {
-    background: var(--accent-solid);
-    color: var(--accent-contrast);
+    background: var(--ink);
+    color: var(--ink-contrast);
   }
   .primary:hover:not(:disabled) {
-    background: var(--accent-solid-hover);
+    background: var(--ink-hover);
   }
 
   .secondary {
     background: var(--bg-app);
     border-color: var(--border);
     color: var(--text);
+    box-shadow: var(--shadow-control);
   }
   .secondary:hover:not(:disabled),
   .secondary.active {

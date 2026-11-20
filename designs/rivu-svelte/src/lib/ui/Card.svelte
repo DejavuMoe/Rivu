@@ -1,5 +1,5 @@
 <!--
-  卡片：0.5px 描边、无阴影。header 区放标题和右侧动作（不放描述）；footer 区放保存按钮或必要的署名。
+  卡片：水面上的一张纸。0.5px 描边，浅色模式有一层几乎看不见的影子把纸托起来。header 区放标题和右侧动作（不放描述）；footer 区放保存按钮或必要的署名。
   flush 去掉内容区内边距（表格、列表直接贴边）。
 -->
 <script lang="ts">
@@ -42,6 +42,7 @@
     background: var(--bg-app);
     border: var(--hairline) solid var(--border-subtle);
     border-radius: var(--r-md);
+    box-shadow: var(--shadow-card);
   }
   .danger {
     border-color: var(--bad-border);

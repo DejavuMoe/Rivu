@@ -115,8 +115,8 @@
     justify-content: space-between;
     gap: 12px;
     width: 100%;
-    height: 32px;
-    margin-bottom: 2px;
+    height: 34px;
+    margin-bottom: 3px;
     padding: 0 8px;
     border: 0;
     border-radius: var(--r-xs);
@@ -143,8 +143,17 @@
     transition:
       width var(--dur) var(--ease-move),
       background-color var(--dur-fast) var(--ease);
-    animation: bar-grow var(--dur) var(--ease);
+    animation: bar-grow var(--dur-arrive) var(--ease-settle) backwards;
   }
+  /* 条形一条接一条地长出来 */
+  .row:nth-child(2) .bar { animation-delay: 30ms; }
+  .row:nth-child(3) .bar { animation-delay: 60ms; }
+  .row:nth-child(4) .bar { animation-delay: 90ms; }
+  .row:nth-child(5) .bar { animation-delay: 120ms; }
+  .row:nth-child(6) .bar { animation-delay: 150ms; }
+  .row:nth-child(7) .bar { animation-delay: 180ms; }
+  .row:nth-child(8) .bar { animation-delay: 210ms; }
+  .row:nth-child(n + 9) .bar { animation-delay: 240ms; }
   @keyframes bar-grow {
     from {
       width: 0;

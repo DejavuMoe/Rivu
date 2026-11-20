@@ -296,7 +296,9 @@
   }
   .main {
     border: var(--hairline) solid var(--border-subtle);
-    border-radius: var(--r-md);
+    border-radius: var(--r-lg);
+    background: var(--bg-app);
+    box-shadow: var(--shadow-card);
     overflow: hidden;
   }
   .strip {
@@ -320,9 +322,11 @@
     color: var(--text-muted);
   }
   .value {
-    font-size: var(--fs-xl);
+    font-family: var(--font-display);
+    font-size: var(--fs-2xl);
     font-weight: var(--fw-semibold);
-    line-height: var(--lh-tight);
+    line-height: var(--lh-display);
+    letter-spacing: var(--track-display);
     white-space: nowrap;
   }
   .chart-head {

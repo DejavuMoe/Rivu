@@ -1,0 +1,16 @@
+/*
+ * 展示字体 Bricolage Grotesque（SIL Open Font License 1.1，许可全文见同目录 OFL-bricolage-grotesque.txt）。
+ * 文件取自 @fontsource-variable/bricolage-grotesque 5.3.0 的拉丁子集、只带字重轴的那一份（41 KB），随应用打包，不从第三方加载。
+ * 只用于数字与标题：指标数值、页面标题、登录页标题。
+ */
+@font-face {
+  font-family: "Bricolage Grotesque Variable";
+  font-style: normal;
+  font-display: swap;
+  /* design-lint-allow font-weight: 可变字体在这里声明它支持的字重范围，不是在用字重 */
+  font-weight: 200 800;
+  src: url("./bricolage-grotesque-latin-wght-normal.woff2") format("woff2-variations");
+  unicode-range:
+    U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122,
+    U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}

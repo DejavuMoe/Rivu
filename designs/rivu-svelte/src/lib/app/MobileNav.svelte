@@ -86,7 +86,7 @@
       gap: var(--sp-2);
       height: 52px;
       padding: 0 var(--sp-2);
-      background: var(--bg-app);
+      background: var(--bg-canvas);
       border-bottom: var(--hairline) solid var(--border-subtle);
     }
   }
@@ -111,7 +111,7 @@
     padding: 0;
     border: 0;
     border-radius: 0 var(--r-lg) var(--r-lg) 0;
-    background: var(--bg-subtle);
+    background: var(--bg-canvas);
     color: var(--text);
     box-shadow: var(--shadow-pop);
     overflow: hidden;

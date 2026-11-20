@@ -219,13 +219,15 @@
     background: var(--bg-app);
     border: var(--hairline) solid var(--border-subtle);
     border-radius: var(--r-md);
+    box-shadow: var(--shadow-card);
     transition:
-      background-color var(--dur-fast) var(--ease),
-      border-color var(--dur-fast) var(--ease);
+      border-color var(--dur-fast) var(--ease),
+      transform var(--dur) var(--ease-settle);
   }
+  /* 悬停时纸被轻轻托起一点 */
   .site:hover {
-    background: var(--bg-subtle);
-    border-color: var(--border);
+    border-color: var(--border-hover);
+    transform: translateY(-2px);
   }
   .site:focus-within {
     border-color: var(--accent-focus);
@@ -281,9 +283,11 @@
     font-size: var(--fs-sm);
   }
   .value {
-    font-size: var(--fs-xl);
+    font-family: var(--font-display);
+    font-size: var(--fs-2xl);
     font-weight: var(--fw-semibold);
-    line-height: var(--lh-tight);
+    line-height: var(--lh-display);
+    letter-spacing: var(--track-display);
   }
   .failed {
     color: var(--text-muted);

@@ -4,15 +4,16 @@
 // It enforces the mechanical part of apps/dashboard/DESIGN.md section 1, so a rule holds because a wrong value
 // fails CI, not because someone remembered it:
 //   raw-color    colors come from tokens.css only: no hex, rgb(), hsl(), and no Radix scale steps in components
-//   font-size    only var(--fs-*) (four sizes)
+//   font-size    only var(--fs-*)
 //   font-weight  only var(--fw-*)
 //   border       border widths are var(--hairline) or 0
 //   radius       var(--r-*), or 0 / 1px / 2px / 50% / inherit
-//   shadow       var(--shadow-pop), var(--focus-ring), or a hairline ring
-//   effect       no gradients, no backdrop-filter, no blur
+//   shadow       the shadow tokens, var(--focus-ring), or a hairline ring
+//   effect       no gradients, no backdrop-filter, no blur in components (gradients live in tokens.css as tokens)
 //   motion       transition and animation durations use var(--dur*)
 //   middle-dot   no "·" in interface copy
 //   drift        tokens and shared components are byte-identical in the prototype and in production
+//                (suspended while an approved redesign waits to be implemented; see SYNC_SUSPENDED below)
 //
 // A deliberate exception stays next to the code, with its reason:
 //   /* design-lint-allow raw-color: QR codes need a white background */     (CSS, same line or the line above)
@@ -37,6 +38,10 @@ const SHARED = [
   { dir: "styles", path: "tokens.css" },
   { dir: "styles", path: "radix.css" },
 ];
+// The redesign approved on 2026-11-20 exists in the prototype only until apps/dashboard implements it, so the
+// shared files differ on purpose. While this names the approved proposal, differences are listed but do not
+// fail the check. Set it to null in the change that brings the dashboard to the new design.
+const SYNC_SUSPENDED = "docs/ui/redesign-2026-11.md";
 const RADIX_SCALES = "gray|mauve|slate|sage|olive|sand|tomato|red|ruby|crimson|pink|plum|purple|violet|iris|indigo|blue|cyan|teal|jade|green|grass|bronze|gold|brown|orange|amber|yellow|lime|mint|sky";
 
 const problems = [];
@@ -109,7 +114,7 @@ function checkCss(file, fullText, css, offset) {
     }
     if (new RegExp(`var\\(--(${RADIX_SCALES})-a?\\d+\\)`).test(value)) fail("raw-color", "use a semantic token, not a Radix scale step");
 
-    if (prop === "font-size" && !/^(var\(--fs-(sm|md|lg|xl)\)|inherit)$/.test(value)) fail("font-size", "use var(--fs-sm|md|lg|xl)");
+    if (prop === "font-size" && !/^(var\(--fs-(sm|md|lg|xl|2xl|3xl)\)|inherit)$/.test(value)) fail("font-size", "use var(--fs-sm|md|lg|xl|2xl|3xl)");
     if (prop === "font-weight" && !/^(var\(--fw-(regular|medium|semibold)\)|inherit)$/.test(value)) fail("font-weight", "use var(--fw-regular|medium|semibold)");
     if (prop === "font" && !/^inherit$/.test(value)) fail("font-size", "set font-size and font-weight with tokens instead of the font shorthand");
 
@@ -121,14 +126,14 @@ function checkCss(file, fullText, css, offset) {
       if (bad.length) fail("radius", "use var(--r-xs|sm|md|lg|full)");
     }
     if (prop === "box-shadow") {
-      const ok = value.split(/,(?![^(]*\))/).every((part) => /^(none|var\(--(shadow-pop|focus-ring)\)|(inset )?0 0 0 (var\(--hairline\)|1px|2px) var\(--[a-z-]+\))$/.test(part.trim()));
-      if (!ok) fail("shadow", "only var(--shadow-pop) on overlays, var(--focus-ring), or a hairline ring");
+      const ok = value.split(/,(?![^(]*\))/).every((part) => /^(none|var\(--(shadow-pop|shadow-card|shadow-control|focus-ring)\)|(inset )?0 0 0 (var\(--hairline\)|1px|2px) var\(--[a-z-]+\))$/.test(part.trim()));
+      if (!ok) fail("shadow", "only the shadow tokens (--shadow-pop, --shadow-card, --shadow-control), var(--focus-ring), or a hairline ring");
     }
     if (/gradient\(/.test(value) || prop === "backdrop-filter" || (prop === "filter" && /blur\(/.test(value))) {
       fail("effect", "no gradients, glass or blur");
     }
     if (/^(transition|animation)(-duration)?$/.test(prop) && /(?<![\w.-])\d*\.?\d+m?s\b/.test(value.replace(/var\([^)]*\)/g, ""))) {
-      fail("motion", "use var(--dur-fast|dur-pop|dur)");
+      fail("motion", "use a duration token (--dur-fast, --dur-pop, --dur, --dur-arrive, --dur-draw, --dur-pulse)");
     }
   }
 }
@@ -202,9 +207,15 @@ for (const item of SHARED) {
   }
 }
 
+const drift = SYNC_SUSPENDED ? problems.filter((p) => p.rule === "drift") : [];
+if (drift.length) {
+  for (const p of drift) problems.splice(problems.indexOf(p), 1);
+  console.log(`Sync check suspended (${SYNC_SUSPENDED}): ${drift.length} shared file(s) differ between the prototype and the dashboard.`);
+}
+
 if (problems.length) {
   for (const p of problems) console.error(`${p.file}:${p.line}  ${p.rule}  ${p.message}`);
   console.error(`\n${problems.length} design rule problem(s). Rules: apps/dashboard/DESIGN.md section 1.`);
   process.exit(1);
 }
-console.log("Design rules pass (registered exceptions aside): tokens only, four font sizes, hairline borders, no gradients, prototype and production in sync.");
+console.log(`Design rules pass (registered exceptions aside): tokens only, token font sizes, hairline borders, no gradients in components${SYNC_SUSPENDED ? "" : ", prototype and production in sync"}.`);
