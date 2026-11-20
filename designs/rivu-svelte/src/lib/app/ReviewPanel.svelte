@@ -294,6 +294,20 @@
         />
       </div>
       <div class="row">
+        <span>图表批注</span>
+        <Segmented
+          size="sm"
+          label="图表批注"
+          value={app.review.notes}
+          onchange={(v) => setReview({ notes: v })}
+          options={[
+            { value: "some", label: "有" },
+            { value: "none", label: "无" },
+            { value: "full", label: "已满" },
+          ]}
+        />
+      </div>
+      <div class="row">
         <span>语言与主题</span>
         <div class="pair">
           <Segmented size="sm" label="语言" value={app.lang} onchange={setLang} options={[{ value: "zh", label: "中" }, { value: "en", label: "EN" }]} />

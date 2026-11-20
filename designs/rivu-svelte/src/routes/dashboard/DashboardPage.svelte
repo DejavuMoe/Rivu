@@ -2,10 +2,11 @@
   站点看板：页头（站点、在线人数）→ 筛选栏 → 指标与趋势 → 来源、页面、地区、设备 → 目标、属性。
   状态都在 URL 查询串里，可分享、刷新不丢。
   mode="shared" 用于共享链接与公开看板：只读，没有任何管理入口，也没有分群。
+  图表批注：登录后的看板、非实时范围在趋势图下方显示批注标记；editor 起可以添加、修改、删除，表格视图多一列「批注」。
   分群：URL 的 seg=<id> 引用站点的一个分群，它的条件和 f= 里的临时筛选同时生效；分群已被删除时提示一句，按没有分群查询。
 -->
 <script lang="ts">
-  import { ChartSpline, CircleAlert, Clock, Download, Hourglass, Inbox, Share2, Table2 } from "@lucide/svelte";
+  import { ChartSpline, CircleAlert, Clock, Download, Hourglass, Inbox, MessageSquarePlus, Share2, Table2 } from "@lucide/svelte";
   import SiteHeader from "../../lib/app/SiteHeader.svelte";
   import Callout from "../../lib/ui/Callout.svelte";
   import Card from "../../lib/ui/Card.svelte";
@@ -28,6 +29,11 @@
   import SegmentMenu from "./SegmentMenu.svelte";
   import { findSegment, type Segment } from "./segments.svelte";
   import "./segment-strings";
+  import NotesDialog from "./NotesDialog.svelte";
+  import { bucketIndex, notesOf, type Note } from "./notes.svelte";
+  import { dateShort } from "../../lib/format";
+  import type { ChartMark } from "../../lib/charts/types";
+  import "./note-strings";
   import {
     CITY_LEVEL_DIMS,
     DIMS,
@@ -79,6 +85,50 @@
   const compareText = $derived(
     dash.compare === "year_over_year" ? t("compare.year_over_year") : t("compare.previous_period"),
   );
+
+  // ---------- 图表批注 ----------
+  /** 批注在这个视图里显示：登录后的看板、不是实时 */
+  const notesOn = $derived(!shared && !realtime);
+  const mayNote = $derived(notesOn && canEdit(site));
+  /** 每个时间桶里的批注 */
+  const noteBuckets = $derived.by(() => {
+    const m = new Map<number, Note[]>();
+    if (!notesOn) return m;
+    for (const n of notesOf(site.id)) {
+      const i = bucketIndex(res.points, dash.gran, n.date);
+      if (i >= 0) m.set(i, [...(m.get(i) ?? []), n]);
+    }
+    return m;
+  });
+  /** 一个桶跨好几天（按周、按月）时，提示里的每条批注前面写上日期 */
+  const multiDay = $derived(dash.gran === "week" || dash.gran === "month");
+  const noteLine = (n: Note) => (multiDay ? `${dateShort(new Date(`${n.date}T00:00:00`), app.lang)} ${n.text}` : n.text);
+  const marks = $derived.by<ChartMark[] | undefined>(() => {
+    if (!notesOn) return undefined;
+    return [...noteBuckets].map(([index, ns]) => ({
+      index,
+      count: ns.length,
+      label: ns.length === 1 ? t("note.markOne", { date: res.tipLabels[index] }) : t("note.mark", { date: res.tipLabels[index], n: ns.length }),
+      lines: [...ns.slice(0, 3).map(noteLine), ...(ns.length > 3 ? [t("note.more", { n: ns.length - 3 })] : [])],
+    }));
+  });
+
+  let notesOpen = $state(false);
+  let notesMode = $state<"list" | "add">("list");
+  let notesList = $state<Note[]>([]);
+  let notesHeading = $state("");
+  let notesDated = $state(false);
+  function openMark(indices: number[]) {
+    notesList = indices.flatMap((i) => noteBuckets.get(i) ?? []);
+    notesHeading = indices.length === 1 ? res.tipLabels[indices[0]] : `${res.tipLabels[indices[0]]} – ${res.tipLabels[indices[indices.length - 1]]}`;
+    notesDated = multiDay || indices.length > 1;
+    notesMode = "list";
+    notesOpen = true;
+  }
+  function openAddNote() {
+    notesMode = "add";
+    notesOpen = true;
+  }
 
   /** 导出：有效角色 editor 起（含站点访客 editor）；分享：组织成员里的 editor 起，站点访客不行 */
   const mayExport = $derived(canEdit(site));
@@ -221,6 +271,9 @@
               options={grans(dash.range).map((g) => ({ value: g, label: t(`gran.${g}`) }))}
             />
           {/if}
+          {#if mayNote}
+            <Button variant="ghost" size="sm" icon={MessageSquarePlus} aria-label={t("note.add")} title={t("note.add")} onclick={openAddNote} />
+          {/if}
           <Segmented
             size="sm"
             label={t("common.view")}
@@ -251,6 +304,8 @@
             partialText={t("dash.partial")}
             deltaOf={(cur, prev) => delta(cur, prev, metric === "bounce_rate" ? app.lang : undefined)}
             lowerIsBetter={lowerIsBetter(metric)}
+            {marks}
+            onmark={openMark}
             series={[
               { key: "cur", label: t(`metric.${metric}`), values },
               ...(prevValues ? [{ key: "prev", label: compareText, values: prevValues, compare: true, labels: res.prevTipLabels }] : []),
@@ -272,10 +327,11 @@
                   align: "right" as const,
                   optional: k !== metric && k !== "visitors",
                 })),
+                ...(noteBuckets.size ? [{ key: "notes", label: t("note.col"), optional: true }] : []),
               ]}
             >
               {#snippet cell(r, c)}
-                {#if c.key === "t"}{res.tipLabels[r.i]}{:else}{fmtMetric(c.key as MetricKey, r.p[c.key as MetricKey] as number, app.lang, "full")}{/if}
+                {#if c.key === "t"}{res.tipLabels[r.i]}{:else if c.key === "notes"}<span class="note-cell">{(noteBuckets.get(r.i) ?? []).map(noteLine).join(app.lang === "zh" ? "；" : "; ")}</span>{:else}{fmtMetric(c.key as MetricKey, r.p[c.key as MetricKey] as number, app.lang, "full")}{/if}
               {/snippet}
             </Table>
           </div>
@@ -329,6 +385,10 @@
     </div>
   {/if}
 </div>
+
+{#if notesOn}
+  <NotesDialog bind:open={notesOpen} bind:mode={notesMode} {site} notes={notesList} heading={notesHeading} showDates={notesDated} canWrite={mayNote} />
+{/if}
 
 <style>
   .page {
@@ -408,6 +468,10 @@
     margin-left: var(--sp-3);
     border: var(--hairline) solid var(--border-subtle);
     border-radius: var(--r-sm);
+  }
+  .note-cell {
+    color: var(--text-muted);
+    white-space: normal;
   }
   .grid {
     display: grid;
