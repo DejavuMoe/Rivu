@@ -314,6 +314,25 @@ export function simulateFetch<T>(value: () => T, signal: AbortSignal, ms = 300):
   });
 }
 
+// ---------- 页面的滚动深度与停留时间 ----------
+
+/** 页面的平均滚动深度（0–100）与平均停留时间（秒）；站点没开「页面停留时长」采集时没有（正式实现：这个范围里没有 engagement 事件）。 */
+export interface PageEngagement {
+  scroll_depth: number;
+  time_on_page: number;
+}
+
+export function pageEngagement(site: Site, page: string): PageEngagement | null {
+  if (!cfgs[site.id]?.script.engagement) return null;
+  // 按页面路径固定生成：首页滚得浅、文档和博客读得久
+  let h = site.id * 131;
+  for (const c of page) h = (h * 31 + c.charCodeAt(0)) % 100_003;
+  const kind = page === "/" ? 0 : page.startsWith("/blog") ? 1 : page.startsWith("/docs") ? 2 : 3;
+  const depth = [44, 68, 61, 52][kind] + (h % 17) - 8;
+  const secs = [38, 164, 131, 57][kind] + (h % 41) - 20;
+  return { scroll_depth: Math.max(5, Math.min(100, depth)), time_on_page: Math.max(4, secs) };
+}
+
 // ---------- 地理库 ----------
 
 /** 地理库的署名：服务端随含位置维度的查询一起返回，文字固定是英文。 */

@@ -13,6 +13,7 @@
 - 图表批注（#41）：`src/routes/dashboard/NotesDialog.svelte` 与 `lib/charts/TrendChart.svelte` 的 `marks`；`#/s/1` 趋势图下方的标记、图表右上角「添加批注」；评审面板「图表批注」切换有 / 无 / 已满。
 - 合并看板（#42）：`src/routes/sites/CombinedPage.svelte`，`#/sites/combined`，站点列表页头的「合并看板」标签与命令面板；Northwind Labs 与 Fabrikam Studio 有，只有一个站点的「开源文档社区」没有（直接打开是 404）；评审面板「数据状态」演示加载、无数据、出错。
 - 自定义日期范围、「昨天」「上个月」、上一周期 / 下一周期（#32）：`src/routes/dashboard/period.ts`、`RangeDialog.svelte`、`FilterBar.svelte`。范围按钮菜单最后一项「自定义范围…」；箭头按范围自己的长度前后平移，按月的范围按自然月平移；实时和全部时间没有箭头。合并看板 `#/sites/combined` 也用这个控件（`RangeControl.svelte`），自定义日期每个站点按自己的时区算。
+- 页面报表的平均滚动深度、平均停留时间（#34）：只在「页面」卡片的明细表（「查看全部」）里，窄屏收进页面名下面的一行小字；口径写在表格下方。卡片本身不变。
 
 ## 运行
 

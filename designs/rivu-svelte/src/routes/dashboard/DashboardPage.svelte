@@ -18,7 +18,7 @@
   import TrendChart from "../../lib/charts/TrendChart.svelte";
   import { t } from "../../lib/i18n";
   import { app, canEdit, siteAccess, toast } from "../../lib/state.svelte";
-  import { delta } from "../../lib/format";
+  import { delta, duration, percent } from "../../lib/format";
   import { href, route, setQuery } from "../../lib/router.svelte";
   import { propertyKeys, type Site } from "../../lib/data/fixtures";
   import FilterBar from "./FilterBar.svelte";
@@ -41,6 +41,7 @@
     encodeFilters,
     firstDay,
     geoHasRegions,
+    pageEngagement,
     grans,
     readState,
     runQuery,
@@ -50,6 +51,7 @@
     type MetricKey,
   } from "./query";
   import { fmtAxis, fmtMetric, lowerIsBetter } from "./metrics";
+  import type { Details } from "./BreakdownCard.svelte";
   import { NOW } from "../../lib/data/fixtures";
   import { periodText, rangeQuery, ymd, type RangeParam } from "./period";
   import { rangeUi } from "./range";
@@ -152,6 +154,22 @@
   /** 地理库到地区级时，位置卡片有「地区」标签页；筛选里没有城市（见 query.ts） */
   const regions = $derived(geoHasRegions(site));
   const filterDims = $derived(DIMS.filter((d) => d !== "city" && (regions || !CITY_LEVEL_DIMS.has(d))));
+
+  // 页面报表的明细表多两列：平均滚动深度、平均停留时间（只有「页面」，入口页和退出页没有）。
+  // 卡片太窄放不下三列数字，所以只在「查看全部」里出现
+  const pageDetails = $derived<Details>({
+    dims: ["page"],
+    headers: [t("metric.scroll_depth"), t("metric.time_on_page")],
+    values: (page) => {
+      const e = pageEngagement(site, page);
+      return e ? [percent(e.scroll_depth / 100, 0), duration(e.time_on_page, app.lang)] : null;
+    },
+    notes: [
+      t("dash.defLine", { m: t("metric.scroll_depth"), d: t("metric.scroll_depth.def") }),
+      t("dash.defLine", { m: t("metric.time_on_page"), d: t("metric.time_on_page.def") }),
+    ],
+    missing: t("dash.engagementMissing"),
+  });
 
   function addFilter(dim: string, value: string) {
     const rest = dash.filters.filter((f) => f.dim !== dim);
@@ -377,6 +395,7 @@
       <BreakdownCard
         title={t("dash.card.pages")}
         dims={["page", "entry_page", "exit_page"]}
+        details={pageDetails}
         rowsOf={res.breakdown}
         total={res.totalVisitors}
         onpick={addFilter}
