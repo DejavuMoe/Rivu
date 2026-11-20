@@ -8,6 +8,7 @@
 
 - 修改登录邮箱（#37）：`src/routes/account/LoginEmail.svelte`（账号页个人资料的「邮箱」一行和对话框）与确认链接页 `src/routes/auth/EmailChangeConfirmPage.svelte`（`#/email-change/confirm/t0k3n`）。
 - 月报（#38）：`src/routes/account/WeeklyReportsCard.svelte` 改成「邮件订阅」卡片，站点 × 周报 / 月报的开关表（文件名沿用）。
+- 流量突增通知（#39）：站点设置的「通知」分区 `src/routes/settings/AlertsSection.svelte`（`#/s/1/settings/alerts`，所有者 / 管理员，且「邮件」为已配置），以及「邮件订阅」表里的「流量突增」一列。
 
 ## 运行
 

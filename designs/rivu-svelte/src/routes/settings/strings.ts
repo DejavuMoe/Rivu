@@ -15,6 +15,7 @@ extend({
   "set.nav.shield": ["屏蔽规则", "Block rules"],
   "set.nav.goals": ["目标", "Goals"],
   "set.nav.sharing": ["共享", "Sharing"],
+  "set.nav.alerts": ["通知", "Notifications"],
   "set.nav.imports": ["导入", "Imports"],
   "set.nav.danger": ["危险操作", "Danger zone"],
 
@@ -273,4 +274,17 @@ extend({
   "set.danger.site.done": ["{n} 已进入 7 天恢复期", "{n} can be restored for 7 days"],
   "set.danger.site.dlg.title": ["删除站点", "Delete site"],
   "set.danger.site.confirm": ["删除站点", "Delete site"],
+
+  // ---- 通知（流量突增）----
+  "set.alerts.title": ["流量突增通知", "Traffic spike alerts"],
+  "set.alerts.threshold": ["提醒人数", "Alert threshold"],
+  "set.alerts.hint": ["当前访客超过这个人数时发邮件。一次突增只发一封，回落到这个人数以下满 30 分钟后才会再发。", "Email when current visitors go above this number. One email per spike; the next one can only come after visitors stay below it for 30 minutes."],
+  "set.alerts.placeholder": ["不提醒", "Off"],
+  "set.alerts.unit": ["人", "visitors"],
+  "set.alerts.bad": ["请输入 1 到 {max} 之间的整数，或留空", "Enter a whole number from 1 to {max}, or leave empty"],
+  "set.alerts.recipients": ["收件人", "Recipients"],
+  "set.alerts.recipientsBody": ["在账号页的邮件订阅里打开了这个站点流量突增的人。", "People who turned on traffic spikes for this site in the email subscriptions on their account page."],
+  "set.alerts.toAccount": ["去订阅", "Subscribe"],
+  "set.alerts.on": ["已保存，当前访客超过 {n} 人时发邮件", "Saved. Alerts go out above {n} current visitors"],
+  "set.alerts.off": ["已关闭流量突增通知", "Traffic spike alerts turned off"],
 });

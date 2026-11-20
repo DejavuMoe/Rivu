@@ -1,13 +1,13 @@
 // 站点设置的分区与可见性（对应 apps/dashboard 的 lib/admin/sections.ts）：只决定界面上显示与否。
 // 站点页头的「设置」标签链接到第一个可见分区，一个都看不到时没有这个标签；设置页的分区导航也按它过滤。
 
-import { canEdit, siteAccess } from "../state.svelte";
+import { app, canEdit, siteAccess } from "../state.svelte";
 import type { Site } from "./fixtures";
 
-export type SectionKey = "general" | "hostnames" | "collection" | "privacy" | "shield" | "goals" | "sharing" | "imports" | "danger";
+export type SectionKey = "general" | "hostnames" | "collection" | "privacy" | "shield" | "goals" | "sharing" | "alerts" | "imports" | "danger";
 
 /** 分区顺序即导航顺序。 */
-export const SECTIONS: SectionKey[] = ["general", "hostnames", "collection", "privacy", "shield", "goals", "sharing", "imports", "danger"];
+export const SECTIONS: SectionKey[] = ["general", "hostnames", "collection", "privacy", "shield", "goals", "sharing", "alerts", "imports", "danger"];
 
 type Access = ReturnType<typeof siteAccess>;
 
@@ -17,7 +17,7 @@ const isEditor = (s: Access) => !!s.role && s.role !== "viewer";
 
 /**
  * 能进入这个分区：设置类、导入与危险操作需要组织的 owner / admin；屏蔽规则与目标 editor 起可看（含站点访客 editor）；
- * 共享链接要组织角色 editor 起（站点访客不行）。
+ * 共享链接要组织角色 editor 起（站点访客不行）。通知（流量突增的提醒人数）同设置类，另外要求实例配置了邮件。
  */
 export function sectionVisible(key: SectionKey, site: Site): boolean {
   const s = siteAccess(site);
@@ -27,6 +27,8 @@ export function sectionVisible(key: SectionKey, site: Site): boolean {
       return isEditor(s);
     case "sharing":
       return isMember(s) && isEditor(s);
+    case "alerts":
+      return isManager(s) && app.review.mail;
     default:
       return isManager(s);
   }

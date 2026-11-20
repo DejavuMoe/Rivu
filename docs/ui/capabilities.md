@@ -392,6 +392,11 @@ Approved marketing copy: none.
 | API key | API 密钥 | API key | PO:120 |
 | site deletion grace period | 删除撤销窗口 | Deletion grace period | PO:234 "宽限期", PO:223 "撤销窗口" |
 | DB-IP attribution | unspecified | unspecified | Required text not given; CC BY 4.0 (SD:272) |
+| sign-in email | 登录邮箱 | Sign-in email | `proposed` (#37, 2026-11-20) |
+| email subscriptions (account card) | 邮件订阅 | Email subscriptions | `proposed` (#38, 2026-11-20) |
+| weekly / monthly report | 周报 / 月报 | Weekly report / Monthly report | `proposed` (#38, 2026-11-20) |
+| traffic spike alert | 流量突增通知 | Traffic spike alert | `proposed` (#39, 2026-11-20) |
+| spike threshold | 提醒人数 | Alert threshold | `proposed` (#39, 2026-11-20) |
 
 ## Known unknowns
 

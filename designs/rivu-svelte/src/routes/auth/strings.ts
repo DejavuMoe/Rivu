@@ -91,7 +91,7 @@ extend({
 
   // ---- 确认邮件订阅的邮箱（邮件里的链接）----
   "wconfirm.title": ["确认接收邮箱", "Confirm your email"],
-  "wconfirm.body": ["确认后，{email} 可以接收 Rivu 的站点周报和月报。", "After you confirm, {email} can receive Rivu weekly and monthly site reports."],
+  "wconfirm.body": ["确认后，{email} 可以接收 Rivu 的站点周报、月报和流量突增通知。", "After you confirm, {email} can receive Rivu weekly and monthly site reports and traffic spike alerts."],
   "wconfirm.submit": ["确认邮箱", "Confirm email"],
   "wconfirm.failed": ["确认失败，请稍后重试。", "Couldn't confirm. Try again shortly."],
   "wconfirm.doneTitle": ["邮箱已确认", "Email confirmed"],
