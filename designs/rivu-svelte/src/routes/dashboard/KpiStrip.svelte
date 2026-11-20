@@ -17,8 +17,18 @@
     selected: MetricKey;
     onselect: (k: MetricKey) => void;
     loading?: boolean;
+    /** 指标名与说明（默认取词表；合并看板把访客写成「访客之和」） */
+    labelOf?: (k: MetricKey) => string;
+    defOf?: (k: MetricKey) => string;
   }
-  let { kpis, selected, onselect, loading = false }: Props = $props();
+  let {
+    kpis,
+    selected,
+    onselect,
+    loading = false,
+    labelOf = (k: MetricKey) => t(`metric.${k}`),
+    defOf = (k: MetricKey) => t(`metric.${k}.def`),
+  }: Props = $props();
 </script>
 
 <div class="strip" style:--n={kpis.length} style:--n-narrow={Math.min(kpis.length, 3)} role="tablist" aria-label={t("common.metrics")}>
@@ -33,7 +43,7 @@
       {@const d = k.prev === null ? null : delta(k.value, k.prev, key === "bounce_rate" ? app.lang : undefined)}
       {@const good = d && d.dir !== "flat" && (d.dir === "up") !== lowerIsBetter(key)}
       <button type="button" role="tab" class="kpi" aria-selected={selected === key} onclick={() => onselect(key)}>
-        <span class="label" title={t(`metric.${key}.def`)}>{t(`metric.${key}`)}</span>
+        <span class="label" title={defOf(key)}>{labelOf(key)}</span>
         {#if loading}
           <Skeleton width="72px" height={28} />
         {:else}

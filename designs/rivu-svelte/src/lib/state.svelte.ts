@@ -38,6 +38,10 @@ interface Review {
   weeklyMail: "ok" | "fails";
   /** 修改登录邮箱的确认链接在哪里打开：登录着这个账号的浏览器，或没登录的（如手机的邮件 App） */
   emailLink: "signedIn" | "signedOut";
+  /** 看板的分群：站点 1、2 有现成的分群，或者所有站点都还没有 */
+  segments: "some" | "none";
+  /** 图表批注：站点 1、2 有几条，或者都没有，或者已到每站 500 条的上限 */
+  notes: "some" | "none" | "full";
 }
 
 function load<T>(key: string, fallback: T, storage: "local" | "session" = "local"): T {
@@ -81,6 +85,8 @@ export const app = $state({
       deleted: "some",
       weeklyMail: "ok",
       emailLink: "signedIn",
+      segments: "some",
+      notes: "some",
     },
     "session",
   ),

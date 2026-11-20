@@ -22,6 +22,7 @@
     ["/invite/t0k3n", "接受邀请"],
     ["/sites", "站点"],
     ["/sites/new", "添加站点"],
+    ["/sites/combined", "合并看板"],
     ["/s/4/install", "安装"],
     ["/s/1", "看板"],
     ["/s/1/diagnostics", "诊断"],
@@ -277,6 +278,33 @@
           options={[
             { value: "signedIn", label: "已登录" },
             { value: "signedOut", label: "未登录" },
+          ]}
+        />
+      </div>
+      <div class="row">
+        <span>看板分群</span>
+        <Segmented
+          size="sm"
+          label="看板分群"
+          value={app.review.segments}
+          onchange={(v) => setReview({ segments: v })}
+          options={[
+            { value: "some", label: "有" },
+            { value: "none", label: "无" },
+          ]}
+        />
+      </div>
+      <div class="row">
+        <span>图表批注</span>
+        <Segmented
+          size="sm"
+          label="图表批注"
+          value={app.review.notes}
+          onchange={(v) => setReview({ notes: v })}
+          options={[
+            { value: "some", label: "有" },
+            { value: "none", label: "无" },
+            { value: "full", label: "已满" },
           ]}
         />
       </div>

@@ -7,10 +7,14 @@
   - 进行中的最后一个时间桶用虚线（「数据未完整」的约定含义），其余一律实线。
   - 悬停 / 键盘左右键：竖向十字线 + 每个序列一个带 2px 表面色描边的圆点 + 浮动提示。
   - 网格是 1px 实线发丝线；刻度 0 起，取整。
+  - marks（可选，如图表批注）：横轴文字上方多留一行放标记，挨得太近的标记合成一个；标记是按钮，
+    悬停、聚焦时与悬停到那个点一样显示提示框（多出标记的文字），点击或 Enter 交给 onmark。
+    不传 marks 时图表和以前完全一样。
 -->
 <script lang="ts">
+  import { MessageSquareText } from "@lucide/svelte";
   import { monotonePath, niceTicks } from "./scale";
-  import type { Series } from "./types";
+  import type { ChartMark, Series } from "./types";
 
   interface Props {
     series: Series[];
@@ -31,6 +35,10 @@
     deltaOf?: (cur: number, prev: number) => { text: string; dir: "up" | "down" | "flat" };
     /** 指标「越低越好」（跳出率）时，下降显示为好 */
     lowerIsBetter?: boolean;
+    /** 标记（如图表批注）；传了就在横轴上方留出一行，哪怕是空数组 */
+    marks?: ChartMark[];
+    /** 打开标记：参数是这个标记覆盖的点的下标（合并后的标记覆盖多个点） */
+    onmark?: (indices: number[]) => void;
   }
 
   let {
@@ -46,9 +54,13 @@
     onselect,
     deltaOf,
     lowerIsBetter = false,
+    marks,
+    onmark,
   }: Props = $props();
 
-  const pad = { top: 12, right: 12, bottom: 28, left: 48 };
+  /** 标记行高 20：在绘图区与横轴文字之间 */
+  const MARK_ROW = 20;
+  const pad = $derived({ top: 12, right: 12, bottom: marks ? 28 + MARK_ROW : 28, left: 48 });
 
   let width = $state(640);
   let hover: number | null = $state(null);
@@ -126,6 +138,22 @@
     }
   }
 
+  // 标记：按下标排序，与前一个标记相距不到 20px 的并进前一个（窄屏上相邻几天的批注不叠在一起）
+  const clusters = $derived.by(() => {
+    const out: { x: number; indices: number[]; count: number; labels: string[] }[] = [];
+    const sorted = (marks ?? []).filter((m) => m.index >= 0 && m.index < n).sort((a, b) => a.index - b.index);
+    for (const m of sorted) {
+      const last = out[out.length - 1];
+      if (last && xs[m.index] - last.x < MARK_ROW) {
+        last.indices.push(m.index);
+        last.count += m.count;
+        last.labels.push(m.label);
+      } else out.push({ x: xs[m.index], indices: [m.index], count: m.count, labels: [m.label] });
+    }
+    return out;
+  });
+  const hoverMarks = $derived(hover === null ? [] : (marks ?? []).filter((m) => m.index === hover));
+
   const tipLeft = $derived(hover === null ? 0 : xs[hover]);
   const tipFlip = $derived(tipLeft > width * 0.62);
 </script>
@@ -188,6 +216,25 @@
     {/if}
   </svg>
 
+  {#each clusters as c (c.indices[0])}
+    <button
+      type="button"
+      class="mark"
+      class:on={hover !== null && c.indices.includes(hover)}
+      style:left="{c.x}px"
+      style:top="{pad.top + plotH + 4}px"
+      aria-label={c.labels.join("; ")}
+      onpointerenter={() => (hover = c.indices[0])}
+      onpointerleave={() => (hover = null)}
+      onfocus={() => (hover = c.indices[0])}
+      onblur={() => (hover = null)}
+      onclick={() => onmark?.(c.indices)}
+    >
+      <MessageSquareText size={12} strokeWidth={2} aria-hidden="true" />
+      {#if c.count > 1}<span>{c.count}</span>{/if}
+    </button>
+  {/each}
+
   {#if hover !== null}
     {@const main = colored.find((s) => !s.compare)}
     {@const cmp = colored.find((s) => s.compare)}
@@ -202,6 +249,11 @@
           <span class="tip-val">{v === null || v === undefined ? "—" : format(v)}</span>
         </div>
       {/each}
+      {#if hoverMarks.length}
+        <div class="tip-marks">
+          {#each hoverMarks.flatMap((m) => m.lines) as line, i (i)}<p>{line}</p>{/each}
+        </div>
+      {/if}
       {#if main && cmp && deltaOf}
         {@const a = main.values[hover]}
         {@const b = cmp.values[hover]}
@@ -333,6 +385,46 @@
     color: var(--text-muted);
     font-size: var(--fs-sm);
     font-variant-numeric: tabular-nums;
+  }
+  .tip-marks {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    max-width: 240px;
+    margin-top: 6px;
+    padding-top: 6px;
+    border-top: var(--hairline) solid var(--border-subtle);
+    overflow-wrap: anywhere;
+  }
+  .mark {
+    position: absolute;
+    z-index: 2;
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    height: 16px;
+    min-width: 16px;
+    padding: 0 3px;
+    border: var(--hairline) solid var(--border);
+    border-radius: var(--r-xs);
+    background: var(--bg-app);
+    color: var(--text-muted);
+    font-size: var(--fs-sm);
+    line-height: 1;
+    font-variant-numeric: tabular-nums;
+    transform: translateX(-50%);
+  }
+  /* 手指点得到：点击区域比看到的大 */
+  .mark::before {
+    content: "";
+    position: absolute;
+    inset: -6px -4px;
+  }
+  .mark:hover,
+  .mark.on {
+    border-color: var(--border-hover);
+    background: var(--bg-element);
+    color: var(--text);
   }
   .tip-delta.good {
     color: var(--good-text);

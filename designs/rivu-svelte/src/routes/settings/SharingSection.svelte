@@ -1,10 +1,10 @@
 <!--
-  共享链接：只读统计权限；可设密码、有效期。表格 + 右上角「创建链接」；密码的 12 小时有效期写在字段提示里。
+  共享链接：只读统计权限；可设密码、有效期，可绑定一个分群（通过链接看到的数据都带着它的条件）。表格 + 右上角「创建链接」；密码的 12 小时有效期写在字段提示里。
   有效期选项换算成所选日期当天本地时间的末尾（见 store.svelte.ts 的 computeExpiry）。已过期的链接仍列出，标「已过期」。
   组织角色 editor 起可管理，站点访客不行（分区本身对访客不可见）。
 -->
 <script lang="ts">
-  import { CircleAlert, Copy, Lock, Plus, Trash2 } from "@lucide/svelte";
+  import { Bookmark, CircleAlert, Copy, Lock, Plus, Trash2 } from "@lucide/svelte";
   import Badge from "../../lib/ui/Badge.svelte";
   import Button from "../../lib/ui/Button.svelte";
   import Card from "../../lib/ui/Card.svelte";
@@ -13,11 +13,14 @@
   import Field from "../../lib/ui/Field.svelte";
   import Input from "../../lib/ui/Input.svelte";
   import Segmented from "../../lib/ui/Segmented.svelte";
+  import Select from "../../lib/ui/Select.svelte";
   import Skeleton from "../../lib/ui/Skeleton.svelte";
   import Table from "../../lib/ui/Table.svelte";
   import { t } from "../../lib/i18n";
   import { app, toast } from "../../lib/state.svelte";
   import { NOW, USER, type Site } from "../../lib/data/fixtures";
+  import { findSegment, segmentsOf } from "../dashboard/segments.svelte";
+  import "../dashboard/segment-strings";
   import { cfgs, computeExpiry, INSTANCE, nextId, ymd, type ExpiryKind, type ShareLink } from "./store.svelte";
   import "./strings";
 
@@ -34,6 +37,9 @@
   let password = $state("");
   let expiry = $state<ExpiryKind>("never");
   let custom = $state("");
+  /** 绑定的分群：none 或分群 id */
+  let segment = $state("none");
+  const segments = $derived(segmentsOf(site.id));
 
   const minDate = ymd(new Date(NOW.getTime() + 864e5));
   const exp = $derived(computeExpiry(expiry, custom, NOW));
@@ -45,6 +51,7 @@
   function openAdd() {
     name = password = custom = "";
     expiry = "never";
+    segment = "none";
     open = true;
   }
 
@@ -62,6 +69,7 @@
       slug: slug(),
       password: password.length > 0,
       expires: exp.at,
+      segment: segment === "none" ? null : Number(segment),
       by: USER.name,
       createdAt: NOW,
     });
@@ -118,6 +126,7 @@
           <span class="name" class:dead={expired(l.expires)}>
             {label(l)}
             {#if l.password}<Badge icon={Lock}>{t("set.share.password")}</Badge>{/if}
+            {#if findSegment(site.id, l.segment)}<Badge icon={Bookmark}>{findSegment(site.id, l.segment)?.name}</Badge>{/if}
           </span>
         {:else if c.key === "exp"}
           {#if !l.expires}
@@ -167,6 +176,16 @@
     <Field label={t("set.share.pw")} for="l-pw" optional hint={t("set.share.pwHint")} error={pwBad ? t("set.share.pwShort") : undefined}>
       <Input id="l-pw" type="password" bind:value={password} maxlength={128} autocomplete="new-password" invalid={pwBad} />
     </Field>
+    {#if segments.length}
+      <Field label={t("seg.term")} optional>
+        <Select
+          label={t("seg.term")}
+          block
+          bind:value={segment}
+          options={[{ value: "none", label: t("set.share.seg.none") }, ...segments.map((s) => ({ value: String(s.id), label: s.name }))]}
+        />
+      </Field>
+    {/if}
     <Field label={t("set.share.expiry")} error={customBad ? t("set.share.expPast") : undefined}>
       <Segmented
         label={t("set.share.expiry")}

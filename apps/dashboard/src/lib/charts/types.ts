@@ -9,6 +9,17 @@ export interface Series {
   labels?: string[];
 }
 
+/** 趋势图上的一个标记（如图表批注）：落在第 index 个点上。 */
+export interface ChartMark {
+  index: number;
+  /** 这个点上有几条（大于 1 时标记上显示数字） */
+  count: number;
+  /** 读屏读到的名字 */
+  label: string;
+  /** 悬停或键盘移到这个点时，提示框里列出的文字 */
+  lines: string[];
+}
+
 export interface BarRow {
   key: string;
   label: string;
