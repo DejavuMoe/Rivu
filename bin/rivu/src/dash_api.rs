@@ -33,6 +33,7 @@
 //! | `GET /api/internal/sites/{site}/goals`、`POST`、`DELETE …/goals/{id}` | 会话，有效角色 editor+（含站点访客 editor，`site.content.write`） | 目标的列表、添加（`{"kind":"event","event_name"}` 或 `{"kind":"page","page_path"}`，可带 `display_name`；同类同值或同名 409 `conflict`，每站 100 个 409 `limit_reached`）、删除；实现在 [`crate::goals_admin`] |
 //! | `GET /api/internal/sites/{site}/imports`、`POST …/imports?file_name=`、`DELETE …/imports/{id}` | 会话，组织 admin+ | Plausible 导出的导入：列表（带 `native_from`，站点自己的数据开始的那天）、上传 zip（请求体是原样字节，最大 128 MiB；202，后台导入；进行中时 409 `import_running`）、删除（进行中 409）；实现在 [`crate::imports_admin`] |
 //! | `/api/internal/auth-options`、`/password-reset`、`/login/totp`、`/me/totp/*` | 见 [`crate::account`] | 找回密码、登录的第二步、账户的两步验证 |
+//! | `GET /api/internal/orgs/{org_id}/consolidated?range=\|from=&to=&interval=&compare=` | 会话；组织里至少一个能读统计的站点（成员或站点访客），否则 404 | 多站点汇总：调用者能读的全部站点的访客（各站之和）、访问、浏览量、跳出率与访问时长（按访问加权）、趋势与每个站点的数字，最多 100 个站点；实现在 [`crate::consolidated`] |
 //!
 //! | `GET /api/internal/orgs/{org_id}/members` | 会话，任一组织成员 | 成员、待处理邀请、站点访客，带 `can_manage` 与 `my_role` |
 //! | `PATCH /api/internal/orgs/{org_id}/members/{user_id}`、`DELETE` | 会话，组织 admin+ | 改角色、移除成员（移除同时吊销其在该组织的 API key）；admin 不能碰 owner，不能改自己，最后一名 owner 409 |
@@ -99,7 +100,7 @@
 //! 指标：`rivu_login_total{result=success|failure|rate_limited}`、`rivu_auth_login_alerts_total{kind=account|global}`、
 //! `rivu_auth_active_sessions`（每分钟刷新）、
 //! `rivu_csrf_rejected_total{reason}`、`rivu_api_requests_total{route="internal.*"}`、
-//! `rivu_query_seconds{route=internal.query|internal.realtime|shared.query|shared.realtime|public.query|public.realtime}`。
+//! `rivu_query_seconds{route=internal.query|internal.realtime|internal.consolidated|shared.query|shared.realtime|public.query|public.realtime}`。
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
@@ -1411,27 +1412,70 @@ impl DashApi {
             tracing::error!(link_id = l.id, "共享链接绑定的 segment 过滤无法解析");
             return Err(DashError::Internal);
         }
-        let site = query_api::load_site_context(
+        let site = self.site_context(auth.site.id, &auth.site.site_key).await?;
+        let opts = self.exec_options(timeout, route, auth.site.organization_id, comment);
+        Ok((site, opts, timeout))
+    }
+
+    /// 查询内核要的站点上下文（时区、目标、保留期、导入覆盖，`query_api::load_site_context`）。
+    async fn site_context(&self, site_id: u64, site_key: &str) -> Result<SiteContext, DashError> {
+        query_api::load_site_context(
             &self.pg,
             self.geo.as_deref(),
-            auth.site.id,
-            &auth.site.site_key,
+            site_id,
+            site_key,
             self.retention_days,
         )
         .await
         .map_err(|e| match e {
             rivu_auth::ApiError::NotFound => DashError::NotFound,
             _ => DashError::Internal,
-        })?;
+        })
+    }
+
+    /// 执行选项：超时档、注入的「现在」、路由标签、`log_comment`（组织与主体）、选层阈值。
+    fn exec_options(
+        &self,
+        timeout: u64,
+        route: &'static str,
+        org_id: i64,
+        comment: Option<(&str, i64)>,
+    ) -> ExecOptions {
         let mut opts = ExecOptions::new(timeout)
             .with_now((self.clock)())
             .with_route(route)
-            .with_comment("org", auth.site.organization_id);
+            .with_comment("org", org_id);
         if let Some((k, v)) = comment {
             opts = opts.with_comment(k, v);
         }
         opts.rollup_min_rows = self.rollup_min_rows;
-        Ok((site, opts, timeout))
+        opts
+    }
+
+    /// 以登录用户的身份查一个站点：与看板的 `POST /sites/{site}/query` 同一条路径（站点上下文、看板档超时、
+    /// `log_comment`、结果缓存）。**调用方必须已经按 §4.2 判定过这个用户能读这个站点的统计**。
+    pub(crate) async fn query_as_user(
+        &self,
+        user_id: i64,
+        site_id: u64,
+        site_key: &str,
+        org_id: i64,
+        spec: QuerySpec,
+        route: &'static str,
+    ) -> Result<QueryResult, DashError> {
+        let timeout = self.dashboard_timeout_secs;
+        let site = self.site_context(site_id, site_key).await?;
+        let opts = self.exec_options(timeout, route, org_id, Some(("user", user_id)));
+        query_api::execute_cached(
+            &self.reader,
+            self.cache.as_deref(),
+            &site,
+            spec,
+            opts,
+            route,
+        )
+        .await
+        .map_err(|e| DashError::Fail(Fail::Query(e), timeout))
     }
 
     async fn execute(
@@ -1885,6 +1929,7 @@ pub fn router(api: Arc<DashApi>) -> Router {
         ))
         .merge(crate::site_admin::routes(a))
         .merge(crate::goals_admin::routes(a))
+        .merge(crate::consolidated::routes(a))
         .merge(crate::diagnostics::routes(a))
         .merge(crate::org_admin::routes(a))
         .merge(crate::imports_admin::routes(a))

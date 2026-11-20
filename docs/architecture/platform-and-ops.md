@@ -259,6 +259,35 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 
 **看板站点管理端点**（`bin/rivu/src/site_admin.rs`，`/api/internal/*`，会话鉴权 + CSRF）按同一矩阵判定，`Action` 另有 `SiteSettingsRead`（读设置、屏蔽规则、共享链接列表：有效角色 ≥ editor，站点访客 editor 也可读）、`SiteSettingsWrite`（设置、hostnames、shield 写）、`SitePublicToggle`、`SiteCreate`、`SiteDelete`（均 owner、admin）、`SharedLinkManage`（owner、admin、editor）。**接入诊断**（`GET /api/internal/sites/{site}/diagnostics?range=1h|24h|7d`，`bin/rivu/src/diagnostics.rs`）读 ClickHouse `ingest_counters`，与读设置同级（`SiteSettingsRead`：有效角色 ≥ editor），用看板档超时；按 UTC 对齐的时间桶（1h = 60 × 1 分钟，24h = 24 × 1 小时，7d = 28 × 6 小时）给出已接收 / 已丢弃、按原因（指标去掉 `dropped_` 前缀，不含 `dropped_unknown_site`）与脚本版本（`script_version` 数字、事件数、最后出现）的合计，以及最后收到事件的分钟（范围内没有 `accepted` 时向前回溯 90 天）；最后一个桶包含「现在」，计数只刷出已结束的 10 秒桶，所以 `partial_last` 恒为真，「最后收到事件」只精确到分钟。写动作与 `shared_link.manage` 只认**组织角色**，站点访客永远不够。响应码规则：未登录 401；站点对调用者不可见（不存在、已删除、非组织成员且无访客授权）404，与 4.2 一致；**站点可见但角色不够 403 `forbidden`**（已经可见，403 不泄露存在性）；建站（`POST /orgs/{org_id}/sites`）看目标组织里的组织角色，不是该组织成员 404、成员但低于 admin 403。取值非法 400，重复 409 `conflict`，屏蔽规则已满 409 `limit_reached`。站点删除是**软删除加恢复窗口**（`DELETE /sites/{site}`，`SiteDelete`；请求体 `confirm` 须等于站点名）：同一事务置 `sites.deleted_at` 并写入 `scope='site'` 的删除意图（`not_before = 删除时刻 + RIVU_SITE_RESTORE_DAYS`，默认 7 天），之后统计、共享链接、公开看板、设置都 404；`GET /orgs/{org_id}/deleted-sites`（组织 owner、admin；非成员 404，角色不够 403）列出意图仍是 `pending` 且未到期的已删除站点（`id`、`site_key`、`name`、`domain` = 白名单第一条、`deleted_at`、`purge_at`）；`POST /sites/{site}/restore`（站点所属组织的 owner、admin；已删除站点不在可见性查询里，按「调用者是该组织成员」判定，否则 404）在一个事务里锁站点行与意图，意图须仍是 `pending` 且 `not_before > now()`（窗口已过或清除已开始 409 `conflict`），意图置 `cancelled`、清掉 `deleted_at`，响应与站点列表的一项相同；恢复后可以再删除（部分唯一索引只约束未取消的意图）。窗口过后 `ch_delete_batch` 清除该站点在 ClickHouse 的全部数据（§6）。**按日期范围删除统计数据**（`StatsDelete`，owner、admin，只认组织角色）：`POST /sites/{site}/stats-deletions`，请求体 `{"from","to","confirm"}`，日期是站点本地日期（`YYYY-MM-DD`），`from <= to`、`to` 不晚于站点时区的今天、跨度最多 731 天（原始数据保留期），`confirm` 须等于站点名，否则 400；写入 `scope='date_range'` 意图（`not_before = now()`，写入后立即唤醒 `ch_delete_batch`），201 返回 `{"deletion":{id,from,to,status,created_at,completed_at,error_code}}`；`GET` 同一路径列出最近 50 条日期范围删除（新的在前，不含站点删除意图）；时区证据校验失败时 error_code 为 stats_deletion_timezone_unproven。共享链接密码与命令行一致（12–128 字符，argon2id）；hostnames 写入前拒绝 `www.` 开头（含 `*.www.`），因为采集侧规范化会去掉 `www.`，写进去永远匹配不到；允许删光白名单（空白名单 = 丢弃全部事件，fail-closed）。
 
+**多站点汇总端点**（`bin/rivu/src/consolidated.rs`，`GET /api/internal/orgs/{org_id}/consolidated`，只有会话鉴权，口径见 `system-design.md` §6.11）：把一个组织里调用者能读统计的全部未删除站点加在一起。没有会话 401；组织不存在或已删除、调用者在这个组织里一个能读的站点都没有（不是成员、组织里没有站点、只是别的组织的站点访客）一律 404；站点访客只汇总被授权的站点。API key、共享链接、公开看板都调不到，公开查询 API 也没有对应的入口。
+
+| 参数 | 取值 |
+|---|---|
+| `range` | 看板总览的时间范围关键词（`day`、`24h`、`7d`、`30d`、`month`、`6mo`、`12mo`、`year`、`all`，以及查询内核接受的其他 `<N>d`、`<N>mo`），默认 `30d`；`realtime` 400 |
+| `from`、`to` | 自定义范围，两个都要给，站点本地日期 `YYYY-MM-DD`，含两端；不能和 `range` 同时给 |
+| `interval` | 趋势的粒度：`day`（默认）或 `month` |
+| `compare` | `off`（默认）、`previous_period`、`year_over_year` |
+
+参数不合法 400 `invalid_request`；查询内核拒绝的取值（未知关键词、不存在的日期、桶太多）按单站查询的错误体返回 400。响应：
+
+```json
+{
+  "organization": {"id": 1, "name": "Acme", "slug": "acme"},
+  "date_range": "30d",
+  "interval": "day",
+  "compare": null,
+  "totals": {"visitors": 5, "visits": 5, "pageviews": 9, "bounce_rate": 0.4, "visit_duration": 42.0},
+  "trend": [{"date": "2026-11-10", "visitors": 3, "visits": 3, "pageviews": 6, "bounce_rate": 0.333, "visit_duration": 60.0}],
+  "sites": [{"id": 3, "site_key": "k7qm2xwatbrd", "name": "example.com", "timezone": "Asia/Tokyo",
+             "totals": {"visitors": 2, "visits": 2, "pageviews": 3, "bounce_rate": 0.5, "visit_duration": 30.0},
+             "range": {"start": "2026-10-22T00:00:00+09:00", "end": "2026-11-20T21:00:00+09:00"}}],
+  "meta": {"visitors": "sum_of_sites", "note": "…", "sites_total": 2, "sites_included": 2, "max_sites": 100,
+           "truncated": false, "warnings": [{"site_id": 3, "code": "…", "message": "…"}]}
+}
+```
+
+`trend` 是各站点时间桶标签的并集（升序，没有数据的桶为 0）；`sites` 按站点名排序，`range` 是该站点解析后的时间范围（本地时间）；`warnings` 是各站点查询的警告，带站点 id。给了 `compare` 时，顶层多一个 `comparison_totals`，`sites` 的每一项多一个 `comparison_totals`。比率是 0 到 1，时长是秒，与查询 API 相同。
+
 **看板成员与 API key 端点**（`bin/rivu/src/org_admin.rs`，`/api/internal/orgs/{org_id}/members`、`invitations`、`guests`、`api-keys`，以及公开的 `/api/internal/invitations/{token}` 与 `.../accept`；会话鉴权 + CSRF，API key 永远调不到）：`Action` 另有 `MemberManage`（邀请、移除、改角色：owner、admin）、`SiteMembershipManage`（站点访客的邀请与移除：owner、admin）、`ApiKeyManageOwn`（所有 org 角色，只管自己的 key）；「谁能给谁什么角色、谁能改谁」走纯函数 `can_assign`、`can_modify`，并在锁住 org 行的事务里按最新角色再判一次。org 不存在或调用者不是（未删除的）成员 404，是成员但角色不够 403 `forbidden`；任何人都不能通过这些端点改自己的角色或移除自己（403）；降级或移除 owner 时先 `SELECT ... FOR UPDATE` 锁 org 行再数 owner，最后一名 owner 409 `conflict`；移除成员的同一事务里软删除他在该 org 的 API key（否则重新加回他会让旧 key 复活）。邀请不发邮件：创建返回一次性链接 `<RIVU_BASE_URL>/invite/<token>`（令牌 32 字节随机数的 base64url，库里只存 SHA-256，7 天有效，只在创建响应里出现一次），owner 不可被邀请，已是成员 409，同范围已有未过期的待处理邀请 409（已过期的先在同一事务里软删除，所以过期后可以重新邀请）。邀请页的查询与接受不需要登录，按客户端 IP 限流（参数同共享链接与公开看板，在查库之前），令牌无效、过期、已接受、已撤销、org 或站点已删除一律同一个 404；接受时锁邀请行：邮箱已有账号则必须是该账号的会话（无会话 401，别的账号 403 `email_mismatch`，被禁用的账号 404），没有账号则必须给密码（12 到 128 个字符）并在同一事务里创建账号、写成员或访客关系，再像登录一样签发会话 cookie（不撤销请求里带的其它会话）。API key 的创建返回明文一次（`rivu_` 加 43 个字符，格式、哈希与 `rivu apikey create` 相同），可限定 `stats:read:<site_key>` 的站点（须是本 org 未删除的站点，否则 400）与 30、90、365 天的有效期；列表只含调用者自己未吊销的 key（过期的仍列出），吊销别人的 key 是 404。
 
 **状态规则**（服务层事务内校验；04§2.1 同样把此类规则留在 service）：org 至少保留一名 owner（降级、移除、自行退出都先 `SELECT ... FOR UPDATE` 锁 org 行再数 owner）；同时有 org 角色与站点访客角色时取较高者；邀请不能授予超出邀请人可分配范围的角色，过期或已接受的邀请不可复用；站点已软删除时除恢复外的写动作返回 404。
@@ -276,7 +305,7 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 | 6 | 无授权但 `is_public` 且动作为 `stats.read` → 放行 | 对应 `sites.public` |
 | 7 | 其他 → 404 | — |
 
-有意不做：超管直接放行（第 1 步，`ADMIN_USER_IDS`）、团队 `locked` 与套餐 feature（第 2、3 步）、consolidated view（第 5 步）。实例管理员（`users.is_instance_admin`）只管用户与实例设置，**不能**据此读取任意站点统计。
+有意不做：超管直接放行（第 1 步，`ADMIN_USER_IDS`）、团队 `locked` 与套餐 feature（第 2、3 步）。Plausible 把合并视图当成一个特殊站点来授权（第 5 步）；Rivu 的多站点汇总不是站点，只在登录后的看板里有，逐站按本节判定（见 4.1「多站点汇总端点」）。实例管理员（`users.is_instance_admin`）只管用户与实例设置，**不能**据此读取任意站点统计。
 
 ### 4.3 API key 作用域
 | 项 | 规则 |
