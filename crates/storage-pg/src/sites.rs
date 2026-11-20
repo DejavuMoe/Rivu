@@ -549,6 +549,8 @@ pub struct SiteAdminView {
     pub ingest_rate_limit_per_min: Option<i32>,
     pub geo_level: String,
     pub retention_days: Option<i32>,
+    /// 流量激增提醒的阈值（当前在线访客数）；`None` = 没开。
+    pub spike_threshold: Option<i32>,
 }
 
 /// 读设置页的站点视图；站点不存在或已软删除返回 `None`。
@@ -563,7 +565,8 @@ pub async fn admin_view(db: impl PgExecutor<'_>, site_id: u64) -> Result<Option<
                 COALESCE(ss.tracker, '{}'::jsonb)::text AS tracker,
                 ss.ingest_rate_limit_per_min,
                 COALESCE(ss.geo_level, 'city') AS geo_level,
-                ss.retention_days
+                ss.retention_days,
+                ss.spike_threshold
          FROM sites s LEFT JOIN site_settings ss ON ss.site_id = s.id
          WHERE s.id = $1 AND s.deleted_at IS NULL"
     ))
@@ -586,6 +589,7 @@ pub async fn admin_view(db: impl PgExecutor<'_>, site_id: u64) -> Result<Option<
             ingest_rate_limit_per_min: r.try_get("ingest_rate_limit_per_min")?,
             geo_level: r.try_get("geo_level")?,
             retention_days: r.try_get("retention_days")?,
+            spike_threshold: r.try_get("spike_threshold")?,
         })
     })
     .transpose()
@@ -606,6 +610,8 @@ pub struct SitePatch<'a> {
     pub geo_level: Option<&'a str>,
     /// 外层 `Some` = 要改；内层 `None` = 用全局 `RIVU_RETENTION_DAYS`。
     pub retention_days: Option<Option<i32>>,
+    /// 外层 `Some` = 要改；内层 `None` = 关掉流量激增提醒。
+    pub spike_threshold: Option<Option<i32>>,
 }
 
 /// 维护任务在同步等待 ClickHouse 时，PG 会话处于事务内空闲状态。
@@ -677,7 +683,8 @@ pub async fn update_site(
              ingest_rate_limit_per_min =
                  CASE WHEN $5::boolean THEN $6::integer ELSE ingest_rate_limit_per_min END,
              tracker = CASE WHEN $7::text IS NULL THEN tracker ELSE tracker || $7::jsonb END,
-             retention_days = CASE WHEN $8::boolean THEN $9::integer ELSE retention_days END
+             retention_days = CASE WHEN $8::boolean THEN $9::integer ELSE retention_days END,
+             spike_threshold = CASE WHEN $10::boolean THEN $11::integer ELSE spike_threshold END
          WHERE site_id = $1",
     )
     .bind(id)
@@ -698,6 +705,8 @@ pub async fn update_site(
     }))
     .bind(patch.retention_days.is_some())
     .bind(patch.retention_days.flatten())
+    .bind(patch.spike_threshold.is_some())
+    .bind(patch.spike_threshold.flatten())
     .execute(&mut **tx)
     .await
     .context("更新 site_settings 失败")?;

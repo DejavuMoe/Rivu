@@ -16,6 +16,7 @@ use axum::routing::{MethodRouter, get, post, put};
 use jiff::civil::{Date, Weekday};
 use jiff::tz::TimeZone;
 use jiff::{Timestamp, ToSpan};
+use rivu_auth::scope::{Action, OrgRole, allowed};
 use rivu_auth::session;
 use rivu_mail::weekly_report::{Cadence, Report, confirmation, report};
 use rivu_query::result::MetricValue;
@@ -40,23 +41,28 @@ const CONFIRM_PAGE: &str = "/weekly-report/confirm";
 pub(crate) enum Kind {
     Weekly,
     Monthly,
+    /// Traffic spike alerts ([`crate::traffic_spike`]): not periodic, sent when a spike starts.
+    Spike,
 }
 
 impl Kind {
-    const ALL: [Kind; 2] = [Kind::Weekly, Kind::Monthly];
+    /// The periodic reports that [`run_once`] sends.
+    const REPORTS: [Kind; 2] = [Kind::Weekly, Kind::Monthly];
 
     /// The `kind` column value.
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Weekly => "weekly",
             Self::Monthly => "monthly",
+            Self::Spike => "spike",
         }
     }
 
-    fn cadence(self) -> Cadence {
+    fn cadence(self) -> Option<Cadence> {
         match self {
-            Self::Weekly => Cadence::Weekly,
-            Self::Monthly => Cadence::Monthly,
+            Self::Weekly => Some(Cadence::Weekly),
+            Self::Monthly => Some(Cadence::Monthly),
+            Self::Spike => None,
         }
     }
 
@@ -65,18 +71,20 @@ impl Kind {
         match self {
             Self::Weekly => "weekly_report",
             Self::Monthly => "monthly_report",
+            Self::Spike => "traffic_spike",
         }
     }
 
-    fn unsubscribe_path(self) -> &'static str {
+    pub(crate) fn unsubscribe_path(self) -> &'static str {
         match self {
             Self::Weekly => "/api/weekly-report/unsubscribe",
             Self::Monthly => "/api/monthly-report/unsubscribe",
+            Self::Spike => "/api/traffic-spike/unsubscribe",
         }
     }
 }
 
-/// `PUT`/`DELETE /api/internal/sites/{site}/{weekly,monthly}-report`.
+/// `PUT`/`DELETE /api/internal/sites/{site}/{weekly-report,monthly-report,traffic-spike}`.
 fn switch(kind: Kind) -> MethodRouter<Arc<DashApi>> {
     put(
         move |api: State<Arc<DashApi>>, site: Path<String>, req: Request| {
@@ -135,6 +143,12 @@ pub(crate) fn routes(api: &Arc<DashApi>) -> Router {
         "/api/internal/sites/{site}/monthly-report",
         switch(Kind::Monthly),
     ))
+    .merge(endpoint(
+        api,
+        "internal.traffic_spike",
+        "/api/internal/sites/{site}/traffic-spike",
+        switch(Kind::Spike),
+    ))
     // These endpoints authorize solely with the mail token, never cookies.
     .merge(crate::query_api::count_requests(
         Router::new()
@@ -154,6 +168,11 @@ pub(crate) fn routes(api: &Arc<DashApi>) -> Router {
         api,
         Kind::Monthly,
         "monthly_report.unsubscribe",
+    ))
+    .merge(unsubscribe_link(
+        api,
+        Kind::Spike,
+        "traffic_spike.unsubscribe",
     ))
 }
 
@@ -186,9 +205,9 @@ struct LangBody {
     lang: Lang,
 }
 
-struct Recipient {
-    email: String,
-    timezone: String,
+pub(crate) struct Recipient {
+    pub(crate) email: String,
+    pub(crate) timezone: String,
     week_starts_on: i16,
 }
 
@@ -205,7 +224,7 @@ async fn lock_user(tx: &mut PgConnection, user_id: i64) -> anyhow::Result<Option
 
 // The user lock serializes mailbox and subscription changes with claims.
 // Share locks keep the account's site, calendar and access valid through commit.
-async fn lock_recipient(
+pub(crate) async fn lock_recipient(
     tx: &mut PgConnection,
     user_id: i64,
     site_id: i64,
@@ -307,6 +326,15 @@ async fn email_status<'c>(
     })
 }
 
+/// One site's switches on the account page.
+struct Switches {
+    week_starts_on: i16,
+    spike_threshold: Option<i32>,
+    weekly: bool,
+    monthly: bool,
+    spike: bool,
+}
+
 /// `GET /api/internal/account/weekly-report`; the confirmation request returns it too.
 async fn account_body(api: &DashApi, user_id: i64, email: &str) -> Res<Value> {
     let status = email_status(&api.pg, user_id, email).await?;
@@ -322,12 +350,16 @@ async fn account_body(api: &DashApi, user_id: i64, email: &str) -> Res<Value> {
         .map(|s| i64::try_from(s.id))
         .collect::<Result<Vec<_>, _>>()
         .map_err(anyhow::Error::from)?;
-    let details: HashMap<i64, (i16, bool, bool)> = sqlx::query_as::<_, (i64, i16, bool, bool)>(
-        "SELECT s.id, COALESCE(ss.week_starts_on, 1)::smallint,
+    type Row = (i64, i16, Option<i32>, bool, bool, bool);
+    let details: HashMap<i64, Switches> = sqlx::query_as::<_, Row>(
+        "SELECT s.id, COALESCE(ss.week_starts_on, 1)::smallint AS week_starts_on,
+                ss.spike_threshold,
                 EXISTS (SELECT FROM weekly_report_subscriptions w
-                        WHERE w.user_id = $2 AND w.site_id = s.id AND w.kind = 'weekly'),
+                        WHERE w.user_id = $2 AND w.site_id = s.id AND w.kind = 'weekly') AS weekly,
                 EXISTS (SELECT FROM weekly_report_subscriptions w
-                        WHERE w.user_id = $2 AND w.site_id = s.id AND w.kind = 'monthly')
+                        WHERE w.user_id = $2 AND w.site_id = s.id AND w.kind = 'monthly') AS monthly,
+                EXISTS (SELECT FROM weekly_report_subscriptions w
+                        WHERE w.user_id = $2 AND w.site_id = s.id AND w.kind = 'spike') AS spike
          FROM unnest($1::bigint[]) AS s (id)
          LEFT JOIN site_settings ss ON ss.site_id = s.id",
     )
@@ -337,22 +369,40 @@ async fn account_body(api: &DashApi, user_id: i64, email: &str) -> Res<Value> {
     .await
     .map_err(anyhow::Error::from)?
     .into_iter()
-    .map(|(id, week_starts_on, weekly, monthly)| (id, (week_starts_on, weekly, monthly)))
+    .map(|(id, week_starts_on, spike_threshold, weekly, monthly, spike)| {
+        let switches = Switches {
+            week_starts_on,
+            spike_threshold,
+            weekly,
+            monthly,
+            spike,
+        };
+        (id, switches)
+    })
     .collect();
     let sites: Vec<Value> = sites
         .iter()
         .zip(&ids)
         .map(|(site, id)| {
-            let (week_starts_on, weekly, monthly) =
-                details.get(id).copied().unwrap_or((1, false, false));
-            // `subscribed` is the weekly switch; it predates the monthly report.
+            let row = details.get(id);
+            // Only an organization owner or admin may set the spike threshold; guests never.
+            let can_edit_settings = site
+                .roles
+                .org_role
+                .as_deref()
+                .and_then(OrgRole::parse)
+                .is_some_and(|r| allowed(r, Action::SiteSettingsWrite));
+            // `subscribed` is the weekly switch; it predates the other reports.
             json!({
                 "id": site.id,
                 "name": site.name,
                 "timezone": site.timezone,
-                "week_starts_on": week_starts_on,
-                "subscribed": weekly,
-                "monthly_subscribed": monthly,
+                "week_starts_on": row.map_or(1, |r| r.week_starts_on),
+                "subscribed": row.is_some_and(|r| r.weekly),
+                "monthly_subscribed": row.is_some_and(|r| r.monthly),
+                "spike_subscribed": row.is_some_and(|r| r.spike),
+                "spike_threshold": row.and_then(|r| r.spike_threshold),
+                "can_edit_settings": can_edit_settings,
             })
         })
         .collect();
@@ -530,6 +580,23 @@ async fn subscribe(
             ),
         ));
     }
+    if kind == Kind::Spike {
+        let threshold: Option<i32> = sqlx::query_scalar(
+            "SELECT spike_threshold FROM site_settings WHERE site_id = $1 FOR SHARE",
+        )
+        .bind(site_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(anyhow::Error::from)?
+        .flatten();
+        if threshold.is_none() {
+            return Err(DashError::Conflict(
+                "spike_threshold_unset",
+                "this site has no traffic spike threshold; an owner or admin sets it in the site settings"
+                    .into(),
+            ));
+        }
+    }
     // An unchanged address keeps its subscription time, so earlier unsubscribe links stay valid.
     sqlx::query(
         "INSERT INTO weekly_report_subscriptions AS w
@@ -701,6 +768,16 @@ fn unsubscribe_pages(kind: Kind) -> [&'static str; 3] {
             r#"<!doctype html><html lang="en"><meta charset="utf-8"><title>Rivu monthly reports</title>
             <p>This link has expired or the subscription is already off.</p><p lang="zh">退订链接已过期，或订阅已关闭。</p></html>"#,
         ],
+        Kind::Spike => [
+            r#"<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Unsubscribe · Rivu</title>
+        <h1>Unsubscribe from Rivu traffic spike alerts</h1>
+        <p lang="zh">退订 Rivu 流量激增提醒</p>
+        <form method="post"><button>Unsubscribe · <span lang="zh">退订</span></button></form></html>"#,
+            r#"<!doctype html><html lang="en"><meta charset="utf-8"><title>Rivu traffic spike alerts</title>
+        <p>You have unsubscribed from Rivu traffic spike alerts for this site.</p><p lang="zh">你已退订此站点的 Rivu 流量激增提醒。</p></html>"#,
+            r#"<!doctype html><html lang="en"><meta charset="utf-8"><title>Rivu traffic spike alerts</title>
+            <p>This link has expired or the subscription is already off.</p><p lang="zh">退订链接已过期，或订阅已关闭。</p></html>"#,
+        ],
     }
 }
 
@@ -815,6 +892,7 @@ impl Site {
                 due_period(now, &tz, week_start)
             }
             Kind::Monthly => due_month(now, &tz),
+            Kind::Spike => Ok(None),
         }
     }
 }
@@ -927,7 +1005,7 @@ async fn deliver(
     site: &Site,
     now: Timestamp,
 ) -> anyhow::Result<()> {
-    let Some(period) = site.due(kind, now)? else {
+    let (Some(cadence), Some(period)) = (kind.cadence(), site.due(kind, now)?) else {
         return Ok(());
     };
     let candidates = candidates(&api.pg, kind, site.id, period).await?;
@@ -983,7 +1061,7 @@ async fn deliver(
             } else {
                 rivu_mail::Lang::En
             },
-            cadence: kind.cadence(),
+            cadence,
             to: &email,
             base_url: base,
             site_id: site.id,
@@ -1014,7 +1092,7 @@ pub async fn run_once(api: &DashApi) -> anyhow::Result<()> {
         return Ok(());
     };
     let now = (api.clock)();
-    for kind in Kind::ALL {
+    for kind in Kind::REPORTS {
         let sites = sqlx::query_as::<_, (i64, String, String, String, i16)>(
             "SELECT s.id, s.site_key, s.name, s.timezone, COALESCE(ss.week_starts_on, 1)::smallint
              FROM sites s JOIN organizations o ON o.id = s.organization_id AND o.deleted_at IS NULL

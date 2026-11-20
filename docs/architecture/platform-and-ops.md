@@ -93,7 +93,7 @@ Rivu 只支持单实例：会话分配依赖单写者，同一时间只能有一
 | `invitations` | 合并 Plausible 的 `team_invitations` 与 `guest_invitations`（04§1.2） | `organization_id`、`email`、`role`、`site_id` NULL、`site_role`、`token_hash`、`expires_at`、`accepted_at` | `UNIQUE(token_hash)`；`UNIQUE(org,email,COALESCE(site_id,0))` 仅待处理 |
 | `sites` | 站点 | `organization_id`、`site_key`、`name`、`timezone`、`is_public` | `UNIQUE(site_key)`（含已删除）；`INDEX(organization_id)`、`INDEX(updated_at)` |
 | `site_hostnames` | 来源主机名白名单 | `site_id`、`pattern`（小写 punycode，支持 `*.example.com`） | `UNIQUE(site,pattern)` 部分唯一 |
-| `site_settings` | 采集、隐私、保留期（1:1） | `site_id` PK、`collect_enabled`、`ingest_rate_limit_per_min`、`retention_days`、`geo_level`、`strip_query_params`、`allowed_event_props`、`tracker jsonb` | `retention_days` 在 30 到 `RIVU_RETENTION_DAYS` 之间（应用层校验；全局调小后以全局为准）；`geo_level` 选 region / city 需要库提供子区划码与城市 id，默认 DB-IP Lite 没有，看板据 `meta.geo_capability` 提示（`system-design.md` §10 Q24、§6.10）；`tracker` 取代 `tracker_script_configuration` 表（04§1.2） |
+| `site_settings` | 采集、隐私、保留期（1:1） | `site_id` PK、`collect_enabled`、`ingest_rate_limit_per_min`、`retention_days`、`geo_level`、`strip_query_params`、`allowed_event_props`、`tracker jsonb`、`spike_threshold` | `spike_threshold` 是流量激增提醒的阈值（当前在线访客数，≥ 1，`NULL` = 关闭，见§6「流量激增提醒」）；`retention_days` 在 30 到 `RIVU_RETENTION_DAYS` 之间（应用层校验；全局调小后以全局为准）；`geo_level` 选 region / city 需要库提供子区划码与城市 id，默认 DB-IP Lite 没有，看板据 `meta.geo_capability` 提示（`system-design.md` §10 Q24、§6.10）；`tracker` 取代 `tracker_script_configuration` 表（04§1.2） |
 | `goals` | 转化目标 | `site_id`、`kind` ∈ event/page、`event_name`、`page_path`、`display_name` | `UNIQUE(site,kind,COALESCE(event_name,page_path))` 部分唯一 |
 | `funnels`、`funnel_steps` | 漏斗（第 4 阶段） | `site_id`、`name`；`funnel_id`、`goal_id`、`step_order` | `UNIQUE(funnel_id,step_order)` |
 | `segments` | 保存的筛选段 | `site_id`、`owner_user_id` NULL=站点级、`name`、`filter jsonb`（结构见 `system-design.md`） | `INDEX(site_id)` |
@@ -442,7 +442,7 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 | `tombstone_purge` | cron | 每日 | 硬删除 30 天前的软删除行（`sites` 除外） |
 | `jobs_reaper`、`jobs_prune` | cron | 每分钟 / 每日 | 租约回收；清理历史 |
 | `weekly_report` | 已配置 SMTP 时启动 | 启动即检查，之后每分钟检查 | 同一个任务发周报和月报（`bin/rivu/src/weekly_report.rs`）。周报按站点时区和每周起始日处理最近一个完整周，从下一周首日当地 09:00 起发送；月报按站点时区处理上一个自然月，从每月 1 日当地 09:00 起发送。用 reader 账号查询访客、访问和浏览量。有查询错误或覆盖警告时，跳过该次发送 |
-| `spike_notify`（第 4 阶段） | cron | 每 15 分钟 | 以站点最近发送时间去重（04§3.2 `TrafficChangeNotifier`，用途为推断） |
+| `traffic_spike` | 已配置 SMTP 时启动 | 启动即检查，之后每分钟检查 | 流量激增提醒（`bin/rivu/src/traffic_spike.rs`）。每次检查对所有设了阈值、且至少有一人打开提醒的站点只发一条 ClickHouse 查询，状态存在 `traffic_spikes`，每位收件人每次激增最多一封。查询失败时不改状态。详见§6「流量激增提醒」 |
 
 `retention_purge` 通过 PG 站点行锁固定设置并协调显式擦除，ClickHouse writer 可继续写入。每个站点从 `rollup_site FINAL` 里第一个已过结算期的当前时区原生完成标记开始，逐日验证直到首个缺标记或未结算的本地日。设 `A`、`B` 分别为首个已验证日、首个未覆盖日的本地午夜，分别换算成 UTC。只有 `origin = 'native'`、`import_id = 0` 的站点标记能提供证明，空日的标记也有效。存在旧时区标记、站点被软删除、擦除任务未完成、缺少站点元数据或未取得行锁时，跳过该站点的自动清理。显式擦除按自身意图与恢复期限执行。
 
@@ -463,15 +463,15 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 
 ### 周报订阅接口
 
-收不收周报、月报是个人偏好：邮箱在账号上确认一次，之后每个能看的站点各有一个周报开关和一个月报开关，两个开关互不影响。收件人始终是登录账号当前的邮箱。月报和周报共用邮箱确认、表和发送任务，表名沿用 `weekly_report_*`，用 `kind` 列区分（迁移 `20261120125000_monthly_reports`，已有的行都是 `weekly`）。下文说「周报」的规则，除单独写明的以外，对月报同样适用。
+收不收周报、月报和流量激增提醒是个人偏好：邮箱在账号上确认一次，之后每个能看的站点各有周报、月报和流量激增提醒三个开关，互不影响。收件人始终是登录账号当前的邮箱。月报、流量激增提醒和周报共用邮箱确认和表，表名沿用 `weekly_report_*`，用 `kind` 列区分（迁移 `20261120125000_monthly_reports`，已有的行都是 `weekly`）。下文说「周报」的规则，除单独写明的以外，对月报同样适用。
 
 **三张表**
 
 | 表 | 一行代表 | 说明 |
 |---|---|---|
 | `weekly_report_emails` | 一个账号的邮箱确认 | 记录确认的是哪个邮箱、确认时间、待用的链接令牌（只存 SHA-256 摘要）及其过期时间、上次请求时间（限流用）、确认邮件的语言。周报和月报共用 |
-| `weekly_report_subscriptions` | 一个账号订阅了一个站点的一种报告 | 主键 `(user_id, site_id, kind)`，`kind` 是 `weekly` 或 `monthly`。有这一行就是开着，关掉即删除。`email` 是这份订阅投递的邮箱（订阅时的账号邮箱，确认新邮箱后改为新邮箱），`confirmed_at` 是订阅时间，`lang` 是报告语言 |
-| `weekly_report_claims` | 一次已领取的发送 | 主键 `(user_id, site_id, kind, period_end)`。`period_end` 是这一期结束的本地午夜（UTC），`confirmed_at` 是领取时订阅的订阅时间，`unsubscribe_hash` 是这封邮件退订令牌的摘要 |
+| `weekly_report_subscriptions` | 一个账号订阅了一个站点的一种报告 | 主键 `(user_id, site_id, kind)`，`kind` 是 `weekly`、`monthly` 或 `spike`（流量激增提醒）。有这一行就是开着，关掉即删除。`email` 是这份订阅投递的邮箱（订阅时的账号邮箱，确认新邮箱后改为新邮箱），`confirmed_at` 是订阅时间，`lang` 是报告语言 |
+| `weekly_report_claims` | 一次已领取的发送 | 主键 `(user_id, site_id, kind, period_end)`；流量激增提醒的 `period_end` 是这次激增的开始时间。`period_end` 是这一期结束的本地午夜（UTC），`confirmed_at` 是领取时订阅的订阅时间，`unsubscribe_hash` 是这封邮件退订令牌的摘要 |
 
 邮箱状态按账号当前的邮箱判断：
 
@@ -483,13 +483,15 @@ CREATE UNIQUE INDEX pending_stats_deletions_site_once ON pending_stats_deletions
 
 | 请求 | 用途 |
 |---|---|
-| `GET /api/internal/account/weekly-report` | 返回 `available`（实例是否配置了 SMTP）、`email`、`email_status`、`sites`。`sites` 是这个账号有统计读权限的全部站点（组织成员或站点访客，不含已删除的站点和组织），每项有 `id`（数字站点 ID）、`name`、`timezone`、`week_starts_on`（`0` 为周日）、`subscribed`（周报开关：有 `weekly` 订阅行即为 `true`）、`monthly_subscribed`（月报开关：有 `monthly` 订阅行即为 `true`），按名称排序（不区分大小写），同名按 ID |
+| `GET /api/internal/account/weekly-report` | 返回 `available`（实例是否配置了 SMTP）、`email`、`email_status`、`sites`。`sites` 是这个账号有统计读权限的全部站点（组织成员或站点访客，不含已删除的站点和组织），每项有 `id`（数字站点 ID）、`name`、`timezone`、`week_starts_on`（`0` 为周日）、`subscribed`（周报开关：有 `weekly` 订阅行即为 `true`）、`monthly_subscribed`（月报开关：有 `monthly` 订阅行即为 `true`）、`spike_subscribed`（流量激增提醒开关）、`spike_threshold`（站点设置的阈值，没设是 `null`）、`can_edit_settings`（调用者能否改这个站点的设置，即组织 owner 或 admin；站点访客总是 `false`），按名称排序（不区分大小写），同名按 ID |
 | `POST /api/internal/account/weekly-report/confirmation` + `{"lang":"zh"}` 或 `{"lang":"en"}` | 给账号邮箱发确认邮件，邮件里是一个确认链接。每个账号每分钟最多一次，超出返回 `429` 和 `Retry-After`。已确认时只更新语言，不发邮件。成功返回与 `GET` 相同的对象 |
 | `DELETE /api/internal/account/weekly-report/confirmation` | 取消待确认（作废还没用的链接），返回 `204`。不影响已经确认的邮箱 |
 | `PUT /api/internal/sites/{site}/weekly-report` + `{"lang":"zh"}` 或 `{"lang":"en"}` | 订阅这个站点，返回 `204`。`{site}` 接受站点 ID 或 `site_key`；没有统计读权限或站点不存在都是 `404`。邮箱未确认返回 `409 email_unconfirmed`。已用当前邮箱订阅时只更新语言，订阅时间不变 |
 | `DELETE /api/internal/sites/{site}/weekly-report` | 取消订阅这个站点，返回 `204`，可重复调用。没有统计读权限或站点不存在是 `404` |
 | `PUT /api/internal/sites/{site}/monthly-report` + `{"lang":"zh"}` 或 `{"lang":"en"}` | 打开这个站点的月报，规则与周报的 `PUT` 相同，不影响周报开关 |
 | `DELETE /api/internal/sites/{site}/monthly-report` | 关掉这个站点的月报，规则与周报的 `DELETE` 相同，不影响周报开关 |
+| `PUT /api/internal/sites/{site}/traffic-spike` + `{"lang":"zh"}` 或 `{"lang":"en"}` | 打开这个站点的流量激增提醒，规则与周报的 `PUT` 相同。站点没设阈值时返回 `409 spike_threshold_unset`（先检查邮箱，邮箱未确认仍是 `409 email_unconfirmed`） |
+| `DELETE /api/internal/sites/{site}/traffic-spike` | 关掉这个站点的流量激增提醒，规则与周报的 `DELETE` 相同 |
 
 各路径的其他方法返回 `405` 和 `Allow`。旧版按站点的 `GET`、`POST`（申请确认码）和 `POST …/confirm` 已删除。
 
@@ -537,6 +539,18 @@ SMTP 未配置时，`GET` 返回 `available: false`，`POST …/confirmation` �
 - 确认邮件只有一种，文案仍是「确认接收 Rivu 周报」，月报不另发确认邮件。
 
 模板在 `crates/mail/src/weekly_report.rs`（周报和月报共用，按 `Cadence` 换文案），排版和文案来自原型 `designs/weekly-report/email.html`。
+
+#### 流量激增提醒
+
+站点的当前在线访客数（最近 5 分钟的去重访客，与看板的 `realtime` 同口径：`uniq(visitor_id)`，不含 `engagement` 事件）达到阈值时，给打开了提醒的人发一封邮件。默认关闭，需要 SMTP。
+
+- **阈值**是站点设置 `spike_threshold`（整数，1 到 2147483647，`null` 关闭），只有组织 owner 和 admin 能改（`PATCH /api/internal/sites/{site}` + `{"spike_threshold": 100}`，`site.settings.write`；editor、viewer 和站点访客 `403`），能读设置的人在 `GET /api/internal/sites/{site}/settings` 的 `settings.spike_threshold` 里看到。设置响应顶层另有 `mail_available`（实例是否配置了 SMTP），看板据此在没有邮件时隐藏这一项。
+- **收件人**是在账号页给这个站点打开「流量激增提醒」的人：同一个已确认邮箱、同样的权限和邮箱复核，开关是订阅表里 `kind = 'spike'` 的行。阈值改成 `null` 时开关保留，但不再检查这个站点，也不再发信。
+- **检查**：后台任务 `traffic_spike` 每分钟一次。先删除不再被检查的站点的激增状态，再取出所有设了阈值、站点和组织未删除、至少有一个 `spike` 订阅的站点，然后对这些站点一共发**一条** ClickHouse 查询（`site_id IN (…)`，`GROUP BY site_id`），时间条件与看板的 `realtime` 相同（`[now − 5 分钟, now]`，另加 UTC 日期条件让主键 `(site_id, toDate(ts), …)` 剪枝）。查询带 `max_execution_time`（看板超时）和 `log_comment = 'traffic_spike'`。
+- **开销**：每分钟一条查询，只读这些站点当天（UTC）和前一天跨零点时的 `events` 分区片段，读的量与打开看板实时数字一次相同，按站点数线性增长，与 `realtime` 每 3 秒一次的看板刷新相比可以忽略。PostgreSQL 每分钟两条站点查询，每个站点一个短事务。
+- **一次激增一封信**：`traffic_spikes` 一个站点一行，有这一行就表示站点正在激增，`started_at` 是开始时间，`below_since` 是数字回落到阈值以下后的第一次检查。在线访客 ≥ 阈值且没有这一行时，插入一行（`ON CONFLICT DO NOTHING`，多个进程同时检查只有一个能插入）并给收件人发信。激增期间数字低于阈值时记下 `below_since`，又回到阈值以上时清空；连续低于阈值满 30 分钟（冷却时间，常量 `traffic_spike::COOLDOWN`）后删除这一行，激增结束，之后再达到阈值才算新的一次。状态存在 PostgreSQL 里，重启不会重发。
+- **发送**：只在数字达到阈值的那次检查里发。每个收件人每次激增领取一条记录（`weekly_report_claims`，`kind = 'spike'`，`period_end = started_at`），领取前在周报同样的锁里复核账号、邮箱、权限，以及激增仍是同一次；所以同一次激增里不会有第二封，进程在领取后退出或 SMTP 没有明确结果也不会重发。开关必须在激增开始前打开，激增中途打开的人从下一次激增开始收到。
+- **邮件**：纯文本加 HTML，结构同周报（站点名、检测时刻和时区、数字格子、「打开看板」、页脚）。主题例如「studio.example.com：现在有 132 位访客在线」、「studio.example.com: 132 current visitors」。数字格子是「当前在线」和「提醒阈值」，下面一句「这次激增结束前不会再发提醒。」。页脚是收件原因、「管理提醒」（`{base}/account`）和「退订提醒」，退订链接 `{base}/api/traffic-spike/unsubscribe/{token}` 同样支持 RFC 8058 一键退订，只关掉这个站点的流量激增提醒。模板是 `crates/mail/src/weekly_report.rs` 的 `spike`。
 
 **从旧流程升级**：旧版本按站点用确认码确认。升级时（迁移 `20261119120000_weekly_report_account_email`），已有生效订阅（已确认且邮箱等于账号当前邮箱）的账号视为邮箱已确认，这些订阅保留，订阅时间不变，已发出的退订链接继续有效；还没确认完的申请、已关闭的订阅和邮箱已变更的旧订阅删除。
 
@@ -589,7 +603,7 @@ SMTP 未配置时，`GET` 返回 `available: false`，`POST …/confirmation` �
 | `RIVU_LOG_FORMAT`、`RIVU_LOG_LEVEL` | `json`、`info` | 格式为 `json` 或 `pretty`。开发排障可提高到 `debug` 或 `trace`，见[排障](../install.md#排障) |
 | `RIVU_METRICS` | `on` | 内部口 `/metrics` 开关（Plausible 默认关，04§0#6） |
 | `RIVU_OTLP_ENDPOINT`、`RIVU_ERROR_REPORT_DSN` | 空（关闭） | OTLP 导出（同 04§4.2 `OTLP_ENDPOINT` 思路）；可选错误上报，脱敏见第 10 节 |
-| `RIVU_SMTP_URL`、`RIVU_SMTP_FROM` | 两项须一起设置 | 邀请、密码重置、周报、更换登录邮箱的确认（不设置时更换登录邮箱立即生效）。支持 `smtps://` 或 `smtp://…?tls=required`，见[安装说明](../install.md#安装) |
+| `RIVU_SMTP_URL`、`RIVU_SMTP_FROM` | 两项须一起设置 | 邀请、密码重置、周报、月报、流量激增提醒、更换登录邮箱的确认（不设置时更换登录邮箱立即生效）。支持 `smtps://` 或 `smtp://…?tls=required`，见[安装说明](../install.md#安装) |
 | `RIVU_S3_ENDPOINT`、`_REGION`、`_BUCKET`、`_ACCESS_KEY_ID`、`_SECRET_ACCESS_KEY` | 空 | 导出对象存储，未配置则落本地；启用后缺一即报错（04§4.2 S3 段） |
 
 ## 8. 数据库账号与权限

@@ -452,6 +452,10 @@ pub async fn run(config: Config) -> Result<ExitCode> {
             Arc::clone(&dash),
             bg_stop_rx.clone(),
         ));
+        background.push(crate::traffic_spike::spawn(
+            Arc::clone(&dash),
+            bg_stop_rx.clone(),
+        ));
     }
     let query_routes = query_api::router(Arc::new(
         QueryApi::new(
