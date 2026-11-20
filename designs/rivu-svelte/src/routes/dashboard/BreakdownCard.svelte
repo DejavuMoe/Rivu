@@ -60,7 +60,14 @@
 
   const rows = $derived(rowsOf(dim));
   const toBars = (d: string, rs: Row[]): BarRow[] =>
-    rs.map((r) => ({ key: r.label, label: displayValue(d, r.label, app.lang), code: valueCode(d, r.label), value: r.visitors }));
+    rs.map((r) => ({
+      key: r.label,
+      label: displayValue(d, r.label, app.lang),
+      // 城市行：城市名后面跟国家名，行首是国家代码
+      code: valueCode(d, r.label) ?? r.country,
+      sub: r.country ? displayValue("country", r.country, app.lang) : undefined,
+      value: r.visitors,
+    }));
   const bars = $derived(toBars(dim, rows));
 
   /** 明细表：这个维度有附加列时，每行带上附加列；没有数据的显示「—」 */

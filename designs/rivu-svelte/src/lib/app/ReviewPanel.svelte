@@ -309,6 +309,20 @@
         />
       </div>
       <div class="row">
+        <span>地理库</span>
+        <Segmented
+          size="sm"
+          label="地理库"
+          value={app.review.geoDb}
+          onchange={(v) => setReview({ geoDb: v })}
+          options={[
+            { value: "site", label: "按站点" },
+            { value: "city", label: "城市级" },
+            { value: "country", label: "国家级" },
+          ]}
+        />
+      </div>
+      <div class="row">
         <span>语言与主题</span>
         <div class="pair">
           <Segmented size="sm" label="语言" value={app.lang} onchange={setLang} options={[{ value: "zh", label: "中" }, { value: "en", label: "EN" }]} />

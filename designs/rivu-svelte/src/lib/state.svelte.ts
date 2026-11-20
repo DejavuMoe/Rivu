@@ -42,6 +42,8 @@ interface Review {
   segments: "some" | "none";
   /** 图表批注：站点 1、2 有几条，或者都没有，或者已到每站 500 条的上限 */
   notes: "some" | "none" | "full";
+  /** 实例加载的地理库：site 按站点给几种（见 settings/store 的 geoCapability），city 城市级（MaxMind GeoLite2 City 或同结构的自定义库），country 国家级（默认的 DB-IP Lite） */
+  geoDb: "site" | "city" | "country";
 }
 
 function load<T>(key: string, fallback: T, storage: "local" | "session" = "local"): T {
@@ -87,6 +89,7 @@ export const app = $state({
       emailLink: "signedIn",
       segments: "some",
       notes: "some",
+      geoDb: "site",
     },
     "session",
   ),

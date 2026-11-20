@@ -79,7 +79,7 @@
       >
         {#snippet cell(r, c)}
           {#if c.key === "label"}
-            <button class="lbl" type="button">{r.label}</button>
+            <button class="lbl" type="button">{r.label}{#if r.sub}<span class="sub">{r.sub}</span>{/if}</button>
             {#if extras.length}
               <span class="mini">
                 {#each extras as h, i (i)}<span>{h} <span class="num">{r.extra?.[i] ?? "—"}</span></span>{/each}
@@ -120,6 +120,10 @@
   .tools :global(.input) {
     flex: 1;
     min-width: 0;
+  }
+  .sub {
+    margin-left: var(--sp-2);
+    color: var(--text-muted);
   }
   .mini {
     display: none;

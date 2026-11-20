@@ -6,7 +6,8 @@
   分群：URL 的 seg=<id> 引用站点的一个分群，它的条件和 f= 里的临时筛选同时生效；分群已被删除时提示一句，按没有分群查询。
 -->
 <script lang="ts">
-  import { ChartSpline, CircleAlert, Clock, Download, Hourglass, Inbox, MessageSquarePlus, Share2, Table2 } from "@lucide/svelte";
+  import { ChartSpline, CircleAlert, Clock, Download, Hourglass, Inbox, Info, MessageSquarePlus, Share2, Table2 } from "@lucide/svelte";
+  import Popover from "../../lib/ui/Popover.svelte";
   import SiteHeader from "../../lib/app/SiteHeader.svelte";
   import Callout from "../../lib/ui/Callout.svelte";
   import Card from "../../lib/ui/Card.svelte";
@@ -35,12 +36,12 @@
   import type { ChartMark } from "../../lib/charts/types";
   import "./note-strings";
   import {
-    CITY_LEVEL_DIMS,
     DIMS,
-    GEO_ATTRIBUTION,
     encodeFilters,
     firstDay,
-    geoHasRegions,
+    geoAttribution,
+    geoCountryOnly,
+    geoLevels,
     pageEngagement,
     grans,
     readState,
@@ -58,6 +59,8 @@
 
   let { site, mode = "app" }: { site: Site; mode?: "app" | "shared" } = $props();
   const shared = $derived(mode === "shared");
+  /** 安装文档里地理库一节（链接，不加载任何资源） */
+  const GEO_DOCS = "https://github.com/DejavuMoe/Rivu/blob/master/docs/install.md#geoip-%E5%9C%B0%E7%90%86%E5%BA%93";
 
   const dash = $derived(readState(route.current.query));
   /** URL 里的分群 id；分群只在登录后的看板里生效 */
@@ -151,9 +154,14 @@
   const mayExport = $derived(canEdit(site));
   const mayShare = $derived(canEdit(site) && siteAccess(site).access === "member");
 
-  /** 地理库到地区级时，位置卡片有「地区」标签页；筛选里没有城市（见 query.ts） */
-  const regions = $derived(geoHasRegions(site));
-  const filterDims = $derived(DIMS.filter((d) => d !== "city" && (regions || !CITY_LEVEL_DIMS.has(d))));
+  /**
+   * 位置卡片的级别：城市级地理库下有国家、地区、城市三个标签页，筛选里也有地区和城市；
+   * 只有国家级地理库（默认的 DB-IP Lite）时只有国家，卡片底部一个「为什么只有国家」说明原因和要配置什么。
+   */
+  const geoDims = $derived(geoLevels(site));
+  const countryOnly = $derived(geoCountryOnly(site));
+  const attr = $derived(geoAttribution(site));
+  const filterDims = $derived(DIMS.filter((d) => (d !== "region" && d !== "city") || geoDims.includes(d as "region" | "city")));
 
   // 页面报表的明细表多两列：平均滚动深度、平均停留时间（只有「页面」，入口页和退出页没有）。
   // 卡片太窄放不下三列数字，所以只在「查看全部」里出现
@@ -204,7 +212,20 @@
 </script>
 
 {#snippet attribution()}
-  <a href={GEO_ATTRIBUTION.url} target="_blank" rel="noreferrer">{GEO_ATTRIBUTION.text}</a>
+  <a href={attr.url} target="_blank" rel="noreferrer">{attr.text}</a>
+  {#if countryOnly && !shared}
+    <Popover width={300} role="dialog" align="end" side="top" label={t("dash.geo.why")}>
+      {#snippet trigger({ toggle, props })}
+        <button type="button" class="why" onclick={toggle} {...props}><Info size={14} strokeWidth={1.75} />{t("dash.geo.why")}</button>
+      {/snippet}
+      {#snippet children()}
+        <div class="why-pop">
+          <p>{t("dash.geo.whyBody")}</p>
+          <a href={GEO_DOCS} target="_blank" rel="noreferrer">{t("dash.geo.whyLink")}</a>
+        </div>
+      {/snippet}
+    </Popover>
+  {/if}
 {/snippet}
 
 <div class="page">
@@ -404,7 +425,7 @@
       />
       <BreakdownCard
         title={t("dash.card.locations")}
-        dims={regions ? ["country", "region"] : ["country"]}
+        dims={geoDims}
         rowsOf={res.breakdown}
         total={res.totalVisitors}
         onpick={addFilter}
@@ -522,6 +543,28 @@
   .note-cell {
     color: var(--text-muted);
     white-space: normal;
+  }
+  .why {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--sp-1);
+    flex: none;
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--text-muted);
+    font-size: var(--fs-sm);
+  }
+  .why:hover,
+  .why[aria-expanded="true"] {
+    color: var(--text);
+  }
+  .why-pop {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-2);
+    padding: var(--sp-2) var(--sp-3);
+    font-size: var(--fs-sm);
   }
   .grid {
     display: grid;

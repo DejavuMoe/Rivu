@@ -4,7 +4,7 @@
 import { breakdown, daily, hourly, monthly, NOW, type Point, type Row as FixtureRow, type Site } from "../../lib/data/fixtures";
 import { dateShort, hourLabel, dateLong } from "../../lib/format";
 import { app, type Lang } from "../../lib/state.svelte";
-import { cfgs, INSTANCE_RETENTION } from "../settings/store.svelte";
+import { cfgs, geoCapability, INSTANCE_RETENTION } from "../settings/store.svelte";
 import { capped, comparePeriod, dayCount, readRange, resolve, type Period, type RangeKey, type RangeParam } from "./period";
 
 export type { RangeKey } from "./period";
@@ -186,6 +186,8 @@ export interface Kpi {
 export interface Row {
   label: string;
   visitors: number;
+  /** 城市行所在的国家（ISO 代码），界面上和城市名一起显示 */
+  country?: string;
 }
 
 export interface GoalRow {
@@ -255,7 +257,11 @@ function rowsFor(site: Site, dim: string, total: number): Row[] {
   }
   const extra = EXTRA_DIMS[dim];
   if (extra) return extra.map(([label, share]) => ({ label, visitors: Math.max(1, Math.round(total * share)) }));
-  return breakdown(site, dim, total).map((r) => ({ label: rawLabel(dim, r), visitors: r.visitors }));
+  return breakdown(site, dim, total).map((r) => ({
+    label: rawLabel(dim, r),
+    visitors: r.visitors,
+    ...(dim === "city" && r.code ? { country: r.code } : {}),
+  }));
 }
 
 /** 筛选对话框里的候选值：该维度的排行。 */
@@ -335,15 +341,26 @@ export function pageEngagement(site: Site, page: string): PageEngagement | null 
 
 // ---------- 地理库 ----------
 
-/** 地理库的署名：服务端随含位置维度的查询一起返回，文字固定是英文。 */
-export const GEO_ATTRIBUTION = { text: "IP Geolocation by DB-IP", url: "https://db-ip.com" };
+/** 地理库的署名：服务端随含位置维度的查询一起返回（meta.geo_attribution），文字固定是英文。 */
+export function geoAttribution(site: Site): { text: string; url: string } {
+  return geoCapability(site) === "city"
+    ? { text: "This product includes GeoLite Data created by MaxMind", url: "https://www.maxmind.com" }
+    : { text: "IP Geolocation by DB-IP", url: "https://db-ip.com" };
+}
+
+/** 地理库只有国家级（meta.geo_capability = country，默认的 DB-IP Lite）：位置卡片只有国家，并说明原因。 */
+export function geoCountryOnly(site: Site): boolean {
+  return geoCapability(site) === "country";
+}
 
 /**
- * 地理库能不能到地区级。正式实现取自查询返回的 meta.geo_capability（默认的 DB-IP Lite 只有国家级）；
- * 原型里跟着站点设置的地理精度，选「国家」时看板只有国家。城市级没有名称，看板不显示城市。
+ * 位置卡片的级别：地理库的能力和站点的地理精度（geo_level）取低的那个。城市级库下可以到地区、城市；
+ * 站点自己选了「国家」时也只有国家（这是站点的选择，不用解释）。
  */
-export function geoHasRegions(site: Site): boolean {
-  return (cfgs[site.id]?.geo ?? "city") !== "country";
+export function geoLevels(site: Site): ("country" | "region" | "city")[] {
+  if (geoCapability(site) !== "city") return ["country"];
+  const level = cfgs[site.id]?.geo ?? "city";
+  return level === "country" ? ["country"] : level === "region" ? ["country", "region"] : ["country", "region", "city"];
 }
 
 // ---------- 提示：保留期与导入 ----------
