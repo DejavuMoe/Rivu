@@ -794,7 +794,8 @@ async fn weekly_report_confirms_the_mailbox_once_and_switches_sites() {
 
     let site_entry = |s: &Site, name: &str, week_starts_on: i64, subscribed: bool| {
         json!({"id": s.id, "name": name, "timezone": "UTC",
-               "week_starts_on": week_starts_on, "subscribed": subscribed})
+               "week_starts_on": week_starts_on, "subscribed": subscribed,
+               "monthly_subscribed": false})
     };
     assert_eq!(
         weekly_account(&http, &cookie).await,
@@ -1580,6 +1581,415 @@ async fn weekly_report_rechecks_recipients_and_claims_survive_restart() {
     .unwrap();
     assert!(!still_subscribed);
     assert_eq!(iso.count("weekly_report_claims").await, 6);
+    cleanup(&env, &[site.id]).await;
+    iso.drop().await;
+}
+
+#[tokio::test]
+async fn monthly_report_migration_keeps_weekly_rows_and_links() {
+    const MONTHLY: u64 = 20261120125000;
+    let Some(env) = test_env("monthly_report_migration") else {
+        return;
+    };
+    migrate_once(&env).await;
+    let iso = isolated_with(&env, |v| v < MONTHLY).await;
+    let pg = &iso.pool;
+    let org = make_org(pg).await;
+    let site = make_site(pg, &org, false).await;
+    let user = make_user(pg, Some((&org, "viewer"))).await;
+    let at = "2026-03-01T00:00:00Z";
+    sqlx::query(
+        "INSERT INTO weekly_report_subscriptions (user_id, site_id, email, lang, confirmed_at)
+         VALUES ($1, $2, $3, 'zh', $4::text::timestamptz)",
+    )
+    .bind(user.id)
+    .bind(site.id as i64)
+    .bind(&user.email)
+    .bind(at)
+    .execute(pg)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO weekly_report_claims
+             (user_id, site_id, period_end, confirmed_at, unsubscribe_hash)
+         VALUES ($1, $2, '2026-03-09T00:00:00Z', $3::text::timestamptz, $4)",
+    )
+    .bind(user.id)
+    .bind(site.id as i64)
+    .bind(at)
+    .bind(vec![9_u8; 32])
+    .execute(pg)
+    .await
+    .unwrap();
+
+    apply_pg_migrations(pg, |v| v >= MONTHLY).await;
+    let kinds: Vec<(String, String)> = sqlx::query_as(
+        "SELECT 'subscription', kind FROM weekly_report_subscriptions
+         UNION ALL SELECT 'claim', kind FROM weekly_report_claims ORDER BY 1",
+    )
+    .fetch_all(pg)
+    .await
+    .unwrap();
+    assert_eq!(
+        kinds,
+        [
+            ("claim".into(), "weekly".into()),
+            ("subscription".into(), "weekly".into())
+        ]
+    );
+    // An unsubscribe link mailed before the upgrade still matches its subscription.
+    let matched: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM weekly_report_subscriptions w JOIN weekly_report_claims c
+           ON c.user_id = w.user_id AND c.site_id = w.site_id AND c.kind = w.kind
+          AND c.confirmed_at = w.confirmed_at
+         WHERE c.unsubscribe_hash = $1 AND c.kind = 'weekly'",
+    )
+    .bind(vec![9_u8; 32])
+    .fetch_one(pg)
+    .await
+    .unwrap();
+    assert_eq!(matched, 1);
+    iso.drop().await;
+}
+
+const MONTHLY_ACCOUNT_FIELDS: [&str; 2] = ["subscribed", "monthly_subscribed"];
+
+fn monthly_site(site: impl std::fmt::Display) -> String {
+    format!("/api/internal/sites/{site}/monthly-report")
+}
+
+#[tokio::test]
+async fn monthly_report_switch_is_independent_of_the_weekly_one() {
+    let Some(env) = test_env("monthly_report_switch") else {
+        return;
+    };
+    migrate_once(&env).await;
+    let iso = isolated(&env).await;
+    let pg = &iso.pool;
+    let org = make_org(pg).await;
+    let member = make_user(pg, Some((&org, "viewer"))).await;
+    let site = make_site(pg, &org, false).await;
+    let foreign = make_site(pg, &make_org(pg).await, false).await;
+    let cfg = config(&env, &[]);
+    let reader = rivu_storage_ch::client(&env.ch_url, &account("reader"), Some(&ch_database()));
+    let (mailer, outbox) = rivu_mail::Mailer::memory("rivu@example.test");
+    let api = DashApi::new(&cfg, pg.clone(), reader, None)
+        .unwrap()
+        .with_mailer(mailer);
+    let http = serve_dashboard(Arc::new(api), &cfg.base_url).await;
+    let cookie = login_cookie(&http, &member.email).await;
+    let monthly = monthly_site(&site.key);
+    let weekly = weekly_site(site.id);
+    let lang = json!({"lang": "zh"});
+
+    assert_eq!(http.put(&monthly, &lang).send().await.status, 401);
+    let rejected = http
+        .put(&monthly, &lang)
+        .cookie(&cookie)
+        .header("Origin", "https://outside.test")
+        .send()
+        .await;
+    assert_eq!(rejected.status, 403);
+    assert_eq!(http.get(&monthly).cookie(&cookie).send().await.status, 405);
+    let unconfirmed = http.put(&monthly, &lang).cookie(&cookie).send().await;
+    assert_eq!(unconfirmed.status, 409);
+    assert_eq!(unconfirmed.json()["error"], "email_unconfirmed");
+    for target in [monthly_site(foreign.id), monthly_site("not-a-site")] {
+        assert_eq!(
+            http.put(&target, &lang).cookie(&cookie).send().await.status,
+            404
+        );
+        assert_eq!(
+            http.delete(&target).cookie(&cookie).send().await.status,
+            404
+        );
+    }
+
+    // The one mailbox confirmation covers both reports.
+    let (token, _) = weekly_link(&http, &outbox, &cookie, "zh", &member.email).await;
+    assert_eq!(weekly_token(&http, "POST", &token).await.status, 200);
+    let switches = |status: Value| {
+        MONTHLY_ACCOUNT_FIELDS.map(|field| status["sites"][0][field].as_bool().unwrap())
+    };
+    assert_eq!(
+        switches(weekly_account(&http, &cookie).await),
+        [false, false]
+    );
+    let on = http.put(&monthly, &lang).cookie(&cookie).send().await;
+    assert_eq!(on.status, 204, "{}", on.body);
+    assert_eq!(on.header("cache-control"), Some("no-store"));
+    assert_eq!(
+        switches(weekly_account(&http, &cookie).await),
+        [false, true]
+    );
+    assert_eq!(
+        http.put(&weekly, &lang).cookie(&cookie).send().await.status,
+        204
+    );
+    assert_eq!(switches(weekly_account(&http, &cookie).await), [true, true]);
+    let kinds = || {
+        sqlx::query_scalar::<_, String>(
+            "SELECT kind FROM weekly_report_subscriptions WHERE user_id = $1 ORDER BY kind",
+        )
+        .bind(member.id)
+        .fetch_all(pg)
+    };
+    assert_eq!(kinds().await.unwrap(), ["monthly", "weekly"]);
+    // Switching one off leaves the other alone, in both directions.
+    for _ in 0..2 {
+        assert_eq!(
+            http.delete(&monthly).cookie(&cookie).send().await.status,
+            204
+        );
+    }
+    assert_eq!(
+        switches(weekly_account(&http, &cookie).await),
+        [true, false]
+    );
+    assert_eq!(
+        http.put(&monthly, &lang)
+            .cookie(&cookie)
+            .send()
+            .await
+            .status,
+        204
+    );
+    assert_eq!(
+        http.delete(&weekly).cookie(&cookie).send().await.status,
+        204
+    );
+    assert_eq!(
+        switches(weekly_account(&http, &cookie).await),
+        [false, true]
+    );
+    assert_eq!(kinds().await.unwrap(), ["monthly"]);
+    assert!(outbox.take().is_empty());
+
+    // Losing access removes every report switch for that site.
+    let owner = make_user(pg, Some((&org, "owner"))).await;
+    rivu_storage_pg::members::remove_member(pg, org.id, owner.id, member.id, |_, _| true)
+        .await
+        .unwrap();
+    assert!(kinds().await.unwrap().is_empty());
+    iso.drop().await;
+}
+
+#[tokio::test]
+async fn monthly_report_is_sent_once_per_month_and_unsubscribes_alone() {
+    let Some(env) = test_env("monthly_report_delivery") else {
+        return;
+    };
+    migrate_once(&env).await;
+    let iso = isolated(&env).await;
+    let pg = &iso.pool;
+    sqlx::query("SELECT setval(pg_get_serial_sequence('sites', 'id'), $1, false)")
+        .bind(16_000_000_000_i64 + i64::from(rand::random::<u32>()))
+        .execute(pg)
+        .await
+        .unwrap();
+    let org = make_org(pg).await;
+    let owner = make_user(pg, Some((&org, "owner"))).await;
+    let guest = make_user(pg, None).await;
+    let late = make_user(pg, Some((&org, "viewer"))).await;
+    let site = make_site(pg, &org, false).await;
+    let id = site.id as i64;
+    sqlx::query("INSERT INTO site_memberships (site_id, user_id, role) VALUES ($1, $2, 'viewer')")
+        .bind(id)
+        .bind(guest.id)
+        .execute(pg)
+        .await
+        .unwrap();
+    let subscribe = |user: &User, kind: &str, lang: &str, at: &str| {
+        sqlx::query(
+            "INSERT INTO weekly_report_subscriptions
+                 (user_id, site_id, kind, email, lang, confirmed_at)
+             VALUES ($1, $2, $3, $4, $5, $6::text::timestamptz)",
+        )
+        .bind(user.id)
+        .bind(id)
+        .bind(kind.to_owned())
+        .bind(user.email.clone())
+        .bind(lang.to_owned())
+        .bind(at.to_owned())
+        .execute(pg)
+    };
+    for (user, lang) in [(&owner, "en"), (&guest, "zh"), (&late, "en")] {
+        sqlx::query(
+            "INSERT INTO weekly_report_emails (user_id, email, lang, confirmed_at)
+             VALUES ($1, $2, $3, '2026-03-01T00:00:00Z')",
+        )
+        .bind(user.id)
+        .bind(&user.email)
+        .bind(lang)
+        .execute(pg)
+        .await
+        .unwrap();
+    }
+    subscribe(&owner, "monthly", "en", "2026-03-10T00:00:00Z")
+        .await
+        .unwrap();
+    subscribe(&guest, "monthly", "zh", "2026-03-31T23:59:59Z")
+        .await
+        .unwrap();
+    // Switched on after March ended: the first report for it is April.
+    subscribe(&late, "monthly", "en", "2026-04-01T00:00:00Z")
+        .await
+        .unwrap();
+    // The weekly switch is on too, but too late for the week of 23 to 29 March.
+    subscribe(&owner, "weekly", "en", "2026-03-31T00:00:00Z")
+        .await
+        .unwrap();
+
+    let cfg = config(&env, &[]);
+    let reader = rivu_storage_ch::client(&env.ch_url, &account("reader"), Some(&ch_database()));
+    let writer = rivu_storage_ch::writer_client(&env.ch_url, &account("writer"), &ch_database());
+    add_rollup_event(&writer, site.id, date(2026, 2, 28)).await; // Before March.
+    add_rollup_event(&writer, site.id, date(2026, 3, 1)).await;
+    add_rollup_event(&writer, site.id, date(2026, 3, 31)).await;
+    add_rollup_event(&writer, site.id, date(2026, 4, 1)).await; // After March.
+    let make_api = |at: &'static str| {
+        let (mailer, outbox) = rivu_mail::Mailer::memory("rivu@example.test");
+        let api = DashApi::new(&cfg, pg.clone(), reader.clone(), None)
+            .unwrap()
+            .with_clock(move || at.parse().unwrap())
+            .with_mailer(mailer);
+        (Arc::new(api), outbox)
+    };
+    let run = rivu::weekly_report::run_once;
+    let claims = |kind: &'static str| {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM weekly_report_claims WHERE kind = $1")
+            .bind(kind)
+            .fetch_one(pg)
+    };
+
+    // 08:59 on the 1st in the site's time zone (UTC): not yet.
+    let (early, early_outbox) = make_api("2026-04-01T08:59:59Z");
+    run(&early).await.unwrap();
+    assert!(early_outbox.take().is_empty());
+    assert_eq!(claims("monthly").await.unwrap(), 0);
+
+    // Two processes at 09:00 send each recipient one report.
+    let (api, outbox) = make_api("2026-04-01T09:00:00Z");
+    let (other, other_outbox) = make_api("2026-04-01T09:00:00Z");
+    let (a, b) = tokio::join!(run(&api), run(&other));
+    a.unwrap();
+    b.unwrap();
+    let mut reports = outbox.take();
+    reports.extend(other_outbox.take());
+    assert_eq!(reports.len(), 2, "{reports:#?}");
+    assert_eq!(claims("monthly").await.unwrap(), 2);
+    assert_eq!(claims("weekly").await.unwrap(), 0);
+    let en = reports.iter().find(|m| m.to == owner.email).unwrap();
+    assert_eq!(en.subject, "internal-api-e2e monthly report: March 2026");
+    assert!(
+        en.body
+            .starts_with("internal-api-e2e\nMar 1 \u{2013} 31, 2026 (UTC)\n\n"),
+        "{}",
+        en.body
+    );
+    assert!(en.body.contains("\nPageviews: 2\n"), "{}", en.body);
+    assert!(
+        en.body
+            .contains(&format!("Manage monthly report: {HTTP_ORIGIN}/account\n"))
+    );
+    let zh = reports.iter().find(|m| m.to == guest.email).unwrap();
+    assert_eq!(zh.subject, "internal-api-e2e 月报：2026 年 3 月");
+    assert!(zh.body.contains("2026 年 3 月 1 日至 31 日（UTC）\n\n"));
+    assert!(zh.body.contains("\n浏览量：2\n"), "{}", zh.body);
+    for mail in [en, zh] {
+        let link = mail.unsubscribe_url.as_deref().unwrap();
+        assert!(
+            link.starts_with(&format!("{HTTP_ORIGIN}/api/monthly-report/unsubscribe/")),
+            "{link}"
+        );
+        assert!(mail.body.contains(link));
+        assert!(mail.html.as_deref().unwrap().contains(link));
+    }
+
+    // Later in the month and after a restart, March is not sent again.
+    let (restarted, restarted_outbox) = make_api("2026-04-30T23:59:59Z");
+    run(&restarted).await.unwrap();
+    // The owner's weekly report for 20 to 26 April is the only mail.
+    let mails = restarted_outbox.take();
+    assert_eq!(mails.len(), 1);
+    assert_eq!(mails[0].to, owner.email);
+    assert!(mails[0].subject.contains("weekly report"));
+    assert_eq!(claims("monthly").await.unwrap(), 2);
+
+    // A monthly link does nothing at the weekly address, and switches off only the monthly report.
+    let http = serve_dashboard(Arc::clone(&restarted), &cfg.base_url).await;
+    let token = en
+        .unsubscribe_url
+        .as_deref()
+        .unwrap()
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .to_owned();
+    let wrong = http
+        .rb(
+            "POST",
+            &format!("/api/weekly-report/unsubscribe/{token}"),
+            Vec::new(),
+        )
+        .send()
+        .await;
+    assert!(wrong.body.contains("already off"), "{}", wrong.body);
+    let opt_out = format!("/api/monthly-report/unsubscribe/{token}");
+    let page = http.get(&opt_out).send().await;
+    assert_eq!(page.status, 200);
+    assert!(page.body.contains("Rivu monthly reports") && page.body.contains("退订 Rivu 月报"));
+    assert_eq!(
+        page.header("content-security-policy"),
+        Some("default-src 'none'; form-action 'self'; frame-ancestors 'none'")
+    );
+    let subscribed = |kind: &'static str| {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT FROM weekly_report_subscriptions
+                           WHERE user_id = $1 AND site_id = $2 AND kind = $3)",
+        )
+        .bind(owner.id)
+        .bind(id)
+        .bind(kind)
+        .fetch_one(pg)
+    };
+    assert!(subscribed("monthly").await.unwrap(), "GET changes nothing");
+    let done = http
+        .rb("POST", &opt_out, b"List-Unsubscribe=One-Click".to_vec())
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .send()
+        .await;
+    assert_eq!(done.status, 200, "{}", done.body);
+    assert!(
+        done.body
+            .contains("You have unsubscribed from Rivu monthly reports")
+    );
+    assert!(!subscribed("monthly").await.unwrap());
+    assert!(subscribed("weekly").await.unwrap());
+    let again = http.rb("POST", &opt_out, Vec::new()).send().await;
+    assert!(again.body.contains("already off"));
+    assert_eq!(
+        http.get("/api/monthly-report/unsubscribe/not-a-token")
+            .send()
+            .await
+            .status,
+        404
+    );
+
+    // April goes to the two remaining monthly recipients, including the late one.
+    let (may, may_outbox) = make_api("2026-05-01T09:00:00Z");
+    run(&may).await.unwrap();
+    let mut monthly: Vec<String> = may_outbox
+        .take()
+        .into_iter()
+        .filter(|m| m.subject.contains("April 2026") || m.subject.contains("2026 年 4 月"))
+        .map(|m| m.to)
+        .collect();
+    monthly.sort();
+    let mut want = vec![guest.email.clone(), late.email.clone()];
+    want.sort();
+    assert_eq!(monthly, want);
+    assert_eq!(claims("monthly").await.unwrap(), 4);
     cleanup(&env, &[site.id]).await;
     iso.drop().await;
 }

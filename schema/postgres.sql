@@ -428,7 +428,9 @@ TABLE weekly_report_claims
   period_end timestamp with time zone NOT NULL
   confirmed_at timestamp with time zone
   unsubscribe_hash bytea
-  CONSTRAINT weekly_report_claims_pkey PRIMARY KEY (user_id, site_id, period_end)
+  kind text NOT NULL DEFAULT 'weekly'::text
+  CONSTRAINT weekly_report_claims_kind_check CHECK ((kind = ANY (ARRAY['weekly'::text, 'monthly'::text])))
+  CONSTRAINT weekly_report_claims_pkey PRIMARY KEY (user_id, site_id, kind, period_end)
   CONSTRAINT weekly_report_claims_site_id_fkey FOREIGN KEY (site_id) REFERENCES sites(id)
   CONSTRAINT weekly_report_claims_unsubscribe_hash_check CHECK ((octet_length(unsubscribe_hash) = 32))
   CONSTRAINT weekly_report_claims_user_id_fkey FOREIGN KEY (user_id) REFERENCES users(id)
@@ -456,8 +458,10 @@ TABLE weekly_report_subscriptions
   email text NOT NULL
   lang text NOT NULL
   confirmed_at timestamp with time zone NOT NULL
+  kind text NOT NULL DEFAULT 'weekly'::text
+  CONSTRAINT weekly_report_subscriptions_kind_check CHECK ((kind = ANY (ARRAY['weekly'::text, 'monthly'::text])))
   CONSTRAINT weekly_report_subscriptions_lang_check CHECK ((lang = ANY (ARRAY['zh'::text, 'en'::text])))
-  CONSTRAINT weekly_report_subscriptions_pkey PRIMARY KEY (user_id, site_id)
+  CONSTRAINT weekly_report_subscriptions_pkey PRIMARY KEY (user_id, site_id, kind)
   CONSTRAINT weekly_report_subscriptions_site_id_fkey FOREIGN KEY (site_id) REFERENCES sites(id)
   CONSTRAINT weekly_report_subscriptions_user_id_fkey FOREIGN KEY (user_id) REFERENCES users(id)
   CREATE INDEX weekly_report_subscriptions_site ON public.weekly_report_subscriptions USING btree (site_id)
