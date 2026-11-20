@@ -8,3 +8,6 @@
 
 # 第三方与 AI Agent 技能包不计入 GitHub 语言统计（否则 JavaScript 占比会被虚高）。
 .agents/skills/** linguist-vendored
+
+# 设计原型（designs/）是界面草图，不计入语言统计。
+designs/** linguist-vendored
