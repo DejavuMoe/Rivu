@@ -56,6 +56,8 @@ export interface ShareLink {
   slug: string;
   password: boolean;
   expires: Date | null;
+  /** 绑定的分群（segments.id）：通过这个链接看到的数据都带着它的条件 */
+  segment: number | null;
   by: string;
   createdAt: Date;
 }
@@ -179,6 +181,7 @@ function links(site: Site): ShareLink[] {
       slug: "9f3k2m7q8w1x4z6c5v0b2n8m",
       password: false,
       expires: null,
+      segment: null,
       by: "林夏",
       createdAt: day(41),
     },
@@ -188,6 +191,8 @@ function links(site: Site): ShareLink[] {
       slug: "t5r8y2u6i0o3p7a1s4d9f2g6",
       password: true,
       expires: ahead(7),
+      // 站点 1 的「合作方增长看板」只给合作方看博客读者（分群 103），演示删除被链接使用的分群
+      segment: site.id === 1 ? 103 : null,
       by: "林夏",
       createdAt: day(6),
     },
@@ -197,6 +202,7 @@ function links(site: Site): ShareLink[] {
       slug: "expiredq2w3e4r5t6y7u8i9o0p1",
       password: false,
       expires: day(9),
+      segment: null,
       by: "周远",
       createdAt: day(40),
     },
@@ -206,6 +212,7 @@ function links(site: Site): ShareLink[] {
       slug: "m8c2x6v1b5n9q3w7e4r0t2y6",
       password: false,
       expires: null,
+      segment: null,
       by: "周远",
       createdAt: day(3),
     },

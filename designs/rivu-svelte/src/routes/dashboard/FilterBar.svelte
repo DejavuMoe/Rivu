@@ -1,8 +1,9 @@
 <!--
   看板筛选栏：一行，作用于下面所有图表（不在单个卡片里放筛选）。
-  日期范围、对比、已加的筛选条件（可点开修改、可移除）、添加筛选。
+  日期范围、对比、分群（segment 片段，登录后的看板才有）、已加的筛选条件（可点开修改、可移除）、添加筛选。
 -->
 <script lang="ts">
+  import type { Snippet } from "svelte";
   import { CalendarRange, GitCompareArrows, ListFilter, Plus, X } from "@lucide/svelte";
   import Popover from "../../lib/ui/Popover.svelte";
   import MenuItem from "../../lib/ui/MenuItem.svelte";
@@ -24,8 +25,10 @@
     dims: string[];
     /** 维度的候选值（原始取值） */
     suggest: (dim: string) => string[];
+    /** 分群按钮（共享链接与公开看板不传） */
+    segment?: Snippet;
   }
-  let { dash, onrange, oncompare, onfilters, dims, suggest }: Props = $props();
+  let { dash, onrange, oncompare, onfilters, dims, suggest, segment }: Props = $props();
 
   let dialogOpen = $state(false);
   let editing: number | null = $state(null);
@@ -90,6 +93,8 @@
       ]}
     />
   {/if}
+
+  {#if segment}{@render segment()}{/if}
 
   {#each dash.filters as f, i (f.dim)}
     <span class="chip">

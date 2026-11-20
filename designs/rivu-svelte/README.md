@@ -10,6 +10,8 @@
 - 月报（#38）：`src/routes/account/WeeklyReportsCard.svelte` 改成「邮件订阅」卡片，站点 × 周报 / 月报的开关表（文件名沿用）。
 - 流量突增通知（#39）：站点设置的「通知」分区 `src/routes/settings/AlertsSection.svelte`（`#/s/1/settings/alerts`，所有者 / 管理员，且「邮件」为已配置），以及「邮件订阅」表里的「流量突增」一列。
 
+- 分群（#40）：`src/routes/dashboard/SegmentMenu.svelte`，`#/s/1` 筛选栏的「分群」；评审面板「看板分群」切换有 / 无，「角色」切到查看者只剩套用。
+
 ## 运行
 
 依赖装在 WSL 构建镜像里（Windows 只放源码）：

@@ -281,6 +281,19 @@
         />
       </div>
       <div class="row">
+        <span>看板分群</span>
+        <Segmented
+          size="sm"
+          label="看板分群"
+          value={app.review.segments}
+          onchange={(v) => setReview({ segments: v })}
+          options={[
+            { value: "some", label: "有" },
+            { value: "none", label: "无" },
+          ]}
+        />
+      </div>
+      <div class="row">
         <span>语言与主题</span>
         <div class="pair">
           <Segmented size="sm" label="语言" value={app.lang} onchange={setLang} options={[{ value: "zh", label: "中" }, { value: "en", label: "EN" }]} />

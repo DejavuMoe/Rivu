@@ -197,6 +197,7 @@ extend({
   "set.share.exp.custom": ["自定义", "Custom"],
   "set.share.expPast": ["有效期必须晚于现在", "The expiry must be in the future"],
   "set.share.create": ["创建链接", "Create link"],
+  "set.share.seg.none": ["不限", "All visitors"],
   "set.share.created": ["共享链接已创建", "Shared link created"],
   "set.share.revoked": ["共享链接已撤销", "Shared link revoked"],
   "set.share.rv.title": ["撤销「{n}」", "Revoke “{n}”"],

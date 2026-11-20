@@ -1,7 +1,8 @@
 <!--
   站点看板：页头（站点、在线人数）→ 筛选栏 → 指标与趋势 → 来源、页面、地区、设备 → 目标、属性。
   状态都在 URL 查询串里，可分享、刷新不丢。
-  mode="shared" 用于共享链接与公开看板：只读，没有任何管理入口。
+  mode="shared" 用于共享链接与公开看板：只读，没有任何管理入口，也没有分群。
+  分群：URL 的 seg=<id> 引用站点的一个分群，它的条件和 f= 里的临时筛选同时生效；分群已被删除时提示一句，按没有分群查询。
 -->
 <script lang="ts">
   import { ChartSpline, CircleAlert, Clock, Download, Hourglass, Inbox, Share2, Table2 } from "@lucide/svelte";
@@ -24,6 +25,9 @@
   import BreakdownCard from "./BreakdownCard.svelte";
   import GoalsCard from "./GoalsCard.svelte";
   import PropsCard from "./PropsCard.svelte";
+  import SegmentMenu from "./SegmentMenu.svelte";
+  import { findSegment, type Segment } from "./segments.svelte";
+  import "./segment-strings";
   import {
     CITY_LEVEL_DIMS,
     DIMS,
@@ -44,6 +48,15 @@
   const shared = $derived(mode === "shared");
 
   const dash = $derived(readState(route.current.query));
+  /** URL 里的分群 id；分群只在登录后的看板里生效 */
+  const segId = $derived.by(() => {
+    const raw = route.current.query.get("seg");
+    return shared || !raw || !/^\d+$/.test(raw) ? null : Number(raw);
+  });
+  const activeSeg = $derived(findSegment(site.id, segId));
+  const segMissing = $derived(segId !== null && !activeSeg);
+  /** 查询用的状态：分群的条件在前，临时筛选叠加在后 */
+  const query = $derived(activeSeg ? { ...dash, filters: [...activeSeg.filters, ...dash.filters] } : dash);
   const view = $derived(route.current.query.get("view") === "table" ? "table" : "chart");
   const realtime = $derived(dash.range === "realtime");
   const ds = $derived(app.review.dataState);
@@ -55,11 +68,11 @@
   const noData = $derived(site.scale === 0 || ds === "empty");
   const empty = $derived(settled && noData && !realtime);
   /** 站点从来没有收到过数据（决定空状态的文案与动作）；带筛选的查询不做这个判断 */
-  const neverReceived = $derived(site.scale === 0 && !dash.filters.length);
+  const neverReceived = $derived(site.scale === 0 && !query.filters.length);
   /** 页头的在线人数：加载中、出错时还没取到，不显示；范围里没有数据时是 0；其余取站点的模拟值 */
   const live = $derived(!settled ? null : noData ? 0 : undefined);
 
-  const res = $derived(runQuery(site, dash, app.lang, noData && realtime));
+  const res = $derived(runQuery(site, query, app.lang, noData && realtime));
   const metric = $derived(dash.metric);
   const values = $derived(res.points.map((p) => p[metric] as number));
   const prevValues = $derived(res.prevPoints?.map((p) => p[metric] as number) ?? null);
@@ -131,8 +144,27 @@
       onrange={(r) => setQuery({ range: r === "30d" ? null : r, gran: null })}
       oncompare={(c) => setQuery({ cmp: c === "previous_period" ? null : c })}
       onfilters={(fs: Filter[]) => setQuery({ f: fs.length ? encodeFilters(fs) : null })}
-    />
+    >
+      {#snippet segment()}
+        {#if !shared}
+          <SegmentMenu
+            {site}
+            active={activeSeg}
+            filters={dash.filters}
+            canWrite={canEdit(site)}
+            onapply={(s: Segment | null) => setQuery({ seg: s ? String(s.id) : null, f: null })}
+          />
+        {/if}
+      {/snippet}
+    </FilterBar>
   </div>
+
+  {#if segMissing}
+    <Callout tone="warn">
+      {t("seg.missing")}
+      {#snippet actions()}<Button size="sm" onclick={() => setQuery({ seg: null })}>{t("common.close")}</Button>{/snippet}
+    </Callout>
+  {/if}
 
   {#if settled && res.beyondRetention && !empty}
     <Callout tone="warn">{t("dash.retentionWarn")}</Callout>
