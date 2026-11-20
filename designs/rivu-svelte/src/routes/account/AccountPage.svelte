@@ -1,6 +1,6 @@
 <!--
-  账号与安全：个人资料（只读）、修改密码、两步验证、邮件周报、登录会话。主题与语言在侧栏用户菜单里设置。
-  后端目前没有改名、改邮箱的接口。改密码成功后服务端撤销全部旧会话并换发新会话，会话列表只剩当前这一个。
+  账号与安全：个人资料（名字只读，登录邮箱可以修改，见 LoginEmail.svelte）、修改密码、两步验证、邮件订阅（周报、月报、流量突增）、登录会话。主题与语言在侧栏用户菜单里设置。
+  后端目前没有改名的接口。改密码或改邮箱成功后服务端撤销其他设备的会话，会话列表只剩当前这一个。
   评审面板的「登录结果」演示修改密码时当前密码错误、被限流与其他失败；新密码与当前密码相同由原型直接判断。
 -->
 <script lang="ts">
@@ -21,8 +21,10 @@
   import { t } from "../../lib/i18n";
   import { app, passwordResult, toast } from "../../lib/state.svelte";
   import { navigate } from "../../lib/router.svelte";
+  import LoginEmail from "./LoginEmail.svelte";
   import TwoFactorCard from "./TwoFactorCard.svelte";
   import WeeklyReportsCard from "./WeeklyReportsCard.svelte";
+  import { account } from "./email.svelte";
   import "./strings";
 
   interface Session {
@@ -40,7 +42,11 @@
     { id: "s3", device: "Linux Firefox", usedMinutesAgo: 3 * 24 * 60 },
     { id: "s4", device: "Windows Edge", usedMinutesAgo: 9 * 24 * 60 },
     { id: "s5", device: null, usedMinutesAgo: 12 * 24 * 60 },
-  ]);
+  ].filter((s) => s.current || !account.othersSignedOut));
+  // 改邮箱生效后其他设备已退出（没配置邮件时在这个页面上立即生效）
+  $effect(() => {
+    if (account.othersSignedOut) sessions = sessions.filter((s) => s.current);
+  });
   const loading = $derived(app.review.dataState === "loading");
   const failed = $derived(["error", "busy", "timeout"].includes(app.review.dataState));
   const device = (s: Session) => s.device || t("ac.unknownDevice");
@@ -115,12 +121,12 @@
 
   <Card title={t("ac.profile")}>
     <div class="rows">
-      <!-- 还没有修改资料的接口：只读，显示成文字而不是禁用的输入框 -->
+      <!-- 还没有改名的接口：只读，显示成文字而不是禁用的输入框 -->
       <Field layout="row" label={t("ac.name")}>
         <span class="val">{USER.name || "—"}</span>
       </Field>
       <Field layout="row" label={t("ac.email")}>
-        <span class="val">{USER.email}</span>
+        <LoginEmail />
       </Field>
     </div>
   </Card>

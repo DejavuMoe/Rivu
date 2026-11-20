@@ -1,5 +1,5 @@
-// 邮件周报的模拟状态：会话内保持，刷新回到初始值。
-// 邮箱确认是账号级的，只做一次；确认之后每个站点一个开关。真实实现里这些来自服务端。
+// 邮件订阅（周报、月报、流量突增）的模拟状态：会话内保持，刷新回到初始值。
+// 邮箱确认是账号级的，只做一次，各种邮件共用；确认之后每个站点每种邮件一个开关。真实实现里这些来自服务端。
 
 export type WeeklyEmail = "unconfirmed" | "pending" | "confirmed";
 
@@ -12,6 +12,10 @@ export const weekly = $state({
   requestedAt: 0,
   /** 上次的确认邮件是否发出去了：SMTP 拒收时服务端回错误，状态不变，页面留一条提示 */
   delivered: true,
-  /** 站点 id → 是否订阅 */
+  /** 站点 id → 是否订阅周报 */
   sites: {} as Record<number, boolean>,
+  /** 站点 id → 是否订阅月报（与周报互不影响） */
+  monthly: {} as Record<number, boolean>,
+  /** 站点 id → 是否接收流量突增通知（站点设了提醒人数才有用） */
+  spike: {} as Record<number, boolean>,
 });

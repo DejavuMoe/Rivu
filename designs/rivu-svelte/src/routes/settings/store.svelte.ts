@@ -13,6 +13,8 @@ export const RATE_MAX = 1_000_000;
 export const INSTANCE_RETENTION = 731;
 export const MIN_RETENTION = 30;
 export const MAX_RULES = 500;
+/** 流量突增提醒人数的上限。 */
+export const SPIKE_MAX = 1_000_000;
 export const MAX_GOALS = 100;
 
 export type RuleType = "ip" | "cidr" | "country" | "hostname" | "page";
@@ -97,6 +99,8 @@ export interface Cfg {
   eventProps: string[];
   geo: "country" | "region" | "city";
   retention: string;
+  /** 流量突增的提醒人数：当前访客超过它时发邮件；空串 = 不提醒（默认） */
+  spikeThreshold: string;
   rules: Rule[];
   goals: Goal[];
   links: ShareLink[];
@@ -253,6 +257,9 @@ function imports(site: Site): Import[] {
   return [];
 }
 
+/** 设了提醒人数的站点；其余默认不提醒。 */
+const SPIKES: Record<number, string> = { 1: "200", 2: "80", 5: "60" };
+
 function make(site: Site): Cfg {
   return {
     weekStart: "1",
@@ -263,6 +270,7 @@ function make(site: Site): Cfg {
     eventProps: site.id === 1 ? ["plan", "type", "variant"] : [],
     geo: geoCapability(site) === "country" ? "country" : "city",
     retention: "",
+    spikeThreshold: SPIKES[site.id] ?? "",
     rules: rules(site),
     goals: goals(site),
     links: links(site),

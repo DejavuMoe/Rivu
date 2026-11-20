@@ -10,7 +10,7 @@
   import Button from "../../lib/ui/Button.svelte";
   import Callout from "../../lib/ui/Callout.svelte";
   import Skeleton from "../../lib/ui/Skeleton.svelte";
-  import { USER } from "../../lib/data/fixtures";
+  import { account } from "../account/email.svelte";
   import { t } from "../../lib/i18n";
   import { app } from "../../lib/state.svelte";
   import { href } from "../../lib/router.svelte";
@@ -62,7 +62,7 @@
   {:else}
     <div class="col">
       <h1>{t("wconfirm.title")}</h1>
-      <p class="muted">{t("wconfirm.body", { email: USER.email })}</p>
+      <p class="muted">{t("wconfirm.body", { email: account.email })}</p>
       {#if failed}<Callout tone="bad">{t(failed === "network" ? "login.network" : "wconfirm.failed")}</Callout>{/if}
       <Button variant="primary" size="lg" block loading={busy} onclick={confirm}>{t("wconfirm.submit")}</Button>
     </div>

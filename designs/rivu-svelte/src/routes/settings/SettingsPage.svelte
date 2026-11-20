@@ -6,7 +6,7 @@
   分区可见性按角色（见 lib/data/sections.ts 的 visibleSections）；不存在或无权的分区是「找不到页面」。
 -->
 <script lang="ts">
-  import { CircleAlert, Globe, Radio, Settings2, Share2, ShieldBan, Target, TriangleAlert, EyeOff, Upload } from "@lucide/svelte";
+  import { Bell, CircleAlert, Globe, Radio, Settings2, Share2, ShieldBan, Target, TriangleAlert, EyeOff, Upload } from "@lucide/svelte";
   import SiteHeader from "../../lib/app/SiteHeader.svelte";
   import Button from "../../lib/ui/Button.svelte";
   import Card from "../../lib/ui/Card.svelte";
@@ -28,6 +28,7 @@
   import ShieldSection from "./ShieldSection.svelte";
   import GoalsSection from "./GoalsSection.svelte";
   import SharingSection from "./SharingSection.svelte";
+  import AlertsSection from "./AlertsSection.svelte";
   import ImportsSection from "./ImportsSection.svelte";
   import DangerSection from "./DangerSection.svelte";
   import "./strings";
@@ -42,11 +43,12 @@
     shield: ShieldBan,
     goals: Target,
     sharing: Share2,
+    alerts: Bell,
     imports: Upload,
     danger: TriangleAlert,
   };
   /** 这些分区要用站点的 settings；屏蔽规则、目标、共享链接与导入各自加载自己的列表 */
-  const NEEDS_SETTINGS = new Set<SectionKey>(["general", "hostnames", "collection", "privacy"]);
+  const NEEDS_SETTINGS = new Set<SectionKey>(["general", "hostnames", "collection", "privacy", "alerts"]);
 
   const visible = $derived(visibleSections(site));
   const current = $derived(isSectionKey(section) && visible.includes(section) ? section : undefined);
@@ -121,6 +123,8 @@
           <GoalsSection {site} readOnly={sectionReadOnly("goals", site)} />
         {:else if current === "sharing"}
           <SharingSection {site} />
+        {:else if current === "alerts"}
+          <AlertsSection {site} />
         {:else if current === "imports"}
           <ImportsSection {site} />
         {:else if current === "danger"}

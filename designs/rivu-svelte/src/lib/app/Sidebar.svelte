@@ -14,6 +14,7 @@
   import Kbd from "../ui/Kbd.svelte";
   import Segmented from "../ui/Segmented.svelte";
   import { ORGS, USER } from "../data/fixtures";
+  import { account } from "../../routes/account/email.svelte";
   import { SITES } from "../data/sites.svelte";
   import { t } from "../i18n";
   import { app, canAddSite, setLang, setTheme, type ThemePref, type Lang } from "../state.svelte";
@@ -117,7 +118,7 @@
       {#snippet children({ close })}
         <div class="who">
           <span>{USER.name}</span>
-          <span class="muted">{USER.email}</span>
+          <span class="muted">{account.email}</span>
         </div>
         <MenuLabel separator />
         <MenuItem icon={ShieldCheck} onclick={() => { close(); navigate("/account"); }}>{t("nav.account")}</MenuItem>

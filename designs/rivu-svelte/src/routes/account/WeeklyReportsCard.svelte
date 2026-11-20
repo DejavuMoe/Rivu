@@ -1,6 +1,11 @@
 <!--
-  邮件周报：收不收周报是个人偏好，所以放在账号页，一张卡片管所有能看的站点。
-  两步：先确认一次邮箱（点确认邮件里的链接，见 routes/auth/WeeklyConfirmPage.svelte），之后每个站点一个开关，立刻生效。
+  邮件订阅（周报、月报、流量突增）：收不收是个人偏好，所以放在账号页，一张卡片管所有能看的站点。
+  两步：先确认一次邮箱（点确认邮件里的链接，见 routes/auth/WeeklyConfirmPage.svelte），之后每个站点每种邮件一个开关，立刻生效。
+  - 站点 × 邮件种类排成一张表：一行一个站点，一列一种邮件，站点多了也只是多几行；窄屏去掉站点头像，给名字留地方。
+  - 周报在每周第一天（站点设置的每周起始日）09:00 后发上一周的，月报在每月 1 日 09:00 后发上个月的，都按站点时区。
+  - 流量突增：站点管理员在站点设置的「通知」里设了提醒人数才能订阅。没设的站点在这一列不放开关，写「未设置」，
+    能改这个站点设置的人看到的是「去设置」链接；表下面一句话说明要先由管理员设置。用户已打开、之后管理员清掉了人数的，同样显示「未设置」（订阅保留，不发邮件）。
+  文件名沿用已确认的周报卡片，生产里对应同名文件。
   - 确认邮件一分钟只能请求一次；等待时按钮禁用并显示剩余秒数。
   - 邮箱确认一次对所有站点有效；关掉某个站点不影响确认状态，所以误关了再打开就行。
   - 实例没配置邮件：邮箱还没确认时整张卡片不显示（和「忘记密码」入口一样）；已经确认的仍然显示，提示周报暂停，开关照常可用。
@@ -18,13 +23,15 @@
   import Field from "../../lib/ui/Field.svelte";
   import Skeleton from "../../lib/ui/Skeleton.svelte";
   import Switch from "../../lib/ui/Switch.svelte";
-  import { USER, type Site } from "../../lib/data/fixtures";
+  import type { Site } from "../../lib/data/fixtures";
+  import { account } from "./email.svelte";
   import { SITES } from "../../lib/data/sites.svelte";
   import { t } from "../../lib/i18n";
   import { app, toast } from "../../lib/state.svelte";
-  import { cfgs } from "../settings/store.svelte";
   import { weekly, WEEKLY_WAIT_MS } from "./weekly.svelte";
-  import "../settings/strings";
+  import { href } from "../../lib/router.svelte";
+  import { sectionVisible } from "../../lib/data/sections";
+  import { cfgs } from "../settings/store.svelte";
   import "./strings";
 
   const mail = $derived(app.review.mail);
@@ -67,12 +74,17 @@
     }, 280);
   }
 
-  function toggle(site: Site, on: boolean) {
-    weekly.sites[site.id] = on;
-    toast(t(on ? "ac.weekly.on" : "ac.weekly.off", { site: site.name }), on ? "good" : "default");
-  }
+  type Kind = "weekly" | "monthly" | "spike";
+  const KINDS: Kind[] = ["weekly", "monthly", "spike"];
+  const subs = (kind: Kind) => (kind === "weekly" ? weekly.sites : kind === "monthly" ? weekly.monthly : weekly.spike);
+  /** 流量突增要站点设了提醒人数才能订阅 */
+  const noThreshold = (site: Site) => !cfgs[site.id].spikeThreshold;
+  const anyUnset = $derived(SITES.some(noThreshold));
 
-  const schedule = (site: Site) => t("ac.weekly.schedule", { day: t(`set.day.${cfgs[site.id].weekStart}`), tz: site.timezone });
+  function toggle(kind: Kind, site: Site, on: boolean) {
+    subs(kind)[site.id] = on;
+    toast(t(`ac.${kind}.${on ? "on" : "off"}`, { site: site.name }), on ? "good" : "default");
+  }
 </script>
 
 <!-- 页脚只在有按钮时出现：邮箱确认之后没有页脚，不留一条空栏 -->
@@ -110,18 +122,21 @@
     {:else}
       <div class="rows">
         <Field layout="row" label={t("ac.weekly.recipient")}>
-          <span class="val">{USER.email}</span>
+          <span class="val">{account.email}</span>
         </Field>
-        <Field layout="row" label={t("ac.weekly.content")}>
-          <span class="val">{t("ac.weekly.metrics")}</span>
-        </Field>
+        {#each KINDS as kind (kind)}
+          <Field layout="row" label={t(`ac.${kind}.name`)}>
+            <span class="val">{t(`ac.${kind}.about`)}</span>
+          </Field>
+        {/each}
       </div>
+      <p class="note muted">{t("ac.weekly.perSite")}</p>
 
       {#if weekly.email !== "confirmed" && !weekly.delivered}
         <div class="note"><Callout tone="bad">{t("ac.weekly.sendFailed")}</Callout></div>
       {/if}
       {#if weekly.email === "pending"}
-        <p class="note">{t("ac.weekly.pendingBody", { email: USER.email })}</p>
+        <p class="note">{t("ac.weekly.pendingBody", { email: account.email })}</p>
       {:else if weekly.email === "confirmed"}
         {#if !mail}
           <div class="note"><Callout tone="warn">{t("ac.weekly.paused")}</Callout></div>
@@ -129,18 +144,43 @@
         {#if SITES.length === 0}
           <p class="note muted">{t("ac.weekly.noSites")}</p>
         {:else}
-          <ul class="sites" aria-label={t("ac.weekly.sites")}>
-            {#each SITES as site (site.id)}
-              <li>
-                <Avatar name={site.name} shape="square" size={24} />
-                <div class="who">
-                  <span class="name">{site.name}</span>
-                  <span class="when">{schedule(site)}</span>
-                </div>
-                <Switch label={t("ac.weekly.switch", { site: site.name })} checked={!!weekly.sites[site.id]} onchange={(v) => toggle(site, v)} />
-              </li>
-            {/each}
-          </ul>
+          <div class="scroll">
+            <table class="matrix">
+              <caption class="sr-only">{t("ac.weekly.sites")}</caption>
+              <thead>
+                <tr>
+                  <th scope="col" class="site"><span class="sr-only">{t("ac.weekly.site")}</span></th>
+                  {#each KINDS as kind (kind)}<th scope="col">{t(`ac.${kind}.col`)}</th>{/each}
+                </tr>
+              </thead>
+              <tbody>
+                {#each SITES as site (site.id)}
+                  <tr>
+                    <th scope="row" class="site">
+                      <span class="who">
+                        <span class="av"><Avatar name={site.name} shape="square" size={24} /></span>
+                        <span class="name">{site.name}</span>
+                      </span>
+                    </th>
+                    {#each KINDS as kind (kind)}
+                      <td>
+                        {#if kind === "spike" && noThreshold(site)}
+                          {#if sectionVisible("alerts", site)}
+                            <a class="unset link" href={href(`/s/${site.id}/settings/alerts`)} aria-label={t("ac.spike.setUpFor", { site: site.name })}>{t("ac.spike.setUp")}</a>
+                          {:else}
+                            <span class="unset">{t("ac.spike.unset")}</span>
+                          {/if}
+                        {:else}
+                          <Switch label={t(`ac.${kind}.switch`, { site: site.name })} checked={!!subs(kind)[site.id]} onchange={(v) => toggle(kind, site, v)} />
+                        {/if}
+                      </td>
+                    {/each}
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          </div>
+          {#if anyUnset}<p class="note muted">{t("ac.spike.needsThreshold")}</p>{/if}
         {/if}
       {/if}
     {/if}
@@ -164,41 +204,71 @@
   .muted {
     color: var(--text-muted);
   }
-  .sites {
-    display: flex;
-    flex-direction: column;
-    margin: var(--sp-4) 0 0;
-    padding: 0;
-    list-style: none;
-    border-top: var(--hairline) solid var(--border-subtle);
+  .scroll {
+    margin-top: var(--sp-4);
+    overflow-x: auto;
   }
-  .sites li {
-    display: flex;
-    align-items: center;
-    gap: var(--sp-3);
-    min-height: 52px;
+  .matrix {
+    width: 100%;
+    border-collapse: collapse;
+  }
+  .matrix th,
+  .matrix td {
     padding: var(--sp-2) 0;
     border-bottom: var(--hairline) solid var(--border-subtle);
+    font-weight: var(--fw-regular);
+    text-align: center;
   }
-  .sites li:last-child {
+  .matrix thead th {
+    width: 88px;
+    padding-top: 0;
+    color: var(--text-muted);
+    font-size: var(--fs-sm);
+    font-weight: var(--fw-medium);
+  }
+  .matrix thead th.site {
+    width: auto;
+  }
+  .matrix tbody tr:last-child > * {
     padding-bottom: 0;
     border-bottom: 0;
   }
+  .matrix td {
+    height: 52px;
+  }
+  .matrix td :global(.switch) {
+    vertical-align: middle;
+  }
+  /* 名字列占剩下的宽度，过长时省略 */
+  .matrix th.site {
+    max-width: 0;
+    text-align: left;
+  }
+  .unset {
+    color: var(--text-muted);
+    font-size: var(--fs-sm);
+  }
+  .link {
+    color: var(--accent-text);
+  }
+  .link:hover {
+    text-decoration: underline;
+  }
   .who {
     display: flex;
-    flex: 1;
-    flex-direction: column;
+    align-items: center;
+    gap: var(--sp-3);
     min-width: 0;
+  }
+  .av {
+    display: flex;
+    flex: none;
   }
   .name {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
     font-weight: var(--fw-medium);
-  }
-  .when {
-    color: var(--text-muted);
-    font-size: var(--fs-sm);
   }
   .sk {
     display: flex;
@@ -212,5 +282,16 @@
   .actions {
     display: flex;
     gap: var(--sp-2);
+  }
+  @media (max-width: 480px) {
+    .matrix thead th {
+      width: 64px;
+    }
+    .matrix thead th.site {
+      width: auto;
+    }
+    .av {
+      display: none;
+    }
   }
 </style>
