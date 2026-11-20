@@ -68,6 +68,7 @@ impl QueryCache {
         site.timezone.iana_name().unwrap_or("").hash(&mut h);
         format!("{:?}", site.week_starts_on).hash(&mut h);
         format!("{:?}", site.goals).hash(&mut h);
+        format!("{:?}", site.segments).hash(&mut h);
         format!("{:?}", site.geo_attribution).hash(&mut h);
         format!("{:?}", site.geo_capability).hash(&mut h);
         site.imported.hash(&mut h);

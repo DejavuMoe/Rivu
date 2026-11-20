@@ -59,6 +59,9 @@ pub struct SiteContext {
     pub imported: Option<(Date, Date)>,
     /// 与 `imported` 同一次 PG 查询取得的本站点已完成批次 ID（升序）。
     pub completed_import_ids: Vec<u64>,
+    /// 查询里引用到的分群（未删除、属于本站点；调用方按 [`segment_ids`] 从 PG 加载，§6.3 build 阶段「展开分群」）。
+    /// 不在这里的 id 按「未知分群」拒绝。
+    pub segments: Vec<SegmentDef>,
 }
 
 impl SiteContext {
@@ -75,8 +78,99 @@ impl SiteContext {
             retention_days: None,
             imported: None,
             completed_import_ids: Vec::new(),
+            segments: Vec::new(),
         }
     }
+}
+
+/// 一个保存的分群（`segments` 表的一行，§6.2）：查询里的 `["is", "segment", [id]]` 在 build 阶段原地换成它的过滤
+/// （顶层隐式 AND），再做其余的解析与校验；执行器不知道分群的存在（§6.3 宏展开）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SegmentDef {
+    pub id: i64,
+    /// 过滤数组（顶层隐式 AND），至少一个。
+    pub filters: Vec<Filter>,
+}
+
+impl SegmentDef {
+    /// 由 `segments.filter`（JSON）构造：过滤数组，或单个过滤节点（早期手工写进库里的写法）。
+    /// 语法错误带字段路径（`filters[0][2]`）。
+    pub fn from_json(id: i64, filter: &Value) -> Result<SegmentDef, QueryError> {
+        let list = match filter {
+            Value::Array(items) if items.first().is_none_or(Value::is_array) => filter.clone(),
+            _ => Value::Array(vec![filter.clone()]),
+        };
+        let filters = parse_segment_filters(&list)?;
+        if filters.is_empty() {
+            return Err(QueryError::validation(
+                "filters",
+                "a segment needs at least one filter",
+            ));
+        }
+        Ok(SegmentDef { id, filters })
+    }
+}
+
+/// 解析分群的过滤（与 QuerySpec 的 `filters` 同一个解析器，错误路径以 `filters` 开头）。只做语法检查，
+/// 业务校验见 [`validate_segment`]。
+pub fn parse_segment_filters(filters: &Value) -> Result<Vec<Filter>, QueryError> {
+    let spec = QuerySpec::parse(&json!({
+        "metrics": ["visitors"],
+        "date_range": "day",
+        "filters": filters,
+    }))?;
+    Ok(spec.filters)
+}
+
+/// 保存分群前的校验：至少一个过滤；每个叶子按查询的规则校验（取值个数与长度、正则、`event:goal` 的目标、
+/// 叶子上限），不允许时间维度，也不允许再引用分群（不嵌套）。错误路径以 `filters` 开头。
+pub fn validate_segment(filters: &[Filter], site: &SiteContext) -> Result<(), QueryError> {
+    if filters.is_empty() {
+        return Err(QueryError::validation(
+            "filters",
+            "a segment needs at least one filter",
+        ));
+    }
+    let ctx = PredCtx {
+        goals: &site.goals,
+        segments: &[],
+        in_segment: true,
+    };
+    let (mut leaves, mut first_event_leaf, mut keys) = (0usize, None, Vec::new());
+    for (i, f) in filters.iter().enumerate() {
+        build_pred(
+            f,
+            &format!("filters[{i}]"),
+            &mut leaves,
+            &mut first_event_leaf,
+            &ctx,
+            &mut keys,
+        )?;
+    }
+    Ok(())
+}
+
+/// 过滤树里引用到的分群 id（`["is" | "is_not", "segment", [id, …]]`，含 `and` `or` `not` 里面的）。不是正整数的
+/// 取值不在其中（build 阶段按字段路径报错）。调用方据此只加载需要的分群；一个都没有就不必查库。
+pub fn segment_ids(filters: &[Filter]) -> BTreeSet<i64> {
+    fn walk(f: &Filter, out: &mut BTreeSet<i64>) {
+        match f {
+            Filter::Leaf(l) => {
+                if l.target == FilterTarget::Segment {
+                    out.extend(l.values.iter().filter_map(|v| parse_segment_id(v)));
+                }
+            }
+            Filter::And(c) | Filter::Or(c) => c.iter().for_each(|c| walk(c, out)),
+            Filter::Not(c) | Filter::HasDone(c) | Filter::HasNotDone(c) => walk(c, out),
+        }
+    }
+    let mut out = BTreeSet::new();
+    filters.iter().for_each(|f| walk(f, &mut out));
+    out
+}
+
+fn parse_segment_id(v: &str) -> Option<i64> {
+    v.parse::<i64>().ok().filter(|id| *id > 0)
 }
 
 /// 一个目标（`goals` 表的一行）。
@@ -406,15 +500,26 @@ fn leaf_path_error(path: &str, sub: &str, msg: impl Into<String>) -> QueryError 
     QueryError::validation(format!("{path}{sub}"), msg)
 }
 
+/// [`build_pred`] 用的站点数据。
+struct PredCtx<'a> {
+    goals: &'a [GoalDef],
+    segments: &'a [SegmentDef],
+    /// 正在展开一个分群（或校验要保存的分群）：分群里不能再引用分群。
+    in_segment: bool,
+}
+
 fn build_pred(
     f: &Filter,
     path: &str,
     leaves: &mut usize,
     first_event_leaf: &mut Option<String>,
-    goals: &[GoalDef],
+    ctx: &PredCtx<'_>,
     keys: &mut Vec<String>,
 ) -> Result<Pred, QueryError> {
     match f {
+        Filter::Leaf(l) if l.target == FilterTarget::Segment => {
+            expand_segment(l, path, leaves, first_event_leaf, ctx, keys)
+        }
         Filter::Leaf(l) => {
             *leaves += 1;
             if *leaves > MAX_FILTER_LEAVES {
@@ -423,7 +528,7 @@ fn build_pred(
                     format!("a query may have at most {MAX_FILTER_LEAVES} filter conditions"),
                 ));
             }
-            let leaf = build_leaf(l, path, goals, keys)?;
+            let leaf = build_leaf(l, path, ctx.goals, keys)?;
             if leaf.col.is_event_level() && first_event_leaf.is_none() {
                 *first_event_leaf = Some(path.to_owned());
             }
@@ -437,7 +542,7 @@ fn build_pred(
                     &format!("{path}[1][{j}]"),
                     leaves,
                     first_event_leaf,
-                    goals,
+                    ctx,
                     keys,
                 )?);
             }
@@ -452,7 +557,7 @@ fn build_pred(
             &format!("{path}[1]"),
             leaves,
             first_event_leaf,
-            goals,
+            ctx,
             keys,
         )?))),
         Filter::HasDone(_) | Filter::HasNotDone(_) => Err(QueryError::validation(
@@ -462,6 +567,106 @@ fn build_pred(
     }
 }
 
+/// `["is", "segment", [id, …]]`：换成分群的过滤（顶层隐式 AND）；多个 id 是「满足其中任一分群」，`is_not` 取反。
+/// 分群里的叶子照常计入叶子上限。分群内部的错误指向这个 id（`filters[0][2][0]`），消息里带分群 id 和分群内的路径。
+fn expand_segment(
+    l: &FilterLeaf,
+    path: &str,
+    leaves: &mut usize,
+    first_event_leaf: &mut Option<String>,
+    ctx: &PredCtx<'_>,
+    keys: &mut Vec<String>,
+) -> Result<Pred, QueryError> {
+    if ctx.in_segment {
+        return Err(leaf_path_error(
+            path,
+            "[1]",
+            "a segment cannot contain another segment",
+        ));
+    }
+    let negated = match l.op {
+        FilterOp::Is => false,
+        FilterOp::IsNot => true,
+        _ => {
+            return Err(leaf_path_error(
+                path,
+                "[0]",
+                "segment filters only support `is` and `is_not`",
+            ));
+        }
+    };
+    if l.case_sensitive.is_some() {
+        return Err(leaf_path_error(
+            path,
+            "[3]",
+            "segment filters take no modifiers",
+        ));
+    }
+    if l.values.is_empty() {
+        return Err(leaf_path_error(
+            path,
+            "[2]",
+            "expected at least one segment id",
+        ));
+    }
+    let inner_ctx = PredCtx {
+        goals: ctx.goals,
+        segments: &[],
+        in_segment: true,
+    };
+    let mut alternatives = Vec::with_capacity(l.values.len());
+    for (i, v) in l.values.iter().enumerate() {
+        let vpath = format!("{path}[2][{i}]");
+        let Some(id) = parse_segment_id(v) else {
+            return Err(QueryError::validation(vpath, "expected a segment id"));
+        };
+        let Some(seg) = ctx.segments.iter().find(|s| s.id == id) else {
+            return Err(QueryError::validation(
+                vpath,
+                format!(
+                    "unknown segment {id} (it does not exist, was deleted, or belongs to another site)"
+                ),
+            ));
+        };
+        let mut inner_event_leaf = None;
+        let mut parts = Vec::with_capacity(seg.filters.len());
+        for (j, f) in seg.filters.iter().enumerate() {
+            let pred = build_pred(
+                f,
+                &format!("filters[{j}]"),
+                leaves,
+                &mut inner_event_leaf,
+                &inner_ctx,
+                keys,
+            )
+            .map_err(|e| match e {
+                QueryError::Validation { path: p, message } => QueryError::validation(
+                    vpath.clone(),
+                    format!("segment {id}, at `{p}`: {message}"),
+                ),
+                other => other,
+            })?;
+            parts.push(pred);
+        }
+        if inner_event_leaf.is_some() && first_event_leaf.is_none() {
+            *first_event_leaf = Some(path.to_owned());
+        }
+        alternatives.push(match parts.len() {
+            1 => parts.pop().expect("恰好一个"),
+            _ => Pred::And(parts),
+        });
+    }
+    let pred = match alternatives.len() {
+        1 => alternatives.pop().expect("恰好一个"),
+        _ => Pred::Or(alternatives),
+    };
+    Ok(if negated {
+        Pred::Not(Box::new(pred))
+    } else {
+        pred
+    })
+}
+
 fn build_leaf(
     l: &FilterLeaf,
     path: &str,
@@ -469,13 +674,7 @@ fn build_leaf(
     keys: &mut Vec<String>,
 ) -> Result<Leaf, QueryError> {
     let dim = match &l.target {
-        FilterTarget::Segment => {
-            return Err(leaf_path_error(
-                path,
-                "[1]",
-                "segment filters are not supported yet",
-            ));
-        }
+        FilterTarget::Segment => unreachable!("分群叶子在 build_pred 里展开"),
         FilterTarget::Dimension(d) => d,
     };
     if dim.is_time() {
@@ -1303,13 +1502,18 @@ impl ResolvedQuery {
         let mut leaves = 0usize;
         let mut first_event_leaf: Option<String> = None;
         let mut parts = Vec::with_capacity(spec.filters.len());
+        let ctx = PredCtx {
+            goals: &site.goals,
+            segments: &site.segments,
+            in_segment: false,
+        };
         for (i, f) in spec.filters.iter().enumerate() {
             parts.push(build_pred(
                 f,
                 &format!("filters[{i}]"),
                 &mut leaves,
                 &mut first_event_leaf,
-                &site.goals,
+                &ctx,
                 &mut prop_keys,
             )?);
         }

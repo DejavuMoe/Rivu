@@ -716,7 +716,7 @@ TTL minute + INTERVAL 90 DAY DELETE;
 | `metrics` | 至少 1 个、至多 12 个，不得重复：`visitors` `visits` `pageviews` `events` `views_per_visit` `bounce_rate` `visit_duration` `engaged_duration` `percentage` `exit_rate` `time_on_page` `scroll_depth` `conversion_rate`（要求 `event:goal` 维度或过滤，§6.5）。`group_conversion_rate` 能解析，执行时返回 `not supported yet` |
 | `date_range` | `day` `24h` `month` `year` `all` `realtime`、`Nd`（1–5000，含 `7d` `28d` `30d`）、`Nmo`（1–100，含 `6mo` `12mo`），或 `[from, to]`：两端同为日期（`YYYY-MM-DD`，含两端的站点本地日）或同为带 UTC 偏移的 RFC 3339 时间戳（含起点、不含终点）。`realtime` 是最近 5 分钟，QuerySpec 本身接受，是否只对看板开放由路由层决定。换算规则见 §6.7 |
 | `dimensions` | 至多 4 个，不得重复，至多一个时间维度。`event:name` `event:page` `event:hostname` `event:goal` `event:props:<k>`、`visit:entry_page` `visit:exit_page` `visit:source` `visit:channel` `visit:referrer` `visit:utm_*` `visit:country` `visit:region` `visit:city` `visit:device` `visit:browser(_version)` `visit:os(_version)`、`time`（自动粒度）`time:minute` `time:hour` `time:day` `time:week` `time:month` |
-| `filters` | 顶层数组是隐式 AND。叶子节点为 `[op, dim, [values], {case_sensitive}]`：`op` 取 `is` `is_not` `contains` `contains_not` `matches` `matches_not` `matches_wildcard` `matches_wildcard_not`；`values` 是非空的字符串或整数数组；`case_sensitive` 缺省 `true`。组合节点为 `and` `or` `not` `has_done` `has_not_done`；另有 `["is","segment",[id]]`。嵌套至多 8 层，叶子至多 100 个；时间维度不能用于过滤 |
+| `filters` | 顶层数组是隐式 AND。叶子节点为 `[op, dim, [values], {case_sensitive}]`：`op` 取 `is` `is_not` `contains` `contains_not` `matches` `matches_not` `matches_wildcard` `matches_wildcard_not`；`values` 是非空的字符串或整数数组；`case_sensitive` 缺省 `true`。组合节点为 `and` `or` `not` `has_done` `has_not_done`；另有分群引用 `["is","segment",[id]]`（见下面「分群」）。嵌套至多 8 层，叶子至多 100 个；时间维度不能用于过滤 |
 | `order_by` | `[key, "asc"\|"desc"]`，`key` 只能是已查询的指标或维度，按请求里的写法（自动粒度的时间维度写 `time`），不得重复。缺省：有时间维度先按时间升序，再按第一个指标降序；其余按第一个指标降序；没有写进 `order_by` 的维度按原始值升序补在最后，保证分页确定 |
 | `pagination` | `limit` 1–10000（缺省 10000），`offset` |
 | `include` | `time_labels`（必须带时间维度）`total_rows` `compare`（`previous_period`、`year_over_year`、`[from,to]`）。没有 `imports`：未实现，`deny_unknown_fields` 会拒绝 |
@@ -739,11 +739,22 @@ TTL minute + INTERVAL 90 DAY DELETE;
 |---|---|---|
 | 指标 | `visitors` `visits` `pageviews` `events` `views_per_visit` `bounce_rate` `visit_duration` `engaged_duration` `percentage` `exit_rate` `time_on_page` `scroll_depth` `conversion_rate` | 分组转化率（`group_conversion_rate`） |
 | 维度 | `event:name` `event:page` `event:hostname` `event:goal` `visit:entry_page` `visit:exit_page` `visit:source` `visit:channel` `visit:referrer` `visit:utm_*` `visit:country` `visit:region` `visit:city` `visit:device` `visit:browser(_version)` `visit:os(_version)`、`time` `time:minute` `time:hour` `time:day` `time:week` `time:month`（`time:minute` 至多 1500 个桶，约 25 小时）；属性 `event:props:<k>`：取 `props[k]`，没有这个键的事件为 `(none)`，是事件级维度（不能配会话指标与 `time_on_page` `scroll_depth`），一次查询至多 8 个不同的键，键名只以参数出现，暂不走日汇总层 | — |
-| 过滤 | 上述维度（不含时间维度）上的 8 个叶子操作符，以及 `and` `or` `not`；`visit:city` 只支持 `is` `is_not`，取值是 GeoNames id；`event:goal` 只支持 `is` `is_not`，取值是目标的标签或 id；属性上的过滤是事件级叶子（会话指标上是「存在」语义） | `has_done` `has_not_done`、`["is","segment",[id]]` |
+| 过滤 | 上述维度（不含时间维度）上的 8 个叶子操作符，以及 `and` `or` `not`；`visit:city` 只支持 `is` `is_not`，取值是 GeoNames id；`event:goal` 只支持 `is` `is_not`，取值是目标的标签或 id；属性上的过滤是事件级叶子（会话指标上是「存在」语义）；保存的分群 `["is" \| "is_not","segment",[id]]` | `has_done` `has_not_done` |
 | 目标 | 事件目标（事件名）、页面目标（pathname 通配）与滚动深度目标（pathname 通配 + 阈值 1–100），见 §6.6 | 目标的 props 条件（要改表结构） |
 | `date_range` | `day` `24h` `month` `year` `all` `realtime` `Nd` `Nmo` `[from, to]` | — |
 | `include` | `time_labels` `total_rows` `compare` | `imports`（未实现，直接是未知字段） |
 | 数据层 | 原始层（`events` 与 `sessions`）与日汇总层（§5.5、§6.4 选层） | — |
+
+#### 分群
+
+分群（segment）是保存下来的一组过滤，存在 `segments` 表里（`platform-and-ops.md` §3.2），按站点共享。查询里用 `["is","segment",[id]]` 引用它，build 阶段把这个叶子原地换成分群的过滤（分群存的是 `filters` 数组，顶层隐式 AND），再做其余的解析与校验，执行器不知道分群的存在。所以「带分群的查询」与「把分群的过滤直接写进查询」完全等价，结果相同（回显的 `query.filters` 保留分群引用，不展开）。
+
+- `is_not` 是对分群的过滤整体取反，即 `["not", ["and", 分群的过滤]]`；分群里有事件级条件（如页面）时，取反也按事件判定，与直接写 `not` 一样。
+- 一个叶子可以给多个 id：`["is","segment",[1,2]]` 是「满足其中任一分群」。分群引用也可以放在 `and` `or` `not` 里。
+- 分群不嵌套：分群的过滤里不能再引用分群（保存时拒绝，库里万一有，展开时按校验错误拒绝）。分群里的叶子计入叶子上限（100）。
+- 分群只认被查询站点的未删除分群：不存在、已删除、属于别的站点的 id 一律 400，路径指向那个 id（如 `filters[1][2][0]`），三种情况同一个消息，不泄露别的站点有没有这个 id。分群里的条件出错（例如库里的正则已经不合法）也是 400，路径指向引用它的 id，消息带分群 id 和分群内的路径。
+- 叶子只能是 `is` 或 `is_not`，取值是正整数 id，不接受 `case_sensitive` 修饰。
+- 看板内部端点、共享链接（链接绑定的分群加在过滤末尾）、公开查询 API 与 `rivu query` 都走同一条展开路径。
 
 ### 6.3 执行流程
 
@@ -765,7 +776,8 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 - 对比查询沿用 Plausible 的做法：先执行主查询，再用主查询结果中的维度值约束对比期，保证两边的行集一致（R03 §7.5）。时间维度不参与约束。
 - 一次请求可能发多条查询（`all` 的最早事件、`percentage` 的分母、主查询、对比期），共用同一个截止时间（调用方档位的 `max_execution_time`，§6.8）。
 - **地理元数据**：`meta.geo_capability`（`country` 或 `city`）只在维度或过滤涉及位置（`visit:country` `visit:region` `visit:city`）时给出；`meta.geo_attribution` 只在**维度**含位置时给出（§4.4 署名要求）。站点的地理库能力是 `country`，而维度或过滤用到 `visit:region` 或 `visit:city` 时，`meta.warnings` 带 `geo_capability_country_only`（地理库只提供国家级数据，地区与城市为空，§6.10）。维度含 `visit:city` 时另有 `meta.city_names`：`{"<GeoNames id>": {"name": "Berlin", "country": "DE"}}`，只含主结果与对比结果里出现的 id，`country` 没有时为 `null`；库里查不到的 id 不出现（看板显示 id 本身）。名字的语言：看板的内部端点（含共享链接、公开看板、导出）按请求头 `Accept-Language` 的第一个标签，以 `zh` 开头给中文，其余英文，看板发送自己的界面语言；公开 API 没有语言参数，一律英文。城市名索引还没建好、或库不是 City 级时省略这个字段（§4.4「城市名」）。它由 API 层在结果缓存之后补上，执行器与结果缓存都不含它；城市过滤照旧只认 id。
-- **加载目标**：调用方（`query_api::load_site_context`）每次查询从 PG 读站点未删除的目标放进 `SiteContext.goals`，没有缓存，增删立即生效；build 阶段把 `event:goal` 过滤的取值解析成目标的完成条件，`event:goal` 维度用全部目标。分群（`segment`）的展开目前未实现：build 阶段直接返回 `not supported yet`（§6.2）。
+- **加载目标**：调用方（`query_api::load_site_context`）每次查询从 PG 读站点未删除的目标放进 `SiteContext.goals`，没有缓存，增删立即生效；build 阶段把 `event:goal` 过滤的取值解析成目标的完成条件，`event:goal` 维度用全部目标。
+- **展开分群**：过滤里有 `["is","segment",[id]]` 时，调用方（`query_api::attach_segments`）按引用到的 id 从 PG 读这个站点未删除的分群放进 `SiteContext.segments`（只在有引用时查库，没有缓存，改了分群立即生效）；build 阶段把引用原地换成分群的过滤（§6.2「分群」）。读到的分群过滤解析不了按内部错误处理，宁可失败也不少过滤。结果缓存的键里带上加载到的分群（§6.9），所以改了分群不会命中旧结果；共享链接实时人数的 3 秒缓存按链接绑定的分群 id 区分，改了分群的条件至多 3 秒后生效。
 
 ### 6.4 规划器：选表与选层
 
@@ -912,7 +924,7 @@ HTTP ─► auth ─► AuthContext{org, site_ids, role, link?}
 ### 6.9 结果缓存
 
 - 进程内的 moka（`crates/query/src/cache.rs`），看板与公开 API 共用，按结果行数限容（50 万行），只缓存成功的结果。
-- key 是以下内容的哈希：站点 id、规范化的 `QuerySpec`（共享链接叠加的过滤已经并入）、影响结果的站点配置（时区、周起始日、目标、地理库的署名与能力）、站点的数据代数、「现在」所在的时间桶。配置直接进键，改目标或时区立即生效。
+- key 是以下内容的哈希：站点 id、规范化的 `QuerySpec`（共享链接叠加的分群引用已经并入）、影响结果的站点配置（时区、周起始日、目标、查询引用到的分群的过滤、地理库的署名与能力）、站点的数据代数、「现在」所在的时间桶。配置直接进键，改目标、分群或时区立即生效。
 - 时间桶的长度：`realtime` 3 s，`day` 与 `24h` 10 s，含今天的范围 60 s，已结束的历史范围 10 min。同一个桶里的请求拿到同一份结果。
 - 删除统计数据完成后，`ch_delete_batch` 让该站点的数据代数加一。汇总层构建不改变结果（两层口径一致，§6.4），不需要失效。
 - `rivu_query_seconds` 带 `cache` 标签（`hit` / `miss`），命中与未命中分开统计。

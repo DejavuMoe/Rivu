@@ -605,7 +605,7 @@ impl FilterOp {
     }
 }
 
-/// 叶子过滤的对象：维度，或分群（`["is", "segment", [id]]`，本轮不支持）。
+/// 叶子过滤的对象：维度，或分群（`["is", "segment", [id]]`，build 阶段换成分群的过滤，见 `resolve::SegmentDef`）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FilterTarget {
     Dimension(Dimension),
@@ -830,7 +830,7 @@ impl JsonSchema for Filter {
     fn json_schema(_: &mut SchemaGenerator) -> Schema {
         let ops: Vec<&str> = FilterOp::ALL.iter().map(|o| o.as_str()).collect();
         schema(json!({
-            "description": "A filter tree node. Leaf: [op, dimension, [values], {\"case_sensitive\": bool}?]. Branch: [\"and\" | \"or\", [filters]] or [\"not\", filter]. `has_done`, `has_not_done` and `segment` are accepted by the schema but not supported yet.",
+            "description": "A filter tree node. Leaf: [op, dimension, [values], {\"case_sensitive\": bool}?]. Branch: [\"and\" | \"or\", [filters]] or [\"not\", filter]. Saved segment: [\"is\" | \"is_not\", \"segment\", [id]] is replaced by the segment's filters (combined with AND); the segment must belong to the queried site. `has_done` and `has_not_done` are accepted by the schema but not supported yet.",
             "anyOf": [
                 {
                     "type": "array",

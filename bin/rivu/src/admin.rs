@@ -9,13 +9,14 @@ use anyhow::{Context, Result, anyhow, bail};
 use jiff::tz::TimeZone;
 use rivu_common::config::Config;
 use rivu_geo::{GeoDb, NameLang};
+use rivu_query::spec::Filter;
 use rivu_query::{ExecOptions, QuerySpec, SiteContext, TenantScope};
 use rivu_storage_pg::sites::NewSite;
 use serde_json::{Value, json};
 
 use crate::cli::{ExportArgs, ImportAction, MailAction, QueryArgs, SiteAddArgs};
 use crate::export::ExportRequest;
-use crate::query_api::{attach_city_names, load_site_context};
+use crate::query_api::{attach_city_names, attach_segments, load_site_context};
 
 /// 规范化一条 hostname 白名单模式（实现与屏蔽规则的 hostname 类型共用，见 `rivu_ingest::hostname::validated_pattern`）。
 pub fn normalize_pattern(raw: &str) -> Result<String> {
@@ -65,7 +66,7 @@ pub async fn query(config: &Config, args: QueryArgs) -> Result<ExitCode> {
         bail!("QuerySpec 的 `site` 必填");
     };
 
-    let (reader, ctx, geo) = query_context(config, &site_key).await?;
+    let (reader, ctx, geo) = query_context(config, &site_key, &spec.filters).await?;
     // 等同看板查询，用看板档的超时（§10 Q14）。
     let opts = ExecOptions::new(config.query_timeouts.dashboard_secs)
         .with_route("cli.query")
@@ -89,10 +90,12 @@ fn build_city_names(geo: &GeoDb) {
     }
 }
 
-/// 查询用的 `rivu_reader` 客户端、站点上下文与地理库（`rivu query`、`rivu export`）。
+/// 查询用的 `rivu_reader` 客户端、站点上下文与地理库（`rivu query`、`rivu export`）。`filters` 里引用到的分群
+/// 一并加载（与 API 同一个 [`attach_segments`]）。
 async fn query_context(
     config: &Config,
     site_key: &str,
+    filters: &[Filter],
 ) -> Result<(clickhouse::Client, SiteContext, GeoDb)> {
     let pool = rivu_storage_pg::connect(config.database_url.expose(), 2).await?;
     let Some(site) = rivu_storage_pg::sites::find_site_by_key(&pool, site_key).await? else {
@@ -110,7 +113,7 @@ async fn query_context(
     if let Err(e) = geo.reload_if_changed(&config.geo.db_path) {
         tracing::warn!(error = %format!("{e:#}"), "读取 GeoIP 库失败，geo_attribution 与 geo_capability 为 null");
     }
-    let ctx = load_site_context(
+    let mut ctx = load_site_context(
         &pool,
         Some(&geo),
         site.id,
@@ -119,6 +122,9 @@ async fn query_context(
     )
     .await
     .map_err(|e| anyhow!("读取站点 `{site_key}` 的查询设置失败：{e:?}"))?;
+    attach_segments(&pool, &mut ctx, filters)
+        .await
+        .map_err(|e| anyhow!("读取站点 `{site_key}` 的分群失败：{e:?}"))?;
     Ok((reader, ctx, geo))
 }
 
@@ -134,22 +140,17 @@ pub async fn export(config: &Config, args: ExportArgs) -> Result<ExitCode> {
     };
     let body = json!({"date_range": date_range, "filters": filters, "interval": args.interval});
     let request = ExportRequest::parse(&body).map_err(|e| anyhow!("导出参数无效：{e}"))?;
-    let (reader, ctx, geo) = query_context(config, &args.site).await?;
+    let keys_spec = request.keys_spec().map_err(|e| anyhow!("{e}"))?;
+    let (reader, ctx, geo) = query_context(config, &args.site, &keys_spec.filters).await?;
     // `cities.csv` 带城市名（英文）
     build_city_names(&geo);
     let scope = TenantScope::new(ctx.site_id);
     let opts = ExecOptions::new(config.query_timeouts.dashboard_secs)
         .with_route("cli.export")
         .with_rollup(config.rollup_min_rows);
-    let keys = rivu_query::property_keys(
-        &reader,
-        &scope,
-        &ctx,
-        request.keys_spec().map_err(|e| anyhow!("{e}"))?,
-        opts.clone(),
-    )
-    .await
-    .map_err(|e| anyhow!("读取属性键失败：{e}"))?;
+    let keys = rivu_query::property_keys(&reader, &scope, &ctx, keys_spec, opts.clone())
+        .await
+        .map_err(|e| anyhow!("读取属性键失败：{e}"))?;
     let keys: Vec<String> = keys.into_iter().map(|k| k.key).collect();
     let (reader, ctx_ref, scope_ref, geo_ref) = (&reader, &ctx, &scope, &geo);
     let export = crate::export::build(&request, &keys, move |spec| {

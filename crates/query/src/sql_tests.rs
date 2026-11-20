@@ -13,7 +13,9 @@ use serde_json::{Value, json};
 
 use crate::error::QueryError;
 use crate::exec::explain;
-use crate::resolve::{GoalDef, SiteContext};
+use crate::resolve::{
+    GoalDef, SegmentDef, SiteContext, parse_segment_filters, segment_ids, validate_segment,
+};
 use crate::spec::QuerySpec;
 use crate::sql::{ParamValue, Params, TenantScope, check_tenant_scoped};
 
@@ -829,8 +831,8 @@ fn invalid_combinations_and_unsupported_features_fail_with_paths() {
         ),
         (
             json!({"metrics": ["visitors"], "date_range": "day", "filters": [["is", "segment", [1]]]}),
-            "filters[0][1]",
-            "not supported yet",
+            "filters[0][2][0]",
+            "unknown segment 1",
         ),
     ] {
         let (p, m) = v(spec.clone());
@@ -1056,4 +1058,242 @@ fn every_generated_statement_is_tenant_scoped() {
         }
     }
     assert!(built > 100, "{built}");
+}
+
+/// `site()` 再加两个分群：41 是「来自德国的手机访客，看过 /pricing」，42 是单个节点的早期写法。
+fn segment_site() -> SiteContext {
+    let mut s = site();
+    s.segments = vec![
+        SegmentDef::from_json(
+            41,
+            &json!([
+                ["is", "visit:country", ["DE"]],
+                ["is", "visit:device", ["Mobile"]],
+                ["contains", "event:page", ["/pricing"], {"case_sensitive": false}]
+            ]),
+        )
+        .unwrap(),
+        SegmentDef::from_json(42, &json!(["is", "event:goal", ["Signup"]])).unwrap(),
+    ];
+    s
+}
+
+fn validation_err(r: Result<impl std::fmt::Debug, QueryError>) -> (String, String) {
+    match r {
+        Err(QueryError::Validation { path, message }) => (path, message),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_segment_expands_to_exactly_its_inlined_filters() {
+    let site = segment_site();
+    let seg41 = json!([
+        "and",
+        [
+            ["is", "visit:country", ["DE"]],
+            ["is", "visit:device", ["Mobile"]],
+            ["contains", "event:page", ["/pricing"], {"case_sensitive": false}]
+        ]
+    ]);
+    let seg42 = json!(["is", "event:goal", ["Signup"]]);
+    let shapes = [
+        (json!(["visitors", "pageviews", "bounce_rate"]), json!([])),
+        (
+            json!(["visitors", "visit_duration"]),
+            json!(["visit:source"]),
+        ),
+        (json!(["pageviews"]), json!(["event:page", "time:day"])),
+    ];
+    let cases = [
+        (json!([["is", "segment", [41]]]), json!([seg41.clone()])),
+        (
+            json!([
+                ["is", "visit:browser", ["Firefox"]],
+                ["is", "segment", [41]]
+            ]),
+            json!([["is", "visit:browser", ["Firefox"]], seg41.clone()]),
+        ),
+        (
+            json!([["is_not", "segment", [41]]]),
+            json!([["not", seg41.clone()]]),
+        ),
+        (
+            json!([["is", "segment", [41, 42]]]),
+            json!([["or", [seg41.clone(), seg42.clone()]]]),
+        ),
+        (
+            json!([[
+                "or",
+                [["is", "segment", [42]], ["is", "visit:country", ["SE"]]]
+            ]]),
+            json!([["or", [seg42.clone(), ["is", "visit:country", ["SE"]]]]]),
+        ),
+        (
+            json!([["not", ["is", "segment", ["42"]]]]),
+            json!([["not", seg42.clone()]]),
+        ),
+    ];
+    for (metrics, dims) in &shapes {
+        for (with_segment, inlined) in &cases {
+            let spec = |f: &Value| json!({"metrics": metrics, "dimensions": dims, "filters": f, "date_range": "30d"});
+            let a = build_on(&site, spec(with_segment)).unwrap();
+            let b = build_on(&site, spec(inlined)).unwrap();
+            assert_eq!(a, b, "{with_segment} vs {inlined}");
+        }
+    }
+}
+
+#[test]
+fn segment_references_are_validated_with_field_paths() {
+    let site = segment_site();
+    let err = |filters: Value| {
+        validation_err(build_on(
+            &site,
+            json!({"metrics": ["visitors"], "date_range": "day", "filters": filters}),
+        ))
+    };
+    for (filters, path, what) in [
+        (
+            json!([["is", "segment", [7]]]),
+            "filters[0][2][0]",
+            "unknown segment 7",
+        ),
+        (
+            json!([
+                ["is", "visit:country", ["DE"]],
+                ["or", [["is", "segment", [41, 99]]]]
+            ]),
+            "filters[1][1][0][2][1]",
+            "unknown segment 99",
+        ),
+        (
+            json!([["is", "segment", ["x"]]]),
+            "filters[0][2][0]",
+            "expected a segment id",
+        ),
+        (
+            json!([["is", "segment", [0]]]),
+            "filters[0][2][0]",
+            "expected a segment id",
+        ),
+        (
+            json!([["contains", "segment", [41]]]),
+            "filters[0][0]",
+            "only support `is` and `is_not`",
+        ),
+        (
+            json!([["is", "segment", [41], {"case_sensitive": false}]]),
+            "filters[0][3]",
+            "no modifiers",
+        ),
+    ] {
+        let (p, m) = err(filters.clone());
+        assert_eq!(p, path, "{filters}");
+        assert!(m.contains(what), "{filters}: {m}");
+    }
+    // 分群里的错误（这里是库里一条坏掉的正则）指向引用它的那个 id，消息带分群内的路径
+    let mut broken = segment_site();
+    broken.segments.push(
+        SegmentDef::from_json(
+            44,
+            &json!([
+                ["is", "visit:country", ["DE"]],
+                ["matches", "event:page", ["("]]
+            ]),
+        )
+        .unwrap(),
+    );
+    let (p, m) = validation_err(build_on(
+        &broken,
+        json!({"metrics": ["visitors"], "date_range": "day", "filters": [["is", "segment", [41, 44]]]}),
+    ));
+    assert_eq!(p, "filters[0][2][1]");
+    assert!(m.starts_with("segment 44, at `filters[1][2][0]`:"), "{m}");
+    // 分群的叶子计入叶子上限：41 有 3 个叶子，34 次引用 = 102 > 100
+    let many: Vec<Value> = (0..34).map(|_| json!(["is", "segment", [41]])).collect();
+    let (_, m) = err(json!(many));
+    assert!(m.contains("at most 100 filter conditions"), "{m}");
+    // 不嵌套：库里的分群如果引用了分群，展开时拒绝
+    let mut nested = segment_site();
+    nested
+        .segments
+        .push(SegmentDef::from_json(43, &json!([["is", "segment", [41]]])).unwrap());
+    let (p, m) = validation_err(build_on(
+        &nested,
+        json!({"metrics": ["visitors"], "date_range": "day", "filters": [["is", "segment", [43]]]}),
+    ));
+    assert_eq!(p, "filters[0][2][0]");
+    assert!(m.contains("cannot contain another segment"), "{m}");
+}
+
+#[test]
+fn saved_segments_are_validated_like_query_filters() {
+    let site = site();
+    let check = |v: &Value| -> Result<(), QueryError> {
+        let filters = parse_segment_filters(v)?;
+        validate_segment(&filters, &site)
+    };
+    assert!(
+        check(&json!([
+            ["is", "visit:country", ["DE"]],
+            ["is", "event:goal", ["Signup"]]
+        ]))
+        .is_ok()
+    );
+    assert!(
+        check(&json!([[
+            "or",
+            [
+                ["is", "visit:device", ["Mobile"]],
+                ["not", ["contains", "event:page", ["/a"]]]
+            ]
+        ]]))
+        .is_ok()
+    );
+    for (v, path, what) in [
+        (json!([]), "filters", "at least one filter"),
+        (json!("x"), "filters", ""),
+        (json!([["is", "visit:nope", ["x"]]]), "filters[0][1]", ""),
+        (
+            json!([["is", "time:day", ["2026-01-01"]]]),
+            "filters[0][1]",
+            "time dimensions",
+        ),
+        (
+            json!([["is", "segment", [1]]]),
+            "filters[0][1]",
+            "cannot contain another segment",
+        ),
+        (
+            json!([["not", ["is", "segment", [1]]]]),
+            "filters[0][1][1]",
+            "cannot contain another segment",
+        ),
+        (
+            json!([["matches", "event:page", ["("]]]),
+            "filters[0][2][0]",
+            "",
+        ),
+    ] {
+        let (p, m) = validation_err(check(&v));
+        assert_eq!(p, path, "{v}: {m}");
+        assert!(m.contains(what), "{v}: {m}");
+    }
+    // 单个节点（早期写法）与数组都能读
+    assert_eq!(
+        SegmentDef::from_json(1, &json!(["is", "visit:country", ["DE"]])).unwrap(),
+        SegmentDef::from_json(1, &json!([["is", "visit:country", ["DE"]]])).unwrap()
+    );
+    assert!(SegmentDef::from_json(1, &json!([])).is_err());
+    assert!(SegmentDef::from_json(1, &json!(["nope"])).is_err());
+    let spec = QuerySpec::parse(
+        &json!({"metrics": ["visitors"], "date_range": "day", "filters": [
+            ["is", "segment", [3, "4"]],
+            ["not", ["or", [["is_not", "segment", [5]], ["is", "segment", ["x"]]]]],
+            ["is", "visit:country", ["3"]]
+        ]}),
+    )
+    .unwrap();
+    assert_eq!(segment_ids(&spec.filters), BTreeSet::from([3, 4, 5]));
 }

@@ -29,9 +29,10 @@
 //! | `GET /api/internal/sites/{site}/stats-deletions`、`POST` | 会话，组织 admin+ | 按日期范围删除统计数据：列表（最近 50 条，新的在前）与请求（`{"from","to","confirm"}`，站点本地日期，`to` 不晚于今天，最多 731 天，`confirm` 须等于站点名） |
 //! | `POST /api/internal/sites/{site}/hostnames`、`DELETE …/hostnames/{pattern}` | 会话，组织 admin+ | 白名单增删 |
 //! | `GET /api/internal/sites/{site}/shield`（editor+）、`POST`（admin+）、`DELETE …/shield/{id}`（admin+） | 会话 | 屏蔽规则 |
-//! | `GET /api/internal/sites/{site}/shared-links`、`POST`、`DELETE …/shared-links/{id}` | 会话，组织 editor+ | 共享链接的列表、创建、吊销 |
+//! | `GET /api/internal/sites/{site}/shared-links`、`POST`、`DELETE …/shared-links/{id}` | 会话，组织 editor+ | 共享链接的列表、创建（可带 `segment_id` 绑定本站点的分群，否则 400）、吊销；每一项带 `segment`（`{id,name}` 或 `null`） |
 //! | `GET /api/internal/sites/{site}/goals`、`POST`、`PATCH …/goals/{id}`、`DELETE …/goals/{id}` | 会话，有效角色 editor+（含站点访客 editor，`site.content.write`） | 目标的列表、添加（`{"kind":"event","event_name"}`、`{"kind":"page","page_path"}` 或 `{"kind":"scroll","page_path","scroll_threshold"}`，可带 `display_name`；同类同值或同名 409 `conflict`，每站 100 个 409 `limit_reached`）、编辑（请求体同添加，整体替换，id 不变）、删除；实现在 [`crate::goals_admin`] |
 //! | `GET /api/internal/sites/{site}/annotations?from=&to=`、`POST`、`PATCH …/annotations/{id}`、`DELETE …/annotations/{id}` | 会话；列表 `stats.read`（含站点访客 viewer），写 `site.content.write`（有效角色 editor+，含站点访客 editor） | 图表注释：列表（`{"annotations":[{id,date,text,author,mine,created_at,updated_at}],"max_annotations":500}`，可按站点本地日期 `from`、`to` 筛选）、添加（`{"date","text"}`，文本 trim 后 1–255 个字符、无控制字符；每站 500 条 409 `limit_reached`）、修改（`{"date"?,"text"?}`）、删除；公开看板与共享链接不返回；实现在 [`crate::annotations_admin`] |
+//! | `GET /api/internal/sites/{site}/segments`、`POST`、`PATCH …/segments/{id}`、`DELETE …/segments/{id}` | 会话；列表 `stats.read`（含站点访客 viewer），写 `site.content.write`（有效角色 editor+，含站点访客 editor） | 分群：列表（`{"segments":[{id,name,filters,created_at,updated_at}],"max_segments":100}`）、添加（`{"name","filters"}`，名称 trim 后 1–100 个字符，过滤按查询规则校验，400 同查询；同名 409 `conflict`，每站 100 个 409 `limit_reached`）、修改（`{"name"?,"filters"?}`）、删除（有未吊销的共享链接绑定时 409 `segment_in_use`，带 `links`）；实现在 [`crate::segments_admin`] |
 //! | `GET /api/internal/sites/{site}/imports`、`POST …/imports?file_name=`、`DELETE …/imports/{id}` | 会话，组织 admin+ | Plausible 导出的导入：列表（带 `native_from`，站点自己的数据开始的那天）、上传 zip（请求体是原样字节，最大 128 MiB；202，后台导入；进行中时 409 `import_running`）、删除（进行中 409）；实现在 [`crate::imports_admin`] |
 //! | `/api/internal/auth-options`、`/password-reset`、`/login/totp`、`/me/totp/*` | 见 [`crate::account`] | 找回密码、登录的第二步、账户的两步验证 |
 //! | `GET /api/internal/orgs/{org_id}/consolidated?range=\|from=&to=&interval=&compare=` | 会话；组织里至少一个能读统计的站点（成员或站点访客），否则 404 | 多站点汇总：调用者能读的全部站点的访客（各站之和）、访问、浏览量、跳出率与访问时长（按访问加权）、趋势与每个站点的数字，最多 100 个站点；实现在 [`crate::consolidated`] |
@@ -125,7 +126,7 @@ use rivu_common::config::{
     Cidr, Config, DEFAULT_PUBLIC_VIEW_BURST, DEFAULT_PUBLIC_VIEW_RATE_PER_MIN,
 };
 use rivu_geo::{GeoDb, NameLang};
-use rivu_query::spec::Filter;
+use rivu_query::spec::{Filter, FilterLeaf, FilterOp, FilterTarget};
 use rivu_query::{
     ExecOptions, QueryCache, QueryError, QueryResult, QuerySpec, SiteContext, TenantScope,
 };
@@ -1364,19 +1365,15 @@ impl DashApi {
 // 查询
 // ------------------------------------------------------------------------------------------
 
-/// 把链接绑定的 segment 的过滤叠加到查询上（顶层数组是隐式 AND）。过滤既可以是单个节点，也可以是节点数组。
-/// 读不懂的 segment 过滤按内部错误处理：宁可失败，也不能把未过滤的数据放出去。
-fn overlay_segment(spec: &mut QuerySpec, filter_json: &str) -> Result<(), ()> {
-    let value: Value = serde_json::from_str(filter_json).map_err(|_| ())?;
-    let nodes: Vec<Value> = match &value {
-        Value::Array(items) if items.first().is_some_and(Value::is_array) => items.clone(),
-        _ => vec![value],
-    };
-    for n in nodes {
-        spec.filters
-            .push(serde_json::from_value::<Filter>(n).map_err(|_| ())?);
-    }
-    Ok(())
+/// 把链接绑定的分群叠加到查询上（顶层数组是隐式 AND）：加一个 `["is", "segment", [id]]`，与看板里应用分群同一条
+/// 展开路径（`prepare` 随后加载它，build 阶段展开）。
+fn overlay_segment(spec: &mut QuerySpec, segment_id: i64) {
+    spec.filters.push(Filter::Leaf(FilterLeaf {
+        op: FilterOp::Is,
+        target: FilterTarget::Segment,
+        values: vec![segment_id.to_string()],
+        case_sensitive: None,
+    }));
 }
 
 /// 城市名的语言：看板在请求头 `Accept-Language` 里带界面语言（第一个标签以 `zh` 开头为中文，其余英文）。
@@ -1416,19 +1413,33 @@ impl DashApi {
             Principal::Public => (self.public_timeout_secs, None),
         };
         if let Principal::Shared(l) = &auth.principal
-            && let Some(filter) = &l.segment_filter
-            && overlay_segment(spec, filter).is_err()
+            && let Some(segment_id) = l.segment_id
         {
-            tracing::error!(link_id = l.id, "共享链接绑定的 segment 过滤无法解析");
-            return Err(DashError::Internal);
+            overlay_segment(spec, segment_id);
         }
-        let site = self.site_context(auth.site.id, &auth.site.site_key).await?;
+        let mut site = self.site_context(auth.site.id, &auth.site.site_key).await?;
+        self.attach_segments(&mut site, spec).await?;
         let opts = self.exec_options(timeout, route, auth.site.organization_id, comment);
         Ok((site, opts, timeout))
     }
 
+    /// 加载查询引用到的分群（`query_api::attach_segments`）。
+    async fn attach_segments(
+        &self,
+        site: &mut SiteContext,
+        spec: &QuerySpec,
+    ) -> Result<(), DashError> {
+        query_api::attach_segments(&self.pg, site, &spec.filters)
+            .await
+            .map_err(|_| DashError::Internal)
+    }
+
     /// 查询内核要的站点上下文（时区、目标、保留期、导入覆盖，`query_api::load_site_context`）。
-    async fn site_context(&self, site_id: u64, site_key: &str) -> Result<SiteContext, DashError> {
+    pub(crate) async fn site_context(
+        &self,
+        site_id: u64,
+        site_key: &str,
+    ) -> Result<SiteContext, DashError> {
         query_api::load_site_context(
             &self.pg,
             self.geo.as_deref(),
@@ -1474,7 +1485,8 @@ impl DashApi {
         route: &'static str,
     ) -> Result<QueryResult, DashError> {
         let timeout = self.dashboard_timeout_secs;
-        let site = self.site_context(site_id, site_key).await?;
+        let mut site = self.site_context(site_id, site_key).await?;
+        self.attach_segments(&mut site, &spec).await?;
         let opts = self.exec_options(timeout, route, org_id, Some(("user", user_id)));
         query_api::execute_cached(
             &self.reader,
@@ -1664,12 +1676,13 @@ async fn site_realtime(
     // 等价于 `date_range: "realtime"` 的 visitors 查询（`system-design.md` §6.1）
     let value = json!({"metrics": ["visitors"], "date_range": "realtime"});
     let spec = QuerySpec::parse(&value).map_err(|_| DashError::Internal)?;
-    // 3 秒的结果缓存（§6.9）：授权已经在上面判定过了；链接绑定了 segment 时，结果随 segment 变，所以键里带上它
+    // 3 秒的结果缓存（§6.9）：授权已经在上面判定过了；链接绑定了分群时，结果随分群变，所以键里带上它
+    // （改了分群的过滤，至多 3 秒后生效）
     let segment = match &auth.principal {
-        Principal::Shared(l) => l.segment_filter.as_deref().unwrap_or(""),
-        _ => "",
+        Principal::Shared(l) => l.segment_id,
+        _ => None,
     };
-    let key = format!("{}|{segment}", auth.site.id);
+    let key = format!("{}|{segment:?}", auth.site.id);
     let body = if let Some(hit) = api.realtime_cache.get(&key) {
         hit
     } else {
@@ -1948,6 +1961,7 @@ pub fn router(api: Arc<DashApi>) -> Router {
         .merge(crate::goals_admin::routes(a))
         .merge(crate::consolidated::routes(a))
         .merge(crate::annotations_admin::routes(a))
+        .merge(crate::segments_admin::routes(a))
         .merge(crate::diagnostics::routes(a))
         .merge(crate::org_admin::routes(a))
         .merge(crate::imports_admin::routes(a))
@@ -2119,28 +2133,25 @@ mod tests {
     }
 
     #[test]
-    fn segment_overlay_accepts_a_single_node_or_a_list_and_rejects_garbage() {
-        let base =
-            || QuerySpec::parse(&json!({"metrics": ["visitors"], "date_range": "7d"})).unwrap();
-        let mut q = base();
-        overlay_segment(&mut q, r#"["is","visit:country",["SE"]]"#).unwrap();
-        assert_eq!(q.filters.len(), 1);
-        let mut q = base();
-        overlay_segment(
-            &mut q,
-            r#"[["is","visit:country",["SE"]],["is","visit:device",["mobile"]]]"#,
-        )
-        .unwrap();
-        assert_eq!(q.filters.len(), 2);
-        // 叠加在请求自己的过滤之后（隐式 AND）
+    fn segment_overlay_adds_a_segment_reference_after_the_request_filters() {
+        // 叠加在请求自己的过滤之后（隐式 AND），展开与看板里应用分群同一条路径
         let mut q = QuerySpec::parse(&json!({"metrics": ["visitors"], "date_range": "7d",
             "filters": [["is", "visit:browser", ["Chrome"]]]}))
         .unwrap();
-        overlay_segment(&mut q, r#"["is","visit:country",["SE"]]"#).unwrap();
-        assert_eq!(q.filters.len(), 2);
-        for bad in ["", "null", "{}", "[1]", r#"["nope","x",[]]"#, "not json"] {
-            assert!(overlay_segment(&mut base(), bad).is_err(), "{bad:?}");
-        }
+        overlay_segment(&mut q, 42);
+        assert_eq!(
+            serde_json::to_value(&q.filters).unwrap(),
+            json!([
+                ["is", "visit:browser", ["Chrome"]],
+                ["is", "segment", ["42"]]
+            ])
+        );
+        assert_eq!(
+            rivu_query::segment_ids(&q.filters)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            [42]
+        );
     }
 
     #[test]

@@ -1016,6 +1016,7 @@ fn link_json(l: &LinkAdminRow) -> Value {
         "expires_at": l.expires_at, "created_at": l.created_at,
         "created_by": l.created_by.as_ref()
             .map(|u| json!({"id": u.id, "name": u.name, "email": u.email})),
+        "segment": l.segment.as_ref().map(|s| json!({"id": s.id, "name": s.name})),
     })
 }
 
@@ -1044,6 +1045,9 @@ struct LinkBody {
     password: Option<String>,
     #[serde(default)]
     expires_at: Option<String>,
+    /// 绑定的分群（同一站点未删除的分群），通过链接看到的数据都叠加它的过滤。
+    #[serde(default)]
+    segment_id: Option<i64>,
 }
 
 async fn create_link(
@@ -1091,7 +1095,7 @@ async fn create_link(
         v.site_key
     };
     let slug = session::generate().plaintext().to_owned();
-    let id = shared_links::create(
+    let created = shared_links::create(
         &api.pg,
         &NewLink {
             site_key: &site_key,
@@ -1100,9 +1104,19 @@ async fn create_link(
             expires_at_unix,
             created_by: Some(c.session.s.user_id),
             name: name.as_deref(),
+            segment_id: body.segment_id,
         },
     )
-    .await?;
+    .await;
+    let id = match created {
+        Ok(id) => id,
+        Err(e) if e.is::<shared_links::SegmentNotFound>() => {
+            return Err(DashError::Invalid(
+                "the segment_id must be a segment of this site".into(),
+            ));
+        }
+        Err(e) => return Err(e.into()),
+    };
     let row = shared_links::get_for_site(&api.pg, c.site.id, id)
         .await?
         .ok_or(DashError::Internal)?;

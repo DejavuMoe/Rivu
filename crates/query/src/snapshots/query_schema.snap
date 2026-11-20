@@ -202,7 +202,7 @@ expression: "crate::schema_json()"
           "type": "array"
         }
       ],
-      "description": "A filter tree node. Leaf: [op, dimension, [values], {\"case_sensitive\": bool}?]. Branch: [\"and\" | \"or\", [filters]] or [\"not\", filter]. `has_done`, `has_not_done` and `segment` are accepted by the schema but not supported yet."
+      "description": "A filter tree node. Leaf: [op, dimension, [values], {\"case_sensitive\": bool}?]. Branch: [\"and\" | \"or\", [filters]] or [\"not\", filter]. Saved segment: [\"is\" | \"is_not\", \"segment\", [id]] is replaced by the segment's filters (combined with AND); the segment must belong to the queried site. `has_done` and `has_not_done` are accepted by the schema but not supported yet."
     },
     "Include": {
       "additionalProperties": false,
