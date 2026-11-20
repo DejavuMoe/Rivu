@@ -1,0 +1,51 @@
+---
+source: crates/query/src/sql_tests.rs
+expression: "render(&sql, &params)"
+---
+SELECT d0, sum(c_visitors) AS m0, sum(c_visits) AS m1, sum(c_events) AS m2, sum(c_pageviews) AS m3, ifNotFinite(sum(c_visitors) / sum(c_cr_base), 0) AS m4
+FROM (
+  SELECT arrayJoin(arrayDistinct(arrayFilter(g_l -> g_l != '', [if((name = {p4:String}), {p5:String}, ''), if(((name = 'pageview' AND pathname LIKE {p6:String})), {p7:String}, ''), if(((name = 'pageview' AND pathname LIKE {p8:String})), {p9:String}, ''), if(((name = 'engagement' AND scroll_depth >= {p10:UInt8} AND scroll_depth <= 100 AND pathname LIKE {p11:String})), {p12:String}, ''), if(((name = 'engagement' AND scroll_depth >= {p13:UInt8} AND scroll_depth <= 100 AND pathname LIKE {p14:String})), {p15:String}, '')]))) AS d0, uniq(visitor_id) AS c_visitors, countIf(name = 'pageview') AS c_pageviews, countIf(name != 'engagement') AS c_events, uniq(session_id) AS c_visits, toUInt64(0) AS c_cr_base
+  FROM (
+    SELECT *
+    FROM events
+    WHERE site_id = {site:UInt64} AND toDate(ts) >= {from_date:Date} AND toDate(ts) <= {to_date:Date} AND ts >= fromUnixTimestamp64Milli({from_ms:Int64}, 'UTC') AND ts < fromUnixTimestamp64Milli({to_ms:Int64}, 'UTC') AND (name != 'engagement' OR ((name = 'engagement' AND scroll_depth >= {p0:UInt8} AND scroll_depth <= 100 AND pathname LIKE {p1:String}) OR (name = 'engagement' AND scroll_depth >= {p2:UInt8} AND scroll_depth <= 100 AND pathname LIKE {p3:String})))) AS e
+  GROUP BY d0
+  UNION ALL SELECT arrayJoin({p16:Array(String)}) AS d0, toUInt64(0) AS c_visitors, toUInt64(0) AS c_pageviews, toUInt64(0) AS c_events, toUInt64(0) AS c_visits, uniq(visitor_id) AS c_cr_base
+  FROM (
+    SELECT *
+    FROM events
+    WHERE site_id = {site:UInt64} AND toDate(ts) >= {from_date:Date} AND toDate(ts) <= {to_date:Date} AND ts >= fromUnixTimestamp64Milli({from_ms:Int64}, 'UTC') AND ts < fromUnixTimestamp64Milli({to_ms:Int64}, 'UTC') AND name != 'engagement') AS e
+  GROUP BY d0)
+GROUP BY d0
+HAVING sum(c_visitors) > 0
+ORDER BY m0 DESC, d0 ASC
+LIMIT {p17:UInt64} OFFSET {p18:UInt64}
+
+-- params
+site: UInt64 = 4242
+from_ms: Int64 = 1790200800000
+to_ms: Int64 = 1792749600001
+from_date: Date = "2026-09-23"
+to_date: Date = "2026-10-23"
+s_from: Date = "2026-09-16"
+tz: String = "Europe/Berlin"
+wk: UInt8 = 7
+p0: UInt8 = 75
+p1: String = "/blog/%"
+p2: UInt8 = 100
+p3: String = "/blog/%"
+p4: String = "Signup"
+p5: String = "Signup"
+p6: String = "/checkout/%/done"
+p7: String = "Checkout"
+p8: String = "/a\\_b\\%c\\\\d"
+p9: String = "/a_b%c\\d"
+p10: UInt8 = 75
+p11: String = "/blog/%"
+p12: String = "≥ 75%"
+p13: UInt8 = 100
+p14: String = "/blog/%"
+p15: String = "Read all"
+p16: Array(String) = ["/a_b%c\\d", "Checkout", "Read all", "Signup", "≥ 75%"]
+p17: UInt64 = 10000
+p18: UInt64 = 0

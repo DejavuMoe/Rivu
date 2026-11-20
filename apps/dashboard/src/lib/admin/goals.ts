@@ -1,4 +1,4 @@
-// 目标表单的初筛（服务端校验为准，见 bin/rivu/src/goals_admin.rs）：事件名、页面路径、重复与重名。
+// 目标表单的初筛（服务端校验为准，见 bin/rivu/src/goals_admin.rs）：事件名、页面路径、滚动阈值、重复与重名。
 import type { Goal, GoalKind } from "../api.ts";
 
 export const EVENT_NAME_MAX = 120;
@@ -25,14 +25,28 @@ export function pagePathError(raw: string): string | null {
   return null;
 }
 
-/** 目标值：事件名或页面路径。 */
+/** 滚动深度可选的阈值（%），默认 75。 */
+export const SCROLL_DEPTHS = [25, 50, 75, 90, 100];
+/** 滚动深度目标不限定页面时的路径：所有页面（与服务端相同）。 */
+export const SCROLL_ALL_PAGES = "/*";
+
+/** 滚动深度目标没有显示名时的名字（与服务端相同）。 */
+export function scrollLabel(threshold: number): string {
+  return `≥ ${threshold}%`;
+}
+
+/** 目标值：事件名、页面路径，滚动深度目标是 `≥ N%`（路径另行显示）。 */
 export function goalTarget(g: Goal): string {
+  if (g.kind === "scroll") return scrollLabel(g.scroll_threshold ?? 0);
   return g.event_name ?? g.page_path ?? "";
 }
 
-/** 同类同值的目标已经存在。 */
-export function isDuplicateGoal(goals: Goal[], kind: GoalKind, value: string): boolean {
-  return !!value && goals.some((g) => g.kind === kind && goalTarget(g) === value);
+/** 同类同值的目标已经存在；滚动深度目标比较路径与阈值。 */
+export function isDuplicateGoal(goals: Goal[], kind: GoalKind, value: string, threshold: number | null = null): boolean {
+  if (!value) return false;
+  return goals.some(
+    (g) => g.kind === kind && (g.event_name ?? g.page_path ?? "") === value && (kind !== "scroll" || g.scroll_threshold === threshold),
+  );
 }
 
 /** 新目标的名字（显示名，否则目标值）已被别的目标占用：看板按名字区分目标，所以名字不能重。 */

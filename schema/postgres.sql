@@ -99,11 +99,12 @@ TABLE goals
   deleted_at timestamp with time zone
   created_at timestamp with time zone NOT NULL DEFAULT now()
   updated_at timestamp with time zone NOT NULL DEFAULT now()
-  CONSTRAINT goals_check CHECK ((((kind = 'event'::text) AND (event_name IS NOT NULL) AND (page_path IS NULL)) OR ((kind = 'page'::text) AND (page_path IS NOT NULL) AND (event_name IS NULL))))
-  CONSTRAINT goals_kind_check CHECK ((kind = ANY (ARRAY['event'::text, 'page'::text])))
+  scroll_threshold smallint
+  CONSTRAINT goals_check CHECK ((((kind = 'event'::text) AND (event_name IS NOT NULL) AND (page_path IS NULL) AND (scroll_threshold IS NULL)) OR ((kind = 'page'::text) AND (page_path IS NOT NULL) AND (event_name IS NULL) AND (scroll_threshold IS NULL)) OR ((kind = 'scroll'::text) AND (page_path IS NOT NULL) AND (event_name IS NULL) AND ((scroll_threshold >= 1) AND (scroll_threshold <= 100)))))
+  CONSTRAINT goals_kind_check CHECK ((kind = ANY (ARRAY['event'::text, 'page'::text, 'scroll'::text])))
   CONSTRAINT goals_pkey PRIMARY KEY (id)
   CONSTRAINT goals_site_id_fkey FOREIGN KEY (site_id) REFERENCES sites(id)
-  CREATE UNIQUE INDEX goals_unique ON public.goals USING btree (site_id, kind, COALESCE(event_name, page_path)) WHERE (deleted_at IS NULL)
+  CREATE UNIQUE INDEX goals_unique ON public.goals USING btree (site_id, kind, COALESCE(event_name, page_path), COALESCE((scroll_threshold)::integer, 0)) WHERE (deleted_at IS NULL)
   CREATE INDEX goals_updated ON public.goals USING btree (updated_at)
   CREATE TRIGGER goals_set_updated_at BEFORE UPDATE ON public.goals FOR EACH ROW EXECUTE FUNCTION set_updated_at()
 

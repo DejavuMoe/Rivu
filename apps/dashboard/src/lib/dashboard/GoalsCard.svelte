@@ -1,5 +1,6 @@
 <!--
   目标卡片：每个有转化的目标一行（访客、完成次数、转化率），条长按访客数。点行按这个目标筛选。
+  滚动深度目标没有完成次数，那一格显示 —。
   查询返回空（站点没有目标，或这个范围里没有转化）时整张卡片不显示；目标的名字随查询结果返回，所以看板的只读访问也能看到。
 -->
 <script lang="ts">
@@ -42,7 +43,7 @@
       key: r.label,
       label: r.label,
       value: r.visitors,
-      extra: [compact(r.events, app.lang), percent(r.cr)],
+      extra: [r.events === null ? "—" : compact(r.events, app.lang), percent(r.cr)],
     })),
   );
 </script>

@@ -8,6 +8,7 @@ import {
   labelTaken,
   normalizePagePath,
   pagePathError,
+  scrollLabel,
 } from "../src/lib/admin/goals.ts";
 import type { Goal } from "../src/lib/api.ts";
 
@@ -16,6 +17,7 @@ const goal = (g: Partial<Goal>): Goal => ({
   kind: "event",
   event_name: null,
   page_path: null,
+  scroll_threshold: null,
   display_name: null,
   label: "",
   created_at: "2026-10-26T00:00:00.000Z",
@@ -55,4 +57,19 @@ test("重复与重名", () => {
   assert.equal(labelTaken(goals, "Pricing"), true);
   assert.equal(labelTaken(goals, "/pricing"), false);
   assert.equal(labelTaken(goals, ""), false);
+});
+
+test("滚动深度：名字是 ≥ N%，同路径不同阈值不算重复", () => {
+  const goals = [
+    goal({ id: 3, kind: "scroll", page_path: "/blog/*", scroll_threshold: 75, label: "≥ 75%" }),
+    goal({ id: 4, kind: "page", page_path: "/blog/*", label: "/blog/*" }),
+  ];
+  assert.equal(scrollLabel(75), "≥ 75%");
+  assert.equal(goalTarget(goals[0]), "≥ 75%");
+  assert.equal(isDuplicateGoal(goals, "scroll", "/blog/*", 75), true);
+  assert.equal(isDuplicateGoal(goals, "scroll", "/blog/*", 90), false);
+  assert.equal(isDuplicateGoal(goals, "scroll", "/*", 75), false);
+  assert.equal(isDuplicateGoal(goals, "page", "/blog/*"), true);
+  // 另一个路径的同阈值目标没有显示名时名字撞了
+  assert.equal(labelTaken(goals, scrollLabel(75)), true);
 });

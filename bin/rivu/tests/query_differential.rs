@@ -4,7 +4,7 @@
 //! 事件由确定性的随机生成器产生（多人、跨本地午夜与夏令时切换日、多种 UA / IP / referrer / utm / 页面、
 //! engagement 带 sd 或 e、自定义事件），经真实管线（`Pipeline` + 可控时钟）写入 ClickHouse；
 //! 再随机生成数百个合法的 `QuerySpec`（指标子集、0–2 个维度、随机过滤树、随机日期范围与「现在」、order_by、
-//! limit / offset、`include`、对比期；目标：事件与页面目标、通配、`event:goal` 维度与过滤、`conversion_rate`），
+//! limit / offset、`include`、对比期；目标：事件与页面目标、通配、滚动深度目标（含 255 与阈值边界）、`event:goal` 维度与过滤、`conversion_rate`），
 //! 逐个比较两边的结果：计数严格相等，比率 1e-9 容差，
 //! 行序、`time_labels`、`total_rows`、对比期都要一致。失败时把请求最小化后打印。
 //!
@@ -142,29 +142,43 @@ const UTMS: [Option<&str>; 6] = [
     Some("?gclid=abc123"),
 ];
 
-/// 两个站点共用的目标：`(id, kind, 值, 显示名)`。事件目标用生成器的自定义事件名；页面目标覆盖精确路径、
-/// 前缀通配、中间通配、只有 `*`（匹配所有 pageview），以及一个永远完成不了的目标（不出现在结果里）。
-const GOALS: [(i64, &str, &str, Option<&str>); 8] = [
-    (101, "event", "Signup", None),
-    (102, "event", "Download", Some("Got the PDF")),
-    (103, "event", "never-sent", Some("Never")),
-    (104, "page", "/pricing", None),
-    (105, "page", "/docs*", Some("Docs")),
-    (106, "page", "/*/intro", None),
-    (107, "page", "/blog/*", Some("Blog")),
-    (108, "page", "/*", Some("Any page")),
+/// `(id, kind, 值, 滚动阈值, 显示名)`。
+type GoalRowDef = (
+    i64,
+    &'static str,
+    &'static str,
+    Option<u8>,
+    Option<&'static str>,
+);
+
+/// 两个站点共用的目标：`(id, kind, 值, 滚动阈值, 显示名)`。事件目标用生成器的自定义事件名；页面目标覆盖精确路径、
+/// 前缀通配、中间通配、只有 `*`（匹配所有 pageview），以及一个永远完成不了的目标（不出现在结果里）；
+/// 滚动深度目标覆盖同一路径的不同阈值、阈值 1 与 100（生成器的 engagement 事件的 sd 是 0–100 或没有，即 255）。
+const GOALS: [GoalRowDef; 12] = [
+    (101, "event", "Signup", None, None),
+    (102, "event", "Download", None, Some("Got the PDF")),
+    (103, "event", "never-sent", None, Some("Never")),
+    (104, "page", "/pricing", None, None),
+    (105, "page", "/docs*", None, Some("Docs")),
+    (106, "page", "/*/intro", None, None),
+    (107, "page", "/blog/*", None, Some("Blog")),
+    (108, "page", "/*", None, Some("Any page")),
+    (109, "scroll", "/blog/*", Some(50), None),
+    (110, "scroll", "/blog/*", Some(90), Some("Blog read")),
+    (111, "scroll", "/*", Some(100), Some("Bottom")),
+    (112, "scroll", "/docs*", Some(1), Some("Docs scrolled")),
 ];
 
 fn goal_defs() -> Vec<GoalDef> {
     GOALS
         .iter()
-        .map(|(id, kind, v, d)| {
+        .map(|(id, kind, v, t, d)| {
             let (e, p) = if *kind == "event" {
                 (Some(*v), None)
             } else {
                 (None, Some(*v))
             };
-            GoalDef::from_parts(*id, kind, e, p, *d).expect("合法的目标")
+            GoalDef::from_parts(*id, kind, e, p, *t, *d).expect("合法的目标")
         })
         .collect()
 }
@@ -178,6 +192,9 @@ fn ref_goals() -> Vec<RefGoal> {
             kind: match g.kind {
                 GoalKind::Event(n) => RefGoalKind::Event(n),
                 GoalKind::Page(p) => RefGoalKind::Page(p),
+                GoalKind::Scroll { pattern, threshold } => {
+                    RefGoalKind::Scroll { pattern, threshold }
+                }
             },
         })
         .collect()
@@ -720,8 +737,8 @@ impl Gen<'_> {
         let op = *pick(&mut self.rng, &["is", "is", "is_not"]);
         let mut values: Vec<Value> = Vec::new();
         for _ in 0..self.rng.random_range(1..3) {
-            let (id, _, v, d) = *pick(&mut self.rng, &GOALS);
-            let label = d.unwrap_or(v).to_owned();
+            let g = pick(&mut self.rng, &goal_defs()).clone();
+            let (id, label) = (g.id, g.label);
             values.push(match self.rng.random_range(0..10) {
                 0..=4 => json!(label),
                 5 => json!(label.to_uppercase()),

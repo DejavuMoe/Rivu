@@ -257,11 +257,11 @@ export function propertyKeysSpec(s: DashState, now: Date): Spec {
 // ---------- 结果 ----------
 
 export interface GoalRow {
-  /** 目标的名字（显示名，否则事件名或页面路径） */
+  /** 目标的名字（显示名，否则事件名、页面路径或 `≥ N%`） */
   label: string;
   visitors: number;
-  /** 完成次数 */
-  events: number;
+  /** 完成次数；滚动深度目标没有完成次数，为 null */
+  events: number | null;
   /** 0–1 */
   cr: number;
 }
@@ -270,7 +270,9 @@ export function readGoals(res: QueryResult): GoalRow[] {
   return res.results.map((r) => ({
     label: r.dimensions[0],
     visitors: r.metrics[0] ?? 0,
-    events: r.metrics[1] ?? 0,
+    // 事件 / 页面目标的行至少有一次完成；完成次数为 0 的行只能是滚动深度目标（滚动在浏览过程中测量，
+    // 不是单独的事件，服务端对它返回 0，见 system-design.md §6.6）
+    events: r.metrics[1] ? r.metrics[1] : null,
     cr: r.metrics[2] ?? 0,
   }));
 }

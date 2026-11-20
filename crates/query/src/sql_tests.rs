@@ -23,9 +23,17 @@ fn site() -> SiteContext {
     let mut s = SiteContext::new(SITE_ID, TimeZone::get("Europe/Berlin").unwrap());
     s.week_starts_on = Weekday::Sunday;
     s.goals = vec![
-        GoalDef::from_parts(11, "event", Some("Signup"), None, None).unwrap(),
-        GoalDef::from_parts(12, "page", None, Some("/checkout/*/done"), Some("Checkout")).unwrap(),
-        GoalDef::from_parts(13, "page", None, Some("/a_b%c\\d"), None).unwrap(),
+        GoalDef::from_parts(11, "event", Some("Signup"), None, None, None).unwrap(),
+        GoalDef::from_parts(
+            12,
+            "page",
+            None,
+            Some("/checkout/*/done"),
+            None,
+            Some("Checkout"),
+        )
+        .unwrap(),
+        GoalDef::from_parts(13, "page", None, Some("/a_b%c\\d"), None, None).unwrap(),
     ];
     s
 }
@@ -36,8 +44,30 @@ fn now() -> Timestamp {
 }
 
 fn build(spec: Value) -> Result<(String, Params), QueryError> {
+    build_on(&site(), spec)
+}
+
+fn build_on(site: &SiteContext, spec: Value) -> Result<(String, Params), QueryError> {
     let spec = QuerySpec::parse(&spec)?;
-    explain(&TenantScope::new(SITE_ID), &site(), &spec, now(), None)
+    explain(&TenantScope::new(SITE_ID), site, &spec, now(), None)
+}
+
+/// `site()` 再加两个滚动深度目标（同一路径、不同阈值）。
+fn scroll_site() -> SiteContext {
+    let mut s = site();
+    s.goals.extend([
+        GoalDef::from_parts(14, "scroll", None, Some("/blog/*"), Some(75), None).unwrap(),
+        GoalDef::from_parts(
+            15,
+            "scroll",
+            None,
+            Some("/blog/*"),
+            Some(100),
+            Some("Read all"),
+        )
+        .unwrap(),
+    ]);
+    s
 }
 
 /// 在关键字前换行，按括号深度缩进：只为让快照好读。
@@ -120,7 +150,11 @@ fn render(sql: &str, params: &Params) -> String {
 }
 
 fn snap(name: &str, spec: Value) {
-    let (sql, params) = build(spec).unwrap_or_else(|e| panic!("{name}: {e}"));
+    snap_on(&site(), name, spec);
+}
+
+fn snap_on(site: &SiteContext, name: &str, spec: Value) {
+    let (sql, params) = build_on(site, spec).unwrap_or_else(|e| panic!("{name}: {e}"));
     assert!(check_tenant_scoped(&sql), "{name}: 有未带租户范围的 FROM");
     insta::with_settings!({snapshot_path => "snapshots", prepend_module_to_snapshot => false}, {
         insta::assert_snapshot!(name, render(&sql, &params));
@@ -346,6 +380,102 @@ fn sql_goals() {
                         ["is_not", "event:page", ["/admin"]]]
         }),
     );
+}
+
+#[test]
+fn sql_scroll_goals() {
+    // 滚动深度目标：事件组件的基础条件加上完成它的 engagement 事件，`events` 只数非 engagement 事件；
+    // 分母组件仍然只看非 engagement 事件
+    snap_on(
+        &scroll_site(),
+        "goal_scroll_breakdown",
+        json!({
+            "metrics": ["visitors", "visits", "events", "pageviews", "conversion_rate"],
+            "date_range": "30d",
+            "dimensions": ["event:goal"]
+        }),
+    );
+    // 滚动深度目标的过滤：会话指标的存在子查询也接受完成它的 engagement 事件
+    snap_on(
+        &scroll_site(),
+        "goal_scroll_filter",
+        json!({
+            "metrics": ["visitors", "visits", "bounce_rate", "conversion_rate"],
+            "date_range": "7d",
+            "dimensions": ["visit:source"],
+            "filters": [["is", "event:goal", ["≥ 75%"]]]
+        }),
+    );
+}
+
+#[test]
+fn scroll_goals_leave_other_queries_unchanged() {
+    // 不涉及滚动深度目标的查询（过滤只有事件 / 页面目标，或没有目标），站点多了滚动深度目标，SQL 完全相同
+    for spec in [
+        json!({"metrics": ["visitors", "conversion_rate"], "date_range": "7d",
+               "filters": [["is", "event:goal", ["Signup", "Checkout"]]]}),
+        json!({"metrics": ["visitors", "visits", "bounce_rate"], "date_range": "7d",
+               "dimensions": ["visit:source"], "filters": [["is_not", "event:goal", ["12"]]]}),
+        json!({"metrics": ["visitors", "time_on_page", "scroll_depth"], "date_range": "7d",
+               "dimensions": ["event:page"]}),
+    ] {
+        assert_eq!(
+            build(spec.clone()).unwrap(),
+            build_on(&scroll_site(), spec).unwrap()
+        );
+    }
+    // 有目标维度时，没有滚动深度目标的站点 SQL 不变（快照 goal_breakdown）；有了滚动深度目标，
+    // 事件 / 页面目标的条件与标签照旧，只多出滚动深度目标的条件
+    let (sql, params) = build_on(
+        &scroll_site(),
+        json!({"metrics": ["visitors", "events"], "date_range": "day", "dimensions": ["event:goal"]}),
+    )
+    .unwrap();
+    assert!(
+        sql.contains("countIf(name != 'engagement') AS c_events"),
+        "{sql}"
+    );
+    assert!(
+        sql.contains("(name != 'engagement' OR ((name = 'engagement' AND scroll_depth >= "),
+        "{sql}"
+    );
+    assert!(sql.contains("scroll_depth <= 100"), "{sql}");
+    assert!(
+        params.iter().any(|(_, v)| *v == ParamValue::U8(75)),
+        "{params:?}"
+    );
+    assert!(
+        params.iter().any(|(_, v)| *v == ParamValue::U8(100)),
+        "{params:?}"
+    );
+    assert!(
+        params
+            .iter()
+            .any(|(_, v)| *v == ParamValue::Str("/blog/%".to_owned())),
+        "{params:?}"
+    );
+}
+
+#[test]
+fn scroll_goal_definitions() {
+    let g = GoalDef::from_parts(1, "scroll", None, Some("/blog/*"), Some(75), None).unwrap();
+    assert_eq!(g.label, "≥ 75%");
+    assert!(g.kind.is_scroll());
+    let g = GoalDef::from_parts(1, "scroll", None, Some("/*"), Some(1), Some("Any")).unwrap();
+    assert_eq!(g.label, "Any");
+    for (kind, e, p, t) in [
+        ("scroll", None, Some("/a"), Some(0)),
+        ("scroll", None, Some("/a"), Some(101)),
+        ("scroll", None, Some("/a"), None),
+        ("scroll", None, None, Some(50)),
+        ("event", Some("A"), None, Some(50)),
+        ("page", None, Some("/a"), Some(50)),
+    ] {
+        assert!(
+            GoalDef::from_parts(1, kind, e, p, t, None).is_none(),
+            "{kind} {e:?} {p:?} {t:?}"
+        );
+    }
 }
 
 #[test]

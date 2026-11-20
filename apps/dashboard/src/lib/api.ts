@@ -125,20 +125,25 @@ export interface ShieldRule {
   created_at: string;
 }
 
-export type GoalKind = "event" | "page";
+export type GoalKind = "event" | "page" | "scroll";
 
 export interface Goal {
   id: number;
   kind: GoalKind;
   event_name: string | null;
   page_path: string | null;
+  /** 滚动深度目标的阈值（百分比，1–100），其余目标为 null */
+  scroll_threshold: number | null;
   display_name: string | null;
-  /** 显示名，否则事件名，否则页面路径：看板目标卡片与筛选里用的名字 */
+  /** 显示名，否则事件名、页面路径，滚动深度目标是 `≥ N%`：看板目标卡片与筛选里用的名字 */
   label: string;
   created_at: string;
 }
 
-export type NewGoal = { kind: "event"; event_name: string; display_name?: string } | { kind: "page"; page_path: string; display_name?: string };
+export type NewGoal =
+  | { kind: "event"; event_name: string; display_name?: string }
+  | { kind: "page"; page_path: string; display_name?: string }
+  | { kind: "scroll"; page_path?: string; scroll_threshold: number; display_name?: string };
 
 export interface SharedLink {
   id: number;
