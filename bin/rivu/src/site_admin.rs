@@ -272,7 +272,10 @@ async fn settings_body(api: &DashApi, site_id: u64) -> Res<Value> {
             "ingest_rate_limit_per_min": v.ingest_rate_limit_per_min,
             "geo_level": v.geo_level,
             "retention_days": v.retention_days,
+            "spike_threshold": v.spike_threshold,
         },
+        // Traffic spike alerts only send mail when SMTP is configured.
+        "mail_available": api.mailer.is_some(),
         "hostnames": hostnames.iter()
             .map(|h| json!({"pattern": h.pattern, "created_at": h.created_at}))
             .collect::<Vec<_>>(),
@@ -365,6 +368,9 @@ struct PatchBody {
     /// 站点的原始数据保留天数；`null` = 用全局 `RIVU_RETENTION_DAYS`。
     #[serde(default, deserialize_with = "double_option")]
     retention_days: Option<Option<i64>>,
+    /// 流量激增提醒的阈值（当前在线访客数）；`null` = 关掉。
+    #[serde(default, deserialize_with = "double_option")]
+    spike_threshold: Option<Option<i64>>,
 }
 
 async fn patch_site(
@@ -385,7 +391,8 @@ async fn patch_site(
         && body.tracker.as_ref().is_none_or(TrackerPatch::is_empty)
         && body.ingest_rate_limit_per_min.is_none()
         && body.geo_level.is_none()
-        && body.retention_days.is_none();
+        && body.retention_days.is_none()
+        && body.spike_threshold.is_none();
     if empty {
         return Err(DashError::Invalid("no fields to update".into()));
     }
@@ -437,6 +444,17 @@ async fn patch_site(
             )));
         }
     };
+    let spike_threshold = match body.spike_threshold {
+        None => None,
+        Some(None) => Some(None),
+        Some(Some(n)) if (1..=i64::from(i32::MAX)).contains(&n) => Some(Some(n as i32)),
+        Some(Some(_)) => {
+            return Err(DashError::Invalid(format!(
+                "the spike_threshold must be between 1 and {}, or null to turn traffic spike alerts off",
+                i32::MAX
+            )));
+        }
+    };
     let patch = SitePatch {
         name: name.as_deref(),
         timezone: body.timezone.as_deref(),
@@ -451,6 +469,7 @@ async fn patch_site(
         ingest_rate_limit_per_min: ingest,
         geo_level: body.geo_level.as_deref(),
         retention_days: retention,
+        spike_threshold,
     };
     let mut tx = api
         .pg

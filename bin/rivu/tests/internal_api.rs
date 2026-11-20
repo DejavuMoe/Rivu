@@ -795,7 +795,8 @@ async fn weekly_report_confirms_the_mailbox_once_and_switches_sites() {
     let site_entry = |s: &Site, name: &str, week_starts_on: i64, subscribed: bool| {
         json!({"id": s.id, "name": name, "timezone": "UTC",
                "week_starts_on": week_starts_on, "subscribed": subscribed,
-               "monthly_subscribed": false})
+               "monthly_subscribed": false, "spike_subscribed": false,
+               "spike_threshold": null, "can_edit_settings": false})
     };
     assert_eq!(
         weekly_account(&http, &cookie).await,
@@ -1991,6 +1992,403 @@ async fn monthly_report_is_sent_once_per_month_and_unsubscribes_alone() {
     assert_eq!(monthly, want);
     assert_eq!(claims("monthly").await.unwrap(), 4);
     cleanup(&env, &[site.id]).await;
+    iso.drop().await;
+}
+
+async fn add_visit(ch: &Client, site_id: u64, visitor: u64, name: &str, at: Timestamp) {
+    let ms = at.as_millisecond();
+    ch.query(
+        "INSERT INTO events
+         (site_id, ts, event_id, name, visitor_id, session_id, session_start,
+          hostname, pathname, entry_pathname)
+         SELECT ?, fromUnixTimestamp64Milli(?, 'UTC'), generateUUIDv4(), ?, ?, ?,
+                fromUnixTimestamp64Milli(?, 'UTC'), 'example.test', '/', '/'",
+    )
+    .bind(site_id)
+    .bind(ms)
+    .bind(name)
+    .bind(visitor)
+    .bind(visitor)
+    .bind(ms)
+    .execute()
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn traffic_spike_threshold_is_an_admin_setting_and_needs_it_to_subscribe() {
+    let Some(env) = test_env("traffic_spike_settings") else {
+        return;
+    };
+    migrate_once(&env).await;
+    let iso = isolated(&env).await;
+    let pg = &iso.pool;
+    let org = make_org(pg).await;
+    let admin = make_user(pg, Some((&org, "admin"))).await;
+    let editor = make_user(pg, Some((&org, "editor"))).await;
+    let viewer = make_user(pg, Some((&org, "viewer"))).await;
+    let site = make_site(pg, &org, false).await;
+    let guest = guest_of(pg, &site, "editor").await;
+    let cfg = config(&env, &[]);
+    let reader = rivu_storage_ch::client(&env.ch_url, &account("reader"), Some(&ch_database()));
+    let (mailer, _outbox) = rivu_mail::Mailer::memory("rivu@example.test");
+    let api = DashApi::new(&cfg, pg.clone(), reader.clone(), None)
+        .unwrap()
+        .with_mailer(mailer);
+    let http = serve_dashboard(Arc::new(api), &cfg.base_url).await;
+    let cookie = |u: &User| {
+        let (http, email) = (&http, u.email.clone());
+        async move { login_cookie(http, &email).await }
+    };
+    let (admin_c, editor_c, viewer_c, guest_c) = (
+        cookie(&admin).await,
+        cookie(&editor).await,
+        cookie(&viewer).await,
+        cookie(&guest).await,
+    );
+    let update = site_path(site.id, "");
+    let threshold = |n: Value| json!({ "spike_threshold": n });
+
+    // Only an organization owner or admin sets the threshold.
+    for who in [&editor_c, &viewer_c, &guest_c] {
+        let r = http
+            .patch(&update, &threshold(json!(3)))
+            .cookie(who)
+            .send()
+            .await;
+        assert_eq!(r.status, 403, "{}", r.body);
+    }
+    let settings = http
+        .get(&site_path(site.id, "/settings"))
+        .cookie(&admin_c)
+        .send()
+        .await;
+    assert_eq!(settings.status, 200);
+    let settings = settings.json();
+    assert_eq!(settings["settings"]["spike_threshold"], Value::Null);
+    assert_eq!(settings["mail_available"], true);
+    for bad in [json!(0), json!(-1), json!(2_147_483_648_i64), json!("3")] {
+        let r = http
+            .patch(&update, &threshold(bad))
+            .cookie(&admin_c)
+            .send()
+            .await;
+        assert_eq!(r.status, 400, "{}", r.body);
+    }
+
+    // The account page: no threshold yet, and only the admin may set one.
+    let sub = |s: &Site| format!("/api/internal/sites/{}/traffic-spike", s.id);
+    for (user, can_edit) in [(&admin, true), (&viewer, false), (&guest, false)] {
+        sqlx::query(
+            "INSERT INTO weekly_report_emails (user_id, email, lang, confirmed_at)
+             VALUES ($1, $2, 'en', now())",
+        )
+        .bind(user.id)
+        .bind(&user.email)
+        .execute(pg)
+        .await
+        .unwrap();
+        let c = cookie(user).await;
+        let entry = weekly_account(&http, &c).await["sites"][0].clone();
+        assert_eq!(entry["spike_threshold"], Value::Null);
+        assert_eq!(entry["spike_subscribed"], false);
+        assert_eq!(entry["can_edit_settings"], can_edit, "{}", user.email);
+        let r = http
+            .put(&sub(&site), &json!({"lang": "en"}))
+            .cookie(&c)
+            .send()
+            .await;
+        assert_eq!(r.status, 409, "{}", r.body);
+        assert_eq!(r.json()["error"], "spike_threshold_unset");
+    }
+
+    let r = http
+        .patch(&update, &threshold(json!(3)))
+        .cookie(&admin_c)
+        .send()
+        .await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.json()["settings"]["spike_threshold"], 3);
+    for c in [&viewer_c, &guest_c] {
+        let r = http
+            .put(&sub(&site), &json!({"lang": "zh"}))
+            .cookie(c)
+            .send()
+            .await;
+        assert_eq!(r.status, 204, "{}", r.body);
+        let entry = weekly_account(&http, c).await["sites"][0].clone();
+        assert_eq!(entry["spike_threshold"], 3);
+        assert_eq!(entry["spike_subscribed"], true);
+        assert_eq!(entry["subscribed"], false);
+        assert_eq!(entry["monthly_subscribed"], false);
+    }
+    assert_eq!(
+        http.delete(&sub(&site))
+            .cookie(&guest_c)
+            .send()
+            .await
+            .status,
+        204
+    );
+    assert_eq!(
+        weekly_account(&http, &guest_c).await["sites"][0]["spike_subscribed"],
+        false
+    );
+    // Turning the threshold off keeps the switches, but nothing is watched any more.
+    let r = http
+        .patch(&update, &threshold(Value::Null))
+        .cookie(&admin_c)
+        .send()
+        .await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.json()["settings"]["spike_threshold"], Value::Null);
+    let entry = weekly_account(&http, &viewer_c).await["sites"][0].clone();
+    assert_eq!(entry["spike_subscribed"], true);
+    assert_eq!(entry["spike_threshold"], Value::Null);
+
+    // Without SMTP the settings say so.
+    let quiet = DashApi::new(&cfg, pg.clone(), reader, None).unwrap();
+    let quiet = serve_dashboard(Arc::new(quiet), &cfg.base_url).await;
+    let settings = quiet
+        .get(&site_path(site.id, "/settings"))
+        .cookie(&admin_c)
+        .send()
+        .await
+        .json();
+    assert_eq!(settings["mail_available"], false);
+    iso.drop().await;
+}
+
+#[tokio::test]
+async fn traffic_spike_sends_one_alert_per_spike() {
+    let Some(env) = test_env("traffic_spike_delivery") else {
+        return;
+    };
+    migrate_once(&env).await;
+    let iso = isolated(&env).await;
+    let pg = &iso.pool;
+    sqlx::query("SELECT setval(pg_get_serial_sequence('sites', 'id'), $1, false)")
+        .bind(17_000_000_000_i64 + i64::from(rand::random::<u32>()))
+        .execute(pg)
+        .await
+        .unwrap();
+    let org = make_org(pg).await;
+    let owner = make_user(pg, Some((&org, "owner"))).await;
+    let guest = make_user(pg, None).await;
+    let late = make_user(pg, Some((&org, "viewer"))).await;
+    let site = make_site(pg, &org, false).await;
+    let calm = make_site(pg, &org, false).await;
+    let id = site.id as i64;
+    sqlx::query("INSERT INTO site_memberships (site_id, user_id, role) VALUES ($1, $2, 'viewer')")
+        .bind(id)
+        .bind(guest.id)
+        .execute(pg)
+        .await
+        .unwrap();
+    for (s, threshold) in [(&site, 3), (&calm, 100)] {
+        sqlx::query("UPDATE site_settings SET spike_threshold = $2 WHERE site_id = $1")
+            .bind(s.id as i64)
+            .bind(threshold)
+            .execute(pg)
+            .await
+            .unwrap();
+    }
+    let subscribe = |user: &User, s: &Site, kind: &'static str, lang: &'static str, at: &str| {
+        sqlx::query(
+            "INSERT INTO weekly_report_subscriptions
+                 (user_id, site_id, kind, email, lang, confirmed_at)
+             VALUES ($1, $2, $3, $4, $5, $6::text::timestamptz)",
+        )
+        .bind(user.id)
+        .bind(s.id as i64)
+        .bind(kind)
+        .bind(user.email.clone())
+        .bind(lang)
+        .bind(at.to_owned())
+        .execute(pg)
+    };
+    for (user, lang) in [(&owner, "en"), (&guest, "zh"), (&late, "en")] {
+        sqlx::query(
+            "INSERT INTO weekly_report_emails (user_id, email, lang, confirmed_at)
+             VALUES ($1, $2, $3, '2030-01-01T00:00:00Z')",
+        )
+        .bind(user.id)
+        .bind(&user.email)
+        .bind(lang)
+        .execute(pg)
+        .await
+        .unwrap();
+    }
+    let before = "2030-01-01T11:00:00Z";
+    subscribe(&owner, &site, "spike", "en", before)
+        .await
+        .unwrap();
+    subscribe(&owner, &site, "weekly", "en", before)
+        .await
+        .unwrap();
+    subscribe(&guest, &site, "spike", "zh", before)
+        .await
+        .unwrap();
+    subscribe(&owner, &calm, "spike", "en", before)
+        .await
+        .unwrap();
+    // Switched on while the first spike is running: only the next spike reaches this account.
+    subscribe(&late, &site, "spike", "en", "2030-01-01T12:00:30Z")
+        .await
+        .unwrap();
+
+    let t0: Timestamp = "2030-01-01T12:00:00Z".parse().unwrap();
+    let minutes = |m: i64| t0 + jiff::SignedDuration::from_mins(m);
+    let writer = rivu_storage_ch::writer_client(&env.ch_url, &account("writer"), &ch_database());
+    for visitor in 1..=3 {
+        add_visit(&writer, site.id, visitor, "pageview", minutes(-1)).await;
+        add_visit(&writer, calm.id, visitor, "pageview", minutes(-1)).await;
+    }
+    // Neither counts: an engagement event, and a pageview more than 5 minutes ago.
+    add_visit(&writer, calm.id, 4, "engagement", minutes(-1)).await;
+    add_visit(&writer, calm.id, 5, "pageview", minutes(-6)).await;
+
+    let cfg = config(&env, &[]);
+    let reader = rivu_storage_ch::client(&env.ch_url, &account("reader"), Some(&ch_database()));
+    let make_api = |at: Timestamp| {
+        let (mailer, outbox) = rivu_mail::Mailer::memory("rivu@example.test");
+        let api = DashApi::new(&cfg, pg.clone(), reader.clone(), None)
+            .unwrap()
+            .with_clock(move || at)
+            .with_mailer(mailer);
+        (Arc::new(api), outbox)
+    };
+    let run = rivu::traffic_spike::run_once;
+    let spike_row = || {
+        sqlx::query_as::<_, (i64, Option<i64>)>(
+            "SELECT extract(epoch FROM started_at)::bigint, extract(epoch FROM below_since)::bigint
+             FROM traffic_spikes WHERE site_id = $1",
+        )
+        .bind(id)
+        .fetch_optional(pg)
+    };
+    let claims = || {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM weekly_report_claims WHERE kind = 'spike'",
+        )
+        .fetch_one(pg)
+    };
+
+    // Two processes check at the same minute: one spike, one email per recipient.
+    let (a, a_out) = make_api(t0);
+    let (b, b_out) = make_api(t0);
+    let (ra, rb) = tokio::join!(run(&a), run(&b));
+    ra.unwrap();
+    rb.unwrap();
+    let mut mails = a_out.take();
+    mails.extend(b_out.take());
+    assert_eq!(mails.len(), 2, "{mails:#?}");
+    assert_eq!(claims().await.unwrap(), 2);
+    assert_eq!(spike_row().await.unwrap(), Some((t0.as_second(), None)));
+    let en = mails.iter().find(|m| m.to == owner.email).unwrap();
+    assert_eq!(en.subject, "internal-api-e2e: 3 current visitors");
+    assert!(
+        en.body.starts_with(
+            "internal-api-e2e\nJan 1, 2030, 12:00 (UTC)\n\nCurrent visitors: 3\nAlert threshold: 3\n"
+        ),
+        "{}",
+        en.body
+    );
+    assert!(
+        en.body
+            .contains(&format!("Open dashboard: {HTTP_ORIGIN}/s/{}\n", site.id))
+    );
+    let zh = mails.iter().find(|m| m.to == guest.email).unwrap();
+    assert_eq!(zh.subject, "internal-api-e2e：现在有 3 位访客在线");
+    for mail in [en, zh] {
+        let link = mail.unsubscribe_url.as_deref().unwrap();
+        assert!(link.starts_with(&format!("{HTTP_ORIGIN}/api/traffic-spike/unsubscribe/")));
+        assert!(mail.body.contains(link));
+    }
+    // The calm site has 3 current visitors (the engagement and the old pageview do not count),
+    // below its threshold of 100.
+    let calm_row: Option<i64> =
+        sqlx::query_scalar("SELECT site_id FROM traffic_spikes WHERE site_id = $1")
+            .bind(calm.id as i64)
+            .fetch_optional(pg)
+            .await
+            .unwrap();
+    assert_eq!(calm_row, None);
+
+    // Still above a minute later, and after a restart: no second email.
+    let (next, next_out) = make_api(minutes(1));
+    run(&next).await.unwrap();
+    assert!(next_out.take().is_empty());
+    // Below the threshold: the cooldown starts and the spike holds for 30 minutes.
+    let (below, below_out) = make_api(minutes(10));
+    run(&below).await.unwrap();
+    assert_eq!(
+        spike_row().await.unwrap(),
+        Some((t0.as_second(), Some(minutes(10).as_second())))
+    );
+    let (cooling, _) = make_api(minutes(39));
+    run(&cooling).await.unwrap();
+    assert!(spike_row().await.unwrap().is_some());
+    let (over, _) = make_api(minutes(40));
+    run(&over).await.unwrap();
+    assert_eq!(spike_row().await.unwrap(), None);
+    assert!(below_out.take().is_empty());
+
+    // A new spike is a new email, also for the account that switched on during the first one.
+    for visitor in 11..=14 {
+        add_visit(&writer, site.id, visitor, "pageview", minutes(44)).await;
+    }
+    let (second, second_out) = make_api(minutes(45));
+    run(&second).await.unwrap();
+    let mails = second_out.take();
+    let mut to: Vec<_> = mails.iter().map(|m| m.to.clone()).collect();
+    to.sort();
+    let mut want = vec![owner.email.clone(), guest.email.clone(), late.email.clone()];
+    want.sort();
+    assert_eq!(to, want);
+    assert!(mails.iter().all(|m| m.subject.contains('4')));
+    assert_eq!(claims().await.unwrap(), 5);
+
+    // The alert's link switches off only the alert; the weekly link path does not accept it.
+    let http = serve_dashboard(Arc::clone(&second), &cfg.base_url).await;
+    let link = mails
+        .iter()
+        .find(|m| m.to == owner.email)
+        .and_then(|m| m.unsubscribe_url.clone())
+        .unwrap();
+    let token = link.rsplit('/').next().unwrap();
+    let wrong = http
+        .rb(
+            "POST",
+            &format!("/api/weekly-report/unsubscribe/{token}"),
+            Vec::new(),
+        )
+        .send()
+        .await;
+    assert!(wrong.body.contains("already off"), "{}", wrong.body);
+    let path = link.strip_prefix(HTTP_ORIGIN).unwrap();
+    let page = http.get(path).send().await;
+    assert!(page.body.contains("traffic spike alerts") && page.body.contains("流量激增提醒"));
+    let done = http
+        .rb("POST", path, b"List-Unsubscribe=One-Click".to_vec())
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .send()
+        .await;
+    assert!(
+        done.body
+            .contains("You have unsubscribed from Rivu traffic spike alerts")
+    );
+    let kinds: Vec<String> = sqlx::query_scalar(
+        "SELECT kind FROM weekly_report_subscriptions WHERE user_id = $1 AND site_id = $2
+         ORDER BY kind",
+    )
+    .bind(owner.id)
+    .bind(id)
+    .fetch_all(pg)
+    .await
+    .unwrap();
+    assert_eq!(kinds, ["weekly"]);
+    cleanup(&env, &[site.id, calm.id]).await;
     iso.drop().await;
 }
 
@@ -6463,7 +6861,7 @@ async fn site_admin_create_and_settings() {
     assert_eq!(
         st["settings"],
         json!({"week_starts_on": 1, "collect_enabled": true, "tracker": {"hash": false, "engagement": true, "outbound": false, "downloads": false, "forms": false, "tagged": true},
-               "ingest_rate_limit_per_min": null, "geo_level": "city", "retention_days": null})
+               "ingest_rate_limit_per_min": null, "geo_level": "city", "retention_days": null, "spike_threshold": null})
     );
     assert_eq!(
         st["limits"]["shield_max_rules"],
@@ -6730,7 +7128,7 @@ async fn site_admin_create_and_settings() {
     assert_eq!(
         st["settings"],
         json!({"week_starts_on": 1, "collect_enabled": true, "tracker": {"hash": false, "engagement": true, "outbound": false, "downloads": false, "forms": false, "tagged": true},
-               "ingest_rate_limit_per_min": null, "geo_level": "city", "retention_days": null})
+               "ingest_rate_limit_per_min": null, "geo_level": "city", "retention_days": null, "spike_threshold": null})
     );
     let v = expect(&patch(json!({"week_starts_on": 6})).await, 200);
     assert_eq!(v["settings"]["week_starts_on"], 6);

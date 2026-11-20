@@ -1,12 +1,13 @@
 //! 报告邮件：确认邮箱的链接邮件，以及周报和月报本身。
 //!
-//! 周报和月报用同一个模板（[`report`]），只有文案和日期写法按 [`Cadence`] 不同。
+//! 周报和月报用同一个模板（[`report`]），只有文案和日期写法按 [`Cadence`] 不同；流量激增提醒
+//! （[`spike`]）沿用同一套外框、数字格子和页脚。
 //! 每封都有纯文本和 HTML 两个部分，内容相同、链接相同。排版和文案来自
 //! `designs/weekly-report/email.html`（2026-11-19 确认）：表格布局、行内样式，没有脚本、图片和
 //! 远程资源，深色由 `prefers-color-scheme: dark` 切换。插进 HTML 的每个值都经过转义；
 //! 链接只用服务端拼出来的地址（`RIVU_BASE_URL` 加固定路径和令牌），不用任何用户输入。
 
-use jiff::civil::Date;
+use jiff::civil::{Date, DateTime};
 
 use crate::{Lang, Mail};
 
@@ -96,35 +97,11 @@ pub fn report(r: &Report<'_>) -> Mail {
         s.open, s.manage, s.unsubscribe, r.unsubscribe_url
     ));
 
-    let metric = |label: &str, value: &str, first: bool| {
-        format!(
-            "<td class=\"metric line\" width=\"33%\" valign=\"top\" style=\"width:33%;padding:14px 16px;{}\">\n{}\n\
-             <p class=\"tx\" style=\"margin:4px 0 0;font-family:{SANS};font-size:24px;line-height:32px;font-weight:600;color:{TEXT};font-variant-numeric:tabular-nums;mso-line-height-rule:exactly;\">{}</p>\n</td>",
-            if first {
-                String::new()
-            } else {
-                format!("border-left:1px solid {LINE};")
-            },
-            para(Tone::Muted, &escape(label), ""),
-            escape(value),
-        )
-    };
     let range = format!(
         "<span class=\"mu\" style=\"color:{MUTED};\">{}{open_zone}{}{close_zone}</span>",
         escape(&long),
         escape(r.timezone)
     );
-    let footer_link = |href: &str, label: &str| {
-        para(
-            Tone::Muted,
-            &format!(
-                "<a class=\"lk\" href=\"{}\" style=\"color:{LINK};text-decoration:underline;\">{}</a>",
-                escape(href),
-                escape(label)
-            ),
-            "margin-top:4px;",
-        )
-    };
     let body = format!(
         "\n<tr><td class=\"px\" style=\"padding:20px 32px 0;\">\n{}\n{}\n</td></tr>\n\
          <tr><td class=\"px\" style=\"padding:20px 32px 0;\">\n\
@@ -134,9 +111,9 @@ pub fn report(r: &Report<'_>) -> Mail {
          {}",
         heading(&escape(r.site_name)),
         para(Tone::Body, &range, "margin-top:2px;"),
-        metric(s.visitors, visitors, true),
-        metric(s.visits, visits, false),
-        metric(s.pageviews, pageviews, false),
+        metric(s.visitors, visitors, true, "33%"),
+        metric(s.visits, visits, false, "33%"),
+        metric(s.pageviews, pageviews, false, "33%"),
         if quiet {
             para(Tone::Muted, &escape(s.no_visits), "margin-top:8px;")
         } else {
@@ -205,6 +182,133 @@ pub fn confirmation(lang: Lang, to: &str, link: &str) -> Mail {
         body: text,
         html: Some(shell(lang, subject, lead, &body)),
         unsubscribe_url: None,
+    }
+}
+
+/// 一封流量激增提醒用到的数据。
+#[derive(Clone, Copy, Debug)]
+pub struct Spike<'a> {
+    pub lang: Lang,
+    /// 收件地址，也写在页脚里。
+    pub to: &'a str,
+    /// `RIVU_BASE_URL`，末尾不带 `/`。
+    pub base_url: &'a str,
+    pub site_id: i64,
+    pub site_name: &'a str,
+    pub timezone: &'a str,
+    /// 检测到的时刻（站点时区的本地时间）。
+    pub at: DateTime,
+    /// 检测时的当前在线访客（最近 5 分钟的访客数）。
+    pub visitors: u64,
+    /// 站点设置的提醒阈值。
+    pub threshold: u64,
+    /// 这次发送的退订地址，同时放进 `List-Unsubscribe`。
+    pub unsubscribe_url: &'a str,
+}
+
+/// 流量激增提醒：结构与周报相同（站点名、时间、数字格子、「打开看板」、页脚），数字是当前在线和提醒阈值。
+pub fn spike(r: &Spike<'_>) -> Mail {
+    let site_name = single_line(r.site_name);
+    let timezone = single_line(r.timezone);
+    let visitors = grouped(r.visitors);
+    let threshold = grouped(r.threshold);
+    let (current, limit, note, manage, unsubscribe, colon) = match r.lang {
+        Lang::Zh => (
+            "当前在线",
+            "提醒阈值",
+            "这次激增结束前不会再发提醒。",
+            "管理提醒",
+            "退订提醒",
+            "：",
+        ),
+        Lang::En => (
+            "Current visitors",
+            "Alert threshold",
+            "You won\u{2019}t get another alert until this spike is over.",
+            "Manage alerts",
+            "Unsubscribe",
+            ": ",
+        ),
+    };
+    let noun = if r.visitors == 1 {
+        "current visitor"
+    } else {
+        "current visitors"
+    };
+    let subject = match r.lang {
+        Lang::Zh => format!("{site_name}：现在有 {visitors} 位访客在线"),
+        Lang::En => format!("{site_name}: {visitors} {noun}"),
+    };
+    let (open_zone, close_zone) = match r.lang {
+        Lang::Zh => ("（", "）"),
+        Lang::En => (" (", ")"),
+    };
+    let when = moment(r.at, r.lang);
+    let dashboard = format!("{}/s/{}", r.base_url, r.site_id);
+    let manage_url = format!("{}/account", r.base_url);
+    let reason = match r.lang {
+        Lang::Zh => format!("你订阅了 {site_name} 的流量激增提醒，收件地址 {}。", r.to),
+        Lang::En => format!(
+            "You subscribed to traffic spike alerts for {site_name} at {}.",
+            r.to
+        ),
+    };
+    let open = Words::of(r.lang, Cadence::Weekly).open;
+
+    let text = format!(
+        "{site_name}\n{when}{open_zone}{timezone}{close_zone}\n\n\
+         {current}{colon}{visitors}\n{limit}{colon}{threshold}\n{note}\n\n\
+         {open}{colon}{dashboard}\n\n\
+         {reason}\n{manage}{colon}{manage_url}\n{unsubscribe}{colon}{}\n",
+        r.unsubscribe_url
+    );
+    let moment_line = format!(
+        "<span class=\"mu\" style=\"color:{MUTED};\">{}{open_zone}{}{close_zone}</span>",
+        escape(&when),
+        escape(&timezone)
+    );
+    let body = format!(
+        "\n<tr><td class=\"px\" style=\"padding:20px 32px 0;\">\n{}\n{}\n</td></tr>\n\
+         <tr><td class=\"px\" style=\"padding:20px 32px 0;\">\n\
+         <table role=\"presentation\" class=\"line\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" border=\"0\" style=\"border:1px solid {LINE};border-radius:8px;border-collapse:separate;\">\n\
+         <tr>{}{}</tr>\n</table>\n{}\n</td></tr>\n\
+         <tr><td class=\"px\" style=\"padding:24px 32px 0;\">\n{}\n</td></tr>\n\
+         {}",
+        heading(&escape(&site_name)),
+        para(Tone::Body, &moment_line, "margin-top:2px;"),
+        metric(current, &visitors, true, "50%"),
+        metric(limit, &threshold, false, "50%"),
+        para(Tone::Muted, &escape(note), "margin-top:8px;"),
+        button(&dashboard, open),
+        footer(&[
+            para(Tone::Muted, &escape(&reason), ""),
+            footer_link(&manage_url, manage),
+            footer_link(r.unsubscribe_url, unsubscribe),
+        ]),
+    );
+    let preheader = match r.lang {
+        Lang::Zh => format!("当前在线 {visitors}，提醒阈值 {threshold}"),
+        Lang::En => format!("{visitors} {noun}, alert threshold {threshold}"),
+    };
+    Mail {
+        to: r.to.to_owned(),
+        html: Some(shell(r.lang, &subject, &preheader, &body)),
+        subject,
+        body: text,
+        unsubscribe_url: Some(r.unsubscribe_url.to_owned()),
+    }
+}
+
+/// 提醒里的时刻：「2026 年 11 月 20 日 14:32」/「Nov 20, 2026, 14:32」。
+fn moment(at: DateTime, lang: Lang) -> String {
+    let (y, m, d) = (at.year(), at.month(), at.day());
+    let (h, min) = (at.hour(), at.minute());
+    match lang {
+        Lang::Zh => format!("{y} 年 {m} 月 {d} 日 {h:02}:{min:02}"),
+        Lang::En => format!(
+            "{} {d}, {y}, {h:02}:{min:02}",
+            MONTHS[usize::try_from(m - 1).unwrap_or(0)]
+        ),
     }
 }
 
@@ -355,6 +459,36 @@ pub(crate) fn button(href: &str, label: &str) -> String {
          </td></tr></table>",
         escape(href),
         escape(label)
+    )
+}
+
+/// 数字格子里的一格：标签在上，数字在下。`width` 是这一格占的宽度。
+fn metric(label: &str, value: &str, first: bool, width: &str) -> String {
+    format!(
+        "<td class=\"metric line\" width=\"{width}\" valign=\"top\" style=\"width:{width};padding:14px 16px;{}\">
+{}
+         <p class=\"tx\" style=\"margin:4px 0 0;font-family:{SANS};font-size:24px;line-height:32px;font-weight:600;color:{TEXT};font-variant-numeric:tabular-nums;mso-line-height-rule:exactly;\">{}</p>
+</td>",
+        if first {
+            String::new()
+        } else {
+            format!("border-left:1px solid {LINE};")
+        },
+        para(Tone::Muted, &escape(label), ""),
+        escape(value),
+    )
+}
+
+/// 页脚里的一个链接，单独一行。
+fn footer_link(href: &str, label: &str) -> String {
+    para(
+        Tone::Muted,
+        &format!(
+            "<a class=\"lk\" href=\"{}\" style=\"color:{LINK};text-decoration:underline;\">{}</a>",
+            escape(href),
+            escape(label)
+        ),
+        "margin-top:4px;",
     )
 }
 
@@ -929,6 +1063,103 @@ mod tests {
         assert_eq!(
             mail.subject,
             "<b>Acme</b> Bcc: thief@example.test monthly report: October 2026"
+        );
+        assert_eq!(
+            mail.body.lines().next().unwrap(),
+            "<b>Acme</b> Bcc: thief@example.test"
+        );
+        let html = mail.html.unwrap();
+        self_contained(&html);
+        assert!(html.contains(">&lt;b&gt;Acme&lt;/b&gt; Bcc: thief@example.test</h1>"));
+        assert!(!html.contains("<b>"));
+        assert_eq!(hrefs(&html).len(), 3);
+    }
+
+    const SPIKE_UNSUBSCRIBE: &str = "https://rivu.example.com/api/traffic-spike/unsubscribe/U-T6YSW5Iz5wLwwUwOIRmlrLLTd32AZim_9uftvAePg";
+
+    fn spike_fixture(lang: Lang) -> Spike<'static> {
+        Spike {
+            lang,
+            to: "viewer@example.com",
+            base_url: BASE,
+            site_id: 1,
+            site_name: "studio.example.com",
+            timezone: "Asia/Taipei",
+            at: "2026-11-20T14:32:07".parse().unwrap(),
+            visitors: 1_320,
+            threshold: 100,
+            unsubscribe_url: SPIKE_UNSUBSCRIBE,
+        }
+    }
+
+    #[test]
+    fn a_spike_alert_in_both_languages() {
+        let zh = spike(&spike_fixture(Lang::Zh));
+        assert_eq!(zh.subject, "studio.example.com：现在有 1,320 位访客在线");
+        assert_eq!(
+            zh.body,
+            format!(
+                "studio.example.com\n2026 年 11 月 20 日 14:32（Asia/Taipei）\n\n\
+                 当前在线：1,320\n提醒阈值：100\n这次激增结束前不会再发提醒。\n\n\
+                 打开看板：{BASE}/s/1\n\n\
+                 你订阅了 studio.example.com 的流量激增提醒，收件地址 viewer@example.com。\n\
+                 管理提醒：{BASE}/account\n退订提醒：{SPIKE_UNSUBSCRIBE}\n"
+            )
+        );
+        assert_eq!(zh.unsubscribe_url.as_deref(), Some(SPIKE_UNSUBSCRIBE));
+        let html = zh.html.unwrap();
+        self_contained(&html);
+        assert!(html.contains("<title>studio.example.com：现在有 1,320 位访客在线</title>"));
+        assert!(html.contains(">当前在线 1,320，提醒阈值 100</div>"));
+        assert!(html.contains(">2026 年 11 月 20 日 14:32（Asia/Taipei）</span>"));
+        assert!(html.contains(">1,320</p>") && html.contains(">100</p>"));
+        assert!(html.contains(">管理提醒</a>") && html.contains(">退订提醒</a>"));
+        assert!(!html.contains("周报"));
+
+        let en = spike(&spike_fixture(Lang::En));
+        assert_eq!(en.subject, "studio.example.com: 1,320 current visitors");
+        assert_eq!(
+            en.body,
+            format!(
+                "studio.example.com\nNov 20, 2026, 14:32 (Asia/Taipei)\n\n\
+                 Current visitors: 1,320\nAlert threshold: 100\n\
+                 You won\u{2019}t get another alert until this spike is over.\n\n\
+                 Open dashboard: {BASE}/s/1\n\n\
+                 You subscribed to traffic spike alerts for studio.example.com at viewer@example.com.\n\
+                 Manage alerts: {BASE}/account\nUnsubscribe: {SPIKE_UNSUBSCRIBE}\n"
+            )
+        );
+        let html = en.html.unwrap();
+        self_contained(&html);
+        assert!(html.contains(">Manage alerts</a>"));
+        assert!(!html.contains("weekly"));
+        let want = [
+            format!("{BASE}/s/1"),
+            format!("{BASE}/account"),
+            SPIKE_UNSUBSCRIBE.to_owned(),
+        ];
+        assert_eq!(text_links(&en.body), want);
+        assert_eq!(hrefs(&html), want);
+
+        let mut one = spike_fixture(Lang::En);
+        (one.visitors, one.threshold) = (1, 1);
+        let mail = spike(&one);
+        assert_eq!(mail.subject, "studio.example.com: 1 current visitor");
+        assert!(
+            mail.html
+                .unwrap()
+                .contains(">1 current visitor, alert threshold 1</div>")
+        );
+    }
+
+    #[test]
+    fn a_hostile_site_name_in_a_spike_alert() {
+        let mut r = spike_fixture(Lang::Zh);
+        r.site_name = "<b>Acme</b>\r\nBcc: thief@example.test";
+        let mail = spike(&r);
+        assert_eq!(
+            mail.subject,
+            "<b>Acme</b> Bcc: thief@example.test：现在有 1,320 位访客在线"
         );
         assert_eq!(
             mail.body.lines().next().unwrap(),

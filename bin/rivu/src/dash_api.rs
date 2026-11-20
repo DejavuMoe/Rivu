@@ -20,9 +20,9 @@
 //! | `POST /api/internal/shared/{slug}/auth` | 无（限流） | 共享链接密码，通过后签发 12 小时的访问凭证 cookie |
 //! | `GET /api/internal/public/{site}` | 无（限流） | 公开站点（`is_public`）的入口信息 |
 //! | `POST /api/internal/orgs/{org_id}/sites` | 会话，组织 admin+ | 建站（域名规范化、白名单 = [域名]） |
-//! | `GET /api/internal/sites/{site}/settings` | 会话，有效角色 editor+ | 站点设置、白名单、限额与地理库能力 |
+//! | `GET /api/internal/sites/{site}/settings` | 会话，有效角色 editor+ | 站点设置（含流量激增提醒阈值 `spike_threshold`）、白名单、限额、地理库能力与 `mail_available` |
 //! | `GET /api/internal/sites/{site}/diagnostics?range=1h\|24h\|7d` | 会话，有效角色 editor+ | 接入诊断：按 `ingest_counters` 聚合的时间桶（已接收 / 已丢弃）、合计、丢弃原因、脚本版本、最后收到事件的时间；实现在 [`crate::diagnostics`] |
-//! | `PATCH /api/internal/sites/{site}` | 会话，组织 admin+ | 改名称、时区、周起始日、公开、采集、hash 路由、限速、地理精度 |
+//! | `PATCH /api/internal/sites/{site}` | 会话，组织 admin+ | 改名称、时区、周起始日、公开、采集、hash 路由、限速、地理精度、流量激增提醒阈值 |
 //! | `DELETE /api/internal/sites/{site}` | 会话，组织 admin+ | 软删除（请求体 `confirm` 须等于站点名），同一事务写入站点删除意图，`RIVU_SITE_RESTORE_DAYS`（默认 7）天内可恢复，之后 `ch_delete_batch` 清除统计数据 |
 //! | `GET /api/internal/orgs/{org_id}/deleted-sites` | 会话，组织 admin+ | 恢复窗口内的已删除站点 `{"sites":[{id,site_key,name,domain,deleted_at,purge_at}]}` |
 //! | `POST /api/internal/sites/{site}/restore` | 会话，站点所属组织 admin+（非成员 404） | 恢复已删除的站点，响应同站点列表的一项；窗口已过或清除已开始 409 `conflict` |

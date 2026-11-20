@@ -366,11 +366,13 @@ TABLE site_settings
   tracker jsonb NOT NULL DEFAULT '{}'::jsonb
   created_at timestamp with time zone NOT NULL DEFAULT now()
   updated_at timestamp with time zone NOT NULL DEFAULT now()
+  spike_threshold integer
   CONSTRAINT site_settings_geo_level_check CHECK ((geo_level = ANY (ARRAY['country'::text, 'region'::text, 'city'::text])))
   CONSTRAINT site_settings_ingest_rate_limit_per_min_check CHECK ((ingest_rate_limit_per_min > 0))
   CONSTRAINT site_settings_pkey PRIMARY KEY (site_id)
   CONSTRAINT site_settings_retention_days_check CHECK ((retention_days > 0))
   CONSTRAINT site_settings_site_id_fkey FOREIGN KEY (site_id) REFERENCES sites(id)
+  CONSTRAINT site_settings_spike_threshold_check CHECK ((spike_threshold >= 1))
   CONSTRAINT site_settings_week_starts_on_check CHECK (((week_starts_on >= 0) AND (week_starts_on <= 6)))
   CREATE INDEX site_settings_updated ON public.site_settings USING btree (updated_at)
   CREATE TRIGGER site_settings_notify_changed AFTER INSERT OR UPDATE ON public.site_settings FOR EACH ROW EXECUTE FUNCTION notify_site_changed('site_id')
@@ -394,6 +396,13 @@ TABLE sites
   CREATE INDEX sites_updated ON public.sites USING btree (updated_at)
   CREATE TRIGGER sites_notify_changed AFTER INSERT OR UPDATE ON public.sites FOR EACH ROW EXECUTE FUNCTION notify_site_changed('id')
   CREATE TRIGGER sites_set_updated_at BEFORE UPDATE ON public.sites FOR EACH ROW EXECUTE FUNCTION set_updated_at()
+
+TABLE traffic_spikes
+  site_id bigint NOT NULL
+  started_at timestamp with time zone NOT NULL
+  below_since timestamp with time zone
+  CONSTRAINT traffic_spikes_pkey PRIMARY KEY (site_id)
+  CONSTRAINT traffic_spikes_site_id_fkey FOREIGN KEY (site_id) REFERENCES sites(id)
 
 TABLE user_totp
   user_id bigint NOT NULL
@@ -429,7 +438,7 @@ TABLE weekly_report_claims
   confirmed_at timestamp with time zone
   unsubscribe_hash bytea
   kind text NOT NULL DEFAULT 'weekly'::text
-  CONSTRAINT weekly_report_claims_kind_check CHECK ((kind = ANY (ARRAY['weekly'::text, 'monthly'::text])))
+  CONSTRAINT weekly_report_claims_kind_check CHECK ((kind = ANY (ARRAY['weekly'::text, 'monthly'::text, 'spike'::text])))
   CONSTRAINT weekly_report_claims_pkey PRIMARY KEY (user_id, site_id, kind, period_end)
   CONSTRAINT weekly_report_claims_site_id_fkey FOREIGN KEY (site_id) REFERENCES sites(id)
   CONSTRAINT weekly_report_claims_unsubscribe_hash_check CHECK ((octet_length(unsubscribe_hash) = 32))
@@ -459,7 +468,7 @@ TABLE weekly_report_subscriptions
   lang text NOT NULL
   confirmed_at timestamp with time zone NOT NULL
   kind text NOT NULL DEFAULT 'weekly'::text
-  CONSTRAINT weekly_report_subscriptions_kind_check CHECK ((kind = ANY (ARRAY['weekly'::text, 'monthly'::text])))
+  CONSTRAINT weekly_report_subscriptions_kind_check CHECK ((kind = ANY (ARRAY['weekly'::text, 'monthly'::text, 'spike'::text])))
   CONSTRAINT weekly_report_subscriptions_lang_check CHECK ((lang = ANY (ARRAY['zh'::text, 'en'::text])))
   CONSTRAINT weekly_report_subscriptions_pkey PRIMARY KEY (user_id, site_id, kind)
   CONSTRAINT weekly_report_subscriptions_site_id_fkey FOREIGN KEY (site_id) REFERENCES sites(id)
