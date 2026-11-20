@@ -1,6 +1,22 @@
 -- 由 bin/rivu/tests/schema_snapshot.rs 生成（RIVU_SCHEMA_UPDATE=1），不要手工编辑。
 -- 迁移后 PostgreSQL public 模式的结构：表（列、约束、索引、触发器）与函数，按名字排序。
 
+TABLE annotations
+  id bigint NOT NULL GENERATED ALWAYS AS IDENTITY
+  site_id bigint NOT NULL
+  date date NOT NULL
+  text text NOT NULL
+  created_by bigint
+  deleted_at timestamp with time zone
+  created_at timestamp with time zone NOT NULL DEFAULT now()
+  updated_at timestamp with time zone NOT NULL DEFAULT now()
+  CONSTRAINT annotations_created_by_fkey FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL
+  CONSTRAINT annotations_pkey PRIMARY KEY (id)
+  CONSTRAINT annotations_site_id_fkey FOREIGN KEY (site_id) REFERENCES sites(id)
+  CONSTRAINT annotations_text_check CHECK (((char_length(text) >= 1) AND (char_length(text) <= 255)))
+  CREATE INDEX annotations_site_date ON public.annotations USING btree (site_id, date) WHERE (deleted_at IS NULL)
+  CREATE TRIGGER annotations_set_updated_at BEFORE UPDATE ON public.annotations FOR EACH ROW EXECUTE FUNCTION set_updated_at()
+
 TABLE api_keys
   id bigint NOT NULL GENERATED ALWAYS AS IDENTITY
   organization_id bigint NOT NULL

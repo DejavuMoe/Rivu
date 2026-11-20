@@ -254,7 +254,7 @@ pub enum Action {
     StatsDelete,
     /// `shared_link.manage`：owner、admin、editor。
     SharedLinkManage,
-    /// `site.content.write`（目标的增删）：owner、admin、editor；看板按有效角色判定，站点访客 editor 也可以。
+    /// `site.content.write`（目标的增删、图表注释的增删改）：owner、admin、editor；看板按有效角色判定，站点访客 editor 也可以。
     SiteContentWrite,
     /// `member.invite`、`member.remove`、`member.role.change`：owner、admin（admin 能碰到哪些角色见 [`can_assign`]、[`can_modify`]）。
     MemberManage,
